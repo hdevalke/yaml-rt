@@ -553,6 +553,8 @@ pub enum NodeKind {
     FlowSequence,
     /// Single-line flow mapping collection.
     FlowMapping,
+    /// Literal block scalar collection.
+    LiteralScalar,
     /// Scalar syntax span.
     Scalar,
 }
@@ -595,9 +597,9 @@ impl<'source> Parser<'source> {
         }
 
         let lines = SourceLines::new(self.source).collect::<Result<Vec<_>, _>>()?;
-        for (index, line) in lines.iter().copied().enumerate() {
-            let next_significant_indent = next_significant_indent(&lines, index)?;
-            self.parse_line(document, line, next_significant_indent)?;
+        let mut index = 0;
+        while index < lines.len() {
+            index += self.parse_line(document, &lines, index)?;
         }
 
         Ok(self.nodes)
@@ -606,17 +608,18 @@ impl<'source> Parser<'source> {
     fn parse_line(
         &mut self,
         document: NodeId,
-        line: SourceLine<'_>,
-        next_significant_indent: Option<usize>,
-    ) -> Result<(), YamlError> {
+        lines: &[SourceLine<'_>],
+        index: usize,
+    ) -> Result<usize, YamlError> {
+        let line = lines[index];
         let content = line.content_without_break;
         let trimmed = content.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            return Ok(());
+            return Ok(1);
         }
 
         if trimmed == "---" || trimmed == "..." {
-            return Ok(());
+            return Ok(1);
         }
         if trimmed.starts_with("---") || trimmed.starts_with("...") {
             return Err(invalid_document_marker(line));
@@ -629,21 +632,19 @@ impl<'source> Parser<'source> {
         reject_unexpected_line_start(body, line.content_start + indent)?;
 
         if is_sequence_entry(body) {
-            self.parse_sequence_entry(document, line, indent, body)
+            self.parse_sequence_entry(document, lines, index, indent, body)
+        } else if body.starts_with('|') {
+            let (node, consumed) =
+                self.parse_literal_scalar(lines, index, line.content_start + indent, indent, body)?;
+            self.nodes[document.0 as usize].children.push(node);
+            Ok(consumed)
         } else if body.starts_with('[') || body.starts_with('{') {
             let (node, end) = self.parse_flow_value(body, line.content_start + indent)?;
             reject_trailing_flow_content(body, end, line.content_start + indent)?;
             self.nodes[document.0 as usize].children.push(node);
-            Ok(())
+            Ok(1)
         } else if let Some(colon_byte) = find_mapping_colon(body) {
-            self.parse_mapping_entry(
-                document,
-                line,
-                indent,
-                body,
-                colon_byte,
-                next_significant_indent,
-            )
+            self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
         } else {
             let scalar_span = Span::new(
                 (line.content_start + indent) as u32,
@@ -651,19 +652,20 @@ impl<'source> Parser<'source> {
             );
             let scalar = self.push_node(NodeKind::Scalar, scalar_span);
             self.nodes[document.0 as usize].children.push(scalar);
-            Ok(())
+            Ok(1)
         }
     }
 
     fn parse_mapping_entry(
         &mut self,
         document: NodeId,
-        line: SourceLine<'_>,
+        lines: &[SourceLine<'_>],
+        index: usize,
         indent: usize,
         body: &str,
         colon_byte: usize,
-        next_significant_indent: Option<usize>,
-    ) -> Result<(), YamlError> {
+    ) -> Result<usize, YamlError> {
+        let line = lines[index];
         let mapping = self.ensure_mapping(
             document,
             indent,
@@ -691,6 +693,7 @@ impl<'source> Parser<'source> {
 
         let value = &body[colon_byte + 1..];
         let value_trimmed = value.trim_start();
+        let next_significant_indent = next_significant_indent(lines, index)?;
         if value_trimmed.is_empty() && next_significant_indent.is_none_or(|next| next <= indent) {
             return Err(missing_mapping_value(line, indent, colon_byte));
         }
@@ -698,20 +701,29 @@ impl<'source> Parser<'source> {
         if !value_trimmed.is_empty() {
             let leading = value.len() - value_trimmed.len();
             let value_start = line.content_start + indent + colon_byte + 1 + leading;
-            let value_node = self.parse_inline_value(value_trimmed, value_start)?;
+            let value_node = if value_trimmed.starts_with('|') {
+                let (node, consumed) =
+                    self.parse_literal_scalar(lines, index, value_start, indent, value_trimmed)?;
+                self.nodes[entry.0 as usize].children.push(node);
+                return Ok(consumed);
+            } else {
+                self.parse_inline_value(value_trimmed, value_start)?
+            };
             self.nodes[entry.0 as usize].children.push(value_node);
         }
 
-        Ok(())
+        Ok(1)
     }
 
     fn parse_sequence_entry(
         &mut self,
         document: NodeId,
-        line: SourceLine<'_>,
+        lines: &[SourceLine<'_>],
+        index: usize,
         indent: usize,
         body: &str,
-    ) -> Result<(), YamlError> {
+    ) -> Result<usize, YamlError> {
+        let line = lines[index];
         let sequence = self.ensure_sequence(
             document,
             indent,
@@ -732,11 +744,18 @@ impl<'source> Parser<'source> {
         if !value.is_empty() {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
-            let value_node = self.parse_inline_value(value, value_start)?;
+            let value_node = if value.starts_with('|') {
+                let (node, consumed) =
+                    self.parse_literal_scalar(lines, index, value_start, indent, value)?;
+                self.nodes[entry.0 as usize].children.push(node);
+                return Ok(consumed);
+            } else {
+                self.parse_inline_value(value, value_start)?
+            };
             self.nodes[entry.0 as usize].children.push(value_node);
         }
 
-        Ok(())
+        Ok(1)
     }
 
     fn parse_inline_value(
@@ -783,6 +802,57 @@ impl<'source> Parser<'source> {
                 end,
             ))
         }
+    }
+
+    fn parse_literal_scalar(
+        &mut self,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        header_start: usize,
+        parent_indent: usize,
+        header: &str,
+    ) -> Result<(NodeId, usize), YamlError> {
+        let header = parse_literal_header(header, header_start)?;
+        let mut consumed = 1;
+        let mut content_indent = header
+            .indent
+            .map(|indent| parent_indent + indent)
+            .unwrap_or(usize::MAX);
+        let mut end = lines[index].line_end;
+
+        for line in &lines[index + 1..] {
+            let trimmed = line.content_without_break.trim();
+            if trimmed == "---" || trimmed == "..." {
+                break;
+            }
+
+            if trimmed.is_empty() {
+                consumed += 1;
+                end = line.line_end;
+                continue;
+            }
+
+            let indent = count_literal_content_indent(line.content_without_break);
+            if content_indent == usize::MAX {
+                if indent <= parent_indent && parent_indent > 0 {
+                    break;
+                }
+                content_indent = indent;
+            }
+
+            if indent < content_indent {
+                break;
+            }
+
+            consumed += 1;
+            end = line.line_end;
+        }
+
+        let scalar = self.push_node(
+            NodeKind::LiteralScalar,
+            Span::new(header_start as u32, end as u32),
+        );
+        Ok((scalar, consumed))
     }
 
     fn parse_flow_sequence(
@@ -1115,6 +1185,7 @@ impl TokenKind {
 struct SourceLine<'source> {
     content_start: usize,
     content_end: usize,
+    line_end: usize,
     content_without_break: &'source str,
 }
 
@@ -1166,6 +1237,7 @@ impl<'source> Iterator for SourceLines<'source> {
                 .map(|content_without_break| SourceLine {
                     content_start: start,
                     content_end,
+                    line_end: next_start,
                     content_without_break,
                 }),
         )
@@ -1195,6 +1267,75 @@ fn invalid_document_marker(line: SourceLine<'_>) -> YamlError {
             Span::new(line.content_start as u32, line.content_end as u32),
         )
         .with_expected("--- or ... followed by separation or line break"),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockChomp {
+    Strip,
+    Clip,
+    Keep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiteralHeader {
+    chomp: BlockChomp,
+    indent: Option<usize>,
+}
+
+fn parse_literal_header(header: &str, header_start: usize) -> Result<LiteralHeader, YamlError> {
+    debug_assert!(header.starts_with('|'));
+
+    let mut chomp = BlockChomp::Clip;
+    let mut indent = None;
+    let mut seen_chomp = false;
+    let mut seen_indent = false;
+    let mut offset = 1;
+
+    while offset < header.len() {
+        let character = header[offset..]
+            .chars()
+            .next()
+            .expect("offset is inside header");
+        match character {
+            '-' | '+' if !seen_chomp => {
+                chomp = if character == '-' {
+                    BlockChomp::Strip
+                } else {
+                    BlockChomp::Keep
+                };
+                seen_chomp = true;
+                offset += character.len_utf8();
+            }
+            '1'..='9' if !seen_indent => {
+                indent = Some(character.to_digit(10).expect("digit") as usize);
+                seen_indent = true;
+                offset += character.len_utf8();
+            }
+            ' ' | '\t' => {
+                let rest = &header[offset..];
+                let comment_start = rest.find('#').unwrap_or(rest.len());
+                if rest[..comment_start].trim().is_empty() {
+                    return Ok(LiteralHeader { chomp, indent });
+                }
+                return Err(invalid_literal_header(header_start + offset, character));
+            }
+            '#' => return Ok(LiteralHeader { chomp, indent }),
+            _ => return Err(invalid_literal_header(header_start + offset, character)),
+        }
+    }
+
+    Ok(LiteralHeader { chomp, indent })
+}
+
+fn invalid_literal_header(offset: usize, found: char) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("invalid literal scalar header before `{found}`"),
+            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+        )
+        .with_expected("|, |-, |+, or a one-digit indentation indicator"),
     )
 }
 
@@ -1251,6 +1392,10 @@ fn count_indent(content: &str, content_start: usize) -> Result<usize, YamlError>
         }
     }
     Ok(indent)
+}
+
+fn count_literal_content_indent(content: &str) -> usize {
+    content.bytes().take_while(|byte| *byte == b' ').count()
 }
 
 fn is_sequence_entry(body: &str) -> bool {
@@ -1738,6 +1883,10 @@ fn format_double_quoted_scalar_value(value: &str) -> String {
 }
 
 fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
+    if text.starts_with('|') {
+        return decode_literal_scalar_value(text);
+    }
+
     if text.starts_with('"') {
         let end = double_quoted_scalar_end(text).ok_or_else(|| {
             YamlError::new(
@@ -1767,6 +1916,134 @@ fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
     }
 
     Ok(text[..plain_scalar_end(text)].to_owned())
+}
+
+fn decode_literal_scalar_value(text: &str) -> Result<String, YamlError> {
+    let (header, content_start) = split_first_line(text);
+    let header = parse_literal_header(header, 0)?;
+    let content = &text[content_start..];
+    let content_indent = header
+        .indent
+        .unwrap_or_else(|| detect_literal_content_indent(content));
+    let mut decoded = String::new();
+    let mut position = 0;
+
+    while position < content.len() {
+        let (line, next_position) = next_literal_content_line(content, position);
+        let (body, break_text) = split_line_break(line);
+        let stripped = if body.trim().is_empty() {
+            ""
+        } else {
+            strip_literal_indent(body, content_indent)
+        };
+        decoded.push_str(stripped);
+        decoded.push_str(break_text);
+        position = next_position;
+    }
+
+    Ok(apply_block_chomp(decoded, header.chomp))
+}
+
+fn split_first_line(text: &str) -> (&str, usize) {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            return (&text[..index], index + 1);
+        }
+        if *byte == b'\r' {
+            let end = if bytes.get(index + 1) == Some(&b'\n') {
+                index + 2
+            } else {
+                index + 1
+            };
+            return (&text[..index], end);
+        }
+    }
+    (text, text.len())
+}
+
+fn next_literal_content_line(text: &str, start: usize) -> (&str, usize) {
+    let bytes = text.as_bytes();
+    let mut index = start;
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            return (&text[start..index + 1], index + 1);
+        }
+        if bytes[index] == b'\r' {
+            let end = if bytes.get(index + 1) == Some(&b'\n') {
+                index + 2
+            } else {
+                index + 1
+            };
+            return (&text[start..end], end);
+        }
+        index += 1;
+    }
+    (&text[start..], text.len())
+}
+
+fn split_line_break(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else if let Some(body) = line.strip_suffix('\r') {
+        (body, "\r")
+    } else {
+        (line, "")
+    }
+}
+
+fn detect_literal_content_indent(content: &str) -> usize {
+    let mut position = 0;
+    while position < content.len() {
+        let (line, next_position) = next_literal_content_line(content, position);
+        let (body, _) = split_line_break(line);
+        if !body.trim().is_empty() {
+            return body.bytes().take_while(|byte| *byte == b' ').count();
+        }
+        position = next_position;
+    }
+    0
+}
+
+fn strip_literal_indent(line: &str, indent: usize) -> &str {
+    let mut stripped = 0;
+    for (offset, byte) in line.bytes().enumerate() {
+        if stripped == indent || byte != b' ' {
+            return &line[offset..];
+        }
+        stripped += 1;
+    }
+    ""
+}
+
+fn apply_block_chomp(mut value: String, chomp: BlockChomp) -> String {
+    match chomp {
+        BlockChomp::Keep => value,
+        BlockChomp::Strip => {
+            trim_trailing_line_breaks(&mut value);
+            value
+        }
+        BlockChomp::Clip => {
+            let had_line_break = ends_with_line_break(&value);
+            trim_trailing_line_breaks(&mut value);
+            if had_line_break {
+                value.push('\n');
+            }
+            value
+        }
+    }
+}
+
+fn trim_trailing_line_breaks(value: &mut String) {
+    while value.ends_with('\n') || value.ends_with('\r') {
+        value.pop();
+    }
+}
+
+fn ends_with_line_break(value: &str) -> bool {
+    value.ends_with('\n') || value.ends_with('\r')
 }
 
 fn decode_double_quoted_scalar(text: &str) -> Result<String, YamlError> {
@@ -1987,7 +2264,18 @@ impl YamlDoc {
     /// scalars unescape doubled apostrophes, and double-quoted scalars unescape
     /// the common JSON/YAML escapes currently used by the typed overlay MVP.
     pub fn scalar_value(&self, node: NodeId) -> Result<String, YamlError> {
-        let node = self.expect_node_kind(node, NodeKind::Scalar)?;
+        let node = self.expect_node(node)?;
+        if !matches!(node.kind, NodeKind::Scalar | NodeKind::LiteralScalar) {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    format!("expected scalar value, found {:?}", node.kind),
+                    node.span,
+                )
+                .with_expected("Scalar or LiteralScalar"),
+            )
+            .with_position_from(&self.source));
+        }
         decode_scalar_value(self.source.slice(node.span))
     }
 
@@ -2637,6 +2925,21 @@ fn write_existing_scalar(
     value: &str,
 ) -> Result<NodeId, YamlError> {
     let node = node.ok_or_else(missing_write_node_error)?;
+    if doc
+        .node(node)
+        .is_some_and(|node| node.kind == NodeKind::LiteralScalar)
+    {
+        let literal = doc.expect_node(node)?;
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Emitter,
+                "literal scalar rewriting is not implemented yet",
+                literal.span,
+            )
+            .with_expected("an existing plain, single-quoted, or double-quoted scalar"),
+        )
+        .with_position_from(&doc.source));
+    }
     let (span, style) = doc.scalar_replacement_target(node)?;
     let replacement = format_scalar_value(value, style)?;
     doc.queue_edit(span, replacement)?;
@@ -3084,6 +3387,121 @@ ports:
         assert!(scalar_texts(&doc).contains(&"localhost"));
         assert!(scalar_texts(&doc).contains(&"8080"));
         assert!(scalar_texts(&doc).contains(&"9090"));
+    }
+
+    #[test]
+    fn parser_builds_root_literal_scalar_cst() {
+        let input = "|\n  hello\n  world\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept root literal scalar");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(count_nodes(&doc, NodeKind::LiteralScalar), 1);
+        let literal = literal_scalar(&doc).expect("literal scalar exists");
+        assert_eq!(
+            doc.source
+                .slice(doc.node(literal).expect("node exists").span),
+            input
+        );
+    }
+
+    #[test]
+    fn parser_builds_literal_scalar_mapping_value_cst() {
+        let input = "message: |\n  hello\n  world\nnext: value\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept literal mapping value");
+        let message = doc
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.node(message).map(|node| node.kind),
+            Some(NodeKind::LiteralScalar)
+        );
+        assert_eq!(
+            String::read_yaml(&doc, message).expect("literal reads"),
+            "hello\nworld\n"
+        );
+        assert_eq!(
+            doc.get_path(&["next"])
+                .expect("lookup succeeds")
+                .map(|node| doc.scalar_text(node).expect("scalar")),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn yaml_value_reads_literal_scalar_chomping() {
+        let strip = YamlDoc::parse("message: |-\n  hello\n\n").expect("valid strip literal");
+        let keep = YamlDoc::parse("message: |+\n  hello\n\n").expect("valid keep literal");
+        let strip_node = strip
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+        let keep_node = keep
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        assert_eq!(
+            String::read_yaml(&strip, strip_node).expect("strip reads"),
+            "hello"
+        );
+        assert_eq!(
+            String::read_yaml(&keep, keep_node).expect("keep reads"),
+            "hello\n\n"
+        );
+    }
+
+    #[test]
+    fn parser_builds_literal_scalar_inside_block_sequence_entry() {
+        let input = "- |\n  hello\n  # content comment\n- next\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept literal sequence value");
+        let literal = literal_scalar(&doc).expect("literal scalar exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            String::read_yaml(&doc, literal).expect("literal reads"),
+            "hello\n# content comment\n"
+        );
+        assert_eq!(count_nodes(&doc, NodeKind::SequenceEntry), 2);
+    }
+
+    #[test]
+    fn parser_reports_invalid_literal_scalar_headers() {
+        for input in ["message: |bad\n", "message: |0\n", "message: |--\n"] {
+            let error = YamlDoc::parse(input).expect_err("literal header should be rejected");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+            assert!(
+                error
+                    .diagnostic
+                    .message
+                    .starts_with("invalid literal scalar header before")
+            );
+            assert!(!error.diagnostic.expected.is_empty());
+            assert!(error.diagnostic.position.is_some());
+        }
+    }
+
+    #[test]
+    fn yaml_value_rejects_literal_scalar_writes_for_now() {
+        let mut doc = YamlDoc::parse("message: |\n  hello\n").expect("valid literal scalar");
+        let message = doc
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        let error = "updated"
+            .to_owned()
+            .write_yaml(&mut doc, Some(message))
+            .expect_err("literal scalar writes are intentionally not implemented yet");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(
+            error.diagnostic.message,
+            "literal scalar rewriting is not implemented yet"
+        );
     }
 
     #[test]
@@ -3686,6 +4104,14 @@ debug: false
             .filter(|node| node.kind == NodeKind::Scalar)
             .map(|node| doc.source.slice(node.span))
             .collect()
+    }
+
+    fn literal_scalar(doc: &YamlDoc) -> Option<NodeId> {
+        doc.nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == NodeKind::LiteralScalar)
+            .map(|(index, _)| NodeId(index as u32))
     }
 
     fn flow_sequence_scalar_texts(doc: &YamlDoc, sequence: NodeId) -> Vec<&str> {

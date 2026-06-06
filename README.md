@@ -318,7 +318,9 @@ Add support incrementally:
 - [x] Single-line flow mappings: `{a: 1, b: 2}`, including nested flow
       collections and typed `BTreeMap<String, T>` reads. Flow mapping patch
       writing remains a later writer milestone.
-- Literal scalars: `|`.
+- [x] Literal scalars: `|`, including strip/clip/keep chomping and typed
+      `String` reads. Literal scalar patch writing remains a later writer
+      milestone.
 - Folded scalars: `>`.
 - Anchors: `&name`.
 - Aliases: `*name`.

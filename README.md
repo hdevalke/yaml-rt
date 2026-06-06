@@ -81,9 +81,9 @@ Lexer
   ↓
 Token stream
   ↓
-Lossless CST
+Parser events + lossless CST
   ↓
-Semantic YAML graph
+CST-linked semantic YAML graph
   ↓
 Typed derive overlay
   ↓
@@ -100,7 +100,9 @@ instead of replacing it.
 pub struct YamlDoc {
     source: Source,
     tokens: Vec<Token>,
+    events: Vec<YamlEvent>,
     nodes: Vec<Node>,
+    graph: SemanticGraph,
     edits: Vec<Edit>,
 }
 
@@ -259,6 +261,8 @@ Add path APIs:
 - [x] `doc.get_mapping_entry(mapping, "port")`
 - [x] `doc.get_mapping_value(mapping, "port")`
 - [x] `doc.scalar_text(node)`
+- [x] `doc.get_graph_path(&["server", "port"])`
+- [x] `doc.graph_node_cst(graph_node)`
 
 Typed parsing can now bind fields to MVP YAML nodes without losing the CST as the
 source of truth.
@@ -552,8 +556,11 @@ correct.
       generated from upstream `v2022-01-17`.
 - [x] Support focused valid/invalid parse and byte-identical round-trip checks
       through `crates/yaml-rt-core/tests/yaml_test_suite.rs`.
-- [ ] Support event stream, JSON-compatible value, and emit fixture categories.
-- [ ] Record expected failures while the parser is incomplete and require the
+- [x] Support parser-produced event stream checks for currently accepted cases.
+- [x] Compose a CST-linked semantic graph from parser events for the accepted
+      subset.
+- [ ] Support JSON-compatible value and emit fixture categories.
+- [x] Record expected failures while the parser is incomplete and require the
       list to shrink as phases land.
 - [ ] Classify failures by source validation, lexer, parser, composer, schema,
       typed overlay, or emitter.

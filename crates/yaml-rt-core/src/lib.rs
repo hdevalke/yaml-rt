@@ -561,18 +561,173 @@ pub enum NodeKind {
     Scalar,
 }
 
+/// Semantic YAML event produced by the parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YamlEvent {
+    /// Event classification.
+    pub kind: YamlEventKind,
+    /// Source span associated with this event.
+    pub span: Span,
+}
+
+/// YAML collection spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionStyle {
+    /// Block collection syntax.
+    Block,
+    /// Flow collection syntax.
+    Flow,
+}
+
+/// YAML scalar spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YamlScalarStyle {
+    /// Plain scalar syntax.
+    Plain,
+    /// Single-quoted scalar syntax.
+    SingleQuoted,
+    /// Double-quoted scalar syntax.
+    DoubleQuoted,
+    /// Literal block scalar syntax.
+    Literal,
+    /// Folded block scalar syntax.
+    Folded,
+}
+
+/// Semantic YAML event kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YamlEventKind {
+    /// Start of a YAML stream.
+    StreamStart,
+    /// End of a YAML stream.
+    StreamEnd,
+    /// Start of a YAML document.
+    DocumentStart {
+        /// Whether the source used an explicit `---` marker.
+        explicit: bool,
+    },
+    /// End of a YAML document.
+    DocumentEnd,
+    /// Start of a sequence node.
+    SequenceStart {
+        /// Sequence spelling style.
+        style: CollectionStyle,
+    },
+    /// End of a sequence node.
+    SequenceEnd,
+    /// Start of a mapping node.
+    MappingStart {
+        /// Mapping spelling style.
+        style: CollectionStyle,
+    },
+    /// End of a mapping node.
+    MappingEnd,
+    /// Scalar node with decoded content.
+    Scalar {
+        /// Scalar spelling style.
+        style: YamlScalarStyle,
+        /// Decoded scalar value.
+        value: String,
+    },
+    /// Alias node.
+    Alias {
+        /// Alias name without the leading `*`.
+        name: String,
+    },
+}
+
 /// Parses the MVP token/source pair into a lossless CST node arena.
 pub fn parse_cst(source: &Source, tokens: &[Token]) -> Result<Vec<Node>, YamlError> {
-    Parser::new(source, tokens).parse()
+    Parser::new(source, tokens)
+        .parse()
+        .map(|parsed| parsed.nodes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedYaml {
+    nodes: Vec<Node>,
+    events: Vec<YamlEvent>,
+}
+
+/// Identifier for a semantic graph node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphNodeId(pub u32);
+
+/// Semantic graph node built from parser events and linked back to the CST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphNode {
+    /// Semantic node classification.
+    pub kind: GraphKind,
+    /// Source span associated with the semantic node.
+    pub span: Span,
+    /// Best matching CST node, when the semantic node has one.
+    pub cst: Option<NodeId>,
+}
+
+/// Semantic graph node kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphKind {
+    /// YAML document node.
+    Document {
+        /// Document content nodes.
+        children: Vec<GraphNodeId>,
+    },
+    /// YAML mapping node.
+    Mapping {
+        /// Mapping spelling style.
+        style: CollectionStyle,
+        /// Key/value node pairs in source order.
+        entries: Vec<(GraphNodeId, GraphNodeId)>,
+    },
+    /// YAML sequence node.
+    Sequence {
+        /// Sequence spelling style.
+        style: CollectionStyle,
+        /// Item nodes in source order.
+        items: Vec<GraphNodeId>,
+    },
+    /// YAML scalar node.
+    Scalar {
+        /// Scalar spelling style.
+        style: YamlScalarStyle,
+        /// Decoded scalar value.
+        value: String,
+        /// Placeholder for schema-resolved tags.
+        tag: Option<String>,
+        /// Placeholder for anchors.
+        anchor: Option<String>,
+    },
+    /// YAML alias node.
+    Alias {
+        /// Alias name without the leading `*`.
+        name: String,
+    },
+}
+
+/// CST-linked semantic graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticGraph {
+    /// Graph nodes in stable insertion order.
+    pub nodes: Vec<GraphNode>,
+    /// Root document node.
+    pub root: Option<GraphNodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenEventCollection {
+    Mapping,
+    Sequence,
 }
 
 struct Parser<'source> {
     source: &'source Source,
     tokens: &'source [Token],
     nodes: Vec<Node>,
+    events: Vec<YamlEvent>,
     document: Option<NodeId>,
     mappings: Vec<(usize, NodeId)>,
     sequences: Vec<(usize, NodeId)>,
+    event_collections: Vec<(usize, OpenEventCollection)>,
 }
 
 impl<'source> Parser<'source> {
@@ -581,15 +736,31 @@ impl<'source> Parser<'source> {
             source,
             tokens,
             nodes: Vec::new(),
+            events: Vec::new(),
             document: None,
             mappings: Vec::new(),
             sequences: Vec::new(),
+            event_collections: Vec::new(),
         }
     }
 
-    fn parse(mut self) -> Result<Vec<Node>, YamlError> {
+    fn parse(mut self) -> Result<ParsedYaml, YamlError> {
         let stream = self.push_node(NodeKind::Stream, Span::new(0, self.source.len() as u32));
         let document = self.ensure_document(stream, Span::new(0, self.source.len() as u32));
+        let document_explicit = self
+            .tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::DocumentStart);
+        self.push_event(
+            YamlEventKind::StreamStart,
+            Span::new(0, self.source.len() as u32),
+        );
+        self.push_event(
+            YamlEventKind::DocumentStart {
+                explicit: document_explicit,
+            },
+            Span::new(0, self.source.len() as u32),
+        );
 
         for token in self.tokens {
             if token.kind == TokenKind::DocumentStart || token.kind == TokenKind::DocumentEnd {
@@ -603,8 +774,21 @@ impl<'source> Parser<'source> {
         while index < lines.len() {
             index += self.parse_line(document, &lines, index)?;
         }
+        self.close_event_collections_deeper_than(0);
+        self.close_all_event_collections();
+        self.push_event(
+            YamlEventKind::DocumentEnd,
+            Span::new(self.source.len() as u32, self.source.len() as u32),
+        );
+        self.push_event(
+            YamlEventKind::StreamEnd,
+            Span::new(self.source.len() as u32, self.source.len() as u32),
+        );
 
-        Ok(self.nodes)
+        Ok(ParsedYaml {
+            nodes: self.nodes,
+            events: self.events,
+        })
     }
 
     fn parse_line(
@@ -639,11 +823,13 @@ impl<'source> Parser<'source> {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, line.content_start + indent, indent, body)?;
             self.nodes[document.0 as usize].children.push(node);
+            self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if body.starts_with('[') || body.starts_with('{') {
             let (node, end) = self.parse_flow_value(body, line.content_start + indent)?;
             reject_trailing_flow_content(body, end, line.content_start + indent)?;
             self.nodes[document.0 as usize].children.push(node);
+            self.emit_node_event(node)?;
             Ok(1)
         } else if let Some(colon_byte) = find_mapping_colon(body) {
             self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
@@ -654,6 +840,7 @@ impl<'source> Parser<'source> {
             );
             let scalar = self.push_node(NodeKind::Scalar, scalar_span);
             self.nodes[document.0 as usize].children.push(scalar);
+            self.emit_scalar_event(scalar)?;
             Ok(1)
         }
     }
@@ -691,6 +878,7 @@ impl<'source> Parser<'source> {
                 Span::new(key_start as u32, key_end as u32),
             );
             self.nodes[entry.0 as usize].children.push(key);
+            self.emit_scalar_event(key)?;
         }
 
         let value = &body[colon_byte + 1..];
@@ -707,11 +895,13 @@ impl<'source> Parser<'source> {
                 let (node, consumed) =
                     self.parse_block_scalar(lines, index, value_start, indent, value_trimmed)?;
                 self.nodes[entry.0 as usize].children.push(node);
+                self.emit_scalar_event(node)?;
                 return Ok(consumed);
             } else {
                 self.parse_inline_value(value_trimmed, value_start)?
             };
             self.nodes[entry.0 as usize].children.push(value_node);
+            self.emit_node_event(value_node)?;
         }
 
         Ok(1)
@@ -750,11 +940,13 @@ impl<'source> Parser<'source> {
                 let (node, consumed) =
                     self.parse_block_scalar(lines, index, value_start, indent, value)?;
                 self.nodes[entry.0 as usize].children.push(node);
+                self.emit_scalar_event(node)?;
                 return Ok(consumed);
             } else {
                 self.parse_inline_value(value, value_start)?
             };
             self.nodes[entry.0 as usize].children.push(value_node);
+            self.emit_node_event(value_node)?;
         }
 
         Ok(1)
@@ -1110,6 +1302,14 @@ impl<'source> Parser<'source> {
             let mapping = self.push_node(NodeKind::BlockMapping, span);
             self.nodes[parent.0 as usize].children.push(mapping);
             self.mappings.push((indent, mapping));
+            self.open_event_collection(
+                indent,
+                OpenEventCollection::Mapping,
+                YamlEventKind::MappingStart {
+                    style: CollectionStyle::Block,
+                },
+                span,
+            );
             mapping
         }
     }
@@ -1121,6 +1321,14 @@ impl<'source> Parser<'source> {
             let sequence = self.push_node(NodeKind::BlockSequence, span);
             self.nodes[parent.0 as usize].children.push(sequence);
             self.sequences.push((indent, sequence));
+            self.open_event_collection(
+                indent,
+                OpenEventCollection::Sequence,
+                YamlEventKind::SequenceStart {
+                    style: CollectionStyle::Block,
+                },
+                span,
+            );
             sequence
         }
     }
@@ -1156,6 +1364,7 @@ impl<'source> Parser<'source> {
     fn close_collections_deeper_than(&mut self, indent: usize) {
         self.mappings.retain(|(level, _)| *level <= indent);
         self.sequences.retain(|(level, _)| *level <= indent);
+        self.close_event_collections_deeper_than(indent);
     }
 
     fn push_node(&mut self, kind: NodeKind, span: Span) -> NodeId {
@@ -1171,6 +1380,130 @@ impl<'source> Parser<'source> {
     fn extend_node_span(&mut self, node: NodeId, end: usize) {
         let node = &mut self.nodes[node.0 as usize];
         node.span.end = node.span.end.max(end as u32);
+    }
+
+    fn push_event(&mut self, kind: YamlEventKind, span: Span) {
+        self.events.push(YamlEvent { kind, span });
+    }
+
+    fn open_event_collection(
+        &mut self,
+        indent: usize,
+        collection: OpenEventCollection,
+        kind: YamlEventKind,
+        span: Span,
+    ) {
+        self.event_collections.push((indent, collection));
+        self.push_event(kind, span);
+    }
+
+    fn close_event_collections_deeper_than(&mut self, indent: usize) {
+        while self
+            .event_collections
+            .last()
+            .is_some_and(|(level, _)| *level > indent)
+        {
+            self.close_last_event_collection();
+        }
+    }
+
+    fn close_all_event_collections(&mut self) {
+        while !self.event_collections.is_empty() {
+            self.close_last_event_collection();
+        }
+    }
+
+    fn close_last_event_collection(&mut self) {
+        let Some((_, collection)) = self.event_collections.pop() else {
+            return;
+        };
+        let offset = self.source.len() as u32;
+        let kind = match collection {
+            OpenEventCollection::Mapping => YamlEventKind::MappingEnd,
+            OpenEventCollection::Sequence => YamlEventKind::SequenceEnd,
+        };
+        self.push_event(kind, Span::empty(offset));
+    }
+
+    fn emit_node_event(&mut self, node: NodeId) -> Result<(), YamlError> {
+        match self.nodes[node.0 as usize].kind {
+            NodeKind::FlowSequence => self.emit_flow_sequence_events(node),
+            NodeKind::FlowMapping => self.emit_flow_mapping_events(node),
+            NodeKind::Scalar | NodeKind::LiteralScalar | NodeKind::FoldedScalar => {
+                self.emit_scalar_event(node)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn emit_flow_sequence_events(&mut self, node: NodeId) -> Result<(), YamlError> {
+        let sequence = self.nodes[node.0 as usize].clone();
+        self.push_event(
+            YamlEventKind::SequenceStart {
+                style: CollectionStyle::Flow,
+            },
+            sequence.span,
+        );
+        for child in sequence.children {
+            self.emit_node_event(child)?;
+        }
+        self.push_event(YamlEventKind::SequenceEnd, sequence.span);
+        Ok(())
+    }
+
+    fn emit_flow_mapping_events(&mut self, node: NodeId) -> Result<(), YamlError> {
+        let mapping = self.nodes[node.0 as usize].clone();
+        self.push_event(
+            YamlEventKind::MappingStart {
+                style: CollectionStyle::Flow,
+            },
+            mapping.span,
+        );
+        for entry in mapping.children {
+            let entry = self.nodes[entry.0 as usize].clone();
+            for child in entry.children {
+                self.emit_node_event(child)?;
+            }
+        }
+        self.push_event(YamlEventKind::MappingEnd, mapping.span);
+        Ok(())
+    }
+
+    fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
+        let node = self.nodes[node.0 as usize].clone();
+        let text = self.source.slice(node.span);
+        let trimmed = text.trim();
+        if let Some(alias) = trimmed.strip_prefix('*')
+            && !alias.is_empty()
+            && !alias.chars().any(char::is_whitespace)
+        {
+            self.push_event(
+                YamlEventKind::Alias {
+                    name: alias.to_owned(),
+                },
+                node.span,
+            );
+            return Ok(());
+        }
+        if trimmed.starts_with('&') || trimmed.starts_with('!') {
+            return Err(YamlError::new(Diagnostic::new(
+                DiagnosticKind::Semantic,
+                "anchors and tags are not supported in the event stream yet",
+                node.span,
+            )));
+        }
+
+        let style = match node.kind {
+            NodeKind::LiteralScalar => YamlScalarStyle::Literal,
+            NodeKind::FoldedScalar => YamlScalarStyle::Folded,
+            NodeKind::Scalar if text.starts_with('"') => YamlScalarStyle::DoubleQuoted,
+            NodeKind::Scalar if text.starts_with('\'') => YamlScalarStyle::SingleQuoted,
+            NodeKind::Scalar => YamlScalarStyle::Plain,
+            _ => unreachable!("emit_scalar_event only receives scalar nodes"),
+        };
+        let value = decode_scalar_value(text)?;
+        self.push_event(YamlEventKind::Scalar { style, value }, node.span);
+        Ok(())
     }
 }
 
@@ -2177,6 +2510,68 @@ fn ends_with_line_break(value: &str) -> bool {
     value.ends_with('\n') || value.ends_with('\r')
 }
 
+/// Renders YAML events in the YAML Test Suite `test.event` format.
+#[must_use]
+pub fn events_to_test_string(events: &[YamlEvent]) -> String {
+    let mut output = String::new();
+    for event in events {
+        match &event.kind {
+            YamlEventKind::StreamStart => output.push_str("+STR\n"),
+            YamlEventKind::StreamEnd => output.push_str("-STR\n"),
+            YamlEventKind::DocumentStart { explicit } => {
+                if *explicit {
+                    output.push_str("+DOC ---\n");
+                } else {
+                    output.push_str("+DOC\n");
+                }
+            }
+            YamlEventKind::DocumentEnd => output.push_str("-DOC\n"),
+            YamlEventKind::SequenceStart { style } => match style {
+                CollectionStyle::Block => output.push_str("+SEQ\n"),
+                CollectionStyle::Flow => output.push_str("+SEQ []\n"),
+            },
+            YamlEventKind::SequenceEnd => output.push_str("-SEQ\n"),
+            YamlEventKind::MappingStart { style } => match style {
+                CollectionStyle::Block => output.push_str("+MAP\n"),
+                CollectionStyle::Flow => output.push_str("+MAP {}\n"),
+            },
+            YamlEventKind::MappingEnd => output.push_str("-MAP\n"),
+            YamlEventKind::Scalar { style, value } => {
+                output.push_str("=VAL ");
+                output.push(match style {
+                    YamlScalarStyle::Plain => ':',
+                    YamlScalarStyle::SingleQuoted => '\'',
+                    YamlScalarStyle::DoubleQuoted => '"',
+                    YamlScalarStyle::Literal => '|',
+                    YamlScalarStyle::Folded => '>',
+                });
+                output.push_str(&escape_event_value(value));
+                output.push('\n');
+            }
+            YamlEventKind::Alias { name } => {
+                output.push_str("=ALI *");
+                output.push_str(name);
+                output.push('\n');
+            }
+        }
+    }
+    output
+}
+
+fn escape_event_value(value: &str) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            _ => output.push(character),
+        }
+    }
+    output
+}
+
 fn decode_double_quoted_scalar(text: &str) -> Result<String, YamlError> {
     let mut output = String::new();
     let mut chars = text.chars();
@@ -2228,18 +2623,13 @@ pub struct Edit {
 }
 
 /// Formatting controls for inserting an MVP block mapping entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MappingEntryStyle {
     /// Reuse the target mapping indentation and the document line ending.
+    #[default]
     Inherit,
     /// Insert with an explicit indentation width, in spaces.
     Indent(usize),
-}
-
-impl Default for MappingEntryStyle {
-    fn default() -> Self {
-        Self::Inherit
-    }
 }
 
 /// A source-preserving YAML document.
@@ -2251,6 +2641,10 @@ pub struct YamlDoc {
     pub tokens: Vec<Token>,
     /// CST and semantic nodes. The CST remains the source of truth.
     pub nodes: Vec<Node>,
+    /// Semantic YAML event stream produced by the parser.
+    pub events: Vec<YamlEvent>,
+    /// CST-linked semantic graph composed from parser events.
+    pub graph: SemanticGraph,
     /// Pending patch edits applied from highest offset to lowest offset.
     pub edits: Vec<Edit>,
 }
@@ -2263,13 +2657,18 @@ impl YamlDoc {
     pub fn parse(input: &str) -> Result<Self, YamlError> {
         let source = Source::new(input.to_owned())?;
         let tokens = lex(&source).map_err(|error| error.with_position_from(&source))?;
-        let nodes =
-            parse_cst(&source, &tokens).map_err(|error| error.with_position_from(&source))?;
+        let parsed = Parser::new(&source, &tokens)
+            .parse()
+            .map_err(|error| error.with_position_from(&source))?;
+        let graph = compose_graph(&parsed.events, &parsed.nodes)
+            .map_err(|error| error.with_position_from(&source))?;
 
         Ok(Self {
             source,
             tokens,
-            nodes,
+            nodes: parsed.nodes,
+            events: parsed.events,
+            graph,
             edits: Vec::new(),
         })
     }
@@ -2286,29 +2685,61 @@ impl YamlDoc {
         (!self.nodes.is_empty()).then_some(NodeId(0))
     }
 
+    /// Returns the semantic event stream produced by the parser.
+    #[must_use]
+    pub fn events(&self) -> &[YamlEvent] {
+        &self.events
+    }
+
+    /// Renders semantic events in the YAML Test Suite `test.event` format.
+    #[must_use]
+    pub fn events_to_test_string(&self) -> String {
+        events_to_test_string(&self.events)
+    }
+
+    /// Returns the CST-linked semantic graph.
+    #[must_use]
+    pub fn graph(&self) -> &SemanticGraph {
+        &self.graph
+    }
+
+    /// Returns a semantic graph node by identifier.
+    #[must_use]
+    pub fn graph_node(&self, node: GraphNodeId) -> Option<&GraphNode> {
+        self.graph.nodes.get(node.0 as usize)
+    }
+
+    /// Returns the CST node linked to `node`, when one exists.
+    #[must_use]
+    pub fn graph_node_cst(&self, node: GraphNodeId) -> Option<NodeId> {
+        self.graph_node(node).and_then(|node| node.cst)
+    }
+
     /// Returns a node by identifier.
     #[must_use]
     pub fn node(&self, node: NodeId) -> Option<&Node> {
         self.nodes.get(node.0 as usize)
     }
 
+    /// Returns the root mapping graph node.
+    pub fn root_graph_mapping(&self) -> Result<GraphNodeId, YamlError> {
+        self.root_mapping_graph()
+    }
+
     /// Returns the first root-level block mapping in the document.
     pub fn root_mapping(&self) -> Result<NodeId, YamlError> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .find(|(_, node)| node.kind == NodeKind::BlockMapping && self.node_indent(node) == 0)
-            .map(|(index, _)| NodeId(index as u32))
-            .ok_or_else(|| {
-                YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Semantic,
-                        "document does not contain a root mapping",
-                        Span::empty(0),
-                    )
-                    .with_expected("a block mapping at indentation 0"),
+        let mapping = self.root_mapping_graph()?;
+        self.graph_node_cst(mapping).ok_or_else(|| {
+            YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    "root mapping is not linked to the CST",
+                    self.graph_node(mapping)
+                        .map_or(Span::empty(0), |node| node.span),
                 )
-            })
+                .with_expected("a CST-backed block mapping"),
+            )
+        })
     }
 
     /// Looks up a mapping entry by key inside `mapping`.
@@ -2317,23 +2748,16 @@ impl YamlDoc {
         mapping: NodeId,
         key: &str,
     ) -> Result<Option<NodeId>, YamlError> {
-        let mapping_node = self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
-
-        for entry in &mapping_node.children {
-            let entry_node = self.expect_node(*entry)?;
-            if entry_node.kind != NodeKind::MappingEntry {
-                continue;
-            }
-
-            let Some(key_node) = entry_node.children.first().copied() else {
-                continue;
-            };
-            if self.scalar_text(key_node)? == key {
-                return Ok(Some(*entry));
-            }
-        }
-
-        Ok(None)
+        let Some(mapping_graph) = self.graph_for_cst(mapping) else {
+            return Ok(None);
+        };
+        let Some((key_graph, _)) = self.get_graph_mapping_entry(mapping_graph, key)? else {
+            return Ok(None);
+        };
+        let Some(key_node) = self.graph_node_cst(key_graph) else {
+            return Ok(None);
+        };
+        Ok(self.containing_entry(key_node))
     }
 
     /// Looks up a mapping value by key inside `mapping`.
@@ -2342,45 +2766,161 @@ impl YamlDoc {
         mapping: NodeId,
         key: &str,
     ) -> Result<Option<NodeId>, YamlError> {
-        let mapping_node = self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
-        let mapping_indent = self.node_indent(mapping_node);
-
-        let Some(entry) = self.get_mapping_entry(mapping, key)? else {
+        let Some(mapping_graph) = self.graph_for_cst(mapping) else {
             return Ok(None);
         };
-        let entry_node = self.expect_node(entry)?;
-
-        if let Some(value_node) = entry_node.children.get(1).copied() {
-            return Ok(Some(value_node));
-        }
-
-        Ok(self.find_nested_collection_after(entry_node, mapping_indent))
+        let Some((_, value_graph)) = self.get_graph_mapping_entry(mapping_graph, key)? else {
+            return Ok(None);
+        };
+        Ok(self.graph_node_cst(value_graph))
     }
 
-    /// Looks up a nested path of mapping keys.
-    pub fn get_path(&self, path: &[&str]) -> Result<Option<NodeId>, YamlError> {
+    /// Looks up a nested path of mapping keys and returns the semantic graph node.
+    pub fn get_graph_path(&self, path: &[&str]) -> Result<Option<GraphNodeId>, YamlError> {
         let Some((first, rest)) = path.split_first() else {
             return Ok(None);
         };
 
-        let mut current = match self.get_mapping_value(self.root_mapping()?, first)? {
-            Some(node) => node,
+        let mut current = match self.get_graph_mapping_entry(self.root_mapping_graph()?, first)? {
+            Some((_, value)) => value,
             None => return Ok(None),
         };
 
         for segment in rest {
-            let node = self.expect_node(current)?;
-            if node.kind != NodeKind::BlockMapping {
-                return Ok(None);
-            }
-
-            current = match self.get_mapping_value(current, segment)? {
-                Some(node) => node,
+            current = match self.get_graph_mapping_entry(current, segment)? {
+                Some((_, value)) => value,
                 None => return Ok(None),
             };
         }
 
         Ok(Some(current))
+    }
+
+    /// Looks up a nested path of mapping keys.
+    pub fn get_path(&self, path: &[&str]) -> Result<Option<NodeId>, YamlError> {
+        Ok(self
+            .get_graph_path(path)?
+            .and_then(|node| self.graph_node_cst(node)))
+    }
+
+    fn root_mapping_graph(&self) -> Result<GraphNodeId, YamlError> {
+        let root = self.graph.root.ok_or_else(|| {
+            YamlError::new(Diagnostic::new(
+                DiagnosticKind::Semantic,
+                "document does not contain a semantic root",
+                Span::empty(0),
+            ))
+        })?;
+        let root = self.expect_graph_node(root)?;
+        let GraphKind::Document { children } = &root.kind else {
+            return Err(YamlError::new(Diagnostic::new(
+                DiagnosticKind::Semantic,
+                "semantic root is not a document",
+                root.span,
+            )));
+        };
+        children
+            .iter()
+            .copied()
+            .find(|child| {
+                self.graph_node(*child).is_some_and(|node| {
+                    matches!(node.kind, GraphKind::Mapping { .. })
+                        && node
+                            .cst
+                            .and_then(|cst| self.node(cst))
+                            .is_some_and(|node| node.kind == NodeKind::BlockMapping)
+                })
+            })
+            .ok_or_else(|| {
+                YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Semantic,
+                        "document does not contain a root mapping",
+                        Span::empty(0),
+                    )
+                    .with_expected("a mapping graph node"),
+                )
+            })
+    }
+
+    fn get_graph_mapping_entry(
+        &self,
+        mapping: GraphNodeId,
+        key: &str,
+    ) -> Result<Option<(GraphNodeId, GraphNodeId)>, YamlError> {
+        let mapping_node = self.expect_graph_node(mapping)?;
+        let GraphKind::Mapping { entries, .. } = &mapping_node.kind else {
+            return Ok(None);
+        };
+
+        for (key_node, value_node) in entries {
+            let key_graph = self.expect_graph_node(*key_node)?;
+            if let GraphKind::Scalar { value, .. } = &key_graph.kind
+                && value == key
+            {
+                return Ok(Some((*key_node, *value_node)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn expect_graph_node(&self, node: GraphNodeId) -> Result<&GraphNode, YamlError> {
+        self.graph_node(node).ok_or_else(|| {
+            YamlError::new(Diagnostic::new(
+                DiagnosticKind::Semantic,
+                format!("unknown graph node id {}", node.0),
+                Span::empty(self.source.len() as u32),
+            ))
+        })
+    }
+
+    fn graph_for_cst(&self, cst: NodeId) -> Option<GraphNodeId> {
+        self.graph
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.cst == Some(cst))
+            .map(|(index, _)| GraphNodeId(index as u32))
+    }
+
+    fn graph_scalar_value(&self, node: NodeId) -> Option<&str> {
+        let graph = self.graph_for_cst(node)?;
+        let graph = self.graph_node(graph)?;
+        match &graph.kind {
+            GraphKind::Scalar { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
+    fn graph_sequence_items(&self, node: NodeId) -> Option<Vec<NodeId>> {
+        let graph = self.graph_for_cst(node)?;
+        let graph = self.graph_node(graph)?;
+        let GraphKind::Sequence { items, .. } = &graph.kind else {
+            return None;
+        };
+        Some(
+            items
+                .iter()
+                .filter_map(|item| self.graph_node_cst(*item))
+                .collect(),
+        )
+    }
+
+    fn graph_mapping_entries(&self, node: NodeId) -> Option<Vec<(NodeId, NodeId)>> {
+        let graph = self.graph_for_cst(node)?;
+        let graph = self.graph_node(graph)?;
+        let GraphKind::Mapping { entries, .. } = &graph.kind else {
+            return None;
+        };
+        Some(
+            entries
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((self.graph_node_cst(*key)?, self.graph_node_cst(*value)?))
+                })
+                .collect(),
+        )
     }
 
     /// Returns the source text for a scalar node.
@@ -2395,6 +2935,10 @@ impl YamlDoc {
     /// scalars unescape doubled apostrophes, and double-quoted scalars unescape
     /// the common JSON/YAML escapes currently used by the typed overlay MVP.
     pub fn scalar_value(&self, node: NodeId) -> Result<String, YamlError> {
+        if let Some(value) = self.graph_scalar_value(node) {
+            return Ok(value.to_owned());
+        }
+
         let node = self.expect_node(node)?;
         if !matches!(
             node.kind,
@@ -2584,7 +3128,7 @@ impl YamlDoc {
                 continue;
             };
             let key = self.scalar_text(key_node)?;
-            if !allowed_keys.iter().any(|allowed| *allowed == key) {
+            if !allowed_keys.contains(&key) {
                 removals.push(*entry);
             }
         }
@@ -2784,15 +3328,14 @@ impl YamlDoc {
         self.source.try_slice(span)?;
         validate_yaml_chars(&replacement)?;
 
-        if span.is_empty() {
-            if let Some(existing) = self
+        if span.is_empty()
+            && let Some(existing) = self
                 .edits
                 .iter_mut()
                 .find(|edit| edit.span.is_empty() && edit.span.start == span.start)
-            {
-                existing.replacement.push_str(&replacement);
-                return Ok(());
-            }
+        {
+            existing.replacement.push_str(&replacement);
+            return Ok(());
         }
 
         if let Some(existing) = self
@@ -2870,6 +3413,241 @@ impl YamlDoc {
             .as_bytes()
             .last()
             .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    }
+}
+
+fn compose_graph(events: &[YamlEvent], nodes: &[Node]) -> Result<SemanticGraph, YamlError> {
+    GraphComposer::new(events, nodes).compose()
+}
+
+struct GraphComposer<'events> {
+    events: &'events [YamlEvent],
+    cst_nodes: &'events [Node],
+    graph_nodes: Vec<GraphNode>,
+    stack: Vec<OpenGraphNode>,
+    root: Option<GraphNodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenGraphNode {
+    id: GraphNodeId,
+    kind: OpenGraphKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenGraphKind {
+    Document,
+    Mapping,
+    Sequence,
+}
+
+impl<'events> GraphComposer<'events> {
+    fn new(events: &'events [YamlEvent], cst_nodes: &'events [Node]) -> Self {
+        Self {
+            events,
+            cst_nodes,
+            graph_nodes: Vec::new(),
+            stack: Vec::new(),
+            root: None,
+        }
+    }
+
+    fn compose(mut self) -> Result<SemanticGraph, YamlError> {
+        for event in self.events {
+            match &event.kind {
+                YamlEventKind::StreamStart | YamlEventKind::StreamEnd => {}
+                YamlEventKind::DocumentStart { .. } => {
+                    let id = self.push_node(GraphNode {
+                        kind: GraphKind::Document {
+                            children: Vec::new(),
+                        },
+                        span: event.span,
+                        cst: self.find_cst_node(NodeKind::Document, event.span),
+                    });
+                    if self.root.replace(id).is_some() {
+                        return Err(graph_error(
+                            "multiple documents are not supported yet",
+                            event.span,
+                        ));
+                    }
+                    self.stack.push(OpenGraphNode {
+                        id,
+                        kind: OpenGraphKind::Document,
+                    });
+                }
+                YamlEventKind::DocumentEnd => {
+                    self.close_expected(OpenGraphKind::Document, event.span)?;
+                }
+                YamlEventKind::MappingStart { style } => {
+                    let id = self.push_node(GraphNode {
+                        kind: GraphKind::Mapping {
+                            style: *style,
+                            entries: Vec::new(),
+                        },
+                        span: event.span,
+                        cst: self.find_cst_node(mapping_node_kind(*style), event.span),
+                    });
+                    self.stack.push(OpenGraphNode {
+                        id,
+                        kind: OpenGraphKind::Mapping,
+                    });
+                }
+                YamlEventKind::MappingEnd => {
+                    let id = self.close_expected(OpenGraphKind::Mapping, event.span)?;
+                    self.attach_node(id, event.span)?;
+                }
+                YamlEventKind::SequenceStart { style } => {
+                    let id = self.push_node(GraphNode {
+                        kind: GraphKind::Sequence {
+                            style: *style,
+                            items: Vec::new(),
+                        },
+                        span: event.span,
+                        cst: self.find_cst_node(sequence_node_kind(*style), event.span),
+                    });
+                    self.stack.push(OpenGraphNode {
+                        id,
+                        kind: OpenGraphKind::Sequence,
+                    });
+                }
+                YamlEventKind::SequenceEnd => {
+                    let id = self.close_expected(OpenGraphKind::Sequence, event.span)?;
+                    self.attach_node(id, event.span)?;
+                }
+                YamlEventKind::Scalar { style, value } => {
+                    let id = self.push_node(GraphNode {
+                        kind: GraphKind::Scalar {
+                            style: *style,
+                            value: value.clone(),
+                            tag: None,
+                            anchor: None,
+                        },
+                        span: event.span,
+                        cst: self.find_cst_node(scalar_node_kind(*style), event.span),
+                    });
+                    self.attach_node(id, event.span)?;
+                }
+                YamlEventKind::Alias { name } => {
+                    let id = self.push_node(GraphNode {
+                        kind: GraphKind::Alias { name: name.clone() },
+                        span: event.span,
+                        cst: self.find_cst_node(NodeKind::Scalar, event.span),
+                    });
+                    self.attach_node(id, event.span)?;
+                }
+            }
+        }
+
+        if !self.stack.is_empty() {
+            return Err(graph_error("unclosed graph node", Span::empty(0)));
+        }
+        for node in &self.graph_nodes {
+            if let GraphKind::Mapping { entries, .. } = &node.kind
+                && entries
+                    .iter()
+                    .any(|(_, value)| *value == GraphNodeId(u32::MAX))
+            {
+                return Err(graph_error(
+                    "mapping entry does not contain a value",
+                    node.span,
+                ));
+            }
+        }
+
+        Ok(SemanticGraph {
+            nodes: self.graph_nodes,
+            root: self.root,
+        })
+    }
+
+    fn push_node(&mut self, node: GraphNode) -> GraphNodeId {
+        let id = GraphNodeId(self.graph_nodes.len() as u32);
+        self.graph_nodes.push(node);
+        id
+    }
+
+    fn close_expected(
+        &mut self,
+        expected: OpenGraphKind,
+        span: Span,
+    ) -> Result<GraphNodeId, YamlError> {
+        let Some(open) = self.stack.pop() else {
+            return Err(graph_error("unexpected closing event", span));
+        };
+        if open.kind != expected {
+            return Err(graph_error("mismatched closing event", span));
+        }
+        Ok(open.id)
+    }
+
+    fn attach_node(&mut self, child: GraphNodeId, span: Span) -> Result<(), YamlError> {
+        let Some(parent) = self.stack.last().copied() else {
+            return Ok(());
+        };
+        match &mut self.graph_nodes[parent.id.0 as usize].kind {
+            GraphKind::Document { children } => {
+                children.push(child);
+                Ok(())
+            }
+            GraphKind::Sequence { items, .. } => {
+                items.push(child);
+                Ok(())
+            }
+            GraphKind::Mapping { entries, .. } => {
+                if entries
+                    .last()
+                    .is_none_or(|(_, value)| *value != GraphNodeId(u32::MAX))
+                {
+                    entries.push((child, GraphNodeId(u32::MAX)));
+                } else if let Some((_, value)) = entries.last_mut() {
+                    *value = child;
+                }
+                Ok(())
+            }
+            _ => Err(graph_error("scalar nodes cannot contain children", span)),
+        }
+    }
+
+    fn find_cst_node(&self, kind: NodeKind, span: Span) -> Option<NodeId> {
+        self.cst_nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == kind && node.span == span)
+            .or_else(|| {
+                self.cst_nodes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, node)| node.kind == kind && node.span.start == span.start)
+            })
+            .map(|(index, _)| NodeId(index as u32))
+    }
+}
+
+fn graph_error(message: impl Into<String>, span: Span) -> YamlError {
+    YamlError::new(Diagnostic::new(DiagnosticKind::Semantic, message, span))
+}
+
+const fn mapping_node_kind(style: CollectionStyle) -> NodeKind {
+    match style {
+        CollectionStyle::Block => NodeKind::BlockMapping,
+        CollectionStyle::Flow => NodeKind::FlowMapping,
+    }
+}
+
+const fn sequence_node_kind(style: CollectionStyle) -> NodeKind {
+    match style {
+        CollectionStyle::Block => NodeKind::BlockSequence,
+        CollectionStyle::Flow => NodeKind::FlowSequence,
+    }
+}
+
+const fn scalar_node_kind(style: YamlScalarStyle) -> NodeKind {
+    match style {
+        YamlScalarStyle::Literal => NodeKind::LiteralScalar,
+        YamlScalarStyle::Folded => NodeKind::FoldedScalar,
+        YamlScalarStyle::Plain | YamlScalarStyle::SingleQuoted | YamlScalarStyle::DoubleQuoted => {
+            NodeKind::Scalar
+        }
     }
 }
 
@@ -3241,6 +4019,14 @@ where
     T: YamlValue + ToString,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        if let Some(items) = doc.graph_sequence_items(node) {
+            let mut values = Vec::new();
+            for item in items {
+                values.push(T::read_yaml(doc, item)?);
+            }
+            return Ok(values);
+        }
+
         let sequence = doc.expect_node(node)?;
         let mut values = Vec::new();
 
@@ -3301,6 +4087,15 @@ where
     T: YamlValue + ToString,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        if let Some(entries) = doc.graph_mapping_entries(node) {
+            let mut values = std::collections::BTreeMap::new();
+            for (key_node, value_node) in entries {
+                let key = doc.scalar_value(key_node)?;
+                values.insert(key, T::read_yaml(doc, value_node)?);
+            }
+            return Ok(values);
+        }
+
         let mapping = doc.expect_node(node)?;
         let mut values = std::collections::BTreeMap::new();
 
@@ -3497,6 +4292,197 @@ single: 'hello'
                 .contains("unterminated double-quoted scalar")
         );
         assert_eq!(error.diagnostic.expected, ["closing \"".to_owned()]);
+    }
+
+    #[test]
+    fn events_render_root_scalar() {
+        let doc = YamlDoc::parse("value\n").expect("valid scalar");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n=VAL :value\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_explicit_document_block_mapping() {
+        let doc = YamlDoc::parse("---\nhost: localhost\n").expect("valid mapping");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n+MAP\n=VAL :host\n=VAL :localhost\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_nested_block_sequence() {
+        let doc = YamlDoc::parse("ports:\n  - 8080\n  - 9090\n").expect("valid sequence");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :ports\n+SEQ\n=VAL :8080\n=VAL :9090\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_flow_collections() {
+        let doc = YamlDoc::parse("settings: {a: [b, c]}\n").expect("valid flow collections");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :settings\n+MAP {}\n=VAL :a\n+SEQ []\n=VAL :b\n=VAL :c\n-SEQ\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_scalar_styles_and_decoded_values() {
+        let doc = YamlDoc::parse(
+            "plain: value\nsingle: 'Bob''s'\ndouble: \"line\\nnext\"\nliteral: |\n  one\n  two\nfolded: >\n  one\n  two\n",
+        )
+        .expect("valid scalars");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :plain\n=VAL :value\n=VAL :single\n=VAL 'Bob's\n=VAL :double\n=VAL \"line\\nnext\n=VAL :literal\n=VAL |one\\ntwo\\n\n=VAL :folded\n=VAL >one two\\n\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_events_carry_source_spans() {
+        let doc = YamlDoc::parse("host: localhost\n").expect("valid mapping");
+        let scalar_events: Vec<_> = doc
+            .events()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                YamlEventKind::Scalar { value, .. } => Some((value.as_str(), event.span)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            scalar_events,
+            [("host", Span::new(0, 4)), ("localhost", Span::new(6, 15))]
+        );
+    }
+
+    #[test]
+    fn graph_builds_root_scalar_with_cst_link() {
+        let doc = YamlDoc::parse("value\n").expect("valid scalar");
+        let root = doc.graph().root.expect("graph root exists");
+        let root = doc.graph_node(root).expect("root graph node exists");
+        let GraphKind::Document { children } = &root.kind else {
+            panic!("root should be document");
+        };
+        let scalar = doc
+            .graph_node(children[0])
+            .expect("scalar graph node exists");
+
+        assert_eq!(scalar.span, Span::new(0, 5));
+        assert_eq!(
+            scalar
+                .cst
+                .and_then(|node| doc.node(node))
+                .map(|node| node.kind),
+            Some(NodeKind::Scalar)
+        );
+        assert_eq!(
+            scalar.kind,
+            GraphKind::Scalar {
+                style: YamlScalarStyle::Plain,
+                value: "value".to_owned(),
+                tag: None,
+                anchor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn graph_builds_mapping_sequence_and_preserves_path_lookup() {
+        let doc = YamlDoc::parse("ports:\n  - 8080\n  - 9090\n").expect("valid sequence");
+        let ports = doc
+            .get_path(&["ports"])
+            .expect("path lookup succeeds")
+            .expect("ports exists");
+        let items = doc
+            .graph_sequence_items(ports)
+            .expect("ports is graph-backed sequence");
+
+        assert_eq!(
+            doc.node(ports).map(|node| node.kind),
+            Some(NodeKind::BlockSequence)
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| doc.scalar_value(*item).expect("scalar value"))
+                .collect::<Vec<_>>(),
+            ["8080".to_owned(), "9090".to_owned()]
+        );
+    }
+
+    #[test]
+    fn graph_path_lookup_returns_semantic_node_with_cst_bridge() {
+        let doc = YamlDoc::parse("server:\n  host: localhost\n").expect("valid nested mapping");
+        let host_graph = doc
+            .get_graph_path(&["server", "host"])
+            .expect("graph path lookup succeeds")
+            .expect("host graph node exists");
+        let host_cst = doc.graph_node_cst(host_graph).expect("host has CST link");
+
+        assert_eq!(
+            doc.graph_node(host_graph).map(|node| &node.kind),
+            Some(&GraphKind::Scalar {
+                style: YamlScalarStyle::Plain,
+                value: "localhost".to_owned(),
+                tag: None,
+                anchor: None,
+            })
+        );
+        assert_eq!(
+            doc.get_path(&["server", "host"])
+                .expect("CST path lookup succeeds"),
+            Some(host_cst)
+        );
+    }
+
+    #[test]
+    fn graph_builds_flow_mapping_and_sequence() {
+        let doc = YamlDoc::parse("settings: {a: [b, c]}\n").expect("valid flow collections");
+        let settings = doc
+            .get_path(&["settings"])
+            .expect("path lookup succeeds")
+            .expect("settings exists");
+        let entries = doc
+            .graph_mapping_entries(settings)
+            .expect("settings is graph-backed mapping");
+
+        assert_eq!(
+            doc.node(settings).map(|node| node.kind),
+            Some(NodeKind::FlowMapping)
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(doc.scalar_value(entries[0].0).expect("key reads"), "a");
+        assert_eq!(
+            doc.node(entries[0].1).map(|node| node.kind),
+            Some(NodeKind::FlowSequence)
+        );
+    }
+
+    #[test]
+    fn graph_builds_literal_and_folded_scalars() {
+        let doc = YamlDoc::parse("literal: |\n  one\nfolded: >\n  one\n  two\n")
+            .expect("valid block scalars");
+        let literal = doc
+            .get_path(&["literal"])
+            .expect("path lookup succeeds")
+            .expect("literal exists");
+        let folded = doc
+            .get_path(&["folded"])
+            .expect("path lookup succeeds")
+            .expect("folded exists");
+
+        assert_eq!(doc.scalar_value(literal).expect("literal reads"), "one\n");
+        assert_eq!(doc.scalar_value(folded).expect("folded reads"), "one two\n");
     }
 
     #[test]

@@ -44,28 +44,18 @@ pub fn derive_yaml_round_trip(input: TokenStream) -> TokenStream {
         .into()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum UnknownFieldPolicy {
+    #[default]
     Preserve,
     Prune,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum InsertOrder {
+    #[default]
     Append,
     Struct,
-}
-
-impl Default for InsertOrder {
-    fn default() -> Self {
-        Self::Append
-    }
-}
-
-impl Default for UnknownFieldPolicy {
-    fn default() -> Self {
-        Self::Preserve
-    }
 }
 
 #[derive(Default)]

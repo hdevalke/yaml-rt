@@ -81,6 +81,13 @@ fn yaml_test_suite_data_harness() {
         }
     }
 
+    println!(
+        "ran: {}, failed: {}, success: {}",
+        ran,
+        failures.len() + unexpected_passes.len(),
+        ran - failures.len() - unexpected_passes.len()
+    );
+
     assert!(
         ran > 0,
         "no YAML Test Suite cases matched {CASES_ENV}={}",

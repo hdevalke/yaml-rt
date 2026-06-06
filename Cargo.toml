@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/yaml-rt-core",
+    "crates/yaml-rt-derive",
+    "crates/yaml-rt",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = ""
+
+[workspace.dependencies]
+yaml-rt-core = { path = "crates/yaml-rt-core" }
+yaml-rt-derive = { path = "crates/yaml-rt-derive" }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["derive"] }

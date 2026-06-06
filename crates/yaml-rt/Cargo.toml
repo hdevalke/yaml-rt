@@ -1,0 +1,15 @@
+[package]
+name = "yaml-rt"
+description = "Facade crate for YAML 1.2.2 round-trip parsing and typed overlays"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "yaml_rt"
+path = "src/lib.rs"
+
+[dependencies]
+yaml-rt-core.workspace = true
+yaml-rt-derive.workspace = true

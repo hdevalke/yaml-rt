@@ -1,0 +1,13 @@
+[package]
+name = "yaml-rt-core"
+description = "No-dependency YAML 1.2.2 round-trip parser core under construction"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "yaml_rt_core"
+path = "src/lib.rs"
+
+[dependencies]

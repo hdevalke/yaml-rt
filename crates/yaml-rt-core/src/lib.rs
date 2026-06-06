@@ -549,6 +549,10 @@ pub enum NodeKind {
     BlockSequence,
     /// One sequence entry line.
     SequenceEntry,
+    /// Single-line flow sequence collection.
+    FlowSequence,
+    /// Single-line flow mapping collection.
+    FlowMapping,
     /// Scalar syntax span.
     Scalar,
 }
@@ -626,6 +630,11 @@ impl<'source> Parser<'source> {
 
         if is_sequence_entry(body) {
             self.parse_sequence_entry(document, line, indent, body)
+        } else if body.starts_with('[') || body.starts_with('{') {
+            let (node, end) = self.parse_flow_value(body, line.content_start + indent)?;
+            reject_trailing_flow_content(body, end, line.content_start + indent)?;
+            self.nodes[document.0 as usize].children.push(node);
+            Ok(())
         } else if let Some(colon_byte) = find_mapping_colon(body) {
             self.parse_mapping_entry(
                 document,
@@ -689,12 +698,8 @@ impl<'source> Parser<'source> {
         if !value_trimmed.is_empty() {
             let leading = value.len() - value_trimmed.len();
             let value_start = line.content_start + indent + colon_byte + 1 + leading;
-            let value_end = line.content_end;
-            let scalar = self.push_node(
-                NodeKind::Scalar,
-                Span::new(value_start as u32, value_end as u32),
-            );
-            self.nodes[entry.0 as usize].children.push(scalar);
+            let value_node = self.parse_inline_value(value_trimmed, value_start)?;
+            self.nodes[entry.0 as usize].children.push(value_node);
         }
 
         Ok(())
@@ -727,14 +732,292 @@ impl<'source> Parser<'source> {
         if !value.is_empty() {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
-            let scalar = self.push_node(
-                NodeKind::Scalar,
-                Span::new(value_start as u32, line.content_end as u32),
-            );
-            self.nodes[entry.0 as usize].children.push(scalar);
+            let value_node = self.parse_inline_value(value, value_start)?;
+            self.nodes[entry.0 as usize].children.push(value_node);
         }
 
         Ok(())
+    }
+
+    fn parse_inline_value(
+        &mut self,
+        text: &str,
+        absolute_start: usize,
+    ) -> Result<NodeId, YamlError> {
+        if text.starts_with('[') || text.starts_with('{') {
+            let (node, end) = self.parse_flow_value(text, absolute_start)?;
+            reject_trailing_flow_content(text, end, absolute_start)?;
+            Ok(node)
+        } else {
+            Ok(self.push_node(
+                NodeKind::Scalar,
+                Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+            ))
+        }
+    }
+
+    fn parse_flow_value(
+        &mut self,
+        text: &str,
+        absolute_start: usize,
+    ) -> Result<(NodeId, usize), YamlError> {
+        if text.starts_with('[') {
+            self.parse_flow_sequence(text, absolute_start)
+        } else if text.starts_with('{') {
+            self.parse_flow_mapping(text, absolute_start)
+        } else {
+            let end = flow_scalar_end(text, 0, absolute_start, &[',', ']', '}'])?;
+            let scalar_start = leading_flow_whitespace(&text[..end]);
+            let scalar_end = end - trailing_flow_whitespace(&text[..end]);
+            if scalar_start >= scalar_end {
+                return Err(empty_flow_value(absolute_start));
+            }
+            Ok((
+                self.push_node(
+                    NodeKind::Scalar,
+                    Span::new(
+                        (absolute_start + scalar_start) as u32,
+                        (absolute_start + scalar_end) as u32,
+                    ),
+                ),
+                end,
+            ))
+        }
+    }
+
+    fn parse_flow_sequence(
+        &mut self,
+        text: &str,
+        absolute_start: usize,
+    ) -> Result<(NodeId, usize), YamlError> {
+        debug_assert!(text.starts_with('['));
+
+        let sequence = self.push_node(
+            NodeKind::FlowSequence,
+            Span::new(absolute_start as u32, (absolute_start + 1) as u32),
+        );
+        let mut position = 1;
+        let mut expecting_value = true;
+        let mut saw_item = false;
+
+        loop {
+            position = skip_flow_whitespace(text, position);
+            let Some(character) = text[position..].chars().next() else {
+                return Err(missing_flow_sequence_end(absolute_start, text.len()));
+            };
+
+            match character {
+                ']' => {
+                    if expecting_value || saw_item {
+                        position += 1;
+                        self.nodes[sequence.0 as usize].span.end =
+                            (absolute_start + position) as u32;
+                        return Ok((sequence, position));
+                    }
+                    return Err(empty_flow_sequence_item(absolute_start + position));
+                }
+                ',' => {
+                    return Err(unexpected_flow_comma(absolute_start + position));
+                }
+                '#' => {
+                    return Err(flow_sequence_comment(absolute_start + position));
+                }
+                '[' => {
+                    let child_start = absolute_start + position;
+                    let (child, consumed) =
+                        self.parse_flow_sequence(&text[position..], child_start)?;
+                    self.nodes[sequence.0 as usize].children.push(child);
+                    position += consumed;
+                }
+                '{' => {
+                    let child_start = absolute_start + position;
+                    let (child, consumed) =
+                        self.parse_flow_mapping(&text[position..], child_start)?;
+                    self.nodes[sequence.0 as usize].children.push(child);
+                    position += consumed;
+                }
+                _ => {
+                    let value_start = position;
+                    let value_end = flow_scalar_end(text, position, absolute_start, &[',', ']'])?;
+                    let scalar_start =
+                        value_start + leading_flow_whitespace(&text[value_start..value_end]);
+                    let scalar_end =
+                        value_end - trailing_flow_whitespace(&text[value_start..value_end]);
+                    if scalar_start >= scalar_end {
+                        return Err(empty_flow_sequence_item(absolute_start + position));
+                    }
+                    let scalar = self.push_node(
+                        NodeKind::Scalar,
+                        Span::new(
+                            (absolute_start + scalar_start) as u32,
+                            (absolute_start + scalar_end) as u32,
+                        ),
+                    );
+                    self.nodes[sequence.0 as usize].children.push(scalar);
+                    position = value_end;
+                }
+            }
+
+            saw_item = true;
+            position = skip_flow_whitespace(text, position);
+            let Some(separator) = text[position..].chars().next() else {
+                return Err(missing_flow_sequence_end(absolute_start, text.len()));
+            };
+
+            match separator {
+                ',' => {
+                    position += 1;
+                    expecting_value = true;
+                }
+                ']' => {
+                    expecting_value = false;
+                }
+                '#' => return Err(flow_sequence_comment(absolute_start + position)),
+                _ => {
+                    return Err(expected_flow_separator(
+                        absolute_start + position,
+                        separator,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn parse_flow_mapping(
+        &mut self,
+        text: &str,
+        absolute_start: usize,
+    ) -> Result<(NodeId, usize), YamlError> {
+        debug_assert!(text.starts_with('{'));
+
+        let mapping = self.push_node(
+            NodeKind::FlowMapping,
+            Span::new(absolute_start as u32, (absolute_start + 1) as u32),
+        );
+        let mut position = 1;
+        let mut expecting_pair = true;
+        let mut saw_pair = false;
+
+        loop {
+            position = skip_flow_whitespace(text, position);
+            let Some(character) = text[position..].chars().next() else {
+                return Err(missing_flow_mapping_end(absolute_start, text.len()));
+            };
+
+            match character {
+                '}' => {
+                    if expecting_pair || saw_pair {
+                        position += 1;
+                        self.nodes[mapping.0 as usize].span.end =
+                            (absolute_start + position) as u32;
+                        return Ok((mapping, position));
+                    }
+                    return Err(empty_flow_mapping_pair(absolute_start + position));
+                }
+                ',' => return Err(unexpected_flow_mapping_comma(absolute_start + position)),
+                '#' => return Err(flow_mapping_comment(absolute_start + position)),
+                _ => {}
+            }
+
+            let entry_start = position;
+            let entry = self.push_node(
+                NodeKind::MappingEntry,
+                Span::new(
+                    (absolute_start + entry_start) as u32,
+                    (absolute_start + entry_start) as u32,
+                ),
+            );
+            let key = if character == '[' || character == '{' {
+                let (key, consumed) =
+                    self.parse_flow_value(&text[position..], absolute_start + position)?;
+                position += consumed;
+                key
+            } else {
+                let key_end = flow_scalar_end(text, position, absolute_start, &[':', ',', '}'])?;
+                let key_start = position + leading_flow_whitespace(&text[position..key_end]);
+                let key_trimmed_end = key_end - trailing_flow_whitespace(&text[position..key_end]);
+                if key_start >= key_trimmed_end {
+                    return Err(empty_flow_mapping_key(absolute_start + position));
+                }
+                position = key_end;
+                self.push_node(
+                    NodeKind::Scalar,
+                    Span::new(
+                        (absolute_start + key_start) as u32,
+                        (absolute_start + key_trimmed_end) as u32,
+                    ),
+                )
+            };
+            self.nodes[entry.0 as usize].children.push(key);
+
+            position = skip_flow_whitespace(text, position);
+            let Some(separator) = text[position..].chars().next() else {
+                return Err(missing_flow_mapping_end(absolute_start, text.len()));
+            };
+            if separator != ':' {
+                return Err(missing_flow_mapping_colon(
+                    absolute_start + position,
+                    separator,
+                ));
+            }
+            position += 1;
+            position = skip_flow_whitespace(text, position);
+
+            match text[position..].chars().next() {
+                None => return Err(missing_flow_mapping_end(absolute_start, text.len())),
+                Some(',') | Some('}') => {}
+                Some('#') => return Err(flow_mapping_comment(absolute_start + position)),
+                Some('[') | Some('{') => {
+                    let (value, consumed) =
+                        self.parse_flow_value(&text[position..], absolute_start + position)?;
+                    self.nodes[entry.0 as usize].children.push(value);
+                    position += consumed;
+                }
+                Some(_) => {
+                    let value_end = flow_scalar_end(text, position, absolute_start, &[',', '}'])?;
+                    let value_start =
+                        position + leading_flow_whitespace(&text[position..value_end]);
+                    let value_trimmed_end =
+                        value_end - trailing_flow_whitespace(&text[position..value_end]);
+                    if value_start < value_trimmed_end {
+                        let value = self.push_node(
+                            NodeKind::Scalar,
+                            Span::new(
+                                (absolute_start + value_start) as u32,
+                                (absolute_start + value_trimmed_end) as u32,
+                            ),
+                        );
+                        self.nodes[entry.0 as usize].children.push(value);
+                    }
+                    position = value_end;
+                }
+            }
+
+            self.nodes[entry.0 as usize].span.end = (absolute_start + position) as u32;
+            self.nodes[mapping.0 as usize].children.push(entry);
+            saw_pair = true;
+            position = skip_flow_whitespace(text, position);
+            let Some(separator) = text[position..].chars().next() else {
+                return Err(missing_flow_mapping_end(absolute_start, text.len()));
+            };
+
+            match separator {
+                ',' => {
+                    position += 1;
+                    expecting_pair = true;
+                }
+                '}' => {
+                    expecting_pair = false;
+                }
+                '#' => return Err(flow_mapping_comment(absolute_start + position)),
+                _ => {
+                    return Err(expected_flow_mapping_separator(
+                        absolute_start + position,
+                        separator,
+                    ));
+                }
+            }
+        }
     }
 
     fn ensure_document(&mut self, stream: NodeId, span: Span) -> NodeId {
@@ -972,6 +1255,299 @@ fn count_indent(content: &str, content_start: usize) -> Result<usize, YamlError>
 
 fn is_sequence_entry(body: &str) -> bool {
     body == "-" || body.starts_with("- ") || body.starts_with("-\t")
+}
+
+fn reject_trailing_flow_content(
+    text: &str,
+    parsed_end: usize,
+    absolute_start: usize,
+) -> Result<(), YamlError> {
+    let trailing = &text[parsed_end..];
+    let trailing_whitespace = leading_flow_whitespace(trailing);
+    let offset = parsed_end + trailing_whitespace;
+    let Some(character) = text[offset..].chars().next() else {
+        return Ok(());
+    };
+
+    if character == '#' {
+        return Ok(());
+    }
+
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("unexpected token `{character}` after flow collection"),
+            Span::new(
+                (absolute_start + offset) as u32,
+                (absolute_start + offset + character.len_utf8()) as u32,
+            ),
+        )
+        .with_expected("line break or comment"),
+    ))
+}
+
+fn skip_flow_whitespace(text: &str, mut position: usize) -> usize {
+    while let Some(character) = text[position..].chars().next() {
+        if matches!(character, ' ' | '\t') {
+            position += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    position
+}
+
+fn leading_flow_whitespace(text: &str) -> usize {
+    skip_flow_whitespace(text, 0)
+}
+
+fn trailing_flow_whitespace(text: &str) -> usize {
+    let mut length = 0;
+    for character in text.chars().rev() {
+        if matches!(character, ' ' | '\t') {
+            length += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    length
+}
+
+fn flow_scalar_end(
+    text: &str,
+    start: usize,
+    absolute_start: usize,
+    terminators: &[char],
+) -> Result<usize, YamlError> {
+    let mut position = start;
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        if terminators.contains(&character) {
+            return Ok(position);
+        }
+        match character {
+            '#' => return Err(flow_collection_comment(absolute_start + position)),
+            '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
+            '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
+            _ => position += character.len_utf8(),
+        }
+    }
+
+    Ok(position)
+}
+
+fn double_quoted_flow_end(
+    text: &str,
+    start: usize,
+    absolute_start: usize,
+) -> Result<usize, YamlError> {
+    let mut position = start + 1;
+    let mut escaped = false;
+
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        position += character.len_utf8();
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            return Ok(position);
+        }
+    }
+
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "unterminated double-quoted scalar in flow sequence",
+            Span::new(
+                (absolute_start + start) as u32,
+                (absolute_start + text.len()) as u32,
+            ),
+        )
+        .with_expected("closing \""),
+    ))
+}
+
+fn single_quoted_flow_end(
+    text: &str,
+    start: usize,
+    absolute_start: usize,
+) -> Result<usize, YamlError> {
+    let mut position = start + 1;
+
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        position += character.len_utf8();
+        if character == '\'' {
+            if text[position..].starts_with('\'') {
+                position += 1;
+            } else {
+                return Ok(position);
+            }
+        }
+    }
+
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "unterminated single-quoted scalar in flow sequence",
+            Span::new(
+                (absolute_start + start) as u32,
+                (absolute_start + text.len()) as u32,
+            ),
+        )
+        .with_expected("closing '"),
+    ))
+}
+
+fn missing_flow_sequence_end(absolute_start: usize, text_len: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "missing flow sequence closing bracket",
+            Span::empty((absolute_start + text_len) as u32),
+        )
+        .with_expected("]"),
+    )
+}
+
+fn empty_flow_sequence_item(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "empty flow sequence item",
+            Span::empty(offset as u32),
+        )
+        .with_expected("a scalar or nested flow sequence"),
+    )
+}
+
+fn empty_flow_value(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "empty flow value",
+            Span::empty(offset as u32),
+        )
+        .with_expected("a scalar or nested flow collection"),
+    )
+}
+
+fn unexpected_flow_comma(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "unexpected comma in flow sequence",
+            Span::new(offset as u32, (offset + 1) as u32),
+        )
+        .with_expected("a scalar, nested flow sequence, or ]"),
+    )
+}
+
+fn expected_flow_separator(offset: usize, found: char) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("unexpected token `{found}` in flow sequence"),
+            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+        )
+        .with_expected(", or ]"),
+    )
+}
+
+fn flow_sequence_comment(offset: usize) -> YamlError {
+    flow_collection_comment(offset)
+}
+
+fn missing_flow_mapping_end(absolute_start: usize, text_len: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "missing flow mapping closing brace",
+            Span::empty((absolute_start + text_len) as u32),
+        )
+        .with_expected("}"),
+    )
+}
+
+fn empty_flow_mapping_pair(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "empty flow mapping pair",
+            Span::empty(offset as u32),
+        )
+        .with_expected("a mapping key"),
+    )
+}
+
+fn empty_flow_mapping_key(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "empty flow mapping key",
+            Span::empty(offset as u32),
+        )
+        .with_expected("a mapping key"),
+    )
+}
+
+fn unexpected_flow_mapping_comma(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "unexpected comma in flow mapping",
+            Span::new(offset as u32, (offset + 1) as u32),
+        )
+        .with_expected("a mapping key or }"),
+    )
+}
+
+fn missing_flow_mapping_colon(offset: usize, found: char) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("missing colon after flow mapping key before `{found}`"),
+            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+        )
+        .with_expected(":"),
+    )
+}
+
+fn expected_flow_mapping_separator(offset: usize, found: char) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("unexpected token `{found}` in flow mapping"),
+            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+        )
+        .with_expected(", or }"),
+    )
+}
+
+fn flow_mapping_comment(offset: usize) -> YamlError {
+    flow_collection_comment(offset)
+}
+
+fn flow_collection_comment(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "comments inside flow collections are not supported yet",
+            Span::new(offset as u32, (offset + 1) as u32),
+        )
+        .with_expected("a scalar, separator, or closing delimiter before any comment"),
+    )
 }
 
 fn find_mapping_colon(body: &str) -> Option<usize> {
@@ -2228,15 +2804,35 @@ where
     T: YamlValue + ToString,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?;
+        let sequence = doc.expect_node(node)?;
         let mut values = Vec::new();
 
-        for entry in &sequence.children {
-            let entry_node = doc.expect_node(*entry)?;
-            let Some(value_node) = entry_node.children.first().copied() else {
-                return Err(missing_collection_item_error(doc, entry_node, "sequence"));
-            };
-            values.push(T::read_yaml(doc, value_node)?);
+        match sequence.kind {
+            NodeKind::BlockSequence => {
+                for entry in &sequence.children {
+                    let entry_node = doc.expect_node(*entry)?;
+                    let Some(value_node) = entry_node.children.first().copied() else {
+                        return Err(missing_collection_item_error(doc, entry_node, "sequence"));
+                    };
+                    values.push(T::read_yaml(doc, value_node)?);
+                }
+            }
+            NodeKind::FlowSequence => {
+                for value_node in &sequence.children {
+                    values.push(T::read_yaml(doc, *value_node)?);
+                }
+            }
+            _ => {
+                return Err(YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Typed,
+                        format!("expected sequence, found {:?}", sequence.kind),
+                        sequence.span,
+                    )
+                    .with_expected("BlockSequence or FlowSequence"),
+                )
+                .with_position_from(&doc.source));
+            }
         }
 
         Ok(values)
@@ -2244,6 +2840,18 @@ where
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
         let node = node.ok_or_else(missing_write_node_error)?;
+        let sequence = doc.expect_node(node)?;
+        if sequence.kind == NodeKind::FlowSequence {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Emitter,
+                    "flow sequence rewriting is not implemented yet",
+                    sequence.span,
+                )
+                .with_expected("an existing block sequence"),
+            )
+            .with_position_from(&doc.source));
+        }
         let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?;
         let replacement = format_block_sequence_replacement(doc, sequence, self)?;
         doc.queue_edit(sequence.span, replacement)?;
@@ -2256,23 +2864,54 @@ where
     T: YamlValue + ToString,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        let mapping = doc.expect_node_kind(node, NodeKind::BlockMapping)?;
-        let mapping_indent = doc.node_indent(mapping);
+        let mapping = doc.expect_node(node)?;
         let mut values = std::collections::BTreeMap::new();
 
-        for entry in &mapping.children {
-            let entry_node = doc.expect_node(*entry)?;
-            let Some(key_node) = entry_node.children.first().copied() else {
-                continue;
-            };
-            let key = doc.scalar_text(key_node)?.to_owned();
-            let value_node = if let Some(value_node) = entry_node.children.get(1).copied() {
-                value_node
-            } else {
-                doc.find_nested_collection_after(entry_node, mapping_indent)
-                    .ok_or_else(|| missing_collection_item_error(doc, entry_node, "mapping"))?
-            };
-            values.insert(key, T::read_yaml(doc, value_node)?);
+        match mapping.kind {
+            NodeKind::BlockMapping => {
+                let mapping_indent = doc.node_indent(mapping);
+                for entry in &mapping.children {
+                    let entry_node = doc.expect_node(*entry)?;
+                    let Some(key_node) = entry_node.children.first().copied() else {
+                        continue;
+                    };
+                    let key = doc.scalar_text(key_node)?.to_owned();
+                    let value_node = if let Some(value_node) = entry_node.children.get(1).copied() {
+                        value_node
+                    } else {
+                        doc.find_nested_collection_after(entry_node, mapping_indent)
+                            .ok_or_else(|| {
+                                missing_collection_item_error(doc, entry_node, "mapping")
+                            })?
+                    };
+                    values.insert(key, T::read_yaml(doc, value_node)?);
+                }
+            }
+            NodeKind::FlowMapping => {
+                for entry in &mapping.children {
+                    let entry_node = doc.expect_node(*entry)?;
+                    let Some(key_node) = entry_node.children.first().copied() else {
+                        continue;
+                    };
+                    let key = doc.scalar_text(key_node)?.to_owned();
+                    let value_node =
+                        entry_node.children.get(1).copied().ok_or_else(|| {
+                            missing_collection_item_error(doc, entry_node, "mapping")
+                        })?;
+                    values.insert(key, T::read_yaml(doc, value_node)?);
+                }
+            }
+            _ => {
+                return Err(YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Typed,
+                        format!("expected mapping, found {:?}", mapping.kind),
+                        mapping.span,
+                    )
+                    .with_expected("BlockMapping or FlowMapping"),
+                )
+                .with_position_from(&doc.source));
+            }
         }
 
         Ok(values)
@@ -2280,6 +2919,18 @@ where
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
         let node = node.ok_or_else(missing_write_node_error)?;
+        let mapping = doc.expect_node(node)?;
+        if mapping.kind == NodeKind::FlowMapping {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Emitter,
+                    "flow mapping rewriting is not implemented yet",
+                    mapping.span,
+                )
+                .with_expected("an existing block mapping"),
+            )
+            .with_position_from(&doc.source));
+        }
         let mapping = doc.expect_node_kind(node, NodeKind::BlockMapping)?;
         let replacement = format_block_mapping_replacement(doc, mapping, self)?;
         doc.queue_edit(mapping.span, replacement)?;
@@ -2433,6 +3084,238 @@ ports:
         assert!(scalar_texts(&doc).contains(&"localhost"));
         assert!(scalar_texts(&doc).contains(&"8080"));
         assert!(scalar_texts(&doc).contains(&"9090"));
+    }
+
+    #[test]
+    fn parser_builds_flow_sequence_mapping_value_cst() {
+        let input = "items: [a, b, c]\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept flow sequence mapping value");
+        let items = doc
+            .get_path(&["items"])
+            .expect("lookup succeeds")
+            .expect("items exists");
+        let sequence = doc.node(items).expect("items node exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(sequence.kind, NodeKind::FlowSequence);
+        assert_eq!(sequence.span, Span::new(7, 16));
+        assert_eq!(flow_sequence_scalar_texts(&doc, items), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parser_builds_flow_sequence_inside_block_sequence_entry() {
+        let input = "- [one, two,]\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept flow sequence entry value");
+        let flow = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == NodeKind::FlowSequence)
+            .map(|(index, _)| NodeId(index as u32))
+            .expect("flow sequence exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(flow_sequence_scalar_texts(&doc, flow), ["one", "two"]);
+    }
+
+    #[test]
+    fn parser_builds_nested_root_flow_sequences() {
+        let input = "[a, [b, c]]\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept nested flow sequences");
+        let flow_sequences: Vec<NodeId> = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.kind == NodeKind::FlowSequence)
+            .map(|(index, _)| NodeId(index as u32))
+            .collect();
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(flow_sequences.len(), 2);
+        assert_eq!(flow_sequence_scalar_texts(&doc, flow_sequences[0]), ["a"]);
+        assert_eq!(
+            flow_sequence_scalar_texts(&doc, flow_sequences[1]),
+            ["b", "c"]
+        );
+    }
+
+    #[test]
+    fn yaml_value_reads_flow_sequence_values() {
+        let doc = YamlDoc::parse("items: [one, two]\n").expect("valid flow sequence mapping");
+        let items = doc
+            .get_path(&["items"])
+            .expect("lookup succeeds")
+            .expect("items exists");
+
+        assert_eq!(
+            Vec::<String>::read_yaml(&doc, items).expect("flow sequence reads"),
+            ["one".to_owned(), "two".to_owned()]
+        );
+    }
+
+    #[test]
+    fn yaml_value_rejects_flow_sequence_writes_for_now() {
+        let mut doc = YamlDoc::parse("items: [one, two]\n").expect("valid flow sequence mapping");
+        let items = doc
+            .get_path(&["items"])
+            .expect("lookup succeeds")
+            .expect("items exists");
+
+        let error = vec!["three".to_owned()]
+            .write_yaml(&mut doc, Some(items))
+            .expect_err("flow sequence writes are intentionally not implemented yet");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(
+            error.diagnostic.message,
+            "flow sequence rewriting is not implemented yet"
+        );
+    }
+
+    #[test]
+    fn parser_builds_flow_mapping_mapping_value_cst() {
+        let input = "settings: {a: b, c: d}\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept flow mapping value");
+        let settings = doc
+            .get_path(&["settings"])
+            .expect("lookup succeeds")
+            .expect("settings exists");
+        let mapping = doc.node(settings).expect("settings node exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(mapping.kind, NodeKind::FlowMapping);
+        assert_eq!(mapping.children.len(), 2);
+        assert_eq!(
+            flow_mapping_scalar_pairs(&doc, settings),
+            [("a", "b"), ("c", "d")]
+        );
+    }
+
+    #[test]
+    fn parser_builds_flow_mapping_inside_block_sequence_entry() {
+        let input = "- {a: b}\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept flow mapping entry value");
+        let flow = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == NodeKind::FlowMapping)
+            .map(|(index, _)| NodeId(index as u32))
+            .expect("flow mapping exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(flow_mapping_scalar_pairs(&doc, flow), [("a", "b")]);
+    }
+
+    #[test]
+    fn parser_builds_nested_flow_mapping_collections() {
+        let input = "{a: [b, c], nested: {d: e}}\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept nested flow collections");
+        let flow_mappings = count_nodes(&doc, NodeKind::FlowMapping);
+        let flow_sequences = count_nodes(&doc, NodeKind::FlowSequence);
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(flow_mappings, 2);
+        assert_eq!(flow_sequences, 1);
+        assert!(scalar_texts(&doc).contains(&"a"));
+        assert!(scalar_texts(&doc).contains(&"nested"));
+        assert!(scalar_texts(&doc).contains(&"d"));
+        assert!(scalar_texts(&doc).contains(&"e"));
+    }
+
+    #[test]
+    fn yaml_value_reads_flow_mapping_values() {
+        let doc = YamlDoc::parse("settings: {a: b, c: d}\n").expect("valid flow mapping");
+        let settings = doc
+            .get_path(&["settings"])
+            .expect("lookup succeeds")
+            .expect("settings exists");
+        let values = std::collections::BTreeMap::<String, String>::read_yaml(&doc, settings)
+            .expect("flow mapping reads");
+
+        assert_eq!(values.get("a").map(String::as_str), Some("b"));
+        assert_eq!(values.get("c").map(String::as_str), Some("d"));
+    }
+
+    #[test]
+    fn yaml_value_rejects_flow_mapping_writes_for_now() {
+        let mut doc = YamlDoc::parse("settings: {a: b}\n").expect("valid flow mapping");
+        let settings = doc
+            .get_path(&["settings"])
+            .expect("lookup succeeds")
+            .expect("settings exists");
+        let values = std::collections::BTreeMap::from([("a".to_owned(), "updated".to_owned())]);
+
+        let error = values
+            .write_yaml(&mut doc, Some(settings))
+            .expect_err("flow mapping writes are intentionally not implemented yet");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(
+            error.diagnostic.message,
+            "flow mapping rewriting is not implemented yet"
+        );
+    }
+
+    #[test]
+    fn parser_reports_malformed_flow_mappings() {
+        for (input, message) in [
+            ("settings: {a: b\n", "missing flow mapping closing brace"),
+            ("settings: {, a: b}\n", "unexpected comma in flow mapping"),
+            (
+                "settings: {a: b, , c: d}\n",
+                "unexpected comma in flow mapping",
+            ),
+            (
+                "settings: {a b}\n",
+                "missing colon after flow mapping key before `}`",
+            ),
+            ("{a: b} }\n", "unexpected token `}` after flow collection"),
+            (
+                "settings: {a: # nope}\n",
+                "comments inside flow collections are not supported yet",
+            ),
+        ] {
+            let error = YamlDoc::parse(input).expect_err("input should be rejected");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+            assert_eq!(error.diagnostic.message, message);
+            assert!(
+                !error.diagnostic.expected.is_empty(),
+                "{input:?} should report expected items"
+            );
+            assert!(
+                error.diagnostic.position.is_some(),
+                "{input:?} should include source position"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_reports_malformed_flow_sequences() {
+        for (input, message) in [
+            ("items: [a, b\n", "missing flow sequence closing bracket"),
+            ("items: [a, , b]\n", "unexpected comma in flow sequence"),
+            ("items: [, a]\n", "unexpected comma in flow sequence"),
+            ("[a] ]\n", "unexpected token `]` after flow collection"),
+            (
+                "items: [a, # nope]\n",
+                "comments inside flow collections are not supported yet",
+            ),
+        ] {
+            let error = YamlDoc::parse(input).expect_err("input should be rejected");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+            assert_eq!(error.diagnostic.message, message);
+            assert!(
+                !error.diagnostic.expected.is_empty(),
+                "{input:?} should report expected items"
+            );
+            assert!(
+                error.diagnostic.position.is_some(),
+                "{input:?} should include source position"
+            );
+        }
     }
 
     #[test]
@@ -2802,6 +3685,32 @@ debug: false
             .iter()
             .filter(|node| node.kind == NodeKind::Scalar)
             .map(|node| doc.source.slice(node.span))
+            .collect()
+    }
+
+    fn flow_sequence_scalar_texts(doc: &YamlDoc, sequence: NodeId) -> Vec<&str> {
+        doc.node(sequence)
+            .expect("sequence exists")
+            .children
+            .iter()
+            .filter_map(|child| {
+                let child = doc.node(*child)?;
+                (child.kind == NodeKind::Scalar).then(|| doc.source.slice(child.span))
+            })
+            .collect()
+    }
+
+    fn flow_mapping_scalar_pairs(doc: &YamlDoc, mapping: NodeId) -> Vec<(&str, &str)> {
+        doc.node(mapping)
+            .expect("mapping exists")
+            .children
+            .iter()
+            .filter_map(|entry| {
+                let entry = doc.node(*entry)?;
+                let key = entry.children.first().copied()?;
+                let value = entry.children.get(1).copied()?;
+                Some((doc.scalar_text(key).ok()?, doc.scalar_text(value).ok()?))
+            })
             .collect()
     }
 

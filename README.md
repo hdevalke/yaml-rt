@@ -312,8 +312,12 @@ name: "new"
 
 Add support incrementally:
 
-- Flow sequences: `[a, b, c]`.
-- Flow mappings: `{a: 1, b: 2}`.
+- [x] Single-line flow sequences: `[a, b, c]`, including nested flow sequences
+      and typed `Vec<T>` reads. Flow sequence patch writing remains a later
+      writer milestone.
+- [x] Single-line flow mappings: `{a: 1, b: 2}`, including nested flow
+      collections and typed `BTreeMap<String, T>` reads. Flow mapping patch
+      writing remains a later writer milestone.
 - Literal scalars: `|`.
 - Folded scalars: `>`.
 - Anchors: `&name`.

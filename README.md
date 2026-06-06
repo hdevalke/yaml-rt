@@ -234,6 +234,8 @@ doc.to_string() == input
       nodes.
 - [x] Parse block sequence lines into `BlockSequence`, `SequenceEntry`, and
       scalar nodes.
+- [x] Represent empty mapping values and bare sequence entries as empty scalar
+      nodes.
 - [x] Preserve source spans for all MVP CST nodes.
 - [x] Keep byte-identical output for parsed MVP documents.
 - [x] Reject tabs in indentation with parser diagnostics.
@@ -246,7 +248,7 @@ Add proper errors for:
 - [x] Tabs in indentation.
 - [x] Unterminated quote.
 - [x] Unexpected token.
-- [x] Missing mapping value.
+- [x] Empty mapping value.
 - [x] Invalid document marker.
 
 Diagnostics include spans, line/column positions when a `Source` is available,

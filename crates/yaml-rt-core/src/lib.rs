@@ -885,7 +885,10 @@ impl<'source> Parser<'source> {
         let value_trimmed = value.trim_start();
         let next_significant_indent = next_significant_indent(lines, index)?;
         if value_trimmed.is_empty() && next_significant_indent.is_none_or(|next| next <= indent) {
-            return Err(missing_mapping_value(line, indent, colon_byte));
+            let empty = self.push_empty_scalar(line.content_end);
+            self.nodes[entry.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
+            return Ok(1);
         }
 
         if !value_trimmed.is_empty() {
@@ -947,6 +950,10 @@ impl<'source> Parser<'source> {
             };
             self.nodes[entry.0 as usize].children.push(value_node);
             self.emit_node_event(value_node)?;
+        } else {
+            let empty = self.push_empty_scalar(line.content_start + indent + 1);
+            self.nodes[entry.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
         }
 
         Ok(1)
@@ -1229,7 +1236,10 @@ impl<'source> Parser<'source> {
 
             match text[position..].chars().next() {
                 None => return Err(missing_flow_mapping_end(absolute_start, text.len())),
-                Some(',') | Some('}') => {}
+                Some(',') | Some('}') => {
+                    let value = self.push_empty_scalar(absolute_start + position);
+                    self.nodes[entry.0 as usize].children.push(value);
+                }
                 Some('#') => return Err(flow_mapping_comment(absolute_start + position)),
                 Some('[') | Some('{') => {
                     let (value, consumed) =
@@ -1375,6 +1385,10 @@ impl<'source> Parser<'source> {
             children: Vec::new(),
         });
         id
+    }
+
+    fn push_empty_scalar(&mut self, offset: usize) -> NodeId {
+        self.push_node(NodeKind::Scalar, Span::empty(offset as u32))
     }
 
     fn extend_node_span(&mut self, node: NodeId, end: usize) {
@@ -1738,18 +1752,6 @@ fn reject_unexpected_line_start(body: &str, body_start: usize) -> Result<(), Yam
     } else {
         Ok(())
     }
-}
-
-fn missing_mapping_value(line: SourceLine<'_>, indent: usize, colon_byte: usize) -> YamlError {
-    let colon_offset = line.content_start + indent + colon_byte;
-    YamlError::new(
-        Diagnostic::new(
-            DiagnosticKind::Parser,
-            "missing mapping value",
-            Span::new(colon_offset as u32, (colon_offset + 1) as u32),
-        )
-        .with_expected("a scalar value or an indented collection on the following line"),
-    )
 }
 
 fn count_indent(content: &str, content_start: usize) -> Result<usize, YamlError> {
@@ -5041,21 +5043,42 @@ ports:
     }
 
     #[test]
-    fn parser_reports_missing_mapping_values() {
-        let error = YamlDoc::parse(
+    fn parser_builds_empty_scalar_values() {
+        let doc = YamlDoc::parse(
             "key:
-other: value
+items:
+  -
+flow: {empty:}
 ",
         )
-        .expect_err("key has no value");
+        .expect("empty nodes are valid YAML scalars in the accepted subset");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
-        assert_eq!(error.diagnostic.span, Span::new(3, 4));
         assert_eq!(
-            error.diagnostic.position,
-            Some(LineCol { line: 1, column: 4 })
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :key\n=VAL :\n=VAL :items\n+SEQ\n=VAL :\n-SEQ\n=VAL :flow\n+MAP {}\n=VAL :empty\n=VAL :\n-MAP\n-MAP\n-DOC\n-STR\n"
         );
-        assert_eq!(error.diagnostic.message, "missing mapping value");
+        assert_eq!(
+            doc.scalar_value(doc.get_path(&["key"]).expect("lookup").expect("key"))
+                .expect("empty mapping scalar reads"),
+            ""
+        );
+        let items = doc
+            .get_path(&["items"])
+            .expect("lookup")
+            .expect("items exists");
+        assert_eq!(
+            Vec::<String>::read_yaml(&doc, items).expect("empty sequence scalar reads"),
+            [String::new()]
+        );
+        let flow_empty = doc
+            .get_path(&["flow", "empty"])
+            .expect("lookup")
+            .expect("flow empty exists");
+        assert_eq!(
+            doc.scalar_value(flow_empty)
+                .expect("empty flow scalar reads"),
+            ""
+        );
     }
 
     #[test]

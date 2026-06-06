@@ -555,6 +555,8 @@ pub enum NodeKind {
     FlowMapping,
     /// Literal block scalar collection.
     LiteralScalar,
+    /// Folded block scalar collection.
+    FoldedScalar,
     /// Scalar syntax span.
     Scalar,
 }
@@ -633,9 +635,9 @@ impl<'source> Parser<'source> {
 
         if is_sequence_entry(body) {
             self.parse_sequence_entry(document, lines, index, indent, body)
-        } else if body.starts_with('|') {
+        } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
-                self.parse_literal_scalar(lines, index, line.content_start + indent, indent, body)?;
+                self.parse_block_scalar(lines, index, line.content_start + indent, indent, body)?;
             self.nodes[document.0 as usize].children.push(node);
             Ok(consumed)
         } else if body.starts_with('[') || body.starts_with('{') {
@@ -701,9 +703,9 @@ impl<'source> Parser<'source> {
         if !value_trimmed.is_empty() {
             let leading = value.len() - value_trimmed.len();
             let value_start = line.content_start + indent + colon_byte + 1 + leading;
-            let value_node = if value_trimmed.starts_with('|') {
+            let value_node = if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
                 let (node, consumed) =
-                    self.parse_literal_scalar(lines, index, value_start, indent, value_trimmed)?;
+                    self.parse_block_scalar(lines, index, value_start, indent, value_trimmed)?;
                 self.nodes[entry.0 as usize].children.push(node);
                 return Ok(consumed);
             } else {
@@ -744,9 +746,9 @@ impl<'source> Parser<'source> {
         if !value.is_empty() {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
-            let value_node = if value.starts_with('|') {
+            let value_node = if value.starts_with('|') || value.starts_with('>') {
                 let (node, consumed) =
-                    self.parse_literal_scalar(lines, index, value_start, indent, value)?;
+                    self.parse_block_scalar(lines, index, value_start, indent, value)?;
                 self.nodes[entry.0 as usize].children.push(node);
                 return Ok(consumed);
             } else {
@@ -804,7 +806,7 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn parse_literal_scalar(
+    fn parse_block_scalar(
         &mut self,
         lines: &[SourceLine<'_>],
         index: usize,
@@ -812,7 +814,7 @@ impl<'source> Parser<'source> {
         parent_indent: usize,
         header: &str,
     ) -> Result<(NodeId, usize), YamlError> {
-        let header = parse_literal_header(header, header_start)?;
+        let header = parse_block_scalar_header(header, header_start)?;
         let mut consumed = 1;
         let mut content_indent = header
             .indent
@@ -849,7 +851,7 @@ impl<'source> Parser<'source> {
         }
 
         let scalar = self.push_node(
-            NodeKind::LiteralScalar,
+            header.kind.node_kind(),
             Span::new(header_start as u32, end as u32),
         );
         Ok((scalar, consumed))
@@ -1278,13 +1280,38 @@ enum BlockChomp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LiteralHeader {
+enum BlockScalarKind {
+    Literal,
+    Folded,
+}
+
+impl BlockScalarKind {
+    const fn node_kind(self) -> NodeKind {
+        match self {
+            Self::Literal => NodeKind::LiteralScalar,
+            Self::Folded => NodeKind::FoldedScalar,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockScalarHeader {
+    kind: BlockScalarKind,
     chomp: BlockChomp,
     indent: Option<usize>,
 }
 
-fn parse_literal_header(header: &str, header_start: usize) -> Result<LiteralHeader, YamlError> {
-    debug_assert!(header.starts_with('|'));
+fn parse_block_scalar_header(
+    header: &str,
+    header_start: usize,
+) -> Result<BlockScalarHeader, YamlError> {
+    let kind = if header.starts_with('|') {
+        BlockScalarKind::Literal
+    } else if header.starts_with('>') {
+        BlockScalarKind::Folded
+    } else {
+        unreachable!("block scalar parser only receives | or > headers");
+    };
 
     let mut chomp = BlockChomp::Clip;
     let mut indent = None;
@@ -1316,26 +1343,48 @@ fn parse_literal_header(header: &str, header_start: usize) -> Result<LiteralHead
                 let rest = &header[offset..];
                 let comment_start = rest.find('#').unwrap_or(rest.len());
                 if rest[..comment_start].trim().is_empty() {
-                    return Ok(LiteralHeader { chomp, indent });
+                    return Ok(BlockScalarHeader {
+                        kind,
+                        chomp,
+                        indent,
+                    });
                 }
-                return Err(invalid_literal_header(header_start + offset, character));
+                return Err(invalid_block_scalar_header(
+                    header_start + offset,
+                    character,
+                ));
             }
-            '#' => return Ok(LiteralHeader { chomp, indent }),
-            _ => return Err(invalid_literal_header(header_start + offset, character)),
+            '#' => {
+                return Ok(BlockScalarHeader {
+                    kind,
+                    chomp,
+                    indent,
+                });
+            }
+            _ => {
+                return Err(invalid_block_scalar_header(
+                    header_start + offset,
+                    character,
+                ));
+            }
         }
     }
 
-    Ok(LiteralHeader { chomp, indent })
+    Ok(BlockScalarHeader {
+        kind,
+        chomp,
+        indent,
+    })
 }
 
-fn invalid_literal_header(offset: usize, found: char) -> YamlError {
+fn invalid_block_scalar_header(offset: usize, found: char) -> YamlError {
     YamlError::new(
         Diagnostic::new(
             DiagnosticKind::Parser,
-            format!("invalid literal scalar header before `{found}`"),
+            format!("invalid block scalar header before `{found}`"),
             Span::new(offset as u32, (offset + found.len_utf8()) as u32),
         )
-        .with_expected("|, |-, |+, or a one-digit indentation indicator"),
+        .with_expected("|, >, chomping indicator, or a one-digit indentation indicator"),
     )
 }
 
@@ -1886,6 +1935,9 @@ fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
     if text.starts_with('|') {
         return decode_literal_scalar_value(text);
     }
+    if text.starts_with('>') {
+        return decode_folded_scalar_value(text);
+    }
 
     if text.starts_with('"') {
         let end = double_quoted_scalar_end(text).ok_or_else(|| {
@@ -1920,7 +1972,7 @@ fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
 
 fn decode_literal_scalar_value(text: &str) -> Result<String, YamlError> {
     let (header, content_start) = split_first_line(text);
-    let header = parse_literal_header(header, 0)?;
+    let header = parse_block_scalar_header(header, 0)?;
     let content = &text[content_start..];
     let content_indent = header
         .indent
@@ -1942,6 +1994,85 @@ fn decode_literal_scalar_value(text: &str) -> Result<String, YamlError> {
     }
 
     Ok(apply_block_chomp(decoded, header.chomp))
+}
+
+fn decode_folded_scalar_value(text: &str) -> Result<String, YamlError> {
+    let (header, content_start) = split_first_line(text);
+    let header = parse_block_scalar_header(header, 0)?;
+    let content = &text[content_start..];
+    let content_indent = header
+        .indent
+        .unwrap_or_else(|| detect_literal_content_indent(content));
+    let literal = decode_block_scalar_content(content, content_indent);
+
+    Ok(apply_block_chomp(
+        fold_block_scalar_lines(&literal),
+        header.chomp,
+    ))
+}
+
+fn decode_block_scalar_content(content: &str, content_indent: usize) -> String {
+    let mut decoded = String::new();
+    let mut position = 0;
+
+    while position < content.len() {
+        let (line, next_position) = next_literal_content_line(content, position);
+        let (body, break_text) = split_line_break(line);
+        let stripped = if body.trim().is_empty() {
+            ""
+        } else {
+            strip_literal_indent(body, content_indent)
+        };
+        decoded.push_str(stripped);
+        decoded.push_str(break_text);
+        position = next_position;
+    }
+
+    decoded
+}
+
+fn fold_block_scalar_lines(literal: &str) -> String {
+    let lines = literal_lines(literal);
+    let mut output = String::new();
+
+    for index in 0..lines.len() {
+        let (body, break_text) = lines[index];
+        output.push_str(body);
+        if break_text.is_empty() {
+            continue;
+        }
+
+        let next = lines.get(index + 1).copied();
+        if next.is_none() {
+            output.push_str(break_text);
+        } else if body.is_empty() {
+            output.push_str(break_text);
+        } else if next
+            .is_some_and(|(next_body, _)| next_body.is_empty() || line_is_more_indented(next_body))
+            || line_is_more_indented(body)
+        {
+            output.push_str(break_text);
+        } else {
+            output.push(' ');
+        }
+    }
+
+    output
+}
+
+fn literal_lines(mut text: &str) -> Vec<(&str, &str)> {
+    let mut lines = Vec::new();
+    while !text.is_empty() {
+        let (line, next) = next_literal_content_line(text, 0);
+        let (body, break_text) = split_line_break(line);
+        lines.push((body, break_text));
+        text = &text[next..];
+    }
+    lines
+}
+
+fn line_is_more_indented(line: &str) -> bool {
+    line.starts_with(' ') || line.starts_with('\t')
 }
 
 fn split_first_line(text: &str) -> (&str, usize) {
@@ -2265,14 +2396,17 @@ impl YamlDoc {
     /// the common JSON/YAML escapes currently used by the typed overlay MVP.
     pub fn scalar_value(&self, node: NodeId) -> Result<String, YamlError> {
         let node = self.expect_node(node)?;
-        if !matches!(node.kind, NodeKind::Scalar | NodeKind::LiteralScalar) {
+        if !matches!(
+            node.kind,
+            NodeKind::Scalar | NodeKind::LiteralScalar | NodeKind::FoldedScalar
+        ) {
             return Err(YamlError::new(
                 Diagnostic::new(
                     DiagnosticKind::Semantic,
                     format!("expected scalar value, found {:?}", node.kind),
                     node.span,
                 )
-                .with_expected("Scalar or LiteralScalar"),
+                .with_expected("Scalar, LiteralScalar, or FoldedScalar"),
             )
             .with_position_from(&self.source));
         }
@@ -2927,14 +3061,14 @@ fn write_existing_scalar(
     let node = node.ok_or_else(missing_write_node_error)?;
     if doc
         .node(node)
-        .is_some_and(|node| node.kind == NodeKind::LiteralScalar)
+        .is_some_and(|node| matches!(node.kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar))
     {
-        let literal = doc.expect_node(node)?;
+        let block_scalar = doc.expect_node(node)?;
         return Err(YamlError::new(
             Diagnostic::new(
                 DiagnosticKind::Emitter,
-                "literal scalar rewriting is not implemented yet",
-                literal.span,
+                "block scalar rewriting is not implemented yet",
+                block_scalar.span,
             )
             .with_expected("an existing plain, single-quoted, or double-quoted scalar"),
         )
@@ -3454,6 +3588,86 @@ ports:
     }
 
     #[test]
+    fn parser_builds_root_folded_scalar_cst() {
+        let input = ">\n  folded\n  line\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept root folded scalar");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(count_nodes(&doc, NodeKind::FoldedScalar), 1);
+        let folded = folded_scalar(&doc).expect("folded scalar exists");
+        assert_eq!(
+            doc.source
+                .slice(doc.node(folded).expect("node exists").span),
+            input
+        );
+    }
+
+    #[test]
+    fn parser_builds_folded_scalar_mapping_value_cst() {
+        let input = "message: >\n  folded\n  line\nnext: value\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept folded mapping value");
+        let message = doc
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.node(message).map(|node| node.kind),
+            Some(NodeKind::FoldedScalar)
+        );
+        assert_eq!(
+            String::read_yaml(&doc, message).expect("folded reads"),
+            "folded line\n"
+        );
+        assert_eq!(
+            doc.get_path(&["next"])
+                .expect("lookup succeeds")
+                .map(|node| doc.scalar_text(node).expect("scalar")),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn yaml_value_reads_folded_scalar_paragraphs_and_more_indented_lines() {
+        let doc = YamlDoc::parse("message: >\n  folded\n  line\n\n    literal\n  tail\n")
+            .expect("valid folded scalar");
+        let message = doc
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        assert_eq!(
+            String::read_yaml(&doc, message).expect("folded reads"),
+            "folded line\n\n  literal\ntail\n"
+        );
+    }
+
+    #[test]
+    fn yaml_value_reads_folded_scalar_chomping() {
+        let strip =
+            YamlDoc::parse("message: >-\n  folded\n  line\n\n").expect("valid strip folded");
+        let keep = YamlDoc::parse("message: >+\n  folded\n  line\n\n").expect("valid keep folded");
+        let strip_node = strip
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+        let keep_node = keep
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        assert_eq!(
+            String::read_yaml(&strip, strip_node).expect("strip reads"),
+            "folded line"
+        );
+        assert_eq!(
+            String::read_yaml(&keep, keep_node).expect("keep reads"),
+            "folded line\n\n"
+        );
+    }
+
+    #[test]
     fn parser_builds_literal_scalar_inside_block_sequence_entry() {
         let input = "- |\n  hello\n  # content comment\n- next\n";
         let doc = YamlDoc::parse(input).expect("parser should accept literal sequence value");
@@ -3468,6 +3682,20 @@ ports:
     }
 
     #[test]
+    fn parser_builds_folded_scalar_inside_block_sequence_entry() {
+        let input = "- >\n  folded\n  line\n- next\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept folded sequence value");
+        let folded = folded_scalar(&doc).expect("folded scalar exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            String::read_yaml(&doc, folded).expect("folded reads"),
+            "folded line\n"
+        );
+        assert_eq!(count_nodes(&doc, NodeKind::SequenceEntry), 2);
+    }
+
+    #[test]
     fn parser_reports_invalid_literal_scalar_headers() {
         for input in ["message: |bad\n", "message: |0\n", "message: |--\n"] {
             let error = YamlDoc::parse(input).expect_err("literal header should be rejected");
@@ -3477,7 +3705,24 @@ ports:
                 error
                     .diagnostic
                     .message
-                    .starts_with("invalid literal scalar header before")
+                    .starts_with("invalid block scalar header before")
+            );
+            assert!(!error.diagnostic.expected.is_empty());
+            assert!(error.diagnostic.position.is_some());
+        }
+    }
+
+    #[test]
+    fn parser_reports_invalid_folded_scalar_headers() {
+        for input in ["message: >bad\n", "message: >0\n", "message: >--\n"] {
+            let error = YamlDoc::parse(input).expect_err("folded header should be rejected");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+            assert!(
+                error
+                    .diagnostic
+                    .message
+                    .starts_with("invalid block scalar header before")
             );
             assert!(!error.diagnostic.expected.is_empty());
             assert!(error.diagnostic.position.is_some());
@@ -3500,7 +3745,27 @@ ports:
         assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
         assert_eq!(
             error.diagnostic.message,
-            "literal scalar rewriting is not implemented yet"
+            "block scalar rewriting is not implemented yet"
+        );
+    }
+
+    #[test]
+    fn yaml_value_rejects_folded_scalar_writes_for_now() {
+        let mut doc = YamlDoc::parse("message: >\n  hello\n").expect("valid folded scalar");
+        let message = doc
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        let error = "updated"
+            .to_owned()
+            .write_yaml(&mut doc, Some(message))
+            .expect_err("folded scalar writes are intentionally not implemented yet");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(
+            error.diagnostic.message,
+            "block scalar rewriting is not implemented yet"
         );
     }
 
@@ -4111,6 +4376,14 @@ debug: false
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::LiteralScalar)
+            .map(|(index, _)| NodeId(index as u32))
+    }
+
+    fn folded_scalar(doc: &YamlDoc) -> Option<NodeId> {
+        doc.nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == NodeKind::FoldedScalar)
             .map(|(index, _)| NodeId(index as u32))
     }
 

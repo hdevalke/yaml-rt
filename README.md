@@ -321,7 +321,9 @@ Add support incrementally:
 - [x] Literal scalars: `|`, including strip/clip/keep chomping and typed
       `String` reads. Literal scalar patch writing remains a later writer
       milestone.
-- Folded scalars: `>`.
+- [x] Folded scalars: `>`, including strip/clip/keep chomping and typed
+      `String` reads. Folded scalar patch writing remains a later writer
+      milestone.
 - Anchors: `&name`.
 - Aliases: `*name`.
 - Tags: `!tag`, `!!str`, `!<uri>`.

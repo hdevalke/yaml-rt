@@ -612,6 +612,10 @@ pub enum YamlEventKind {
     SequenceStart {
         /// Sequence spelling style.
         style: CollectionStyle,
+        /// Explicit tag, when present.
+        tag: Option<String>,
+        /// Explicit anchor, when present.
+        anchor: Option<String>,
     },
     /// End of a sequence node.
     SequenceEnd,
@@ -619,6 +623,10 @@ pub enum YamlEventKind {
     MappingStart {
         /// Mapping spelling style.
         style: CollectionStyle,
+        /// Explicit tag, when present.
+        tag: Option<String>,
+        /// Explicit anchor, when present.
+        anchor: Option<String>,
     },
     /// End of a mapping node.
     MappingEnd,
@@ -628,6 +636,10 @@ pub enum YamlEventKind {
         style: YamlScalarStyle,
         /// Decoded scalar value.
         value: String,
+        /// Explicit tag, when present.
+        tag: Option<String>,
+        /// Explicit anchor, when present.
+        anchor: Option<String>,
     },
     /// Alias node.
     Alias {
@@ -676,6 +688,10 @@ pub enum GraphKind {
     Mapping {
         /// Mapping spelling style.
         style: CollectionStyle,
+        /// Placeholder for schema-resolved tags.
+        tag: Option<String>,
+        /// Placeholder for anchors.
+        anchor: Option<String>,
         /// Key/value node pairs in source order.
         entries: Vec<(GraphNodeId, GraphNodeId)>,
     },
@@ -683,6 +699,10 @@ pub enum GraphKind {
     Sequence {
         /// Sequence spelling style.
         style: CollectionStyle,
+        /// Placeholder for schema-resolved tags.
+        tag: Option<String>,
+        /// Placeholder for anchors.
+        anchor: Option<String>,
         /// Item nodes in source order.
         items: Vec<GraphNodeId>,
     },
@@ -825,7 +845,7 @@ impl<'source> Parser<'source> {
             self.nodes[document.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
-        } else if body.starts_with('[') || body.starts_with('{') {
+        } else if body_starts_flow_value(body, line.content_start + indent)? {
             let (node, end) = self.parse_flow_value(body, line.content_start + indent)?;
             reject_trailing_flow_content(body, end, line.content_start + indent)?;
             self.nodes[document.0 as usize].children.push(node);
@@ -964,7 +984,12 @@ impl<'source> Parser<'source> {
         text: &str,
         absolute_start: usize,
     ) -> Result<NodeId, YamlError> {
-        if text.starts_with('[') || text.starts_with('{') {
+        let properties = parse_node_properties(
+            text,
+            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+        )?;
+        let value_text = &text[properties.value_start..];
+        if value_text.starts_with('[') || value_text.starts_with('{') {
             let (node, end) = self.parse_flow_value(text, absolute_start)?;
             reject_trailing_flow_content(text, end, absolute_start)?;
             Ok(node)
@@ -981,24 +1006,33 @@ impl<'source> Parser<'source> {
         text: &str,
         absolute_start: usize,
     ) -> Result<(NodeId, usize), YamlError> {
-        if text.starts_with('[') {
-            self.parse_flow_sequence(text, absolute_start)
-        } else if text.starts_with('{') {
-            self.parse_flow_mapping(text, absolute_start)
+        let properties = parse_node_properties(
+            text,
+            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+        )?;
+        let value_start = properties.value_start;
+        let value_text = &text[value_start..];
+        if value_text.starts_with('[') {
+            let (node, consumed) =
+                self.parse_flow_sequence(value_text, absolute_start + value_start)?;
+            self.nodes[node.0 as usize].span.start = absolute_start as u32;
+            Ok((node, value_start + consumed))
+        } else if value_text.starts_with('{') {
+            let (node, consumed) =
+                self.parse_flow_mapping(value_text, absolute_start + value_start)?;
+            self.nodes[node.0 as usize].span.start = absolute_start as u32;
+            Ok((node, value_start + consumed))
         } else {
-            let end = flow_scalar_end(text, 0, absolute_start, &[',', ']', '}'])?;
-            let scalar_start = leading_flow_whitespace(&text[..end]);
-            let scalar_end = end - trailing_flow_whitespace(&text[..end]);
+            let end = flow_scalar_end(text, value_start, absolute_start, &[',', ']', '}'])?;
+            let scalar_start = value_start + leading_flow_whitespace(&text[value_start..end]);
+            let scalar_end = end - trailing_flow_whitespace(&text[value_start..end]);
             if scalar_start >= scalar_end {
                 return Err(empty_flow_value(absolute_start));
             }
             Ok((
                 self.push_node(
                     NodeKind::Scalar,
-                    Span::new(
-                        (absolute_start + scalar_start) as u32,
-                        (absolute_start + scalar_end) as u32,
-                    ),
+                    Span::new(absolute_start as u32, (absolute_start + scalar_end) as u32),
                 ),
                 end,
             ))
@@ -1317,6 +1351,8 @@ impl<'source> Parser<'source> {
                 OpenEventCollection::Mapping,
                 YamlEventKind::MappingStart {
                     style: CollectionStyle::Block,
+                    tag: None,
+                    anchor: None,
                 },
                 span,
             );
@@ -1336,6 +1372,8 @@ impl<'source> Parser<'source> {
                 OpenEventCollection::Sequence,
                 YamlEventKind::SequenceStart {
                     style: CollectionStyle::Block,
+                    tag: None,
+                    anchor: None,
                 },
                 span,
             );
@@ -1452,9 +1490,12 @@ impl<'source> Parser<'source> {
 
     fn emit_flow_sequence_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let sequence = self.nodes[node.0 as usize].clone();
+        let properties = parse_node_properties(self.source.slice(sequence.span), sequence.span)?;
         self.push_event(
             YamlEventKind::SequenceStart {
                 style: CollectionStyle::Flow,
+                tag: properties.tag,
+                anchor: properties.anchor,
             },
             sequence.span,
         );
@@ -1467,9 +1508,12 @@ impl<'source> Parser<'source> {
 
     fn emit_flow_mapping_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let mapping = self.nodes[node.0 as usize].clone();
+        let properties = parse_node_properties(self.source.slice(mapping.span), mapping.span)?;
         self.push_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Flow,
+                tag: properties.tag,
+                anchor: properties.anchor,
             },
             mapping.span,
         );
@@ -1486,7 +1530,9 @@ impl<'source> Parser<'source> {
     fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
         let node = self.nodes[node.0 as usize].clone();
         let text = self.source.slice(node.span);
-        let trimmed = text.trim();
+        let properties = parse_node_properties(text, node.span)?;
+        let value_text = &text[properties.value_start..];
+        let trimmed = value_text.trim();
         if let Some(alias) = trimmed.strip_prefix('*')
             && !alias.is_empty()
             && !alias.chars().any(char::is_whitespace)
@@ -1499,24 +1545,25 @@ impl<'source> Parser<'source> {
             );
             return Ok(());
         }
-        if trimmed.starts_with('&') || trimmed.starts_with('!') {
-            return Err(YamlError::new(Diagnostic::new(
-                DiagnosticKind::Semantic,
-                "anchors and tags are not supported in the event stream yet",
-                node.span,
-            )));
-        }
 
         let style = match node.kind {
             NodeKind::LiteralScalar => YamlScalarStyle::Literal,
             NodeKind::FoldedScalar => YamlScalarStyle::Folded,
-            NodeKind::Scalar if text.starts_with('"') => YamlScalarStyle::DoubleQuoted,
-            NodeKind::Scalar if text.starts_with('\'') => YamlScalarStyle::SingleQuoted,
+            NodeKind::Scalar if value_text.starts_with('"') => YamlScalarStyle::DoubleQuoted,
+            NodeKind::Scalar if value_text.starts_with('\'') => YamlScalarStyle::SingleQuoted,
             NodeKind::Scalar => YamlScalarStyle::Plain,
             _ => unreachable!("emit_scalar_event only receives scalar nodes"),
         };
-        let value = decode_scalar_value(text)?;
-        self.push_event(YamlEventKind::Scalar { style, value }, node.span);
+        let value = decode_scalar_value(value_text)?;
+        self.push_event(
+            YamlEventKind::Scalar {
+                style,
+                value,
+                tag: properties.tag,
+                anchor: properties.anchor,
+            },
+            node.span,
+        );
         Ok(())
     }
 }
@@ -1528,6 +1575,179 @@ impl TokenKind {
             _ => NodeKind::Scalar,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct NodeProperties {
+    tag: Option<String>,
+    anchor: Option<String>,
+    value_start: usize,
+}
+
+fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, YamlError> {
+    let properties = parse_node_properties(
+        body,
+        Span::new(absolute_start as u32, (absolute_start + body.len()) as u32),
+    )?;
+    Ok(matches!(
+        body[properties.value_start..].chars().next(),
+        Some('[' | '{')
+    ))
+}
+
+fn parse_node_properties(text: &str, span: Span) -> Result<NodeProperties, YamlError> {
+    let mut properties = NodeProperties::default();
+    let mut position = 0;
+
+    loop {
+        position = skip_property_whitespace(text, position);
+        let Some(character) = text[position..].chars().next() else {
+            properties.value_start = position;
+            return Ok(properties);
+        };
+
+        match character {
+            '&' => {
+                if properties.anchor.is_some() {
+                    return Err(node_property_error(
+                        "duplicate anchor property",
+                        span,
+                        position,
+                    ));
+                }
+                let (anchor, next) = parse_anchor_property(text, position, span)?;
+                properties.anchor = Some(anchor);
+                position = next;
+            }
+            '!' => {
+                if properties.tag.is_some() {
+                    return Err(node_property_error(
+                        "duplicate tag property",
+                        span,
+                        position,
+                    ));
+                }
+                let (tag, next) = parse_tag_property(text, position, span)?;
+                properties.tag = Some(tag);
+                position = next;
+            }
+            _ => {
+                properties.value_start = position;
+                return Ok(properties);
+            }
+        }
+
+        if text[position..]
+            .chars()
+            .next()
+            .is_some_and(|next| !next.is_whitespace())
+        {
+            properties.value_start = position;
+            return Ok(properties);
+        }
+    }
+}
+
+fn skip_property_whitespace(text: &str, mut position: usize) -> usize {
+    while let Some(character) = text[position..].chars().next() {
+        if character == ' ' || character == '\t' {
+            position += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    position
+}
+
+fn parse_anchor_property(
+    text: &str,
+    position: usize,
+    span: Span,
+) -> Result<(String, usize), YamlError> {
+    let start = position + 1;
+    let end = property_token_end(text, start);
+    if start == end {
+        return Err(node_property_error_with_expected(
+            "missing anchor name",
+            span,
+            position,
+            "an anchor name after `&`",
+        ));
+    }
+    Ok((text[start..end].to_owned(), end))
+}
+
+fn parse_tag_property(
+    text: &str,
+    position: usize,
+    span: Span,
+) -> Result<(String, usize), YamlError> {
+    if text[position..].starts_with("!<") {
+        let start = position + 2;
+        let Some(relative_end) = text[start..].find('>') else {
+            return Err(node_property_error_with_expected(
+                "unterminated verbatim tag",
+                span,
+                position,
+                "a closing `>`",
+            ));
+        };
+        let end = start + relative_end;
+        if start == end {
+            return Err(node_property_error_with_expected(
+                "empty verbatim tag",
+                span,
+                position,
+                "a tag URI inside `!<...>`",
+            ));
+        }
+        return Ok((format!("!<{}>", &text[start..end]), end + 1));
+    }
+
+    let end = property_token_end(text, position);
+    if end == position + 1 {
+        return Err(node_property_error_with_expected(
+            "missing tag handle or suffix",
+            span,
+            position,
+            "a tag after `!`",
+        ));
+    }
+    Ok((text[position..end].to_owned(), end))
+}
+
+fn property_token_end(text: &str, mut position: usize) -> usize {
+    while let Some(character) = text[position..].chars().next() {
+        if character.is_whitespace() || matches!(character, '[' | ']' | '{' | '}' | ',') {
+            break;
+        }
+        position += character.len_utf8();
+    }
+    position
+}
+
+fn node_property_error(message: impl Into<String>, span: Span, offset: usize) -> YamlError {
+    YamlError::new(Diagnostic::new(
+        DiagnosticKind::Parser,
+        message,
+        Span::empty(span.start + offset as u32),
+    ))
+}
+
+fn node_property_error_with_expected(
+    message: impl Into<String>,
+    span: Span,
+    offset: usize,
+    expected: impl Into<String>,
+) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            message,
+            Span::empty(span.start + offset as u32),
+        )
+        .with_expected(expected),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2528,18 +2748,33 @@ pub fn events_to_test_string(events: &[YamlEvent]) -> String {
                 }
             }
             YamlEventKind::DocumentEnd => output.push_str("-DOC\n"),
-            YamlEventKind::SequenceStart { style } => match style {
-                CollectionStyle::Block => output.push_str("+SEQ\n"),
-                CollectionStyle::Flow => output.push_str("+SEQ []\n"),
-            },
+            YamlEventKind::SequenceStart { style, tag, anchor } => {
+                output.push_str("+SEQ");
+                push_event_properties(&mut output, tag.as_deref(), anchor.as_deref());
+                match style {
+                    CollectionStyle::Block => output.push('\n'),
+                    CollectionStyle::Flow => output.push_str(" []\n"),
+                }
+            }
             YamlEventKind::SequenceEnd => output.push_str("-SEQ\n"),
-            YamlEventKind::MappingStart { style } => match style {
-                CollectionStyle::Block => output.push_str("+MAP\n"),
-                CollectionStyle::Flow => output.push_str("+MAP {}\n"),
-            },
+            YamlEventKind::MappingStart { style, tag, anchor } => {
+                output.push_str("+MAP");
+                push_event_properties(&mut output, tag.as_deref(), anchor.as_deref());
+                match style {
+                    CollectionStyle::Block => output.push('\n'),
+                    CollectionStyle::Flow => output.push_str(" {}\n"),
+                }
+            }
             YamlEventKind::MappingEnd => output.push_str("-MAP\n"),
-            YamlEventKind::Scalar { style, value } => {
-                output.push_str("=VAL ");
+            YamlEventKind::Scalar {
+                style,
+                value,
+                tag,
+                anchor,
+            } => {
+                output.push_str("=VAL");
+                push_event_properties(&mut output, tag.as_deref(), anchor.as_deref());
+                output.push(' ');
                 output.push(match style {
                     YamlScalarStyle::Plain => ':',
                     YamlScalarStyle::SingleQuoted => '\'',
@@ -2558,6 +2793,30 @@ pub fn events_to_test_string(events: &[YamlEvent]) -> String {
         }
     }
     output
+}
+
+fn push_event_properties(output: &mut String, tag: Option<&str>, anchor: Option<&str>) {
+    if let Some(anchor) = anchor {
+        output.push(' ');
+        output.push('&');
+        output.push_str(anchor);
+    }
+    if let Some(tag) = tag {
+        output.push(' ');
+        output.push_str(&event_tag_spelling(tag));
+    }
+}
+
+fn event_tag_spelling(tag: &str) -> String {
+    if let Some(verbatim) = tag.strip_prefix("!<").and_then(|tag| tag.strip_suffix('>')) {
+        format!("<{verbatim}>")
+    } else if let Some(suffix) = tag.strip_prefix("!!") {
+        format!("<tag:yaml.org,2002:{suffix}>")
+    } else if let Some(local) = tag.strip_prefix('!') {
+        format!("<!{local}>")
+    } else {
+        format!("<{tag}>")
+    }
 }
 
 fn escape_event_value(value: &str) -> String {
@@ -2956,7 +3215,9 @@ impl YamlDoc {
             )
             .with_position_from(&self.source));
         }
-        decode_scalar_value(self.source.slice(node.span))
+        let text = self.source.slice(node.span);
+        let properties = parse_node_properties(text, node.span)?;
+        decode_scalar_value(&text[properties.value_start..])
     }
 
     /// Queues a scalar value replacement at `path` while preserving the existing
@@ -3159,6 +3420,18 @@ impl YamlDoc {
     fn scalar_replacement_target(&self, node: NodeId) -> Result<(Span, ScalarStyle), YamlError> {
         let node = self.expect_node_kind(node, NodeKind::Scalar)?;
         let text = self.source.slice(node.span);
+        let properties = parse_node_properties(text, node.span)?;
+        if properties.anchor.is_some() || properties.tag.is_some() {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Emitter,
+                    "anchored or tagged scalar rewriting is not implemented yet",
+                    node.span,
+                )
+                .with_expected("an untagged and unanchored scalar"),
+            )
+            .with_position_from(&self.source));
+        }
 
         if text.starts_with('"') {
             let end = double_quoted_scalar_end(text).ok_or_else(|| {
@@ -3480,10 +3753,12 @@ impl<'events> GraphComposer<'events> {
                 YamlEventKind::DocumentEnd => {
                     self.close_expected(OpenGraphKind::Document, event.span)?;
                 }
-                YamlEventKind::MappingStart { style } => {
+                YamlEventKind::MappingStart { style, tag, anchor } => {
                     let id = self.push_node(GraphNode {
                         kind: GraphKind::Mapping {
                             style: *style,
+                            tag: tag.clone(),
+                            anchor: anchor.clone(),
                             entries: Vec::new(),
                         },
                         span: event.span,
@@ -3498,10 +3773,12 @@ impl<'events> GraphComposer<'events> {
                     let id = self.close_expected(OpenGraphKind::Mapping, event.span)?;
                     self.attach_node(id, event.span)?;
                 }
-                YamlEventKind::SequenceStart { style } => {
+                YamlEventKind::SequenceStart { style, tag, anchor } => {
                     let id = self.push_node(GraphNode {
                         kind: GraphKind::Sequence {
                             style: *style,
+                            tag: tag.clone(),
+                            anchor: anchor.clone(),
                             items: Vec::new(),
                         },
                         span: event.span,
@@ -3516,13 +3793,18 @@ impl<'events> GraphComposer<'events> {
                     let id = self.close_expected(OpenGraphKind::Sequence, event.span)?;
                     self.attach_node(id, event.span)?;
                 }
-                YamlEventKind::Scalar { style, value } => {
+                YamlEventKind::Scalar {
+                    style,
+                    value,
+                    tag,
+                    anchor,
+                } => {
                     let id = self.push_node(GraphNode {
                         kind: GraphKind::Scalar {
                             style: *style,
                             value: value.clone(),
-                            tag: None,
-                            anchor: None,
+                            tag: tag.clone(),
+                            anchor: anchor.clone(),
                         },
                         span: event.span,
                         cst: self.find_cst_node(scalar_node_kind(*style), event.span),
@@ -4346,6 +4628,84 @@ single: 'hello'
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :plain\n=VAL :value\n=VAL :single\n=VAL 'Bob's\n=VAL :double\n=VAL \"line\\nnext\n=VAL :literal\n=VAL |one\\ntwo\\n\n=VAL :folded\n=VAL >one two\\n\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_scalar_anchors_and_tags() {
+        let doc = YamlDoc::parse(
+            "plain: &anchor !<tag:example.com,2026:x> value\nquoted: !!str \"123\"\n",
+        )
+        .expect("valid scalar node properties");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :plain\n=VAL &anchor <tag:example.com,2026:x> :value\n=VAL :quoted\n=VAL <tag:yaml.org,2002:str> \"123\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn graph_preserves_scalar_anchors_and_tags() {
+        let doc =
+            YamlDoc::parse("plain: &anchor !local value\n").expect("valid scalar node properties");
+        let value = doc
+            .get_graph_path(&["plain"])
+            .expect("graph path succeeds")
+            .expect("value exists");
+
+        assert_eq!(
+            doc.graph_node(value).map(|node| &node.kind),
+            Some(&GraphKind::Scalar {
+                style: YamlScalarStyle::Plain,
+                value: "value".to_owned(),
+                tag: Some("!local".to_owned()),
+                anchor: Some("anchor".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn parser_builds_anchored_and_tagged_flow_collection_values() {
+        let doc = YamlDoc::parse(
+            "items: &seq !!seq [one, two]\nsettings: !<tag:yaml.org,2002:map> {a: b}\n",
+        )
+        .expect("valid flow collection node properties");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :items\n+SEQ &seq <tag:yaml.org,2002:seq> []\n=VAL :one\n=VAL :two\n-SEQ\n=VAL :settings\n+MAP <tag:yaml.org,2002:map> {}\n=VAL :a\n=VAL :b\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+        let items = doc
+            .get_graph_path(&["items"])
+            .expect("graph path succeeds")
+            .expect("items exists");
+        assert_eq!(
+            doc.graph_node(items).map(|node| &node.kind),
+            Some(&GraphKind::Sequence {
+                style: CollectionStyle::Flow,
+                tag: Some("!!seq".to_owned()),
+                anchor: Some("seq".to_owned()),
+                items: vec![GraphNodeId(items.0 + 1), GraphNodeId(items.0 + 2),],
+            })
+        );
+    }
+
+    #[test]
+    fn yaml_value_rejects_tagged_or_anchored_scalar_writes_for_now() {
+        let mut doc = YamlDoc::parse("plain: &anchor value\n").expect("valid anchor");
+        let plain = doc
+            .get_path(&["plain"])
+            .expect("path lookup succeeds")
+            .expect("plain exists");
+
+        let error = String::from("updated")
+            .write_yaml(&mut doc, Some(plain))
+            .expect_err("anchored scalar writes are intentionally not implemented yet");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(
+            error.diagnostic.message,
+            "anchored or tagged scalar rewriting is not implemented yet"
         );
     }
 

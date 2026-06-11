@@ -330,9 +330,13 @@ Add support incrementally:
 - [x] Folded scalars: `>`, including strip/clip/keep chomping and typed
       `String` reads. Folded scalar patch writing remains a later writer
       milestone.
-- Anchors: `&name`.
-- Aliases: `*name`.
-- Tags: `!tag`, `!!str`, `!<uri>`.
+- [x] Anchors: `&name` on scalars and flow collections are preserved in events
+      and the semantic graph. Rewriting anchored values remains a later writer
+      milestone.
+- [x] Aliases: `*name`.
+- [x] Tags: `!tag`, `!!str`, `!<uri>` on scalars and flow collections are
+      preserved in events and the semantic graph. `%TAG` directive resolution
+      and tagged-value rewriting remain later milestones.
 - Directives: `%YAML`, `%TAG`.
 - Multi-document streams.
 - Explicit keys: `? key`.

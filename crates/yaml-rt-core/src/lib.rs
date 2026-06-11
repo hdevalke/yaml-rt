@@ -5,7 +5,7 @@
 //! graph, editor, and patch emitter are built out according to the workspace
 //! roadmap.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 /// YAML version targeted by this workspace.
 pub const TARGET_YAML_VERSION: &str = "1.2.2";
@@ -541,6 +541,8 @@ pub enum NodeKind {
     Document,
     /// Explicit document start or end marker.
     DocumentMarker,
+    /// YAML directive line.
+    Directive,
     /// Block mapping collection.
     BlockMapping,
     /// One mapping entry line.
@@ -607,7 +609,10 @@ pub enum YamlEventKind {
         explicit: bool,
     },
     /// End of a YAML document.
-    DocumentEnd,
+    DocumentEnd {
+        /// Whether the source used an explicit `...` marker.
+        explicit: bool,
+    },
     /// Start of a sequence node.
     SequenceStart {
         /// Sequence spelling style.
@@ -731,6 +736,8 @@ pub struct SemanticGraph {
     pub nodes: Vec<GraphNode>,
     /// Root document node.
     pub root: Option<GraphNodeId>,
+    /// All document nodes in stream order.
+    pub documents: Vec<GraphNodeId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -741,23 +748,29 @@ enum OpenEventCollection {
 
 struct Parser<'source> {
     source: &'source Source,
-    tokens: &'source [Token],
     nodes: Vec<Node>,
     events: Vec<YamlEvent>,
+    stream: Option<NodeId>,
     document: Option<NodeId>,
+    document_has_content: bool,
+    document_yaml_directive_seen: bool,
+    tag_handles: BTreeMap<String, String>,
     mappings: Vec<(usize, NodeId)>,
     sequences: Vec<(usize, NodeId)>,
     event_collections: Vec<(usize, OpenEventCollection)>,
 }
 
 impl<'source> Parser<'source> {
-    fn new(source: &'source Source, tokens: &'source [Token]) -> Self {
+    fn new(source: &'source Source, _tokens: &'source [Token]) -> Self {
         Self {
             source,
-            tokens,
             nodes: Vec::new(),
             events: Vec::new(),
+            stream: None,
             document: None,
+            document_has_content: false,
+            document_yaml_directive_seen: false,
+            tag_handles: default_tag_handles(),
             mappings: Vec::new(),
             sequences: Vec::new(),
             event_collections: Vec::new(),
@@ -766,40 +779,23 @@ impl<'source> Parser<'source> {
 
     fn parse(mut self) -> Result<ParsedYaml, YamlError> {
         let stream = self.push_node(NodeKind::Stream, Span::new(0, self.source.len() as u32));
-        let document = self.ensure_document(stream, Span::new(0, self.source.len() as u32));
-        let document_explicit = self
-            .tokens
-            .iter()
-            .any(|token| token.kind == TokenKind::DocumentStart);
+        self.stream = Some(stream);
         self.push_event(
             YamlEventKind::StreamStart,
             Span::new(0, self.source.len() as u32),
         );
-        self.push_event(
-            YamlEventKind::DocumentStart {
-                explicit: document_explicit,
-            },
-            Span::new(0, self.source.len() as u32),
-        );
-
-        for token in self.tokens {
-            if token.kind == TokenKind::DocumentStart || token.kind == TokenKind::DocumentEnd {
-                let marker = self.push_node(token.kind.into_node_kind(), token.span);
-                self.nodes[document.0 as usize].children.push(marker);
-            }
-        }
 
         let lines = SourceLines::new(self.source).collect::<Result<Vec<_>, _>>()?;
         let mut index = 0;
         while index < lines.len() {
-            index += self.parse_line(document, &lines, index)?;
+            index += self.parse_line(&lines, index)?;
         }
-        self.close_event_collections_deeper_than(0);
-        self.close_all_event_collections();
-        self.push_event(
-            YamlEventKind::DocumentEnd,
-            Span::new(self.source.len() as u32, self.source.len() as u32),
-        );
+        if self.document.is_some() {
+            self.close_document(false, Span::empty(self.source.len() as u32))?;
+        } else if self.nodes[stream.0 as usize].children.is_empty() {
+            self.open_document(false, Span::new(0, self.source.len() as u32));
+            self.close_document(false, Span::empty(self.source.len() as u32))?;
+        }
         self.push_event(
             YamlEventKind::StreamEnd,
             Span::new(self.source.len() as u32, self.source.len() as u32),
@@ -811,12 +807,7 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn parse_line(
-        &mut self,
-        document: NodeId,
-        lines: &[SourceLine<'_>],
-        index: usize,
-    ) -> Result<usize, YamlError> {
+    fn parse_line(&mut self, lines: &[SourceLine<'_>], index: usize) -> Result<usize, YamlError> {
         let line = lines[index];
         let content = line.content_without_break;
         let trimmed = content.trim();
@@ -824,45 +815,134 @@ impl<'source> Parser<'source> {
             return Ok(1);
         }
 
-        if trimmed == "---" || trimmed == "..." {
+        if trimmed.starts_with('%') {
+            self.parse_directive_line(line)?;
             return Ok(1);
-        }
-        if trimmed.starts_with("---") || trimmed.starts_with("...") {
-            return Err(invalid_document_marker(line));
         }
 
         let indent = count_indent(content, line.content_start)?;
         let body = &content[indent..];
+
+        if let Some(rest) = document_marker_rest(body, "---") {
+            if indent != 0 {
+                return Err(invalid_document_marker(line));
+            }
+            if self.document.is_some() {
+                self.close_document(false, Span::empty(line.content_start as u32))?;
+            }
+            let document = self.open_document(
+                true,
+                Span::new(line.content_start as u32, line.content_end as u32),
+            );
+            let marker = self.push_node(
+                NodeKind::DocumentMarker,
+                Span::new(line.content_start as u32, (line.content_start + 3) as u32),
+            );
+            self.nodes[document.0 as usize].children.push(marker);
+            let rest = rest.trim_start();
+            if rest.is_empty() || rest.starts_with('#') {
+                return Ok(1);
+            }
+            let rest_start = line.content_end - rest.len();
+            return self.parse_content_body(document, lines, index, 0, rest, rest_start);
+        }
+
+        if let Some(rest) = document_marker_rest(body, "...") {
+            if indent != 0 || !rest.trim().is_empty() && !rest.trim_start().starts_with('#') {
+                return Err(invalid_document_marker(line));
+            }
+            let document = self.ensure_current_document(false, line);
+            let marker = self.push_node(
+                NodeKind::DocumentMarker,
+                Span::new(line.content_start as u32, (line.content_start + 3) as u32),
+            );
+            self.nodes[document.0 as usize].children.push(marker);
+            self.close_document(
+                true,
+                Span::new(line.content_start as u32, line.content_end as u32),
+            )?;
+            return Ok(1);
+        }
+
+        if body.starts_with("---") || body.starts_with("...") {
+            return Err(invalid_document_marker(line));
+        }
+
         self.validate_indent(indent, line)?;
         self.close_collections_deeper_than(indent);
         reject_unexpected_line_start(body, line.content_start + indent)?;
 
+        let document = self.ensure_current_document(false, line);
+        self.parse_content_body(
+            document,
+            lines,
+            index,
+            indent,
+            body,
+            line.content_start + indent,
+        )
+    }
+
+    fn parse_content_body(
+        &mut self,
+        document: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        indent: usize,
+        body: &str,
+        absolute_start: usize,
+    ) -> Result<usize, YamlError> {
+        self.document_has_content = true;
         if is_sequence_entry(body) {
             self.parse_sequence_entry(document, lines, index, indent, body)
         } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
-                self.parse_block_scalar(lines, index, line.content_start + indent, indent, body)?;
+                self.parse_block_scalar(lines, index, absolute_start, indent, body)?;
             self.nodes[document.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
-        } else if body_starts_flow_value(body, line.content_start + indent)? {
-            let (node, end) = self.parse_flow_value(body, line.content_start + indent)?;
-            reject_trailing_flow_content(body, end, line.content_start + indent)?;
+        } else if body_starts_flow_value(body, absolute_start)? {
+            let (flow_text, consumed) = self.flow_collection_text(lines, index, absolute_start)?;
+            let (node, end) = self.parse_flow_value(flow_text, absolute_start)?;
+            reject_trailing_flow_content(flow_text, end, absolute_start)?;
             self.nodes[document.0 as usize].children.push(node);
             self.emit_node_event(node)?;
-            Ok(1)
+            Ok(consumed)
         } else if let Some(colon_byte) = find_mapping_colon(body) {
             self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
         } else {
-            let scalar_span = Span::new(
-                (line.content_start + indent) as u32,
-                line.content_end as u32,
-            );
+            let scalar_span =
+                Span::new(absolute_start as u32, (absolute_start + body.len()) as u32);
             let scalar = self.push_node(NodeKind::Scalar, scalar_span);
             self.nodes[document.0 as usize].children.push(scalar);
             self.emit_scalar_event(scalar)?;
             Ok(1)
         }
+    }
+
+    fn flow_collection_text<'lines>(
+        &self,
+        lines: &'lines [SourceLine<'_>],
+        index: usize,
+        absolute_start: usize,
+    ) -> Result<(&'source str, usize), YamlError> {
+        let source_tail = &self.source.as_str()[absolute_start..];
+        let end = flow_collection_source_end(source_tail, absolute_start)?;
+        let absolute_end = absolute_start + end;
+        let mut consumed = 1;
+        let mut validation_end = lines[index].content_end;
+        for line in &lines[index + 1..] {
+            if line.content_start < absolute_end {
+                consumed += 1;
+                validation_end = line.content_end;
+            } else {
+                break;
+            }
+        }
+        Ok((
+            &self.source.as_str()[absolute_start..validation_end],
+            consumed,
+        ))
     }
 
     fn parse_mapping_entry(
@@ -892,14 +972,16 @@ impl<'source> Parser<'source> {
 
         let key_start = line.content_start + indent;
         let key_end = key_start + body[..colon_byte].trim_end().len();
-        if key_start < key_end {
-            let key = self.push_node(
+        let key = if key_start < key_end {
+            self.push_node(
                 NodeKind::Scalar,
                 Span::new(key_start as u32, key_end as u32),
-            );
-            self.nodes[entry.0 as usize].children.push(key);
-            self.emit_scalar_event(key)?;
-        }
+            )
+        } else {
+            self.push_empty_scalar(key_start)
+        };
+        self.nodes[entry.0 as usize].children.push(key);
+        self.emit_scalar_event(key)?;
 
         let value = &body[colon_byte + 1..];
         let value_trimmed = value.trim_start();
@@ -928,6 +1010,121 @@ impl<'source> Parser<'source> {
         }
 
         Ok(1)
+    }
+
+    fn ensure_current_document(&mut self, explicit: bool, line: SourceLine<'_>) -> NodeId {
+        self.document.unwrap_or_else(|| {
+            self.open_document(
+                explicit,
+                Span::new(line.content_start as u32, line.content_end as u32),
+            )
+        })
+    }
+
+    fn open_document(&mut self, explicit: bool, span: Span) -> NodeId {
+        let stream = self.stream.expect("stream node exists before documents");
+        let document = self.push_node(NodeKind::Document, span);
+        self.nodes[stream.0 as usize].children.push(document);
+        self.document = Some(document);
+        self.document_has_content = false;
+        self.mappings.clear();
+        self.sequences.clear();
+        self.event_collections.clear();
+        self.push_event(YamlEventKind::DocumentStart { explicit }, span);
+        document
+    }
+
+    fn close_document(&mut self, explicit: bool, span: Span) -> Result<(), YamlError> {
+        let Some(document) = self.document else {
+            return Ok(());
+        };
+        self.close_event_collections_deeper_than(0);
+        self.close_all_event_collections();
+        if !self.document_has_content {
+            let empty = self.push_empty_scalar(span.start as usize);
+            self.nodes[document.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
+        }
+        self.push_event(YamlEventKind::DocumentEnd { explicit }, span);
+        self.document = None;
+        self.document_has_content = false;
+        self.document_yaml_directive_seen = false;
+        self.tag_handles = default_tag_handles();
+        self.mappings.clear();
+        self.sequences.clear();
+        self.event_collections.clear();
+        Ok(())
+    }
+
+    fn parse_directive_line(&mut self, line: SourceLine<'_>) -> Result<(), YamlError> {
+        if self.document.is_some() || self.document_has_content {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Parser,
+                    "directives must appear before document content",
+                    Span::new(line.content_start as u32, line.content_end as u32),
+                )
+                .with_expected("a directive before the document start marker or content"),
+            )
+            .with_position_from(self.source));
+        }
+
+        let stream = self.stream.expect("stream node exists before directives");
+        let directive = self.push_node(
+            NodeKind::Directive,
+            Span::new(line.content_start as u32, line.content_end as u32),
+        );
+        self.nodes[stream.0 as usize].children.push(directive);
+
+        let body = strip_inline_comment(line.content_without_break).trim();
+        let mut parts = body.split_whitespace();
+        let Some(name) = parts.next() else {
+            return Err(invalid_directive(line, "missing directive name"));
+        };
+
+        match name {
+            "%YAML" => {
+                if self.document_yaml_directive_seen {
+                    return Err(invalid_directive(line, "duplicate YAML directive"));
+                }
+                let Some(version) = parts.next() else {
+                    return Err(invalid_directive(line, "missing YAML directive version"));
+                };
+                if parts.next().is_some() {
+                    return Err(invalid_directive(
+                        line,
+                        "unexpected YAML directive parameter",
+                    ));
+                }
+                if !matches!(version, "1.1" | "1.2") {
+                    return Err(invalid_directive(
+                        line,
+                        "unsupported YAML directive version",
+                    ));
+                }
+                self.document_yaml_directive_seen = true;
+                Ok(())
+            }
+            "%TAG" => {
+                let Some(handle) = parts.next() else {
+                    return Err(invalid_directive(line, "missing TAG directive handle"));
+                };
+                let Some(prefix) = parts.next() else {
+                    return Err(invalid_directive(line, "missing TAG directive prefix"));
+                };
+                if parts.next().is_some() {
+                    return Err(invalid_directive(
+                        line,
+                        "unexpected TAG directive parameter",
+                    ));
+                }
+                validate_tag_handle(handle, line)?;
+                self.tag_handles
+                    .insert(handle.to_owned(), prefix.to_owned());
+                Ok(())
+            }
+            _ => Err(invalid_directive(line, "unknown directive")),
+        }
     }
 
     fn parse_sequence_entry(
@@ -1241,17 +1438,21 @@ impl<'source> Parser<'source> {
                 let key_end = flow_scalar_end(text, position, absolute_start, &[':', ',', '}'])?;
                 let key_start = position + leading_flow_whitespace(&text[position..key_end]);
                 let key_trimmed_end = key_end - trailing_flow_whitespace(&text[position..key_end]);
-                if key_start >= key_trimmed_end {
+                if key_start >= key_trimmed_end && text[key_end..].starts_with(':') {
+                    position = key_end;
+                    self.push_empty_scalar(absolute_start + key_start)
+                } else if key_start >= key_trimmed_end {
                     return Err(empty_flow_mapping_key(absolute_start + position));
+                } else {
+                    position = key_end;
+                    self.push_node(
+                        NodeKind::Scalar,
+                        Span::new(
+                            (absolute_start + key_start) as u32,
+                            (absolute_start + key_trimmed_end) as u32,
+                        ),
+                    )
                 }
-                position = key_end;
-                self.push_node(
-                    NodeKind::Scalar,
-                    Span::new(
-                        (absolute_start + key_start) as u32,
-                        (absolute_start + key_trimmed_end) as u32,
-                    ),
-                )
             };
             self.nodes[entry.0 as usize].children.push(key);
 
@@ -1325,17 +1526,6 @@ impl<'source> Parser<'source> {
                     ));
                 }
             }
-        }
-    }
-
-    fn ensure_document(&mut self, stream: NodeId, span: Span) -> NodeId {
-        if let Some(document) = self.document {
-            document
-        } else {
-            let document = self.push_node(NodeKind::Document, span);
-            self.nodes[stream.0 as usize].children.push(document);
-            self.document = Some(document);
-            document
         }
     }
 
@@ -1490,7 +1680,9 @@ impl<'source> Parser<'source> {
 
     fn emit_flow_sequence_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let sequence = self.nodes[node.0 as usize].clone();
-        let properties = parse_node_properties(self.source.slice(sequence.span), sequence.span)?;
+        let mut properties =
+            parse_node_properties(self.source.slice(sequence.span), sequence.span)?;
+        self.resolve_node_properties(&mut properties, sequence.span)?;
         self.push_event(
             YamlEventKind::SequenceStart {
                 style: CollectionStyle::Flow,
@@ -1508,7 +1700,8 @@ impl<'source> Parser<'source> {
 
     fn emit_flow_mapping_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let mapping = self.nodes[node.0 as usize].clone();
-        let properties = parse_node_properties(self.source.slice(mapping.span), mapping.span)?;
+        let mut properties = parse_node_properties(self.source.slice(mapping.span), mapping.span)?;
+        self.resolve_node_properties(&mut properties, mapping.span)?;
         self.push_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Flow,
@@ -1530,7 +1723,8 @@ impl<'source> Parser<'source> {
     fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
         let node = self.nodes[node.0 as usize].clone();
         let text = self.source.slice(node.span);
-        let properties = parse_node_properties(text, node.span)?;
+        let mut properties = parse_node_properties(text, node.span)?;
+        self.resolve_node_properties(&mut properties, node.span)?;
         let value_text = &text[properties.value_start..];
         let trimmed = value_text.trim();
         if let Some(alias) = trimmed.strip_prefix('*')
@@ -1566,14 +1760,16 @@ impl<'source> Parser<'source> {
         );
         Ok(())
     }
-}
 
-impl TokenKind {
-    const fn into_node_kind(self) -> NodeKind {
-        match self {
-            TokenKind::DocumentStart | TokenKind::DocumentEnd => NodeKind::DocumentMarker,
-            _ => NodeKind::Scalar,
+    fn resolve_node_properties(
+        &self,
+        properties: &mut NodeProperties,
+        span: Span,
+    ) -> Result<(), YamlError> {
+        if let Some(tag) = properties.tag.as_deref() {
+            properties.tag = Some(resolve_tag(tag, &self.tag_handles, span)?);
         }
+        Ok(())
     }
 }
 
@@ -1593,6 +1789,55 @@ fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, Yam
         body[properties.value_start..].chars().next(),
         Some('[' | '{')
     ))
+}
+
+fn default_tag_handles() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("!".to_owned(), "!".to_owned()),
+        ("!!".to_owned(), "tag:yaml.org,2002:".to_owned()),
+    ])
+}
+
+fn resolve_tag(
+    tag: &str,
+    handles: &BTreeMap<String, String>,
+    span: Span,
+) -> Result<String, YamlError> {
+    if let Some(verbatim) = tag.strip_prefix("!<").and_then(|tag| tag.strip_suffix('>')) {
+        return Ok(verbatim.to_owned());
+    }
+
+    let (handle, suffix) = tag_handle_and_suffix(tag);
+    let Some(prefix) = handles.get(handle) else {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                format!("unresolved tag handle `{handle}`"),
+                span,
+            )
+            .with_expected("a matching %TAG directive"),
+        ));
+    };
+    Ok(format!("{prefix}{suffix}"))
+}
+
+fn tag_handle_and_suffix(tag: &str) -> (&str, &str) {
+    if let Some(suffix) = tag.strip_prefix("!!") {
+        return ("!!", suffix);
+    }
+
+    if let Some(rest) = tag.strip_prefix('!')
+        && let Some(end) = rest.find('!')
+    {
+        let handle_end = 1 + end + 1;
+        return (&tag[..handle_end], &tag[handle_end..]);
+    }
+
+    if let Some(suffix) = tag.strip_prefix('!') {
+        ("!", suffix)
+    } else {
+        ("!", tag)
+    }
 }
 
 fn parse_node_properties(text: &str, span: Span) -> Result<NodeProperties, YamlError> {
@@ -1748,6 +1993,63 @@ fn node_property_error_with_expected(
         )
         .with_expected(expected),
     )
+}
+
+fn document_marker_rest<'text>(body: &'text str, marker: &str) -> Option<&'text str> {
+    let rest = body.strip_prefix(marker)?;
+    if rest
+        .chars()
+        .next()
+        .is_none_or(|character| character.is_whitespace())
+    {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn strip_inline_comment(text: &str) -> &str {
+    let mut quoted = None;
+    let mut previous_was_space = true;
+    for (offset, character) in text.char_indices() {
+        match quoted {
+            Some('"') if character == '"' => quoted = None,
+            Some('\'') if character == '\'' => quoted = None,
+            Some(_) => {}
+            None if character == '"' || character == '\'' => quoted = Some(character),
+            None if character == '#' && previous_was_space => return &text[..offset],
+            None => {}
+        }
+        previous_was_space = character.is_whitespace();
+    }
+    text
+}
+
+fn invalid_directive(line: SourceLine<'_>, message: &'static str) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            message,
+            Span::new(line.content_start as u32, line.content_end as u32),
+        )
+        .with_expected("%YAML or %TAG directive syntax"),
+    )
+}
+
+fn validate_tag_handle(handle: &str, line: SourceLine<'_>) -> Result<(), YamlError> {
+    let valid = handle == "!"
+        || handle == "!!"
+        || (handle.starts_with('!')
+            && handle.ends_with('!')
+            && handle.len() > 2
+            && handle[1..handle.len() - 1].chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '-' || character == '_'
+            }));
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_directive(line, "invalid TAG directive handle"))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1960,7 +2262,7 @@ fn reject_unexpected_line_start(body: &str, body_start: usize) -> Result<(), Yam
         return Ok(());
     };
 
-    if matches!(first, ':' | ',' | ']' | '}') {
+    if matches!(first, ',' | ']' | '}') {
         Err(YamlError::new(
             Diagnostic::new(
                 DiagnosticKind::Parser,
@@ -2035,9 +2337,60 @@ fn reject_trailing_flow_content(
     ))
 }
 
+fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize, YamlError> {
+    let Some(open) = text.chars().next() else {
+        return Err(empty_flow_value(absolute_start));
+    };
+    let close = match open {
+        '[' => ']',
+        '{' => '}',
+        _ => return Err(empty_flow_value(absolute_start)),
+    };
+    let mut stack = vec![close];
+    let mut position = open.len_utf8();
+
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        match character {
+            '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
+            '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
+            '[' => {
+                stack.push(']');
+                position += 1;
+            }
+            '{' => {
+                stack.push('}');
+                position += 1;
+            }
+            ']' | '}' => {
+                if stack.pop() != Some(character) {
+                    return Err(expected_flow_separator(
+                        absolute_start + position,
+                        character,
+                    ));
+                }
+                position += 1;
+                if stack.is_empty() {
+                    return Ok(position);
+                }
+            }
+            _ => position += character.len_utf8(),
+        }
+    }
+
+    if close == ']' {
+        Err(missing_flow_sequence_end(absolute_start, text.len()))
+    } else {
+        Err(missing_flow_mapping_end(absolute_start, text.len()))
+    }
+}
+
 fn skip_flow_whitespace(text: &str, mut position: usize) -> usize {
     while let Some(character) = text[position..].chars().next() {
-        if matches!(character, ' ' | '\t') {
+        if character.is_whitespace() {
             position += character.len_utf8();
         } else {
             break;
@@ -2053,7 +2406,7 @@ fn leading_flow_whitespace(text: &str) -> usize {
 fn trailing_flow_whitespace(text: &str) -> usize {
     let mut length = 0;
     for character in text.chars().rev() {
-        if matches!(character, ' ' | '\t') {
+        if character.is_whitespace() {
             length += character.len_utf8();
         } else {
             break;
@@ -2747,7 +3100,13 @@ pub fn events_to_test_string(events: &[YamlEvent]) -> String {
                     output.push_str("+DOC\n");
                 }
             }
-            YamlEventKind::DocumentEnd => output.push_str("-DOC\n"),
+            YamlEventKind::DocumentEnd { explicit } => {
+                if *explicit {
+                    output.push_str("-DOC ...\n");
+                } else {
+                    output.push_str("-DOC\n");
+                }
+            }
             YamlEventKind::SequenceStart { style, tag, anchor } => {
                 output.push_str("+SEQ");
                 push_event_properties(&mut output, tag.as_deref(), anchor.as_deref());
@@ -3701,6 +4060,7 @@ struct GraphComposer<'events> {
     graph_nodes: Vec<GraphNode>,
     stack: Vec<OpenGraphNode>,
     root: Option<GraphNodeId>,
+    documents: Vec<GraphNodeId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3724,6 +4084,7 @@ impl<'events> GraphComposer<'events> {
             graph_nodes: Vec::new(),
             stack: Vec::new(),
             root: None,
+            documents: Vec::new(),
         }
     }
 
@@ -3739,18 +4100,16 @@ impl<'events> GraphComposer<'events> {
                         span: event.span,
                         cst: self.find_cst_node(NodeKind::Document, event.span),
                     });
-                    if self.root.replace(id).is_some() {
-                        return Err(graph_error(
-                            "multiple documents are not supported yet",
-                            event.span,
-                        ));
+                    if self.root.is_none() {
+                        self.root = Some(id);
                     }
+                    self.documents.push(id);
                     self.stack.push(OpenGraphNode {
                         id,
                         kind: OpenGraphKind::Document,
                     });
                 }
-                YamlEventKind::DocumentEnd => {
+                YamlEventKind::DocumentEnd { .. } => {
                     self.close_expected(OpenGraphKind::Document, event.span)?;
                 }
                 YamlEventKind::MappingStart { style, tag, anchor } => {
@@ -3841,6 +4200,7 @@ impl<'events> GraphComposer<'events> {
         Ok(SemanticGraph {
             nodes: self.graph_nodes,
             root: self.root,
+            documents: self.documents,
         })
     }
 
@@ -4683,11 +5043,90 @@ single: 'hello'
             doc.graph_node(items).map(|node| &node.kind),
             Some(&GraphKind::Sequence {
                 style: CollectionStyle::Flow,
-                tag: Some("!!seq".to_owned()),
+                tag: Some("tag:yaml.org,2002:seq".to_owned()),
                 anchor: Some("seq".to_owned()),
                 items: vec![GraphNodeId(items.0 + 1), GraphNodeId(items.0 + 2),],
             })
         );
+    }
+
+    #[test]
+    fn directives_accept_yaml_version_before_explicit_document() {
+        let doc = YamlDoc::parse("%YAML 1.2 # comment\n--- value\n").expect("valid directive");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL :value\n-DOC\n-STR\n"
+        );
+        assert_eq!(count_nodes(&doc, NodeKind::Directive), 1);
+    }
+
+    #[test]
+    fn tag_directive_resolves_secondary_handle() {
+        let doc = YamlDoc::parse("%TAG !! tag:example.com,2000:app/\n---\n!!int 1 - 3\n")
+            .expect("valid tag directive");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL <tag:example.com,2000:app/int> :1 - 3\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn tag_directive_resolves_named_handle() {
+        let doc = YamlDoc::parse("%TAG !e! tag:example.com,2000:app/\n---\n!e!foo \"bar\"\n")
+            .expect("valid named tag directive");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL <tag:example.com,2000:app/foo> \"bar\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_multi_document_stream_with_explicit_end() {
+        let doc =
+            YamlDoc::parse("%YAML 1.2\n--- |\n%!PS-Adobe-2.0\n...\n%YAML 1.2\n---\n# Empty\n...\n")
+                .expect("valid multi-document stream");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL |%!PS-Adobe-2.0\\n\n-DOC ...\n+DOC ---\n=VAL :\n-DOC ...\n-STR\n"
+        );
+        assert_eq!(doc.graph().documents.len(), 2);
+        assert_eq!(doc.graph().root, doc.graph().documents.first().copied());
+    }
+
+    #[test]
+    fn parser_builds_empty_documents_in_stream() {
+        let doc = YamlDoc::parse("---\n...\n---\n...\n").expect("valid empty documents");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL :\n-DOC ...\n+DOC ---\n=VAL :\n-DOC ...\n-STR\n"
+        );
+        assert_eq!(doc.graph().documents.len(), 2);
+    }
+
+    #[test]
+    fn parser_reports_malformed_and_duplicate_directives() {
+        for (input, message) in [
+            ("%YAML\n---\n", "missing YAML directive version"),
+            ("%YAML 1.2\n%YAML 1.2\n---\n", "duplicate YAML directive"),
+            (
+                "key: value\n%YAML 1.2\n",
+                "directives must appear before document content",
+            ),
+            (
+                "%TAG !bad tag:example.com,2000:app/\n---\n",
+                "invalid TAG directive handle",
+            ),
+        ] {
+            let error = YamlDoc::parse(input).expect_err("directive should be rejected");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+            assert_eq!(error.diagnostic.message, message);
+        }
     }
 
     #[test]
@@ -5383,22 +5822,16 @@ ports:
     }
 
     #[test]
-    fn parser_reports_unexpected_line_start_tokens() {
-        let error = YamlDoc::parse(
+    fn parser_accepts_empty_block_mapping_key() {
+        let doc = YamlDoc::parse(
             ": value
 ",
         )
-        .expect_err("colon cannot start an MVP line");
+        .expect("empty mapping keys are valid YAML");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
-        assert_eq!(error.diagnostic.span, Span::new(0, 1));
         assert_eq!(
-            error.diagnostic.position,
-            Some(LineCol { line: 1, column: 1 })
-        );
-        assert_eq!(
-            error.diagnostic.expected,
-            ["mapping entry, sequence entry, or scalar".to_owned()]
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :\n=VAL :value\n-MAP\n-DOC\n-STR\n"
         );
     }
 

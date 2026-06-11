@@ -337,8 +337,13 @@ Add support incrementally:
 - [x] Tags: `!tag`, `!!str`, `!<uri>` on scalars and flow collections are
       preserved in events and the semantic graph. `%TAG` directive resolution
       and tagged-value rewriting remain later milestones.
-- Directives: `%YAML`, `%TAG`.
-- Multi-document streams.
+- [x] Directives: `%YAML` and `%TAG` are parsed before each document. `%TAG`
+      handles are resolved into event and semantic tag metadata. Directive
+      rewriting remains a later writer milestone.
+- [x] Multi-document streams: explicit document starts and ends produce
+      per-document events and semantic graph document nodes. Path lookup and
+      typed overlays continue to target the first document until document
+      selection APIs are added.
 - Explicit keys: `? key`.
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.

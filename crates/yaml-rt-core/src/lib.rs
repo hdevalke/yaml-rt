@@ -766,6 +766,7 @@ struct Parser<'source> {
     sequences: Vec<(usize, NodeId)>,
     event_collections: Vec<(usize, OpenEventCollection)>,
     pending_node_properties: Vec<PendingNodeProperties>,
+    block_scalar_content_indents: BTreeMap<NodeId, usize>,
 }
 
 impl<'source> Parser<'source> {
@@ -783,6 +784,7 @@ impl<'source> Parser<'source> {
             sequences: Vec::new(),
             event_collections: Vec::new(),
             pending_node_properties: Vec::new(),
+            block_scalar_content_indents: BTreeMap::new(),
         }
     }
 
@@ -915,7 +917,7 @@ impl<'source> Parser<'source> {
             self.parse_explicit_mapping_entry(document, lines, index, indent, body)
         } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
-                self.parse_block_scalar(lines, index, absolute_start, indent, body)?;
+                self.parse_block_scalar(lines, index, absolute_start, indent, body, true)?;
             self.nodes[document.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
@@ -1065,8 +1067,14 @@ impl<'source> Parser<'source> {
             let leading = value.len() - value_trimmed.len();
             let value_start = line.content_start + indent + colon_byte + 1 + leading;
             let value_node = if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
-                let (node, consumed) =
-                    self.parse_block_scalar(lines, index, value_start, indent, value_trimmed)?;
+                let (node, consumed) = self.parse_block_scalar(
+                    lines,
+                    index,
+                    value_start,
+                    indent,
+                    value_trimmed,
+                    false,
+                )?;
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
@@ -1233,7 +1241,7 @@ impl<'source> Parser<'source> {
     ) -> Result<usize, YamlError> {
         if key_text.starts_with('|') || key_text.starts_with('>') {
             let (node, consumed) =
-                self.parse_block_scalar(lines, index, key_start, parent_indent, key_text)?;
+                self.parse_block_scalar(lines, index, key_start, parent_indent, key_text, false)?;
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
@@ -1292,7 +1300,7 @@ impl<'source> Parser<'source> {
         let value_start = line.content_start + indent + 1 + leading;
         if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
             let (node, consumed) =
-                self.parse_block_scalar(lines, index, value_start, indent, value_trimmed)?;
+                self.parse_block_scalar(lines, index, value_start, indent, value_trimmed, false)?;
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
@@ -1591,7 +1599,7 @@ impl<'source> Parser<'source> {
             let value_start = line.content_start + indent + 1 + leading;
             if value.starts_with('|') || value.starts_with('>') {
                 let (node, consumed) =
-                    self.parse_block_scalar(lines, index, value_start, indent, value)?;
+                    self.parse_block_scalar(lines, index, value_start, indent, value, false)?;
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
@@ -1805,6 +1813,7 @@ impl<'source> Parser<'source> {
         header_start: usize,
         parent_indent: usize,
         header: &str,
+        allow_same_indent_content: bool,
     ) -> Result<(NodeId, usize), YamlError> {
         let header = parse_block_scalar_header(header, header_start)?;
         let mut consumed = 1;
@@ -1813,6 +1822,9 @@ impl<'source> Parser<'source> {
             .map(|indent| parent_indent + indent)
             .unwrap_or(usize::MAX);
         let mut end = lines[index].line_end;
+        let inline_header =
+            header_start > lines[index].content_start + parent_indent && !allow_same_indent_content;
+        let mut pending_blank_lines = 0usize;
 
         for line in &lines[index + 1..] {
             let trimmed = line.content_without_break.trim();
@@ -1821,6 +1833,10 @@ impl<'source> Parser<'source> {
             }
 
             if trimmed.is_empty() {
+                if content_indent == usize::MAX && inline_header {
+                    pending_blank_lines += 1;
+                    continue;
+                }
                 consumed += 1;
                 end = line.line_end;
                 continue;
@@ -1828,7 +1844,7 @@ impl<'source> Parser<'source> {
 
             let indent = count_literal_content_indent(line.content_without_break);
             if content_indent == usize::MAX {
-                if indent <= parent_indent && parent_indent > 0 {
+                if indent <= parent_indent && (parent_indent > 0 || inline_header) {
                     break;
                 }
                 content_indent = indent;
@@ -1838,6 +1854,10 @@ impl<'source> Parser<'source> {
                 break;
             }
 
+            if pending_blank_lines > 0 {
+                consumed += pending_blank_lines;
+                pending_blank_lines = 0;
+            }
             consumed += 1;
             end = line.line_end;
         }
@@ -1846,6 +1866,13 @@ impl<'source> Parser<'source> {
             header.kind.node_kind(),
             Span::new(header_start as u32, end as u32),
         );
+        let content_indent = if content_indent == usize::MAX {
+            header.indent.unwrap_or_default()
+        } else {
+            content_indent
+        };
+        self.block_scalar_content_indents
+            .insert(scalar, content_indent);
         Ok((scalar, consumed))
     }
 
@@ -2431,6 +2458,7 @@ impl<'source> Parser<'source> {
     }
 
     fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
+        let node_id = node;
         let node = self.nodes[node.0 as usize].clone();
         let text = self.source.slice(node.span);
         let mut properties = parse_node_properties(text, node.span)?;
@@ -2458,7 +2486,14 @@ impl<'source> Parser<'source> {
             NodeKind::Scalar => YamlScalarStyle::Plain,
             _ => unreachable!("emit_scalar_event only receives scalar nodes"),
         };
-        let value = decode_scalar_value(value_text)?;
+        let value = if matches!(node.kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
+            decode_scalar_value_with_content_indent(
+                value_text,
+                self.block_scalar_content_indents.get(&node_id).copied(),
+            )?
+        } else {
+            decode_scalar_value(value_text)?
+        };
         self.push_event(
             YamlEventKind::Scalar {
                 style,
@@ -3663,11 +3698,18 @@ fn format_double_quoted_scalar_value(value: &str) -> String {
 }
 
 fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
+    decode_scalar_value_with_content_indent(text, None)
+}
+
+fn decode_scalar_value_with_content_indent(
+    text: &str,
+    content_indent: Option<usize>,
+) -> Result<String, YamlError> {
     if text.starts_with('|') {
-        return decode_literal_scalar_value(text);
+        return decode_literal_scalar_value(text, content_indent);
     }
     if text.starts_with('>') {
-        return decode_folded_scalar_value(text);
+        return decode_folded_scalar_value(text, content_indent);
     }
 
     if text.starts_with('"') {
@@ -3829,24 +3871,28 @@ fn decode_plain_scalar_value(text: &str) -> String {
     decoded
 }
 
-fn decode_literal_scalar_value(text: &str) -> Result<String, YamlError> {
-    let (header, content_start) = split_first_line(text);
-    let header = parse_block_scalar_header(header, 0)?;
+fn decode_literal_scalar_value(
+    text: &str,
+    content_indent: Option<usize>,
+) -> Result<String, YamlError> {
+    let (header_text, content_start) = split_first_line(text);
+    let header = parse_block_scalar_header(header_text, 0)?;
     let content = &text[content_start..];
-    let content_indent = header
-        .indent
-        .unwrap_or_else(|| detect_literal_content_indent(content));
+    let content_indent = content_indent.unwrap_or_else(|| {
+        header
+            .indent
+            .unwrap_or_else(|| detect_literal_content_indent(content))
+    });
+    if content.is_empty() && header.chomp == BlockChomp::Keep && content_start > header_text.len() {
+        return Ok("\n".to_owned());
+    }
     let mut decoded = String::new();
     let mut position = 0;
 
     while position < content.len() {
         let (line, next_position) = next_literal_content_line(content, position);
         let (body, break_text) = split_line_break(line);
-        let stripped = if body.trim().is_empty() {
-            ""
-        } else {
-            strip_literal_indent(body, content_indent)
-        };
+        let stripped = strip_literal_indent(body, content_indent);
         decoded.push_str(stripped);
         decoded.push_str(break_text);
         position = next_position;
@@ -3855,13 +3901,21 @@ fn decode_literal_scalar_value(text: &str) -> Result<String, YamlError> {
     Ok(apply_block_chomp(decoded, header.chomp))
 }
 
-fn decode_folded_scalar_value(text: &str) -> Result<String, YamlError> {
-    let (header, content_start) = split_first_line(text);
-    let header = parse_block_scalar_header(header, 0)?;
+fn decode_folded_scalar_value(
+    text: &str,
+    content_indent: Option<usize>,
+) -> Result<String, YamlError> {
+    let (header_text, content_start) = split_first_line(text);
+    let header = parse_block_scalar_header(header_text, 0)?;
     let content = &text[content_start..];
-    let content_indent = header
-        .indent
-        .unwrap_or_else(|| detect_literal_content_indent(content));
+    let content_indent = content_indent.unwrap_or_else(|| {
+        header
+            .indent
+            .unwrap_or_else(|| detect_literal_content_indent(content))
+    });
+    if content.is_empty() && header.chomp == BlockChomp::Keep && content_start > header_text.len() {
+        return Ok("\n".to_owned());
+    }
     let literal = decode_block_scalar_content(content, content_indent);
 
     Ok(apply_block_chomp(
@@ -3877,11 +3931,7 @@ fn decode_block_scalar_content(content: &str, content_indent: usize) -> String {
     while position < content.len() {
         let (line, next_position) = next_literal_content_line(content, position);
         let (body, break_text) = split_line_break(line);
-        let stripped = if body.trim().is_empty() {
-            ""
-        } else {
-            strip_literal_indent(body, content_indent)
-        };
+        let stripped = strip_literal_indent(body, content_indent);
         decoded.push_str(stripped);
         decoded.push_str(break_text);
         position = next_position;
@@ -3893,26 +3943,50 @@ fn decode_block_scalar_content(content: &str, content_indent: usize) -> String {
 fn fold_block_scalar_lines(literal: &str) -> String {
     let lines = literal_lines(literal);
     let mut output = String::new();
+    let mut saw_content_line = false;
+    let mut previous_more_indented = false;
+    let mut pending_blank_lines = 0usize;
+    let mut last_content_had_break = false;
 
-    for index in 0..lines.len() {
-        let (body, break_text) = lines[index];
-        output.push_str(body);
-        if break_text.is_empty() {
+    for (body, break_text) in lines {
+        let more_indented = line_is_more_indented(body);
+        if body.is_empty() {
+            if saw_content_line && !break_text.is_empty() {
+                pending_blank_lines += 1;
+                last_content_had_break = true;
+            } else {
+                output.push_str(break_text);
+            }
             continue;
         }
 
-        let next = lines.get(index + 1).copied();
-        if next.is_none() {
-            output.push_str(break_text);
-        } else if body.is_empty() {
-            output.push_str(break_text);
-        } else if next
-            .is_some_and(|(next_body, _)| next_body.is_empty() || line_is_more_indented(next_body))
-            || line_is_more_indented(body)
-        {
-            output.push_str(break_text);
-        } else {
-            output.push(' ');
+        if saw_content_line {
+            if pending_blank_lines > 0 {
+                let breaks = if previous_more_indented || more_indented {
+                    pending_blank_lines + 1
+                } else {
+                    pending_blank_lines
+                };
+                for _ in 0..breaks {
+                    output.push('\n');
+                }
+            } else if previous_more_indented || more_indented {
+                output.push('\n');
+            } else if last_content_had_break {
+                output.push(' ');
+            }
+        }
+
+        output.push_str(body);
+        saw_content_line = true;
+        previous_more_indented = more_indented;
+        pending_blank_lines = 0;
+        last_content_had_break = !break_text.is_empty();
+    }
+
+    if saw_content_line && last_content_had_break {
+        for _ in 0..=pending_blank_lines {
+            output.push('\n');
         }
     }
 
@@ -6791,6 +6865,22 @@ ports:
     }
 
     #[test]
+    fn yaml_value_preserves_literal_whitespace_only_lines() {
+        let input = "text: |\n  a\n    \n  b\n";
+        let doc = YamlDoc::parse(input).expect("valid literal scalar with whitespace line");
+        let text = doc
+            .get_path(&["text"])
+            .expect("lookup succeeds")
+            .expect("text exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            String::read_yaml(&doc, text).expect("literal reads"),
+            "a\n  \nb\n"
+        );
+    }
+
+    #[test]
     fn parser_builds_root_folded_scalar_cst() {
         let input = ">\n  folded\n  line\n";
         let doc = YamlDoc::parse(input).expect("parser should accept root folded scalar");
@@ -6847,6 +6937,29 @@ ports:
     }
 
     #[test]
+    fn yaml_value_reads_folded_scalar_blank_line_paragraphs() {
+        let doc = YamlDoc::parse(">\n  ab\n  cd\n\n  ef\n\n\n  gh\n").expect("valid folded scalar");
+        let folded = folded_scalar(&doc).expect("folded scalar exists");
+
+        assert_eq!(
+            String::read_yaml(&doc, folded).expect("folded reads"),
+            "ab cd\nef\n\ngh\n"
+        );
+    }
+
+    #[test]
+    fn yaml_value_reads_folded_scalar_more_indented_lines() {
+        let doc = YamlDoc::parse(">\n  folded\n    * bullet\n\n    * list\n  tail\n")
+            .expect("valid folded scalar");
+        let folded = folded_scalar(&doc).expect("folded scalar exists");
+
+        assert_eq!(
+            String::read_yaml(&doc, folded).expect("folded reads"),
+            "folded\n  * bullet\n\n  * list\ntail\n"
+        );
+    }
+
+    #[test]
     fn yaml_value_reads_folded_scalar_chomping() {
         let strip =
             YamlDoc::parse("message: >-\n  folded\n  line\n\n").expect("valid strip folded");
@@ -6867,6 +6980,46 @@ ports:
         assert_eq!(
             String::read_yaml(&keep, keep_node).expect("keep reads"),
             "folded line\n\n"
+        );
+    }
+
+    #[test]
+    fn parser_respects_explicit_block_scalar_indentation() {
+        let input = "- aaa: |2\n    xxx\n  bbb: |\n    xxx\n";
+        let doc = YamlDoc::parse(input).expect("valid explicit indentation scalar");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n+MAP\n=VAL :aaa\n=VAL |xxx\\n\n=VAL :bbb\n=VAL |xxx\\n\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_tab_prefixed_block_scalar_content() {
+        let input = "block: |\n  text\n   \tlines\n";
+        let doc = YamlDoc::parse(input).expect("valid tab content in block scalar");
+        let block = doc
+            .get_path(&["block"])
+            .expect("lookup succeeds")
+            .expect("block exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            String::read_yaml(&doc, block).expect("literal reads"),
+            "text\n \tlines\n"
+        );
+    }
+
+    #[test]
+    fn parser_keeps_empty_block_scalars_from_consuming_siblings() {
+        let input = "strip: >-\n\nclip: >\n\nkeep: |+\n";
+        let doc = YamlDoc::parse(input).expect("valid empty block scalars");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :strip\n=VAL >\n=VAL :clip\n=VAL >\n=VAL :keep\n=VAL |\\n\n-MAP\n-DOC\n-STR\n"
         );
     }
 

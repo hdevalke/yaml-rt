@@ -746,6 +746,13 @@ enum OpenEventCollection {
     Sequence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingNodeProperties {
+    indent: usize,
+    span_start: usize,
+    properties: NodeProperties,
+}
+
 struct Parser<'source> {
     source: &'source Source,
     nodes: Vec<Node>,
@@ -758,6 +765,7 @@ struct Parser<'source> {
     mappings: Vec<(usize, NodeId)>,
     sequences: Vec<(usize, NodeId)>,
     event_collections: Vec<(usize, OpenEventCollection)>,
+    pending_node_properties: Vec<PendingNodeProperties>,
 }
 
 impl<'source> Parser<'source> {
@@ -774,6 +782,7 @@ impl<'source> Parser<'source> {
             mappings: Vec::new(),
             sequences: Vec::new(),
             event_collections: Vec::new(),
+            pending_node_properties: Vec::new(),
         }
     }
 
@@ -893,6 +902,13 @@ impl<'source> Parser<'source> {
         absolute_start: usize,
     ) -> Result<usize, YamlError> {
         self.document_has_content = true;
+        if let Some(next_indent) =
+            property_only_block_collection_indent(body, lines, index, absolute_start)?
+        {
+            self.push_pending_node_properties(body, absolute_start, next_indent)?;
+            return Ok(1);
+        }
+
         if is_sequence_entry(body) {
             self.parse_sequence_entry(document, lines, index, indent, body)
         } else if body.starts_with('|') || body.starts_with('>') {
@@ -1004,6 +1020,16 @@ impl<'source> Parser<'source> {
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
+            } else if let Some(next_indent) =
+                property_only_block_collection_indent(value_trimmed, lines, index, value_start)?
+            {
+                self.push_pending_node_properties(value_trimmed, value_start, next_indent)?;
+                let consumed =
+                    self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
+                let end = lines[index + consumed - 1].content_end;
+                self.extend_node_span(entry, end);
+                self.extend_node_span(mapping, end);
+                return Ok(consumed);
             } else if body_starts_flow_value(raw_value_trimmed, value_start)? {
                 self.parse_inline_value(raw_value_trimmed, value_start)?
             } else {
@@ -1048,6 +1074,16 @@ impl<'source> Parser<'source> {
             }
 
             let body = &line.content_without_break[nested_indent..];
+            if property_only_block_collection_indent(
+                body,
+                lines,
+                nested_index,
+                line.content_start + nested_indent,
+            )?
+            .is_some()
+            {
+                return self.parse_nested_block_value(entry, lines, index, parent_indent);
+            }
             if is_sequence_entry(body) || find_mapping_colon(body).is_some() {
                 return self.parse_nested_block_value(entry, lines, index, parent_indent);
             }
@@ -1064,6 +1100,28 @@ impl<'source> Parser<'source> {
         }
 
         Ok(1)
+    }
+
+    fn push_pending_node_properties(
+        &mut self,
+        text: &str,
+        absolute_start: usize,
+        indent: usize,
+    ) -> Result<(), YamlError> {
+        let mut properties = parse_node_properties(
+            text,
+            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+        )?;
+        self.resolve_node_properties(
+            &mut properties,
+            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+        )?;
+        self.pending_node_properties.push(PendingNodeProperties {
+            indent,
+            span_start: absolute_start,
+            properties,
+        });
+        Ok(())
     }
 
     fn ensure_current_document(&mut self, explicit: bool, line: SourceLine<'_>) -> NodeId {
@@ -1084,6 +1142,7 @@ impl<'source> Parser<'source> {
         self.mappings.clear();
         self.sequences.clear();
         self.event_collections.clear();
+        self.pending_node_properties.clear();
         self.push_event(YamlEventKind::DocumentStart { explicit }, span);
         document
     }
@@ -1107,6 +1166,7 @@ impl<'source> Parser<'source> {
         self.mappings.clear();
         self.sequences.clear();
         self.event_collections.clear();
+        self.pending_node_properties.clear();
         Ok(())
     }
 
@@ -1215,6 +1275,16 @@ impl<'source> Parser<'source> {
                     self.parse_block_scalar(lines, index, value_start, indent, value)?;
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
+                return Ok(consumed);
+            } else if let Some(next_indent) =
+                property_only_block_collection_indent(value, lines, index, value_start)?
+            {
+                self.push_pending_node_properties(value, value_start, next_indent)?;
+                let consumed =
+                    self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
+                let end = lines[index + consumed - 1].content_end;
+                self.extend_node_span(entry, end);
+                self.extend_node_span(sequence, end);
                 return Ok(consumed);
             } else if is_sequence_entry(value) {
                 return self.parse_sequence_entry(
@@ -1706,6 +1776,7 @@ impl<'source> Parser<'source> {
         if let Some((_, node)) = self.mappings.iter().find(|(level, _)| *level == indent) {
             *node
         } else {
+            let (span, tag, anchor) = self.collection_properties(indent, span);
             let mapping = self.push_node(NodeKind::BlockMapping, span);
             self.nodes[parent.0 as usize].children.push(mapping);
             self.mappings.push((indent, mapping));
@@ -1714,8 +1785,8 @@ impl<'source> Parser<'source> {
                 OpenEventCollection::Mapping,
                 YamlEventKind::MappingStart {
                     style: CollectionStyle::Block,
-                    tag: None,
-                    anchor: None,
+                    tag,
+                    anchor,
                 },
                 span,
             );
@@ -1727,6 +1798,7 @@ impl<'source> Parser<'source> {
         if let Some((_, node)) = self.sequences.iter().find(|(level, _)| *level == indent) {
             *node
         } else {
+            let (span, tag, anchor) = self.collection_properties(indent, span);
             let sequence = self.push_node(NodeKind::BlockSequence, span);
             self.nodes[parent.0 as usize].children.push(sequence);
             self.sequences.push((indent, sequence));
@@ -1735,13 +1807,33 @@ impl<'source> Parser<'source> {
                 OpenEventCollection::Sequence,
                 YamlEventKind::SequenceStart {
                     style: CollectionStyle::Block,
-                    tag: None,
-                    anchor: None,
+                    tag,
+                    anchor,
                 },
                 span,
             );
             sequence
         }
+    }
+
+    fn collection_properties(
+        &mut self,
+        indent: usize,
+        span: Span,
+    ) -> (Span, Option<String>, Option<String>) {
+        let Some(index) = self
+            .pending_node_properties
+            .iter()
+            .rposition(|pending| pending.indent == indent)
+        else {
+            return (span, None, None);
+        };
+        let pending = self.pending_node_properties.remove(index);
+        (
+            Span::new(pending.span_start as u32, span.end),
+            pending.properties.tag,
+            pending.properties.anchor,
+        )
     }
 
     fn validate_indent(&self, indent: usize, line: SourceLine<'_>) -> Result<(), YamlError> {
@@ -1775,6 +1867,8 @@ impl<'source> Parser<'source> {
     fn close_collections_deeper_than(&mut self, indent: usize) {
         self.mappings.retain(|(level, _)| *level <= indent);
         self.sequences.retain(|(level, _)| *level <= indent);
+        self.pending_node_properties
+            .retain(|pending| pending.indent <= indent);
         self.close_event_collections_deeper_than(indent);
     }
 
@@ -1962,6 +2056,50 @@ fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, Yam
         body[properties.value_start..].chars().next(),
         Some('[' | '{')
     ))
+}
+
+fn property_only_block_collection_indent(
+    body: &str,
+    lines: &[SourceLine<'_>],
+    index: usize,
+    absolute_start: usize,
+) -> Result<Option<usize>, YamlError> {
+    let body = strip_inline_comment(body).trim_end();
+    let properties = parse_node_properties(
+        body,
+        Span::new(absolute_start as u32, (absolute_start + body.len()) as u32),
+    )?;
+    if properties.anchor.is_none() && properties.tag.is_none() {
+        return Ok(None);
+    }
+    if properties.value_start < body.len() {
+        return Ok(None);
+    }
+
+    let Some((indent, nested_body)) = next_significant_body(lines, index)? else {
+        return Ok(None);
+    };
+    if is_sequence_entry(nested_body) || find_mapping_colon(nested_body).is_some() {
+        Ok(Some(indent))
+    } else {
+        Ok(None)
+    }
+}
+
+fn next_significant_body<'line>(
+    lines: &'line [SourceLine<'_>],
+    current_index: usize,
+) -> Result<Option<(usize, &'line str)>, YamlError> {
+    for line in &lines[current_index + 1..] {
+        let trimmed = line.content_without_break.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = count_indent(line.content_without_break, line.content_start)?;
+        return Ok(Some((indent, &line.content_without_break[indent..])));
+    }
+
+    Ok(None)
 }
 
 fn default_tag_handles() -> BTreeMap<String, String> {
@@ -5627,6 +5765,66 @@ ports:
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :hr\n+SEQ\n=VAL :Mark McGwire\n=VAL :Sammy Sosa\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_anchor_to_root_block_sequence() {
+        let input = "&sequence\n- a\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept anchored root sequence");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ &sequence\n=VAL :a\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_anchor_to_nested_block_mapping() {
+        let input = "top1: &node1\n  key1: one\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept anchored nested mapping");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :top1\n+MAP &node1\n=VAL :key1\n=VAL :one\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_tag_to_nested_block_sequence() {
+        let input = "foo: !!seq\n  - !!str a\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept tagged nested sequence");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :foo\n+SEQ <tag:yaml.org,2002:seq>\n=VAL <tag:yaml.org,2002:str> :a\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_anchor_to_compact_nested_mapping_key() {
+        let input = "top3:\n  &k3 key3: three\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept anchored nested key");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :top3\n+MAP\n=VAL &k3 :key3\n=VAL :three\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_keeps_property_only_value_as_scalar_when_nested_value_is_plain() {
+        let input = "top6: &val6\n  six\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept anchored scalar value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :top6\n=VAL &val6 :six\n-MAP\n-DOC\n-STR\n"
         );
     }
 

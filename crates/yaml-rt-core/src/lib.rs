@@ -831,7 +831,11 @@ impl<'source> Parser<'source> {
             return Ok(1);
         }
 
-        let indent = count_indent(content, line.content_start)?;
+        let indent = if content.starts_with('\t') {
+            0
+        } else {
+            count_indent(content, line.content_start)?
+        };
         let body = &content[indent..];
 
         if let Some(rest) = document_marker_rest(body, "---") {
@@ -1055,13 +1059,6 @@ impl<'source> Parser<'source> {
         let raw_value_trimmed = raw_value.trim_start();
         let value = strip_inline_comment(raw_value);
         let value_trimmed = value.trim_start();
-        let next_significant_indent = next_significant_indent(lines, index)?;
-        if value_trimmed.is_empty() && next_significant_indent.is_none_or(|next| next <= indent) {
-            let empty = self.push_empty_scalar(line.content_end);
-            self.nodes[entry.0 as usize].children.push(empty);
-            self.emit_scalar_event(empty)?;
-            return Ok(1);
-        }
 
         if !value_trimmed.is_empty() {
             let leading = value.len() - value_trimmed.len();
@@ -1099,12 +1096,22 @@ impl<'source> Parser<'source> {
             };
             self.nodes[entry.0 as usize].children.push(value_node);
             self.emit_node_event(value_node)?;
-        } else if next_significant_indent.is_some_and(|next| next > indent) {
-            let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-            let end = lines[index + consumed - 1].content_end;
-            self.extend_node_span(entry, end);
-            self.extend_node_span(mapping, end);
-            return Ok(consumed);
+        } else {
+            let next_significant_indent = next_significant_indent(lines, index)?;
+            if next_significant_indent.is_none_or(|next| next <= indent) {
+                let empty = self.push_empty_scalar(line.content_end);
+                self.nodes[entry.0 as usize].children.push(empty);
+                self.emit_scalar_event(empty)?;
+                return Ok(1);
+            }
+            if next_significant_indent.is_some_and(|next| next > indent) {
+                let consumed =
+                    self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
+                let end = lines[index + consumed - 1].content_end;
+                self.extend_node_span(entry, end);
+                self.extend_node_span(mapping, end);
+                return Ok(consumed);
+            }
         }
 
         Ok(1)
@@ -1204,7 +1211,7 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            let indent = count_indent(line.content_without_break, line.content_start)?;
+            let indent = content_line_indent(line.content_without_break);
             let body = &line.content_without_break[indent..];
             if indent == parent_indent && is_explicit_mapping_value(body) {
                 break;
@@ -1349,7 +1356,7 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            let indent = count_indent(line.content_without_break, line.content_start)?;
+            let indent = content_line_indent(line.content_without_break);
             let body = &line.content_without_break[indent..];
             if indent < parent_indent
                 || (indent == parent_indent
@@ -1392,7 +1399,7 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            let nested_indent = count_indent(line.content_without_break, line.content_start)?;
+            let nested_indent = content_line_indent(line.content_without_break);
             if nested_indent <= parent_indent {
                 break;
             }
@@ -1635,9 +1642,11 @@ impl<'source> Parser<'source> {
                     colon_byte,
                 );
             } else {
-                let value_node = self.parse_inline_value(value, value_start)?;
+                let (value_node, consumed) =
+                    self.parse_block_plain_scalar(lines, index, indent, value_start);
                 self.nodes[entry.0 as usize].children.push(value_node);
-                self.emit_node_event(value_node)?;
+                self.emit_scalar_event(value_node)?;
+                return Ok(consumed);
             }
         } else {
             if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
@@ -1685,7 +1694,7 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            let nested_indent = count_indent(line.content_without_break, line.content_start)?;
+            let nested_indent = content_line_indent(line.content_without_break);
             if nested_indent <= parent_indent {
                 break;
             }
@@ -1730,8 +1739,7 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            let indent = count_literal_content_indent(line.content_without_break);
-            if indent <= parent_indent {
+            if !is_plain_scalar_continuation(line.content_without_break, parent_indent) {
                 break;
             }
 
@@ -1777,7 +1785,8 @@ impl<'source> Parser<'source> {
             text,
             Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
         )?;
-        let value_start = properties.value_start;
+        let value_start =
+            properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
         let value_text = &text[value_start..];
         if value_text.starts_with('[') {
             let (node, consumed) =
@@ -2530,8 +2539,10 @@ fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, Yam
         body,
         Span::new(absolute_start as u32, (absolute_start + body.len()) as u32),
     )?;
+    let value_start =
+        properties.value_start + leading_flow_whitespace(&body[properties.value_start..]);
     Ok(matches!(
-        body[properties.value_start..].chars().next(),
+        body[value_start..].chars().next(),
         Some('[' | '{')
     ))
 }
@@ -2584,7 +2595,7 @@ fn next_significant_body_with_index<'line>(
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let indent = count_indent(line.content_without_break, line.content_start)?;
+        let indent = content_line_indent(line.content_without_break);
         return Ok(Some((index, indent, &line.content_without_break[indent..])));
     }
 
@@ -3100,6 +3111,15 @@ fn count_indent(content: &str, content_start: usize) -> Result<usize, YamlError>
     Ok(indent)
 }
 
+fn content_line_indent(content: &str) -> usize {
+    content.bytes().take_while(|byte| *byte == b' ').count()
+}
+
+fn is_plain_scalar_continuation(content: &str, parent_indent: usize) -> bool {
+    let indent = content_line_indent(content);
+    indent > parent_indent || content.as_bytes().get(indent) == Some(&b'\t')
+}
+
 fn count_literal_content_indent(content: &str) -> usize {
     content.bytes().take_while(|byte| *byte == b' ').count()
 }
@@ -3146,7 +3166,8 @@ fn reject_trailing_flow_content(
 }
 
 fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize, YamlError> {
-    let Some(open) = text.chars().next() else {
+    let start = leading_flow_whitespace(text);
+    let Some(open) = text[start..].chars().next() else {
         return Err(empty_flow_value(absolute_start));
     };
     let close = match open {
@@ -3155,7 +3176,7 @@ fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize
         _ => return Err(empty_flow_value(absolute_start)),
     };
     let mut stack = vec![close];
-    let mut position = open.len_utf8();
+    let mut position = start + open.len_utf8();
 
     while position < text.len() {
         let character = text[position..]
@@ -6729,6 +6750,61 @@ ports:
     }
 
     #[test]
+    fn parser_preserves_tab_prefixed_plain_scalar_continuation() {
+        let input = "plain: text\n \tlines\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept tab-prefixed content");
+        let plain = doc
+            .get_path(&["plain"])
+            .expect("lookup succeeds")
+            .expect("plain exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(doc.scalar_value(plain).expect("plain reads"), "text lines");
+    }
+
+    #[test]
+    fn parser_accepts_tab_prefixed_quoted_scalar_continuation() {
+        let input = "quoted: \"text\n  \tlines\"\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept quoted tab content");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :quoted\n=VAL \"text lines\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_tab_prefixed_sequence_entry_continuation() {
+        let input = "x:\n - x\n  \tx\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept sequence continuation");
+        let items = doc
+            .get_path(&["x"])
+            .expect("lookup succeeds")
+            .expect("x exists");
+        let sequence = doc.graph_sequence_items(items).expect("sequence items");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(sequence.len(), 1);
+        assert_eq!(
+            doc.scalar_value(sequence[0]).expect("sequence item reads"),
+            "x x"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_root_flow_collection_with_leading_tab() {
+        let input = "\t[\n\t]\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept tab-prefixed root flow");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ []\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
     fn parser_treats_inline_comment_mapping_value_as_empty_for_nested_block_value() {
         let input = "hr: # 1998 hr ranking\n  - Mark McGwire\n  - Sammy Sosa\n";
         let doc = YamlDoc::parse(input).expect("parser should accept commented nested value");
@@ -7420,14 +7496,11 @@ ports:
 
     #[test]
     fn parser_reports_tabs_in_indentation() {
-        let error = YamlDoc::parse(
-            "	key: value
-",
-        )
-        .expect_err("tabs are invalid indentation");
+        let error =
+            YamlDoc::parse("root:\n\tchild: value\n").expect_err("tabs are invalid indentation");
 
         assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
-        assert_eq!(error.diagnostic.span, Span::new(0, 1));
+        assert_eq!(error.diagnostic.span, Span::new(6, 7));
         assert_eq!(
             error.diagnostic.expected,
             ["spaces for indentation".to_owned()]

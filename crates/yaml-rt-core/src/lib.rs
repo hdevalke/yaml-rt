@@ -3169,7 +3169,8 @@ fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
                 .with_expected("a closed double-quoted scalar"),
             )
         })?;
-        return decode_double_quoted_scalar(&text[1..end - 1]);
+        let folded = fold_quoted_scalar_lines(&text[1..end - 1]);
+        return decode_double_quoted_scalar(&folded);
     }
 
     if text.starts_with('\'') {
@@ -3183,10 +3184,71 @@ fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
                 .with_expected("a closed single-quoted scalar"),
             )
         })?;
-        return Ok(text[1..end - 1].replace("''", "'"));
+        return Ok(fold_quoted_scalar_lines(&text[1..end - 1]).replace("''", "'"));
     }
 
     Ok(decode_plain_scalar_value(text))
+}
+
+fn fold_quoted_scalar_lines(text: &str) -> String {
+    if !text.contains(['\n', '\r']) {
+        return text.to_owned();
+    }
+
+    let mut folded = String::new();
+    let mut position = 0;
+    let mut pending_breaks = 0usize;
+    let mut saw_content_line = false;
+    let mut first_line = true;
+
+    while position < text.len() {
+        let (line, next_position) = next_literal_content_line(text, position);
+        let (body, break_text) = split_line_break(line);
+        let body = if first_line {
+            body
+        } else {
+            body.trim_start_matches([' ', '\t'])
+        };
+        let body = if break_text.is_empty() {
+            body
+        } else {
+            body.trim_end_matches([' ', '\t'])
+        };
+
+        if body.is_empty() {
+            if !break_text.is_empty() {
+                pending_breaks += 1;
+            }
+        } else {
+            if saw_content_line {
+                push_folded_quoted_breaks(&mut folded, pending_breaks);
+            }
+            folded.push_str(body);
+            pending_breaks = usize::from(!break_text.is_empty());
+            saw_content_line = true;
+        }
+
+        first_line = false;
+        position = next_position;
+    }
+
+    if pending_breaks > 0 && !saw_content_line {
+        push_folded_quoted_breaks(&mut folded, pending_breaks);
+    }
+
+    folded
+}
+
+fn push_folded_quoted_breaks(output: &mut String, breaks: usize) {
+    match breaks {
+        0 => {}
+        1 => output.push(' '),
+        count => {
+            for _ in 1..count {
+                output.push('\n');
+            }
+        }
+    }
 }
 
 fn decode_plain_scalar_value(text: &str) -> String {
@@ -5337,6 +5399,48 @@ single: 'hello'
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :plain\n=VAL :value\n=VAL :single\n=VAL 'Bob's\n=VAL :double\n=VAL \"line\\nnext\n=VAL :literal\n=VAL |one\\ntwo\\n\n=VAL :folded\n=VAL >one two\\n\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_fold_multiline_double_quoted_scalar() {
+        let doc = YamlDoc::parse("quoted: \"So does this\n  quoted scalar.\\n\"\n")
+            .expect("valid multiline double-quoted scalar");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :quoted\n=VAL \"So does this quoted scalar.\\n\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(
+            doc.to_string(),
+            "quoted: \"So does this\n  quoted scalar.\\n\"\n"
+        );
+    }
+
+    #[test]
+    fn events_fold_multiline_single_quoted_blank_values() {
+        let doc = YamlDoc::parse("a: '\n  '\ne: '\n\n  '\ng: '\n\n\n  '\n")
+            .expect("valid multiline single-quoted blanks");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :a\n=VAL ' \n=VAL :e\n=VAL '\\n\n=VAL :g\n=VAL '\\n\\n\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), "a: '\n  '\ne: '\n\n  '\ng: '\n\n\n  '\n");
+    }
+
+    #[test]
+    fn events_fold_multiline_quoted_flow_sequence_values() {
+        let doc = YamlDoc::parse("[\"double\n quoted\", 'single\n quoted']\n")
+            .expect("valid multiline quoted flow scalars");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ []\n=VAL \"double quoted\n=VAL 'single quoted\n-SEQ\n-DOC\n-STR\n"
+        );
+        assert_eq!(
+            doc.to_string(),
+            "[\"double\n quoted\", 'single\n quoted']\n"
         );
     }
 

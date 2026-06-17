@@ -1583,23 +1583,37 @@ impl<'source> Parser<'source> {
                 }
                 _ => {
                     let value_start = position;
-                    let value_end = flow_scalar_end(text, position, absolute_start, &[',', ']'])?;
-                    let scalar_start =
-                        value_start + leading_flow_whitespace(&text[value_start..value_end]);
-                    let scalar_end =
-                        value_end - trailing_flow_whitespace(&text[value_start..value_end]);
-                    if scalar_start >= scalar_end {
-                        return Err(empty_flow_sequence_item(absolute_start + position));
+                    if let Some(colon) =
+                        flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
+                    {
+                        let (mapping, consumed) = self.parse_implicit_flow_mapping(
+                            text,
+                            value_start,
+                            colon,
+                            absolute_start,
+                        )?;
+                        self.nodes[sequence.0 as usize].children.push(mapping);
+                        position = consumed;
+                    } else {
+                        let value_end =
+                            flow_scalar_end(text, position, absolute_start, &[',', ']'])?;
+                        let scalar_start =
+                            value_start + leading_flow_whitespace(&text[value_start..value_end]);
+                        let scalar_end =
+                            value_end - trailing_flow_whitespace(&text[value_start..value_end]);
+                        if scalar_start >= scalar_end {
+                            return Err(empty_flow_sequence_item(absolute_start + position));
+                        }
+                        let scalar = self.push_node(
+                            NodeKind::Scalar,
+                            Span::new(
+                                (absolute_start + scalar_start) as u32,
+                                (absolute_start + scalar_end) as u32,
+                            ),
+                        );
+                        self.nodes[sequence.0 as usize].children.push(scalar);
+                        position = value_end;
                     }
-                    let scalar = self.push_node(
-                        NodeKind::Scalar,
-                        Span::new(
-                            (absolute_start + scalar_start) as u32,
-                            (absolute_start + scalar_end) as u32,
-                        ),
-                    );
-                    self.nodes[sequence.0 as usize].children.push(scalar);
-                    position = value_end;
                 }
             }
 
@@ -1626,6 +1640,81 @@ impl<'source> Parser<'source> {
                 }
             }
         }
+    }
+
+    fn parse_implicit_flow_mapping(
+        &mut self,
+        text: &str,
+        entry_start: usize,
+        colon: usize,
+        absolute_start: usize,
+    ) -> Result<(NodeId, usize), YamlError> {
+        let mapping = self.push_node(
+            NodeKind::FlowMapping,
+            Span::new(
+                (absolute_start + entry_start) as u32,
+                (absolute_start + entry_start) as u32,
+            ),
+        );
+        let entry = self.push_node(
+            NodeKind::MappingEntry,
+            Span::new(
+                (absolute_start + entry_start) as u32,
+                (absolute_start + entry_start) as u32,
+            ),
+        );
+        let key_start = entry_start + leading_flow_whitespace(&text[entry_start..colon]);
+        let key_end = colon - trailing_flow_whitespace(&text[entry_start..colon]);
+        if key_start >= key_end {
+            return Err(empty_flow_mapping_key(absolute_start + entry_start));
+        }
+        let key = self.push_node(
+            NodeKind::Scalar,
+            Span::new(
+                (absolute_start + key_start) as u32,
+                (absolute_start + key_end) as u32,
+            ),
+        );
+        self.nodes[entry.0 as usize].children.push(key);
+
+        let mut value_position = skip_flow_whitespace(text, colon + 1);
+        match text[value_position..].chars().next() {
+            Some(',') | Some(']') => {
+                let value = self.push_empty_scalar(absolute_start + value_position);
+                self.nodes[entry.0 as usize].children.push(value);
+            }
+            Some('#') => return Err(flow_mapping_comment(absolute_start + value_position)),
+            Some('[') | Some('{') => {
+                let (value, consumed) = self
+                    .parse_flow_value(&text[value_position..], absolute_start + value_position)?;
+                self.nodes[entry.0 as usize].children.push(value);
+                value_position += consumed;
+            }
+            Some(_) => {
+                let value_end = flow_scalar_end(text, value_position, absolute_start, &[',', ']'])?;
+                let value_start =
+                    value_position + leading_flow_whitespace(&text[value_position..value_end]);
+                let value_trimmed_end =
+                    value_end - trailing_flow_whitespace(&text[value_position..value_end]);
+                if value_start < value_trimmed_end {
+                    let value = self.push_node(
+                        NodeKind::Scalar,
+                        Span::new(
+                            (absolute_start + value_start) as u32,
+                            (absolute_start + value_trimmed_end) as u32,
+                        ),
+                    );
+                    self.nodes[entry.0 as usize].children.push(value);
+                }
+                value_position = value_end;
+            }
+            None => return Err(missing_flow_sequence_end(absolute_start, text.len())),
+        }
+
+        self.nodes[entry.0 as usize].span.end = (absolute_start + value_position) as u32;
+        self.nodes[mapping.0 as usize].span.end = (absolute_start + value_position) as u32;
+        self.nodes[mapping.0 as usize].children.push(entry);
+        Ok((mapping, value_position))
     }
 
     fn parse_flow_mapping(
@@ -1678,7 +1767,12 @@ impl<'source> Parser<'source> {
                 position += consumed;
                 key
             } else {
-                let key_end = flow_scalar_end(text, position, absolute_start, &[':', ',', '}'])?;
+                let key_separator =
+                    flow_mapping_separator(text, position, absolute_start, &[',', '}'])?;
+                let key_end = key_separator.unwrap_or_else(|| {
+                    flow_scalar_end(text, position, absolute_start, &[',', '}'])
+                        .expect("separator scan already validates flow scalar content")
+                });
                 let key_start = position + leading_flow_whitespace(&text[position..key_end]);
                 let key_trimmed_end = key_end - trailing_flow_whitespace(&text[position..key_end]);
                 if key_start >= key_trimmed_end && text[key_end..].starts_with(':') {
@@ -1703,6 +1797,16 @@ impl<'source> Parser<'source> {
             let Some(separator) = text[position..].chars().next() else {
                 return Err(missing_flow_mapping_end(absolute_start, text.len()));
             };
+            if separator == ',' {
+                let value = self.push_empty_scalar(absolute_start + position);
+                self.nodes[entry.0 as usize].children.push(value);
+                self.nodes[entry.0 as usize].span.end = (absolute_start + position) as u32;
+                self.nodes[mapping.0 as usize].children.push(entry);
+                saw_pair = true;
+                position += 1;
+                expecting_pair = true;
+                continue;
+            }
             if separator != ':' {
                 return Err(missing_flow_mapping_colon(
                     absolute_start + position,
@@ -2724,6 +2828,56 @@ fn trailing_flow_whitespace(text: &str) -> usize {
         }
     }
     length
+}
+
+fn flow_mapping_separator(
+    text: &str,
+    start: usize,
+    absolute_start: usize,
+    terminators: &[char],
+) -> Result<Option<usize>, YamlError> {
+    let mut position = start;
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        if terminators.contains(&character) {
+            return Ok(None);
+        }
+        match character {
+            ':' if is_flow_mapping_separator_colon(text, position) => return Ok(Some(position)),
+            '#' => return Err(flow_collection_comment(absolute_start + position)),
+            '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
+            '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
+            '[' | '{' => {
+                position +=
+                    flow_collection_source_end(&text[position..], absolute_start + position)?;
+            }
+            _ => position += character.len_utf8(),
+        }
+    }
+
+    Ok(None)
+}
+
+fn is_flow_mapping_separator_colon(text: &str, position: usize) -> bool {
+    let next_position = position + ':'.len_utf8();
+    let Some(next) = text[next_position..].chars().next() else {
+        return true;
+    };
+
+    next.is_whitespace()
+        || matches!(next, ',' | ']' | '}')
+        || previous_flow_token_can_end_key(text, position)
+}
+
+fn previous_flow_token_can_end_key(text: &str, position: usize) -> bool {
+    text[..position]
+        .chars()
+        .rev()
+        .find(|character| !character.is_whitespace())
+        .is_some_and(|character| matches!(character, '"' | '\'' | ']' | '}'))
 }
 
 fn flow_scalar_end(
@@ -5445,6 +5599,30 @@ single: 'hello'
     }
 
     #[test]
+    fn events_render_implicit_flow_mapping_sequence_entry() {
+        let doc = YamlDoc::parse("[foo: bar]\n").expect("valid implicit flow mapping item");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ []\n+MAP {}\n=VAL :foo\n=VAL :bar\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), "[foo: bar]\n");
+    }
+
+    #[test]
+    fn events_render_yaml_test_8udb_flow_sequence_shape() {
+        let doc = YamlDoc::parse(
+            "[\n\"double\n quoted\", 'single\n           quoted',\nplain\n text, [ nested ],\nsingle: pair,\n]\n",
+        )
+        .expect("valid flow sequence with implicit mapping");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ []\n=VAL \"double quoted\n=VAL 'single quoted\n=VAL :plain text\n+SEQ []\n=VAL :nested\n-SEQ\n+MAP {}\n=VAL :single\n=VAL :pair\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
     fn events_render_scalar_anchors_and_tags() {
         let doc = YamlDoc::parse(
             "plain: &anchor !<tag:example.com,2026:x> value\nquoted: !!str \"123\"\n",
@@ -6280,6 +6458,67 @@ ports:
         assert_eq!(
             flow_mapping_scalar_pairs(&doc, settings),
             [("a", "b"), ("c", "d")]
+        );
+    }
+
+    #[test]
+    fn parser_keeps_non_separating_colons_in_flow_plain_scalars() {
+        let input = "{url: http://foo.com, empty:, key: value:with:colons}\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept flow plain colons");
+        let mapping = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == NodeKind::FlowMapping)
+            .map(|(index, _)| NodeId(index as u32))
+            .expect("flow mapping exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            flow_mapping_scalar_pairs(&doc, mapping),
+            [
+                ("url", "http://foo.com"),
+                ("empty", ""),
+                ("key", "value:with:colons")
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_builds_key_only_flow_mapping_entry_with_colon_text() {
+        let input = "{http://foo.com, omitted value:}\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept key-only flow entry");
+        let mapping = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == NodeKind::FlowMapping)
+            .map(|(index, _)| NodeId(index as u32))
+            .expect("flow mapping exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            flow_mapping_scalar_pairs(&doc, mapping),
+            [("http://foo.com", ""), ("omitted value", "")]
+        );
+    }
+
+    #[test]
+    fn parser_accepts_quoted_flow_keys_without_separator_space() {
+        let input = "{ \"key\":value, \"key\"::value }\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept quoted flow keys");
+        let mapping = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.kind == NodeKind::FlowMapping)
+            .map(|(index, _)| NodeId(index as u32))
+            .expect("flow mapping exists");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            flow_mapping_scalar_pairs(&doc, mapping),
+            [("\"key\"", "value"), ("\"key\"", ":value")]
         );
     }
 

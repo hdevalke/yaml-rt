@@ -1156,24 +1156,95 @@ impl<'source> Parser<'source> {
         if !value.is_empty() {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
-            let value_node = if value.starts_with('|') || value.starts_with('>') {
+            if value.starts_with('|') || value.starts_with('>') {
                 let (node, consumed) =
                     self.parse_block_scalar(lines, index, value_start, indent, value)?;
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
+            } else if is_sequence_entry(value) {
+                return self.parse_sequence_entry(
+                    entry,
+                    lines,
+                    index,
+                    value_start - line.content_start,
+                    value,
+                );
+            } else if body_starts_flow_value(value, value_start)? {
+                let value_node = self.parse_inline_value(value, value_start)?;
+                self.nodes[entry.0 as usize].children.push(value_node);
+                self.emit_node_event(value_node)?;
+            } else if let Some(colon_byte) = find_mapping_colon(value) {
+                return self.parse_mapping_entry(
+                    entry,
+                    lines,
+                    index,
+                    value_start - line.content_start,
+                    value,
+                    colon_byte,
+                );
             } else {
-                self.parse_inline_value(value, value_start)?
-            };
-            self.nodes[entry.0 as usize].children.push(value_node);
-            self.emit_node_event(value_node)?;
+                let value_node = self.parse_inline_value(value, value_start)?;
+                self.nodes[entry.0 as usize].children.push(value_node);
+                self.emit_node_event(value_node)?;
+            }
         } else {
+            if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
+                let consumed =
+                    self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
+                let end = lines[index + consumed - 1].content_end;
+                self.extend_node_span(entry, end);
+                self.extend_node_span(sequence, end);
+                return Ok(consumed);
+            }
             let empty = self.push_empty_scalar(line.content_start + indent + 1);
             self.nodes[entry.0 as usize].children.push(empty);
             self.emit_scalar_event(empty)?;
         }
 
         Ok(1)
+    }
+
+    fn parse_nested_sequence_entry_value(
+        &mut self,
+        entry: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        parent_indent: usize,
+    ) -> Result<usize, YamlError> {
+        let mut consumed = 1;
+        let mut nested_index = index + 1;
+
+        while nested_index < lines.len() {
+            let line = lines[nested_index];
+            let trimmed = line.content_without_break.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                consumed += 1;
+                nested_index += 1;
+                continue;
+            }
+
+            let nested_indent = count_indent(line.content_without_break, line.content_start)?;
+            if nested_indent <= parent_indent {
+                break;
+            }
+
+            self.close_collections_deeper_than(nested_indent);
+            let body = &line.content_without_break[nested_indent..];
+            reject_unexpected_line_start(body, line.content_start + nested_indent)?;
+            let nested_consumed = self.parse_content_body(
+                entry,
+                lines,
+                nested_index,
+                nested_indent,
+                body,
+                line.content_start + nested_indent,
+            )?;
+            consumed += nested_consumed;
+            nested_index += nested_consumed;
+        }
+
+        Ok(consumed)
     }
 
     fn parse_inline_value(
@@ -5308,6 +5379,67 @@ ports:
         assert!(scalar_texts(&doc).contains(&"localhost"));
         assert!(scalar_texts(&doc).contains(&"8080"));
         assert!(scalar_texts(&doc).contains(&"9090"));
+    }
+
+    #[test]
+    fn parser_builds_mapping_value_for_bare_sequence_entry() {
+        let input = "-\n  name: Mark\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept nested mapping entry value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n+MAP\n=VAL :name\n=VAL :Mark\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_builds_nested_compact_block_sequence_entry() {
+        let input = "- - s1_i1\n  - s1_i2\n- s2\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept nested sequence entry value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n+SEQ\n=VAL :s1_i1\n=VAL :s1_i2\n-SEQ\n=VAL :s2\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_builds_compact_mapping_sequence_entry_value() {
+        let input = "block sequence:\n  - one\n  - two : three\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept compact mapping entry value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :block sequence\n+SEQ\n=VAL :one\n+MAP\n=VAL :two\n=VAL :three\n-MAP\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_builds_nested_mapping_and_sequence_for_bare_sequence_entries() {
+        let input = "-\n foo: bar\n-\n - 42\n";
+        let doc =
+            YamlDoc::parse(input).expect("parser should accept nested bare sequence entry values");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n+MAP\n=VAL :foo\n=VAL :bar\n-MAP\n+SEQ\n=VAL :42\n-SEQ\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_preserves_true_empty_block_sequence_entry() {
+        let input = "-\n- value\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept empty sequence entry");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n=VAL :\n=VAL :value\n-SEQ\n-DOC\n-STR\n"
+        );
     }
 
     #[test]

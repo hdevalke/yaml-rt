@@ -911,6 +911,8 @@ impl<'source> Parser<'source> {
 
         if is_sequence_entry(body) {
             self.parse_sequence_entry(document, lines, index, indent, body)
+        } else if is_explicit_mapping_key(body) {
+            self.parse_explicit_mapping_entry(document, lines, index, indent, body)
         } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, absolute_start, indent, body)?;
@@ -1052,6 +1054,272 @@ impl<'source> Parser<'source> {
         Ok(1)
     }
 
+    fn parse_explicit_mapping_entry(
+        &mut self,
+        document: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        indent: usize,
+        body: &str,
+    ) -> Result<usize, YamlError> {
+        let line = lines[index];
+        let mapping = self.ensure_mapping(
+            document,
+            indent,
+            Span::new(
+                (line.content_start + indent) as u32,
+                line.content_end as u32,
+            ),
+        );
+        let entry = self.push_node(
+            NodeKind::MappingEntry,
+            Span::new(line.content_start as u32, line.content_end as u32),
+        );
+        self.nodes[mapping.0 as usize].children.push(entry);
+        self.extend_node_span(mapping, line.content_end);
+
+        let after_question = if body == "?" { "" } else { &body[1..] };
+        let key_text = strip_inline_comment(after_question).trim_start();
+        let key_consumed = if key_text.is_empty() {
+            if next_significant_body_with_index(lines, index)?.is_some_and(
+                |(_, next_indent, next_body)| {
+                    next_indent >= indent && !is_explicit_mapping_value(next_body)
+                },
+            ) {
+                self.parse_following_explicit_key_block(entry, lines, index, indent)?
+            } else {
+                let key = self.push_empty_scalar(line.content_start + indent + 1);
+                self.nodes[entry.0 as usize].children.push(key);
+                self.emit_scalar_event(key)?;
+                1
+            }
+        } else {
+            let leading = after_question.len() - after_question.trim_start().len();
+            let key_start = line.content_start + indent + 1 + leading;
+            self.parse_explicit_mapping_key_node(entry, lines, index, indent, key_text, key_start)?
+        };
+
+        let Some((value_index, value_indent, value_body)) =
+            next_significant_body_with_index(lines, index + key_consumed - 1)?
+        else {
+            self.close_sequence_at_indent(indent);
+            self.close_collections_deeper_than(indent);
+            let empty = self.push_empty_scalar(line.content_end);
+            self.nodes[entry.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
+            return Ok(key_consumed);
+        };
+
+        if value_indent != indent || !is_explicit_mapping_value(value_body) {
+            self.close_sequence_at_indent(indent);
+            self.close_collections_deeper_than(indent);
+            let empty = self.push_empty_scalar(line.content_end);
+            self.nodes[entry.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
+            return Ok(key_consumed);
+        }
+
+        self.close_sequence_at_indent(indent);
+        self.close_collections_deeper_than(indent);
+        let value_consumed =
+            self.parse_explicit_mapping_value(entry, lines, value_index, indent, value_body)?;
+        let end = lines[value_index + value_consumed - 1].content_end;
+        self.extend_node_span(entry, end);
+        self.extend_node_span(mapping, end);
+        Ok(value_index - index + value_consumed)
+    }
+
+    fn parse_following_explicit_key_block(
+        &mut self,
+        entry: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        parent_indent: usize,
+    ) -> Result<usize, YamlError> {
+        let mut consumed = 1;
+        let mut nested_index = index + 1;
+
+        while nested_index < lines.len() {
+            let line = lines[nested_index];
+            let trimmed = line.content_without_break.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                consumed += 1;
+                nested_index += 1;
+                continue;
+            }
+
+            let indent = count_indent(line.content_without_break, line.content_start)?;
+            let body = &line.content_without_break[indent..];
+            if indent == parent_indent && is_explicit_mapping_value(body) {
+                break;
+            }
+            if indent < parent_indent {
+                break;
+            }
+
+            self.close_collections_deeper_than(indent);
+            reject_unexpected_line_start(body, line.content_start + indent)?;
+            let nested_consumed = self.parse_content_body(
+                entry,
+                lines,
+                nested_index,
+                indent,
+                body,
+                line.content_start + indent,
+            )?;
+            consumed += nested_consumed;
+            nested_index += nested_consumed;
+        }
+
+        Ok(consumed)
+    }
+
+    fn parse_explicit_mapping_key_node(
+        &mut self,
+        entry: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        parent_indent: usize,
+        key_text: &str,
+        key_start: usize,
+    ) -> Result<usize, YamlError> {
+        if key_text.starts_with('|') || key_text.starts_with('>') {
+            let (node, consumed) =
+                self.parse_block_scalar(lines, index, key_start, parent_indent, key_text)?;
+            self.nodes[entry.0 as usize].children.push(node);
+            self.emit_scalar_event(node)?;
+            Ok(consumed)
+        } else if is_sequence_entry(key_text) {
+            self.parse_sequence_entry(
+                entry,
+                lines,
+                index,
+                key_start - lines[index].content_start,
+                key_text,
+            )
+        } else if body_starts_flow_value(key_text, key_start)? {
+            let key = self.parse_inline_value(key_text, key_start)?;
+            self.nodes[entry.0 as usize].children.push(key);
+            self.emit_node_event(key)?;
+            Ok(1)
+        } else {
+            let key = self.parse_inline_value(key_text, key_start)?;
+            self.nodes[entry.0 as usize].children.push(key);
+            self.emit_node_event(key)?;
+            Ok(1)
+        }
+    }
+
+    fn parse_explicit_mapping_value(
+        &mut self,
+        entry: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        indent: usize,
+        body: &str,
+    ) -> Result<usize, YamlError> {
+        let line = lines[index];
+        let raw_value = &body[1..];
+        let raw_value_trimmed = raw_value.trim_start();
+        let value = strip_inline_comment(raw_value);
+        let value_trimmed = value.trim_start();
+
+        if value_trimmed.is_empty() {
+            if next_significant_body_with_index(lines, index)?.is_some_and(
+                |(_, next_indent, next_body)| {
+                    next_indent >= indent
+                        && !is_explicit_mapping_key(next_body)
+                        && !is_explicit_mapping_value(next_body)
+                },
+            ) {
+                return self.parse_following_explicit_value_block(entry, lines, index, indent);
+            }
+            let empty = self.push_empty_scalar(line.content_end);
+            self.nodes[entry.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
+            return Ok(1);
+        }
+
+        let leading = value.len() - value_trimmed.len();
+        let value_start = line.content_start + indent + 1 + leading;
+        if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
+            let (node, consumed) =
+                self.parse_block_scalar(lines, index, value_start, indent, value_trimmed)?;
+            self.nodes[entry.0 as usize].children.push(node);
+            self.emit_scalar_event(node)?;
+            Ok(consumed)
+        } else if let Some(next_indent) =
+            property_only_block_collection_indent(value_trimmed, lines, index, value_start)?
+        {
+            self.push_pending_node_properties(value_trimmed, value_start, next_indent)?;
+            self.parse_nested_mapping_entry_value(entry, lines, index, indent)
+        } else if is_sequence_entry(value_trimmed) {
+            self.parse_sequence_entry(
+                entry,
+                lines,
+                index,
+                value_start - line.content_start,
+                value_trimmed,
+            )
+        } else if body_starts_flow_value(raw_value_trimmed, value_start)? {
+            let value_node = self.parse_inline_value(raw_value_trimmed, value_start)?;
+            self.nodes[entry.0 as usize].children.push(value_node);
+            self.emit_node_event(value_node)?;
+            Ok(1)
+        } else {
+            let (node, consumed) = self.parse_block_plain_scalar(lines, index, indent, value_start);
+            self.nodes[entry.0 as usize].children.push(node);
+            self.emit_scalar_event(node)?;
+            Ok(consumed)
+        }
+    }
+
+    fn parse_following_explicit_value_block(
+        &mut self,
+        entry: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        parent_indent: usize,
+    ) -> Result<usize, YamlError> {
+        let mut consumed = 1;
+        let mut nested_index = index + 1;
+
+        while nested_index < lines.len() {
+            let line = lines[nested_index];
+            let trimmed = line.content_without_break.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                consumed += 1;
+                nested_index += 1;
+                continue;
+            }
+
+            let indent = count_indent(line.content_without_break, line.content_start)?;
+            let body = &line.content_without_break[indent..];
+            if indent < parent_indent
+                || (indent == parent_indent
+                    && (is_explicit_mapping_key(body) || is_explicit_mapping_value(body)))
+            {
+                break;
+            }
+
+            self.close_collections_deeper_than(indent);
+            reject_unexpected_line_start(body, line.content_start + indent)?;
+            let nested_consumed = self.parse_content_body(
+                entry,
+                lines,
+                nested_index,
+                indent,
+                body,
+                line.content_start + indent,
+            )?;
+            consumed += nested_consumed;
+            nested_index += nested_consumed;
+        }
+
+        self.close_sequence_at_indent(parent_indent);
+        Ok(consumed)
+    }
+
     fn parse_nested_mapping_entry_value(
         &mut self,
         entry: NodeId,
@@ -1084,7 +1352,10 @@ impl<'source> Parser<'source> {
             {
                 return self.parse_nested_block_value(entry, lines, index, parent_indent);
             }
-            if is_sequence_entry(body) || find_mapping_colon(body).is_some() {
+            if is_sequence_entry(body)
+                || is_explicit_mapping_key(body)
+                || find_mapping_colon(body).is_some()
+            {
                 return self.parse_nested_block_value(entry, lines, index, parent_indent);
             }
 
@@ -1976,6 +2247,26 @@ impl<'source> Parser<'source> {
         self.close_event_collections_deeper_than(indent);
     }
 
+    fn close_sequence_at_indent(&mut self, indent: usize) {
+        let Some(index) = self
+            .sequences
+            .iter()
+            .rposition(|(level, _)| *level == indent)
+        else {
+            return;
+        };
+        if self
+            .event_collections
+            .last()
+            .is_some_and(|(level, collection)| {
+                *level == indent && *collection == OpenEventCollection::Sequence
+            })
+        {
+            self.sequences.remove(index);
+            self.close_last_event_collection();
+        }
+    }
+
     fn push_node(&mut self, kind: NodeKind, span: Span) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node {
@@ -2183,7 +2474,10 @@ fn property_only_block_collection_indent(
     let Some((indent, nested_body)) = next_significant_body(lines, index)? else {
         return Ok(None);
     };
-    if is_sequence_entry(nested_body) || find_mapping_colon(nested_body).is_some() {
+    if is_sequence_entry(nested_body)
+        || is_explicit_mapping_key(nested_body)
+        || find_mapping_colon(nested_body).is_some()
+    {
         Ok(Some(indent))
     } else {
         Ok(None)
@@ -2194,13 +2488,21 @@ fn next_significant_body<'line>(
     lines: &'line [SourceLine<'_>],
     current_index: usize,
 ) -> Result<Option<(usize, &'line str)>, YamlError> {
-    for line in &lines[current_index + 1..] {
+    Ok(next_significant_body_with_index(lines, current_index)?
+        .map(|(_, indent, body)| (indent, body)))
+}
+
+fn next_significant_body_with_index<'line>(
+    lines: &'line [SourceLine<'_>],
+    current_index: usize,
+) -> Result<Option<(usize, usize, &'line str)>, YamlError> {
+    for (index, line) in lines.iter().enumerate().skip(current_index + 1) {
         let trimmed = line.content_without_break.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let indent = count_indent(line.content_without_break, line.content_start)?;
-        return Ok(Some((indent, &line.content_without_break[indent..])));
+        return Ok(Some((index, indent, &line.content_without_break[indent..])));
     }
 
     Ok(None)
@@ -2721,6 +3023,14 @@ fn count_literal_content_indent(content: &str) -> usize {
 
 fn is_sequence_entry(body: &str) -> bool {
     body == "-" || body.starts_with("- ") || body.starts_with("-\t")
+}
+
+fn is_explicit_mapping_key(body: &str) -> bool {
+    body == "?" || body.starts_with("? ") || body.starts_with("?\t")
+}
+
+fn is_explicit_mapping_value(body: &str) -> bool {
+    body == ":" || body.starts_with(": ") || body.starts_with(":\t")
 }
 
 fn reject_trailing_flow_content(
@@ -5619,6 +5929,77 @@ single: 'hello'
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+SEQ []\n=VAL \"double quoted\n=VAL 'single quoted\n=VAL :plain text\n+SEQ []\n=VAL :nested\n-SEQ\n+MAP {}\n=VAL :single\n=VAL :pair\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_explicit_block_mapping_key_value_pair() {
+        let doc = YamlDoc::parse("? key\n: value\n").expect("valid explicit mapping key");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :key\n=VAL :value\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), "? key\n: value\n");
+    }
+
+    #[test]
+    fn events_render_explicit_key_with_comment_before_value() {
+        let doc =
+            YamlDoc::parse("? key\n# comment\n: value\n").expect("valid explicit key comment");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :key\n=VAL :value\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), "? key\n# comment\n: value\n");
+    }
+
+    #[test]
+    fn events_render_explicit_set_keys_as_empty_values() {
+        let doc = YamlDoc::parse("--- !!set\n? Mark McGwire\n? Sammy Sosa\n")
+            .expect("valid explicit set keys");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n+MAP <tag:yaml.org,2002:set>\n=VAL :Mark McGwire\n=VAL :\n=VAL :Sammy Sosa\n=VAL :\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_render_explicit_sequence_key() {
+        let doc =
+            YamlDoc::parse("complex:\n  ? - a\n  : b\n").expect("valid explicit sequence key");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :complex\n+MAP\n+SEQ\n=VAL :a\n-SEQ\n=VAL :b\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), "complex:\n  ? - a\n  : b\n");
+    }
+
+    #[test]
+    fn events_render_explicit_folded_scalar_key_with_empty_value() {
+        let doc =
+            YamlDoc::parse("complex:\n  ? >\n    a\n  :\n").expect("valid explicit scalar key");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :complex\n+MAP\n=VAL >a\\n\n=VAL :\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), "complex:\n  ? >\n    a\n  :\n");
+    }
+
+    #[test]
+    fn parser_events_render_explicit_following_sequence_key() {
+        let source =
+            Source::new("---\n?\n- a\n- b\n:\n- c\n- d\n".to_owned()).expect("valid source");
+        let tokens = lex(&source).expect("valid tokens");
+        let parsed = Parser::new(&source, &tokens).parse().expect("valid parser");
+
+        assert_eq!(
+            events_to_test_string(&parsed.events),
+            "+STR\n+DOC ---\n+MAP\n+SEQ\n=VAL :a\n=VAL :b\n-SEQ\n+SEQ\n=VAL :c\n=VAL :d\n-SEQ\n-MAP\n-DOC\n-STR\n"
         );
     }
 

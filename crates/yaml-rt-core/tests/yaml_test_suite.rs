@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use yaml_rt_core::YamlDoc;
+use yaml_rt_core::{DiagnosticKind, YamlDoc, YamlError};
 
 /// Environment variable overriding the in-repo YAML Test Suite data checkout.
 const SUITE_DIR_ENV: &str = "YAML_TEST_SUITE_DIR";
@@ -27,6 +27,70 @@ struct SuiteCase {
     input: PathBuf,
     test_event: PathBuf,
     is_error: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FailureCategory {
+    SourceValidation,
+    Lexer,
+    Parser,
+    SemanticGraph,
+    SchemaOrScalarDecode,
+    EmitterRoundTrip,
+    EventMismatch,
+    InvalidAccepted,
+    HarnessIo,
+}
+
+impl FailureCategory {
+    const ALL: [Self; 9] = [
+        Self::SourceValidation,
+        Self::Lexer,
+        Self::Parser,
+        Self::SemanticGraph,
+        Self::SchemaOrScalarDecode,
+        Self::EmitterRoundTrip,
+        Self::EventMismatch,
+        Self::InvalidAccepted,
+        Self::HarnessIo,
+    ];
+}
+
+impl std::fmt::Display for FailureCategory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SourceValidation => "SourceValidation",
+            Self::Lexer => "Lexer",
+            Self::Parser => "Parser",
+            Self::SemanticGraph => "SemanticGraph",
+            Self::SchemaOrScalarDecode => "SchemaOrScalarDecode",
+            Self::EmitterRoundTrip => "EmitterRoundTrip",
+            Self::EventMismatch => "EventMismatch",
+            Self::InvalidAccepted => "InvalidAccepted",
+            Self::HarnessIo => "HarnessIo",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassifiedFailure {
+    category: FailureCategory,
+    message: String,
+}
+
+impl ClassifiedFailure {
+    fn new(category: FailureCategory, message: impl Into<String>) -> Self {
+        Self {
+            category,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ClassifiedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "[{}] {}", self.category, self.message)
+    }
 }
 
 #[test]
@@ -76,7 +140,10 @@ fn yaml_test_suite_data_harness() {
                 );
             }
             Err(error) => {
-                failures.push(format!("{} ({}): {error}", case.id, case.dir.display()));
+                failures.push((
+                    error.category,
+                    format!("{} ({}): {error}", case.id, case.dir.display()),
+                ));
             }
         }
     }
@@ -95,10 +162,16 @@ fn yaml_test_suite_data_harness() {
     );
 
     if !failures.is_empty() {
+        let failure_count = failures.len();
+        let failure_summary = failure_category_summary(&failures);
+        let failure_details = failures
+            .into_iter()
+            .map(|(_, failure)| failure)
+            .collect::<Vec<_>>()
+            .join("\n");
         panic!(
-            "{} YAML Test Suite case(s) failed:\n{}",
-            failures.len(),
-            failures.join("\n")
+            "{} YAML Test Suite case(s) failed:\n{}\n\n{}",
+            failure_count, failure_summary, failure_details
         );
     }
 
@@ -109,6 +182,20 @@ fn yaml_test_suite_data_harness() {
             unexpected_passes.join("\n")
         );
     }
+}
+
+fn failure_category_summary(failures: &[(FailureCategory, String)]) -> String {
+    let mut summary = String::from("failure categories:");
+    for category in FailureCategory::ALL {
+        let count = failures
+            .iter()
+            .filter(|(failure_category, _)| *failure_category == category)
+            .count();
+        if count > 0 {
+            summary.push_str(&format!("\n  {category}: {count}"));
+        }
+    }
+    summary
 }
 
 fn suite_root() -> PathBuf {
@@ -195,31 +282,64 @@ fn case_id(dir: &Path) -> String {
     }
 }
 
-fn run_case(case: &SuiteCase) -> Result<(), String> {
-    let input = fs::read_to_string(&case.input)
-        .map_err(|error| format!("failed to read {}: {error}", case.input.display()))?;
+fn run_case(case: &SuiteCase) -> Result<(), ClassifiedFailure> {
+    let input = fs::read_to_string(&case.input).map_err(|error| {
+        ClassifiedFailure::new(
+            FailureCategory::HarnessIo,
+            format!("failed to read {}: {error}", case.input.display()),
+        )
+    })?;
     let parsed = YamlDoc::parse(&input);
 
     if case.is_error {
         if parsed.is_ok() {
-            return Err("expected parse error, but parser accepted the case".to_owned());
+            return Err(ClassifiedFailure::new(
+                FailureCategory::InvalidAccepted,
+                "expected parse error, but parser accepted the case",
+            ));
         }
         return Ok(());
     }
 
-    let doc = parsed.map_err(|error| format!("expected valid parse: {error}"))?;
+    let doc = parsed.map_err(|error| {
+        ClassifiedFailure::new(
+            failure_category_for_yaml_error(&error),
+            format!("expected valid parse: {error}"),
+        )
+    })?;
     let output = doc.to_string();
     if output != input {
-        return Err("valid case did not round-trip byte-identically".to_owned());
+        return Err(ClassifiedFailure::new(
+            FailureCategory::EmitterRoundTrip,
+            "valid case did not round-trip byte-identically",
+        ));
     }
-    let expected_events = fs::read_to_string(&case.test_event)
-        .map_err(|error| format!("failed to read {}: {error}", case.test_event.display()))?;
+    let expected_events = fs::read_to_string(&case.test_event).map_err(|error| {
+        ClassifiedFailure::new(
+            FailureCategory::HarnessIo,
+            format!("failed to read {}: {error}", case.test_event.display()),
+        )
+    })?;
     let actual_events = doc.events_to_test_string();
     if actual_events != expected_events {
-        return Err(format!(
-            "valid case event stream differed\nexpected:\n{expected_events}\nactual:\n{actual_events}"
+        return Err(ClassifiedFailure::new(
+            FailureCategory::EventMismatch,
+            format!(
+                "valid case event stream differed\nexpected:\n{expected_events}\nactual:\n{actual_events}"
+            ),
         ));
     }
 
     Ok(())
+}
+
+fn failure_category_for_yaml_error(error: &YamlError) -> FailureCategory {
+    match error.diagnostic.kind {
+        DiagnosticKind::Source => FailureCategory::SourceValidation,
+        DiagnosticKind::Lexer => FailureCategory::Lexer,
+        DiagnosticKind::Parser => FailureCategory::Parser,
+        DiagnosticKind::Semantic => FailureCategory::SemanticGraph,
+        DiagnosticKind::Typed => FailureCategory::SchemaOrScalarDecode,
+        DiagnosticKind::Emitter => FailureCategory::EmitterRoundTrip,
+    }
 }

@@ -908,9 +908,7 @@ impl<'source> Parser<'source> {
         absolute_start: usize,
     ) -> Result<usize, YamlError> {
         self.document_has_content = true;
-        if let Some(next_indent) =
-            property_only_block_collection_indent(body, lines, index, absolute_start)?
-        {
+        if let Some(next_indent) = property_only_node_indent(body, lines, index, absolute_start)? {
             self.push_pending_node_properties(body, absolute_start, next_indent)?;
             return Ok(1);
         }
@@ -1070,6 +1068,25 @@ impl<'source> Parser<'source> {
                     value_start,
                     indent,
                     value_trimmed,
+                    false,
+                )?;
+                self.nodes[entry.0 as usize].children.push(node);
+                self.emit_scalar_event(node)?;
+                return Ok(consumed);
+            } else if let Some(header_offset) =
+                block_scalar_after_node_properties(value_trimmed, value_start)?
+            {
+                self.push_pending_node_properties(
+                    &value_trimmed[..header_offset],
+                    value_start,
+                    self.source_indent_at(value_start + header_offset),
+                )?;
+                let (node, consumed) = self.parse_block_scalar(
+                    lines,
+                    index,
+                    value_start + header_offset,
+                    indent,
+                    &value_trimmed[header_offset..],
                     false,
                 )?;
                 self.nodes[entry.0 as usize].children.push(node);
@@ -1311,6 +1328,25 @@ impl<'source> Parser<'source> {
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
+        } else if let Some(header_offset) =
+            block_scalar_after_node_properties(value_trimmed, value_start)?
+        {
+            self.push_pending_node_properties(
+                &value_trimmed[..header_offset],
+                value_start,
+                self.source_indent_at(value_start + header_offset),
+            )?;
+            let (node, consumed) = self.parse_block_scalar(
+                lines,
+                index,
+                value_start + header_offset,
+                indent,
+                &value_trimmed[header_offset..],
+                false,
+            )?;
+            self.nodes[entry.0 as usize].children.push(node);
+            self.emit_scalar_event(node)?;
+            Ok(consumed)
         } else if let Some(next_indent) =
             property_only_block_collection_indent(value_trimmed, lines, index, value_start)?
         {
@@ -1415,6 +1451,16 @@ impl<'source> Parser<'source> {
             {
                 return self.parse_nested_block_value(entry, lines, index, parent_indent);
             }
+            if property_only_node_indent(
+                body,
+                lines,
+                nested_index,
+                line.content_start + nested_indent,
+            )?
+            .is_some()
+            {
+                return self.parse_nested_block_value(entry, lines, index, parent_indent);
+            }
             if is_sequence_entry(body)
                 || is_explicit_mapping_key(body)
                 || find_mapping_colon(body).is_some()
@@ -1450,11 +1496,25 @@ impl<'source> Parser<'source> {
             &mut properties,
             Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
         )?;
-        self.pending_node_properties.push(PendingNodeProperties {
-            indent,
-            span_start: absolute_start,
-            properties,
-        });
+        if let Some(pending) = self
+            .pending_node_properties
+            .iter_mut()
+            .find(|pending| pending.indent == indent)
+        {
+            pending.span_start = pending.span_start.min(absolute_start);
+            if pending.properties.anchor.is_none() {
+                pending.properties.anchor = properties.anchor;
+            }
+            if pending.properties.tag.is_none() {
+                pending.properties.tag = properties.tag;
+            }
+        } else {
+            self.pending_node_properties.push(PendingNodeProperties {
+                indent,
+                span_start: absolute_start,
+                properties,
+            });
+        }
         Ok(())
     }
 
@@ -1610,6 +1670,25 @@ impl<'source> Parser<'source> {
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
+            } else if let Some(header_offset) =
+                block_scalar_after_node_properties(value, value_start)?
+            {
+                self.push_pending_node_properties(
+                    &value[..header_offset],
+                    value_start,
+                    self.source_indent_at(value_start + header_offset),
+                )?;
+                let (node, consumed) = self.parse_block_scalar(
+                    lines,
+                    index,
+                    value_start + header_offset,
+                    indent,
+                    &value[header_offset..],
+                    false,
+                )?;
+                self.nodes[entry.0 as usize].children.push(node);
+                self.emit_scalar_event(node)?;
+                return Ok(consumed);
             } else if let Some(next_indent) =
                 property_only_block_collection_indent(value, lines, index, value_start)?
             {
@@ -1699,8 +1778,55 @@ impl<'source> Parser<'source> {
                 break;
             }
 
-            self.close_collections_deeper_than(nested_indent);
             let body = &line.content_without_break[nested_indent..];
+            if property_only_node_indent(
+                body,
+                lines,
+                nested_index,
+                line.content_start + nested_indent,
+            )?
+            .is_some()
+            {
+                if let Some((header_index, header_indent, header_body)) =
+                    first_non_property_node_after_with_index(
+                        lines,
+                        nested_index,
+                        line.content_start + nested_indent,
+                    )?
+                    && (header_body.starts_with('|') || header_body.starts_with('>'))
+                {
+                    for property_line in &lines[nested_index..header_index] {
+                        let property_trimmed = property_line.content_without_break.trim();
+                        if property_trimmed.is_empty() || property_trimmed.starts_with('#') {
+                            continue;
+                        }
+                        let property_indent =
+                            content_line_indent(property_line.content_without_break);
+                        let property_body = &property_line.content_without_break[property_indent..];
+                        self.push_pending_node_properties(
+                            property_body,
+                            property_line.content_start + property_indent,
+                            header_indent,
+                        )?;
+                    }
+                    let header_start = lines[header_index].content_start + header_indent;
+                    let (node, scalar_consumed) = self.parse_block_scalar(
+                        lines,
+                        header_index,
+                        header_start,
+                        parent_indent,
+                        header_body,
+                        true,
+                    )?;
+                    self.nodes[parent.0 as usize].children.push(node);
+                    self.emit_scalar_event(node)?;
+                    consumed += header_index - nested_index + scalar_consumed;
+                    nested_index = header_index + scalar_consumed;
+                    continue;
+                }
+            }
+
+            self.close_collections_deeper_than(nested_indent);
             reject_unexpected_line_start(body, line.content_start + nested_indent)?;
             let nested_consumed = self.parse_content_body(
                 parent,
@@ -2280,19 +2406,28 @@ impl<'source> Parser<'source> {
         indent: usize,
         span: Span,
     ) -> (Span, Option<String>, Option<String>) {
-        let Some(index) = self
-            .pending_node_properties
-            .iter()
-            .rposition(|pending| pending.indent == indent)
-        else {
+        let Some(pending) = self.take_pending_node_properties(indent) else {
             return (span, None, None);
         };
-        let pending = self.pending_node_properties.remove(index);
         (
             Span::new(pending.span_start as u32, span.end),
             pending.properties.tag,
             pending.properties.anchor,
         )
+    }
+
+    fn take_pending_node_properties(&mut self, indent: usize) -> Option<PendingNodeProperties> {
+        let index = self
+            .pending_node_properties
+            .iter()
+            .rposition(|pending| pending.indent == indent)?;
+        Some(self.pending_node_properties.remove(index))
+    }
+
+    fn source_indent_at(&self, offset: usize) -> usize {
+        let text = self.source.as_str();
+        let line_start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
+        content_line_indent(&text[line_start..offset])
     }
 
     fn validate_indent(&self, indent: usize, line: SourceLine<'_>) -> Result<(), YamlError> {
@@ -2326,8 +2461,6 @@ impl<'source> Parser<'source> {
     fn close_collections_deeper_than(&mut self, indent: usize) {
         self.mappings.retain(|(level, _)| *level <= indent);
         self.sequences.retain(|(level, _)| *level <= indent);
-        self.pending_node_properties
-            .retain(|pending| pending.indent <= indent);
         self.close_event_collections_deeper_than(indent);
     }
 
@@ -2472,6 +2605,19 @@ impl<'source> Parser<'source> {
         let text = self.source.slice(node.span);
         let mut properties = parse_node_properties(text, node.span)?;
         self.resolve_node_properties(&mut properties, node.span)?;
+        let span = if let Some(pending) =
+            self.take_pending_node_properties(self.source_indent_at(node.span.start as usize))
+        {
+            if properties.anchor.is_none() {
+                properties.anchor = pending.properties.anchor;
+            }
+            if properties.tag.is_none() {
+                properties.tag = pending.properties.tag;
+            }
+            Span::new(pending.span_start as u32, node.span.end)
+        } else {
+            node.span
+        };
         let value_text = &text[properties.value_start..];
         let trimmed = value_text.trim();
         if let Some(alias) = trimmed.strip_prefix('*')
@@ -2482,7 +2628,7 @@ impl<'source> Parser<'source> {
                 YamlEventKind::Alias {
                     name: alias.to_owned(),
                 },
-                node.span,
+                span,
             );
             return Ok(());
         }
@@ -2510,7 +2656,7 @@ impl<'source> Parser<'source> {
                 tag: properties.tag,
                 anchor: properties.anchor,
             },
-            node.span,
+            span,
         );
         Ok(())
     }
@@ -2547,7 +2693,89 @@ fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, Yam
     ))
 }
 
+fn block_scalar_after_node_properties(
+    body: &str,
+    absolute_start: usize,
+) -> Result<Option<usize>, YamlError> {
+    let properties = parse_node_properties(
+        body,
+        Span::new(absolute_start as u32, (absolute_start + body.len()) as u32),
+    )?;
+    if properties.anchor.is_none() && properties.tag.is_none() {
+        return Ok(None);
+    }
+    let header_offset =
+        properties.value_start + leading_flow_whitespace(&body[properties.value_start..]);
+    if matches!(body[header_offset..].chars().next(), Some('|' | '>')) {
+        Ok(Some(header_offset))
+    } else {
+        Ok(None)
+    }
+}
+
 fn property_only_block_collection_indent(
+    body: &str,
+    lines: &[SourceLine<'_>],
+    index: usize,
+    absolute_start: usize,
+) -> Result<Option<usize>, YamlError> {
+    let Some(indent) = property_only_node_indent(body, lines, index, absolute_start)? else {
+        return Ok(None);
+    };
+    let Some((_, nested_body)) = first_non_property_node_after(lines, index, absolute_start)?
+    else {
+        return Ok(None);
+    };
+    if is_sequence_entry(nested_body)
+        || is_explicit_mapping_key(nested_body)
+        || find_mapping_colon(nested_body).is_some()
+    {
+        Ok(Some(indent))
+    } else {
+        Ok(None)
+    }
+}
+
+fn first_non_property_node_after<'line>(
+    lines: &'line [SourceLine<'_>],
+    index: usize,
+    absolute_start: usize,
+) -> Result<Option<(usize, &'line str)>, YamlError> {
+    Ok(
+        first_non_property_node_after_with_index(lines, index, absolute_start)?
+            .map(|(_, indent, body)| (indent, body)),
+    )
+}
+
+fn first_non_property_node_after_with_index<'line>(
+    lines: &'line [SourceLine<'_>],
+    index: usize,
+    absolute_start: usize,
+) -> Result<Option<(usize, usize, &'line str)>, YamlError> {
+    let mut scan_index = index;
+    while let Some((next_index, indent, nested_body)) =
+        next_significant_body_with_index(lines, scan_index)?
+    {
+        let nested_body = strip_inline_comment(nested_body).trim_end();
+        let nested_properties = parse_node_properties(
+            nested_body,
+            Span::new(
+                absolute_start as u32,
+                (absolute_start + nested_body.len()) as u32,
+            ),
+        )?;
+        if (nested_properties.anchor.is_some() || nested_properties.tag.is_some())
+            && nested_properties.value_start == nested_body.len()
+        {
+            scan_index = next_index;
+            continue;
+        }
+        return Ok(Some((next_index, indent, nested_body)));
+    }
+    Ok(None)
+}
+
+fn property_only_node_indent(
     body: &str,
     lines: &[SourceLine<'_>],
     index: usize,
@@ -2565,25 +2793,7 @@ fn property_only_block_collection_indent(
         return Ok(None);
     }
 
-    let Some((indent, nested_body)) = next_significant_body(lines, index)? else {
-        return Ok(None);
-    };
-    if is_sequence_entry(nested_body)
-        || is_explicit_mapping_key(nested_body)
-        || find_mapping_colon(nested_body).is_some()
-    {
-        Ok(Some(indent))
-    } else {
-        Ok(None)
-    }
-}
-
-fn next_significant_body<'line>(
-    lines: &'line [SourceLine<'_>],
-    current_index: usize,
-) -> Result<Option<(usize, &'line str)>, YamlError> {
-    Ok(next_significant_body_with_index(lines, current_index)?
-        .map(|(_, indent, body)| (indent, body)))
+    Ok(first_non_property_node_after(lines, index, absolute_start)?.map(|(indent, _)| indent))
 }
 
 fn next_significant_body_with_index<'line>(
@@ -6873,6 +7083,68 @@ ports:
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :top6\n=VAL &val6 :six\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_split_root_scalar_properties() {
+        let input = "---\n&a1\n!!str\nscalar1\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept split scalar properties");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL &a1 <tag:yaml.org,2002:str> :scalar1\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_split_root_scalar_properties_in_reversed_order() {
+        let input = "---\n!!str\n&a2\nscalar2\n";
+        let doc =
+            YamlDoc::parse(input).expect("parser should accept reversed split scalar properties");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL &a2 <tag:yaml.org,2002:str> :scalar2\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_split_properties_to_nested_block_mapping() {
+        let input = "key: &anchor\n !!map\n  a: b\n";
+        let doc =
+            YamlDoc::parse(input).expect("parser should accept split nested mapping properties");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :key\n+MAP &anchor <tag:yaml.org,2002:map>\n=VAL :a\n=VAL :b\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_split_property_to_block_scalar() {
+        let input = "folded:\n   !foo\n  >1\n value\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept tagged block scalar");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :folded\n=VAL <!foo> >value\\n\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_keeps_same_line_split_property_cases() {
+        let input = "&a4 !!map\n&a5 !!str key5: value4\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept same-line properties");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP &a4 <tag:yaml.org,2002:map>\n=VAL &a5 <tag:yaml.org,2002:str> :key5\n=VAL :value4\n-MAP\n-DOC\n-STR\n"
         );
     }
 

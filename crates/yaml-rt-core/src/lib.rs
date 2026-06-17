@@ -983,7 +983,9 @@ impl<'source> Parser<'source> {
         self.nodes[entry.0 as usize].children.push(key);
         self.emit_scalar_event(key)?;
 
-        let value = &body[colon_byte + 1..];
+        let raw_value = &body[colon_byte + 1..];
+        let raw_value_trimmed = raw_value.trim_start();
+        let value = strip_inline_comment(raw_value);
         let value_trimmed = value.trim_start();
         let next_significant_indent = next_significant_indent(lines, index)?;
         if value_trimmed.is_empty() && next_significant_indent.is_none_or(|next| next <= indent) {
@@ -1002,11 +1004,63 @@ impl<'source> Parser<'source> {
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
+            } else if body_starts_flow_value(raw_value_trimmed, value_start)? {
+                self.parse_inline_value(raw_value_trimmed, value_start)?
             } else {
-                self.parse_inline_value(value_trimmed, value_start)?
+                let (node, consumed) =
+                    self.parse_block_plain_scalar(lines, index, indent, value_start);
+                self.nodes[entry.0 as usize].children.push(node);
+                self.emit_scalar_event(node)?;
+                return Ok(consumed);
             };
             self.nodes[entry.0 as usize].children.push(value_node);
             self.emit_node_event(value_node)?;
+        } else if next_significant_indent.is_some_and(|next| next > indent) {
+            let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
+            let end = lines[index + consumed - 1].content_end;
+            self.extend_node_span(entry, end);
+            self.extend_node_span(mapping, end);
+            return Ok(consumed);
+        }
+
+        Ok(1)
+    }
+
+    fn parse_nested_mapping_entry_value(
+        &mut self,
+        entry: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        parent_indent: usize,
+    ) -> Result<usize, YamlError> {
+        let mut nested_index = index + 1;
+        while nested_index < lines.len() {
+            let line = lines[nested_index];
+            let trimmed = line.content_without_break.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                nested_index += 1;
+                continue;
+            }
+
+            let nested_indent = count_indent(line.content_without_break, line.content_start)?;
+            if nested_indent <= parent_indent {
+                break;
+            }
+
+            let body = &line.content_without_break[nested_indent..];
+            if is_sequence_entry(body) || find_mapping_colon(body).is_some() {
+                return self.parse_nested_block_value(entry, lines, index, parent_indent);
+            }
+
+            let (scalar, consumed) = self.parse_block_plain_scalar(
+                lines,
+                nested_index,
+                parent_indent,
+                line.content_start + nested_indent,
+            );
+            self.nodes[entry.0 as usize].children.push(scalar);
+            self.emit_scalar_event(scalar)?;
+            return Ok(nested_index - index + consumed);
         }
 
         Ok(1)
@@ -1212,6 +1266,16 @@ impl<'source> Parser<'source> {
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
+        self.parse_nested_block_value(entry, lines, index, parent_indent)
+    }
+
+    fn parse_nested_block_value(
+        &mut self,
+        parent: NodeId,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        parent_indent: usize,
+    ) -> Result<usize, YamlError> {
         let mut consumed = 1;
         let mut nested_index = index + 1;
 
@@ -1233,7 +1297,7 @@ impl<'source> Parser<'source> {
             let body = &line.content_without_break[nested_indent..];
             reject_unexpected_line_start(body, line.content_start + nested_indent)?;
             let nested_consumed = self.parse_content_body(
-                entry,
+                parent,
                 lines,
                 nested_index,
                 nested_indent,
@@ -1245,6 +1309,44 @@ impl<'source> Parser<'source> {
         }
 
         Ok(consumed)
+    }
+
+    fn parse_block_plain_scalar(
+        &mut self,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        parent_indent: usize,
+        value_start: usize,
+    ) -> (NodeId, usize) {
+        let mut consumed = 1;
+        let mut end = lines[index].content_end;
+        let mut pending_blank_lines = 0usize;
+
+        for line in &lines[index + 1..] {
+            let trimmed = line.content_without_break.trim();
+            if trimmed == "---" || trimmed == "..." {
+                break;
+            }
+
+            if trimmed.is_empty() {
+                pending_blank_lines += 1;
+                continue;
+            }
+
+            let indent = count_literal_content_indent(line.content_without_break);
+            if indent <= parent_indent {
+                break;
+            }
+
+            consumed += pending_blank_lines + 1;
+            pending_blank_lines = 0;
+            end = line.content_end;
+        }
+
+        (
+            self.push_node(NodeKind::Scalar, Span::new(value_start as u32, end as u32)),
+            consumed,
+        )
     }
 
     fn parse_inline_value(
@@ -2946,7 +3048,45 @@ fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
         return Ok(text[1..end - 1].replace("''", "'"));
     }
 
-    Ok(text[..plain_scalar_end(text)].to_owned())
+    Ok(decode_plain_scalar_value(text))
+}
+
+fn decode_plain_scalar_value(text: &str) -> String {
+    if !text.contains(['\n', '\r']) {
+        return text[..plain_scalar_end(text)].to_owned();
+    }
+
+    let mut decoded = String::new();
+    let mut position = 0;
+    let mut pending_breaks = 0usize;
+    let mut saw_value_line = false;
+
+    while position < text.len() {
+        let (line, next_position) = next_literal_content_line(text, position);
+        let (body, _) = split_line_break(line);
+        let body = strip_inline_comment(body).trim();
+
+        if body.is_empty() {
+            pending_breaks += 1;
+        } else {
+            if saw_value_line {
+                if pending_breaks == 0 {
+                    decoded.push(' ');
+                } else {
+                    for _ in 0..pending_breaks {
+                        decoded.push('\n');
+                    }
+                }
+            }
+            decoded.push_str(body);
+            pending_breaks = 0;
+            saw_value_line = true;
+        }
+
+        position = next_position;
+    }
+
+    decoded
 }
 
 fn decode_literal_scalar_value(text: &str) -> Result<String, YamlError> {
@@ -5439,6 +5579,54 @@ ports:
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+SEQ\n=VAL :\n=VAL :value\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_folds_same_line_plain_scalar_continuations() {
+        let input = "plain: a\n b\n\n c\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept plain scalar continuations");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :plain\n=VAL :a b\\nc\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_folds_next_line_plain_scalar_mapping_values() {
+        let input = "key:\n  value\n  with\n  \t\n  tabs\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept next-line plain scalar");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :key\n=VAL :value with\\ntabs\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_folds_log_message_plain_scalar_mapping_value() {
+        let input = "Warning:\n  This is an error message\n  for the log file\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept log message scalar");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :Warning\n=VAL :This is an error message for the log file\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_treats_inline_comment_mapping_value_as_empty_for_nested_block_value() {
+        let input = "hr: # 1998 hr ranking\n  - Mark McGwire\n  - Sammy Sosa\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept commented nested value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :hr\n+SEQ\n=VAL :Mark McGwire\n=VAL :Sammy Sosa\n-SEQ\n-MAP\n-DOC\n-STR\n"
         );
     }
 

@@ -1012,7 +1012,7 @@ impl<'source> Parser<'source> {
         } else if let Some(colon_byte) = flow_collection_mapping_key_colon(body, absolute_start)? {
             self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
         } else if body_starts_flow_value(body, absolute_start)? {
-            let (flow_text, consumed) = self.flow_collection_text(lines, index, absolute_start)?;
+            let (flow_text, consumed) = self.flow_value_text(lines, index, absolute_start, body)?;
             let (node, end) = self.parse_flow_value(flow_text, absolute_start)?;
             reject_trailing_flow_content(flow_text, end, absolute_start)?;
             self.nodes[document.0 as usize].children.push(node);
@@ -2238,28 +2238,29 @@ impl<'source> Parser<'source> {
                     self.nodes[sequence.0 as usize].children.push(mapping);
                     position = consumed;
                 }
-                '[' => {
-                    let child_start = absolute_start + position;
-                    let (child, consumed) =
-                        self.parse_flow_sequence(&text[position..], child_start)?;
-                    self.nodes[sequence.0 as usize].children.push(child);
-                    position += consumed;
-                }
-                '{' => {
-                    let child_start = absolute_start + position;
-                    let (child, consumed) =
-                        self.parse_flow_mapping(&text[position..], child_start)?;
-                    self.nodes[sequence.0 as usize].children.push(child);
-                    position += consumed;
+                '[' | '{' => {
+                    if let Some(colon) =
+                        flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
+                    {
+                        let (mapping, consumed) = self.parse_implicit_flow_mapping(
+                            text,
+                            position,
+                            colon,
+                            absolute_start,
+                        )?;
+                        self.nodes[sequence.0 as usize].children.push(mapping);
+                        position = consumed;
+                    } else {
+                        let child_start = absolute_start + position;
+                        let (child, consumed) =
+                            self.parse_flow_value(&text[position..], child_start)?;
+                        self.nodes[sequence.0 as usize].children.push(child);
+                        position += consumed;
+                    }
                 }
                 _ => {
                     let value_start = position;
-                    if body_starts_flow_value(&text[position..], absolute_start + position)? {
-                        let (value, consumed) =
-                            self.parse_flow_value(&text[position..], absolute_start + position)?;
-                        self.nodes[sequence.0 as usize].children.push(value);
-                        position += consumed;
-                    } else if let Some(colon) =
+                    if let Some(colon) =
                         flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
                     {
                         let (mapping, consumed) = self.parse_implicit_flow_mapping(
@@ -2270,6 +2271,12 @@ impl<'source> Parser<'source> {
                         )?;
                         self.nodes[sequence.0 as usize].children.push(mapping);
                         position = consumed;
+                    } else if body_starts_flow_value(&text[position..], absolute_start + position)?
+                    {
+                        let (value, consumed) =
+                            self.parse_flow_value(&text[position..], absolute_start + position)?;
+                        self.nodes[sequence.0 as usize].children.push(value);
+                        position += consumed;
                     } else {
                         let value_end =
                             flow_scalar_end(text, position, absolute_start, &[',', ']'])?;
@@ -2332,15 +2339,7 @@ impl<'source> Parser<'source> {
             NodeKind::MappingEntry,
             Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
         );
-        let key_start = entry_start + leading_flow_whitespace(&text[entry_start..colon]);
-        let key_end = colon - trailing_flow_whitespace(&text[entry_start..colon]);
-        if key_start >= key_end {
-            return Err(empty_flow_mapping_key(absolute_start + entry_start));
-        }
-        let key = self.push_node(
-            NodeKind::Scalar,
-            Span::from_usize(absolute_start + key_start, absolute_start + key_end),
-        );
+        let key = self.parse_flow_node_segment(text, entry_start, colon, absolute_start)?;
         self.nodes[entry.0 as usize].children.push(key);
 
         let mut value_position = skip_flow_whitespace(text, colon + 1);
@@ -2349,29 +2348,14 @@ impl<'source> Parser<'source> {
                 let value = self.push_empty_scalar(absolute_start + value_position);
                 self.nodes[entry.0 as usize].children.push(value);
             }
-            Some('[' | '{') => {
-                let (value, consumed) = self
-                    .parse_flow_value(&text[value_position..], absolute_start + value_position)?;
-                self.nodes[entry.0 as usize].children.push(value);
-                value_position += consumed;
-            }
             Some(_) => {
-                let value_end = flow_scalar_end(text, value_position, absolute_start, &[',', ']'])?;
-                let value_start =
-                    value_position + leading_flow_whitespace(&text[value_position..value_end]);
-                let value_trimmed_end =
-                    value_end - trailing_flow_whitespace(&text[value_position..value_end]);
-                if value_start < value_trimmed_end {
-                    let value = self.push_node(
-                        NodeKind::Scalar,
-                        Span::from_usize(
-                            absolute_start + value_start,
-                            absolute_start + value_trimmed_end,
-                        ),
-                    );
-                    self.nodes[entry.0 as usize].children.push(value);
-                }
-                value_position = value_end;
+                value_position = self.parse_flow_mapping_value_with_close(
+                    text,
+                    value_position,
+                    absolute_start,
+                    entry,
+                    ']',
+                )?;
             }
             None => return Err(missing_flow_sequence_end(absolute_start, text.len())),
         }
@@ -2672,6 +2656,13 @@ impl<'source> Parser<'source> {
         entry: NodeId,
         close: char,
     ) -> Result<usize, YamlError> {
+        if body_starts_flow_value(&text[position..], absolute_start + position)? {
+            let (value, consumed) =
+                self.parse_flow_value(&text[position..], absolute_start + position)?;
+            self.nodes[entry.0 as usize].children.push(value);
+            return Ok(position + consumed);
+        }
+
         match text[position..].chars().next() {
             None => return Err(missing_flow_mapping_end(absolute_start, text.len())),
             Some(',') => {
@@ -2681,12 +2672,6 @@ impl<'source> Parser<'source> {
             Some(character) if character == close => {
                 let value = self.push_empty_scalar(absolute_start + position);
                 self.nodes[entry.0 as usize].children.push(value);
-            }
-            Some('[' | '{') => {
-                let (value, consumed) =
-                    self.parse_flow_value(&text[position..], absolute_start + position)?;
-                self.nodes[entry.0 as usize].children.push(value);
-                position += consumed;
             }
             Some(_) => {
                 let terminators = [',', close];
@@ -2909,35 +2894,36 @@ impl<'source> Parser<'source> {
 
     fn emit_flow_sequence_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let sequence = self.nodes[node.0 as usize].clone();
-        let mut properties =
-            parse_node_properties(self.source.slice(sequence.span), sequence.span)?;
+        let mut properties = self.flow_event_properties(sequence.span)?;
         self.resolve_node_properties(&mut properties, sequence.span)?;
+        let span = self.apply_pending_event_properties(&mut properties, sequence.span);
         self.push_event(
             YamlEventKind::SequenceStart {
                 style: CollectionStyle::Flow,
                 tag: properties.tag,
                 anchor: properties.anchor,
             },
-            sequence.span,
+            span,
         );
         for child in sequence.children {
             self.emit_node_event(child)?;
         }
-        self.push_event(YamlEventKind::SequenceEnd, sequence.span);
+        self.push_event(YamlEventKind::SequenceEnd, span);
         Ok(())
     }
 
     fn emit_flow_mapping_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let mapping = self.nodes[node.0 as usize].clone();
-        let mut properties = parse_node_properties(self.source.slice(mapping.span), mapping.span)?;
+        let mut properties = self.flow_event_properties(mapping.span)?;
         self.resolve_node_properties(&mut properties, mapping.span)?;
+        let span = self.apply_pending_event_properties(&mut properties, mapping.span);
         self.push_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Flow,
                 tag: properties.tag,
                 anchor: properties.anchor,
             },
-            mapping.span,
+            span,
         );
         for entry in mapping.children {
             let entry = self.nodes[entry.0 as usize].clone();
@@ -2945,8 +2931,37 @@ impl<'source> Parser<'source> {
                 self.emit_node_event(child)?;
             }
         }
-        self.push_event(YamlEventKind::MappingEnd, mapping.span);
+        self.push_event(YamlEventKind::MappingEnd, span);
         Ok(())
+    }
+
+    fn apply_pending_event_properties(
+        &mut self,
+        properties: &mut NodeProperties,
+        span: Span,
+    ) -> Span {
+        if let Some(pending) =
+            self.take_pending_node_properties(self.source_indent_at(span.start as usize))
+        {
+            if properties.anchor.is_none() {
+                properties.anchor = pending.properties.anchor;
+            }
+            if properties.tag.is_none() {
+                properties.tag = pending.properties.tag;
+            }
+            Span::new(Span::usize_to_u32(pending.span_start), span.end)
+        } else {
+            span
+        }
+    }
+
+    fn flow_event_properties(&self, span: Span) -> Result<NodeProperties, YamlError> {
+        let text = self.source.slice(span);
+        if body_starts_flow_value(text, span.start as usize)? {
+            parse_node_properties(text, span)
+        } else {
+            Ok(NodeProperties::default())
+        }
     }
 
     fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
@@ -8436,6 +8451,72 @@ ports:
             block_doc.events_to_test_string(),
             "+STR\n+DOC\n+SEQ\n+MAP\n+MAP\n=VAL :\n=VAL :x\n-MAP\n=VAL :\n-MAP\n-SEQ\n-DOC\n-STR\n"
         );
+    }
+
+    #[test]
+    fn parser_accepts_property_prefixed_root_flow_sequence() {
+        let input = "&flowseq [\n a: b,\n &c c: d\n]\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept anchored flow sequence");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ [] &flowseq\n+MAP {}\n=VAL :a\n=VAL :b\n-MAP\n+MAP {}\n=VAL &c :c\n=VAL :d\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_split_tag_before_flow_value() {
+        let input = "!!map {\n  k: !!seq\n  [ a, !!str b]\n}\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept tagged flow value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP {} <tag:yaml.org,2002:map>\n=VAL :k\n+SEQ [] <tag:yaml.org,2002:seq>\n=VAL :a\n=VAL <tag:yaml.org,2002:str> :b\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_implicit_flow_mapping_collection_key() {
+        let input = "[ {JSON: like}:adjacent ]\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept collection key");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ []\n+MAP {}\n+MAP {}\n=VAL :JSON\n=VAL :like\n-MAP\n=VAL :adjacent\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_nested_flow_collection_key_in_implicit_mapping() {
+        let input = "[[[b,c]]: d, e]\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept nested collection key");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ []\n+MAP {}\n+SEQ []\n+SEQ []\n=VAL :b\n=VAL :c\n-SEQ\n-SEQ\n=VAL :d\n-MAP\n=VAL :e\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_empty_implicit_flow_mapping_keys() {
+        for (input, value) in [
+            ("[ : empty key ]\n", "empty key"),
+            ("[: another empty key]\n", "another empty key"),
+        ] {
+            let doc = YamlDoc::parse(input).expect("parser should accept empty key");
+
+            assert_eq!(doc.to_string(), input);
+            assert_eq!(
+                doc.events_to_test_string(),
+                format!(
+                    "+STR\n+DOC\n+SEQ []\n+MAP {{}}\n=VAL :\n=VAL :{value}\n-MAP\n-SEQ\n-DOC\n-STR\n"
+                )
+            );
+        }
     }
 
     #[test]

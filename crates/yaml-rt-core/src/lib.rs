@@ -14,6 +14,24 @@ pub const TARGET_YAML_VERSION: &str = "1.2.2";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 
+impl NodeId {
+    /// Creates a node ID from a vector index.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` cannot fit in the u32-backed node ID.
+    #[must_use]
+    pub fn from_usize(index: usize) -> Self {
+        Self(u32::try_from(index).expect("node arena is too large for u32-based node IDs"))
+    }
+
+    /// Returns this node ID as a vector index.
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// A byte span inside a [`Source`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Span {
@@ -30,6 +48,16 @@ impl Span {
         Self { start, end }
     }
 
+    /// Creates a span from usize byte offsets.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either offset cannot fit in the u32-backed span.
+    #[must_use]
+    pub fn from_usize(start: usize, end: usize) -> Self {
+        Self::try_from((start, end)).expect("YAML source is too large for u32-based spans")
+    }
+
     /// Returns an empty span at `offset`.
     #[must_use]
     pub const fn empty(offset: u32) -> Self {
@@ -37,6 +65,21 @@ impl Span {
             start: offset,
             end: offset,
         }
+    }
+
+    fn usize_to_u32(offset: usize) -> u32 {
+        u32::try_from(offset).expect("YAML source is too large for u32-based spans")
+    }
+
+    fn offset_from_usize(base: u32, offset: usize) -> u32 {
+        base.checked_add(Self::usize_to_u32(offset))
+            .expect("YAML source is too large for u32-based spans")
+    }
+
+    /// Returns an empty span at `offset`.
+    #[must_use]
+    pub fn empty_from_usize(offset: usize) -> Self {
+        Self::empty(Self::usize_to_u32(offset))
     }
 
     /// Returns the span length in bytes.
@@ -58,6 +101,16 @@ impl Span {
     }
 }
 
+impl TryFrom<(usize, usize)> for Span {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from((start, end): (usize, usize)) -> Result<Self, Self::Error> {
+        Ok(Self {
+            start: Self::usize_to_u32(start),
+            end: Self::usize_to_u32(end),
+        })
+    }
+}
 /// One-based line and column location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineCol {
@@ -77,6 +130,11 @@ pub struct Source {
 impl Source {
     /// Builds a source buffer, validates YAML 1.2.2 printable characters, and
     /// records all line starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `text` contains characters that are not valid in a
+    /// YAML 1.2.2 stream.
     pub fn new(text: String) -> Result<Self, YamlError> {
         validate_yaml_chars(&text)?;
 
@@ -127,6 +185,11 @@ impl Source {
     }
 
     /// Returns the source slice for `span`, or a span-rich error when invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `span` is outside the source text or does not fall
+    /// on UTF-8 boundaries.
     pub fn try_slice(&self, span: Span) -> Result<&str, YamlError> {
         let start = span.start as usize;
         let end = span.end as usize;
@@ -174,7 +237,7 @@ impl Source {
 fn validate_yaml_chars(text: &str) -> Result<(), YamlError> {
     for (offset, character) in text.char_indices() {
         if !is_yaml_printable(character) {
-            let span = Span::new(offset as u32, (offset + character.len_utf8()) as u32);
+            let span = Span::from_usize(offset, offset + character.len_utf8());
             return Err(YamlError::new(
                 Diagnostic::new(
                     DiagnosticKind::Source,
@@ -197,7 +260,7 @@ fn validate_yaml_chars(text: &str) -> Result<(), YamlError> {
 const fn is_yaml_printable(character: char) -> bool {
     matches!(
         character as u32,
-        0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x85 | 0xA0..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+        0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x85 | 0xA0..=0xD7FF | 0xE000..=0xFFFD | 0x001_0000..=0x0010_FFFF
     )
 }
 
@@ -250,6 +313,11 @@ pub enum TokenKind {
 }
 
 /// Lexes YAML source into lossless tokens for the MVP subset.
+///
+/// # Errors
+///
+/// Returns an error when the source contains malformed quoted scalars or other
+/// token-level syntax that the lexer can diagnose.
 pub fn lex(source: &Source) -> Result<Vec<Token>, YamlError> {
     Lexer::new(source).lex()
 }
@@ -326,7 +394,7 @@ impl<'source> Lexer<'source> {
     fn push(&mut self, kind: TokenKind, start: usize) {
         self.tokens.push(Token {
             kind,
-            span: Span::new(start as u32, self.position as u32),
+            span: Span::from_usize(start, self.position),
         });
     }
 
@@ -514,7 +582,7 @@ impl<'source> Lexer<'source> {
             Diagnostic::new(
                 DiagnosticKind::Lexer,
                 format!("unterminated {scalar_name}"),
-                Span::new(start as u32, self.source.len() as u32),
+                Span::from_usize(start, self.source.len()),
             )
             .with_expected(format!("closing {terminator}")),
         )
@@ -654,6 +722,11 @@ pub enum YamlEventKind {
 }
 
 /// Parses the MVP token/source pair into a lossless CST node arena.
+///
+/// # Errors
+///
+/// Returns an error when the token stream contains YAML syntax the parser
+/// cannot accept or when parser events cannot be produced from the CST.
 pub fn parse_cst(source: &Source, tokens: &[Token]) -> Result<Vec<Node>, YamlError> {
     Parser::new(source, tokens)
         .parse()
@@ -669,6 +742,24 @@ struct ParsedYaml {
 /// Identifier for a semantic graph node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GraphNodeId(pub u32);
+
+impl GraphNodeId {
+    /// Creates a graph node ID from a vector index.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` cannot fit in the u32-backed graph node ID.
+    #[must_use]
+    pub fn from_usize(index: usize) -> Self {
+        Self(u32::try_from(index).expect("graph arena is too large for u32-based node IDs"))
+    }
+
+    /// Returns this graph node ID as a vector index.
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
 
 /// Semantic graph node built from parser events and linked back to the CST.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -789,11 +880,11 @@ impl<'source> Parser<'source> {
     }
 
     fn parse(mut self) -> Result<ParsedYaml, YamlError> {
-        let stream = self.push_node(NodeKind::Stream, Span::new(0, self.source.len() as u32));
+        let stream = self.push_node(NodeKind::Stream, Span::from_usize(0, self.source.len()));
         self.stream = Some(stream);
         self.push_event(
             YamlEventKind::StreamStart,
-            Span::new(0, self.source.len() as u32),
+            Span::from_usize(0, self.source.len()),
         );
 
         let lines = SourceLines::new(self.source).collect::<Result<Vec<_>, _>>()?;
@@ -802,14 +893,14 @@ impl<'source> Parser<'source> {
             index += self.parse_line(&lines, index)?;
         }
         if self.document.is_some() {
-            self.close_document(false, Span::empty(self.source.len() as u32))?;
+            self.close_document(false, Span::empty_from_usize(self.source.len()))?;
         } else if self.nodes[stream.0 as usize].children.is_empty() {
-            self.open_document(false, Span::new(0, self.source.len() as u32));
-            self.close_document(false, Span::empty(self.source.len() as u32))?;
+            self.open_document(false, Span::from_usize(0, self.source.len()));
+            self.close_document(false, Span::empty_from_usize(self.source.len()))?;
         }
         self.push_event(
             YamlEventKind::StreamEnd,
-            Span::new(self.source.len() as u32, self.source.len() as u32),
+            Span::from_usize(self.source.len(), self.source.len()),
         );
 
         Ok(ParsedYaml {
@@ -843,15 +934,13 @@ impl<'source> Parser<'source> {
                 return Err(invalid_document_marker(line));
             }
             if self.document.is_some() {
-                self.close_document(false, Span::empty(line.content_start as u32))?;
+                self.close_document(false, Span::empty_from_usize(line.content_start))?;
             }
-            let document = self.open_document(
-                true,
-                Span::new(line.content_start as u32, line.content_end as u32),
-            );
+            let document =
+                self.open_document(true, Span::from_usize(line.content_start, line.content_end));
             let marker = self.push_node(
                 NodeKind::DocumentMarker,
-                Span::new(line.content_start as u32, (line.content_start + 3) as u32),
+                Span::from_usize(line.content_start, line.content_start + 3),
             );
             self.nodes[document.0 as usize].children.push(marker);
             let rest = rest.trim_start();
@@ -869,13 +958,10 @@ impl<'source> Parser<'source> {
             let document = self.ensure_current_document(false, line);
             let marker = self.push_node(
                 NodeKind::DocumentMarker,
-                Span::new(line.content_start as u32, (line.content_start + 3) as u32),
+                Span::from_usize(line.content_start, line.content_start + 3),
             );
             self.nodes[document.0 as usize].children.push(marker);
-            self.close_document(
-                true,
-                Span::new(line.content_start as u32, line.content_end as u32),
-            )?;
+            self.close_document(true, Span::from_usize(line.content_start, line.content_end))?;
             return Ok(1);
         }
 
@@ -939,8 +1025,7 @@ impl<'source> Parser<'source> {
         } else if let Some(colon_byte) = find_mapping_colon(body) {
             self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
         } else {
-            let scalar_span =
-                Span::new(absolute_start as u32, (absolute_start + body.len()) as u32);
+            let scalar_span = Span::from_usize(absolute_start, absolute_start + body.len());
             let scalar = self.push_node(NodeKind::Scalar, scalar_span);
             self.nodes[document.0 as usize].children.push(scalar);
             self.emit_scalar_event(scalar)?;
@@ -966,7 +1051,7 @@ impl<'source> Parser<'source> {
                 Diagnostic::new(
                     DiagnosticKind::Typed,
                     "could not decode quoted scalar",
-                    Span::empty(absolute_start as u32),
+                    Span::empty_from_usize(absolute_start),
                 )
                 .with_expected("a closed quoted scalar"),
             )
@@ -984,7 +1069,7 @@ impl<'source> Parser<'source> {
         Ok((
             self.push_node(
                 NodeKind::Scalar,
-                Span::new(absolute_start as u32, absolute_end as u32),
+                Span::from_usize(absolute_start, absolute_end),
             ),
             consumed,
         ))
@@ -1024,7 +1109,7 @@ impl<'source> Parser<'source> {
     ) -> Result<(&'source str, usize), YamlError> {
         let properties = parse_node_properties(
             value_text,
-            Span::new(value_start as u32, (value_start + value_text.len()) as u32),
+            Span::from_usize(value_start, value_start + value_text.len()),
         )?;
         let marker_offset =
             properties.value_start + leading_flow_whitespace(&value_text[properties.value_start..]);
@@ -1049,14 +1134,11 @@ impl<'source> Parser<'source> {
         let mapping = self.ensure_mapping(
             document,
             indent,
-            Span::new(
-                (line.content_start + indent) as u32,
-                line.content_end as u32,
-            ),
+            Span::from_usize(line.content_start + indent, line.content_end),
         );
         let entry = self.push_node(
             NodeKind::MappingEntry,
-            Span::new(line.content_start as u32, line.content_end as u32),
+            Span::from_usize(line.content_start, line.content_end),
         );
         self.nodes[mapping.0 as usize].children.push(entry);
         self.extend_node_span(mapping, line.content_end);
@@ -1064,10 +1146,7 @@ impl<'source> Parser<'source> {
         let key_start = line.content_start + indent;
         let key_end = key_start + body[..colon_byte].trim_end().len();
         let key = if key_start < key_end {
-            self.push_node(
-                NodeKind::Scalar,
-                Span::new(key_start as u32, key_end as u32),
-            )
+            self.push_node(NodeKind::Scalar, Span::from_usize(key_start, key_end))
         } else {
             self.push_empty_scalar(key_start)
         };
@@ -1131,29 +1210,25 @@ impl<'source> Parser<'source> {
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_node_event(node)?;
                 return Ok(consumed);
-            } else {
-                let (node, consumed) =
-                    self.parse_block_plain_scalar(lines, index, indent, value_start);
-                self.nodes[entry.0 as usize].children.push(node);
-                self.emit_scalar_event(node)?;
-                return Ok(consumed);
             }
-        } else {
-            let next_significant_indent = next_significant_indent(lines, index)?;
-            if next_significant_indent.is_none_or(|next| next <= indent) {
-                let empty = self.push_empty_scalar(line.content_end);
-                self.nodes[entry.0 as usize].children.push(empty);
-                self.emit_scalar_event(empty)?;
-                return Ok(1);
-            }
-            if next_significant_indent.is_some_and(|next| next > indent) {
-                let consumed =
-                    self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-                let end = lines[index + consumed - 1].content_end;
-                self.extend_node_span(entry, end);
-                self.extend_node_span(mapping, end);
-                return Ok(consumed);
-            }
+            let (node, consumed) = self.parse_block_plain_scalar(lines, index, indent, value_start);
+            self.nodes[entry.0 as usize].children.push(node);
+            self.emit_scalar_event(node)?;
+            return Ok(consumed);
+        }
+        let next_significant_indent = next_significant_indent(lines, index)?;
+        if next_significant_indent.is_none_or(|next| next <= indent) {
+            let empty = self.push_empty_scalar(line.content_end);
+            self.nodes[entry.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
+            return Ok(1);
+        }
+        if next_significant_indent.is_some_and(|next| next > indent) {
+            let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
+            let end = lines[index + consumed - 1].content_end;
+            self.extend_node_span(entry, end);
+            self.extend_node_span(mapping, end);
+            return Ok(consumed);
         }
 
         Ok(1)
@@ -1171,14 +1246,11 @@ impl<'source> Parser<'source> {
         let mapping = self.ensure_mapping(
             document,
             indent,
-            Span::new(
-                (line.content_start + indent) as u32,
-                line.content_end as u32,
-            ),
+            Span::from_usize(line.content_start + indent, line.content_end),
         );
         let entry = self.push_node(
             NodeKind::MappingEntry,
-            Span::new(line.content_start as u32, line.content_end as u32),
+            Span::from_usize(line.content_start, line.content_end),
         );
         self.nodes[mapping.0 as usize].children.push(entry);
         self.extend_node_span(mapping, line.content_end);
@@ -1186,7 +1258,7 @@ impl<'source> Parser<'source> {
         let after_question = if body == "?" { "" } else { &body[1..] };
         let key_text = strip_inline_comment(after_question).trim_start();
         let key_consumed = if key_text.is_empty() {
-            if next_significant_body_with_index(lines, index)?.is_some_and(
+            if next_significant_body_with_index(lines, index).is_some_and(
                 |(_, next_indent, next_body)| {
                     next_indent >= indent && !is_explicit_mapping_value(next_body)
                 },
@@ -1205,7 +1277,7 @@ impl<'source> Parser<'source> {
         };
 
         let Some((value_index, value_indent, value_body)) =
-            next_significant_body_with_index(lines, index + key_consumed - 1)?
+            next_significant_body_with_index(lines, index + key_consumed - 1)
         else {
             self.close_sequence_at_indent(indent);
             self.close_collections_deeper_than(indent);
@@ -1302,11 +1374,6 @@ impl<'source> Parser<'source> {
                 key_start - lines[index].content_start,
                 key_text,
             )
-        } else if body_starts_flow_value(key_text, key_start)? {
-            let key = self.parse_inline_value(key_text, key_start)?;
-            self.nodes[entry.0 as usize].children.push(key);
-            self.emit_node_event(key)?;
-            Ok(1)
         } else {
             let key = self.parse_inline_value(key_text, key_start)?;
             self.nodes[entry.0 as usize].children.push(key);
@@ -1330,7 +1397,7 @@ impl<'source> Parser<'source> {
         let value_trimmed = value.trim_start();
 
         if value_trimmed.is_empty() {
-            if next_significant_body_with_index(lines, index)?.is_some_and(
+            if next_significant_body_with_index(lines, index).is_some_and(
                 |(_, next_indent, next_body)| {
                     next_indent >= indent
                         && !is_explicit_mapping_key(next_body)
@@ -1518,11 +1585,11 @@ impl<'source> Parser<'source> {
     ) -> Result<(), YamlError> {
         let mut properties = parse_node_properties(
             text,
-            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+            Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
         self.resolve_node_properties(
             &mut properties,
-            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+            Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
         if let Some(pending) = self
             .pending_node_properties
@@ -1550,7 +1617,7 @@ impl<'source> Parser<'source> {
         self.document.unwrap_or_else(|| {
             self.open_document(
                 explicit,
-                Span::new(line.content_start as u32, line.content_end as u32),
+                Span::from_usize(line.content_start, line.content_end),
             )
         })
     }
@@ -1598,7 +1665,7 @@ impl<'source> Parser<'source> {
                 Diagnostic::new(
                     DiagnosticKind::Parser,
                     "directives must appear before document content",
-                    Span::new(line.content_start as u32, line.content_end as u32),
+                    Span::from_usize(line.content_start, line.content_end),
                 )
                 .with_expected("a directive before the document start marker or content"),
             )
@@ -1608,7 +1675,7 @@ impl<'source> Parser<'source> {
         let stream = self.stream.expect("stream node exists before directives");
         let directive = self.push_node(
             NodeKind::Directive,
-            Span::new(line.content_start as u32, line.content_end as u32),
+            Span::from_usize(line.content_start, line.content_end),
         );
         self.nodes[stream.0 as usize].children.push(directive);
 
@@ -1675,21 +1742,30 @@ impl<'source> Parser<'source> {
         let sequence = self.ensure_sequence(
             document,
             indent,
-            Span::new(
-                (line.content_start + indent) as u32,
-                line.content_end as u32,
-            ),
+            Span::from_usize(line.content_start + indent, line.content_end),
         );
         let entry = self.push_node(
             NodeKind::SequenceEntry,
-            Span::new(line.content_start as u32, line.content_end as u32),
+            Span::from_usize(line.content_start, line.content_end),
         );
         self.nodes[sequence.0 as usize].children.push(entry);
         self.extend_node_span(sequence, line.content_end);
 
         let after_dash = if body == "-" { "" } else { &body[1..] };
         let value = after_dash.trim_start();
-        if !value.is_empty() {
+        if value.is_empty() {
+            if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
+                let consumed =
+                    self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
+                let end = lines[index + consumed - 1].content_end;
+                self.extend_node_span(entry, end);
+                self.extend_node_span(sequence, end);
+                return Ok(consumed);
+            }
+            let empty = self.push_empty_scalar(line.content_start + indent + 1);
+            self.nodes[entry.0 as usize].children.push(empty);
+            self.emit_scalar_event(empty)?;
+        } else {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
             if value.starts_with('|') || value.starts_with('>') {
@@ -1752,25 +1828,12 @@ impl<'source> Parser<'source> {
                     value,
                     colon_byte,
                 );
-            } else {
-                let (value_node, consumed) =
-                    self.parse_block_plain_scalar(lines, index, indent, value_start);
-                self.nodes[entry.0 as usize].children.push(value_node);
-                self.emit_scalar_event(value_node)?;
-                return Ok(consumed);
             }
-        } else {
-            if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
-                let consumed =
-                    self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
-                let end = lines[index + consumed - 1].content_end;
-                self.extend_node_span(entry, end);
-                self.extend_node_span(sequence, end);
-                return Ok(consumed);
-            }
-            let empty = self.push_empty_scalar(line.content_start + indent + 1);
-            self.nodes[entry.0 as usize].children.push(empty);
-            self.emit_scalar_event(empty)?;
+            let (value_node, consumed) =
+                self.parse_block_plain_scalar(lines, index, indent, value_start);
+            self.nodes[entry.0 as usize].children.push(value_node);
+            self.emit_scalar_event(value_node)?;
+            return Ok(consumed);
         }
 
         Ok(1)
@@ -1818,44 +1881,41 @@ impl<'source> Parser<'source> {
                 line.content_start + nested_indent,
             )?
             .is_some()
-            {
-                if let Some((header_index, header_indent, header_body)) =
+                && let Some((header_index, header_indent, header_body)) =
                     first_non_property_node_after_with_index(
                         lines,
                         nested_index,
                         line.content_start + nested_indent,
                     )?
-                    && (header_body.starts_with('|') || header_body.starts_with('>'))
-                {
-                    for property_line in &lines[nested_index..header_index] {
-                        let property_trimmed = property_line.content_without_break.trim();
-                        if property_trimmed.is_empty() || property_trimmed.starts_with('#') {
-                            continue;
-                        }
-                        let property_indent =
-                            content_line_indent(property_line.content_without_break);
-                        let property_body = &property_line.content_without_break[property_indent..];
-                        self.push_pending_node_properties(
-                            property_body,
-                            property_line.content_start + property_indent,
-                            header_indent,
-                        )?;
+                && (header_body.starts_with('|') || header_body.starts_with('>'))
+            {
+                for property_line in &lines[nested_index..header_index] {
+                    let property_trimmed = property_line.content_without_break.trim();
+                    if property_trimmed.is_empty() || property_trimmed.starts_with('#') {
+                        continue;
                     }
-                    let header_start = lines[header_index].content_start + header_indent;
-                    let (node, scalar_consumed) = self.parse_block_scalar(
-                        lines,
-                        header_index,
-                        header_start,
-                        parent_indent,
-                        header_body,
-                        true,
+                    let property_indent = content_line_indent(property_line.content_without_break);
+                    let property_body = &property_line.content_without_break[property_indent..];
+                    self.push_pending_node_properties(
+                        property_body,
+                        property_line.content_start + property_indent,
+                        header_indent,
                     )?;
-                    self.nodes[parent.0 as usize].children.push(node);
-                    self.emit_scalar_event(node)?;
-                    consumed += header_index - nested_index + scalar_consumed;
-                    nested_index = header_index + scalar_consumed;
-                    continue;
                 }
+                let header_start = lines[header_index].content_start + header_indent;
+                let (node, scalar_consumed) = self.parse_block_scalar(
+                    lines,
+                    header_index,
+                    header_start,
+                    parent_indent,
+                    header_body,
+                    true,
+                )?;
+                self.nodes[parent.0 as usize].children.push(node);
+                self.emit_scalar_event(node)?;
+                consumed += header_index - nested_index + scalar_consumed;
+                nested_index = header_index + scalar_consumed;
+                continue;
             }
 
             self.close_collections_deeper_than(nested_indent);
@@ -1907,7 +1967,7 @@ impl<'source> Parser<'source> {
         }
 
         (
-            self.push_node(NodeKind::Scalar, Span::new(value_start as u32, end as u32)),
+            self.push_node(NodeKind::Scalar, Span::from_usize(value_start, end)),
             consumed,
         )
     }
@@ -1919,7 +1979,7 @@ impl<'source> Parser<'source> {
     ) -> Result<NodeId, YamlError> {
         let properties = parse_node_properties(
             text,
-            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+            Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
         let value_text = &text[properties.value_start..];
         if value_text.starts_with('[') || value_text.starts_with('{') {
@@ -1929,7 +1989,7 @@ impl<'source> Parser<'source> {
         } else {
             Ok(self.push_node(
                 NodeKind::Scalar,
-                Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+                Span::from_usize(absolute_start, absolute_start + text.len()),
             ))
         }
     }
@@ -1941,7 +2001,7 @@ impl<'source> Parser<'source> {
     ) -> Result<(NodeId, usize), YamlError> {
         let properties = parse_node_properties(
             text,
-            Span::new(absolute_start as u32, (absolute_start + text.len()) as u32),
+            Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
         let value_start =
             properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
@@ -1949,12 +2009,12 @@ impl<'source> Parser<'source> {
         if value_text.starts_with('[') {
             let (node, consumed) =
                 self.parse_flow_sequence(value_text, absolute_start + value_start)?;
-            self.nodes[node.0 as usize].span.start = absolute_start as u32;
+            self.nodes[node.as_usize()].span.start = Span::usize_to_u32(absolute_start);
             Ok((node, value_start + consumed))
         } else if value_text.starts_with('{') {
             let (node, consumed) =
                 self.parse_flow_mapping(value_text, absolute_start + value_start)?;
-            self.nodes[node.0 as usize].span.start = absolute_start as u32;
+            self.nodes[node.as_usize()].span.start = Span::usize_to_u32(absolute_start);
             Ok((node, value_start + consumed))
         } else {
             let end = flow_scalar_end(text, value_start, absolute_start, &[',', ']', '}'])?;
@@ -1966,7 +2026,7 @@ impl<'source> Parser<'source> {
             Ok((
                 self.push_node(
                     NodeKind::Scalar,
-                    Span::new(absolute_start as u32, (absolute_start + scalar_end) as u32),
+                    Span::from_usize(absolute_start, absolute_start + scalar_end),
                 ),
                 end,
             ))
@@ -1986,8 +2046,7 @@ impl<'source> Parser<'source> {
         let mut consumed = 1;
         let mut content_indent = header
             .indent
-            .map(|indent| parent_indent + indent)
-            .unwrap_or(usize::MAX);
+            .map_or(usize::MAX, |indent| parent_indent + indent);
         let mut end = lines[index].line_end;
         let inline_header =
             header_start > lines[index].content_start + parent_indent && !allow_same_indent_content;
@@ -2029,10 +2088,7 @@ impl<'source> Parser<'source> {
             end = line.line_end;
         }
 
-        let scalar = self.push_node(
-            header.kind.node_kind(),
-            Span::new(header_start as u32, end as u32),
-        );
+        let scalar = self.push_node(header.kind.node_kind(), Span::from_usize(header_start, end));
         let content_indent = if content_indent == usize::MAX {
             header.indent.unwrap_or_default()
         } else {
@@ -2052,7 +2108,7 @@ impl<'source> Parser<'source> {
 
         let sequence = self.push_node(
             NodeKind::FlowSequence,
-            Span::new(absolute_start as u32, (absolute_start + 1) as u32),
+            Span::from_usize(absolute_start, absolute_start + 1),
         );
         let mut position = 1;
         let mut expecting_value = true;
@@ -2068,8 +2124,8 @@ impl<'source> Parser<'source> {
                 ']' => {
                     if expecting_value || saw_item {
                         position += 1;
-                        self.nodes[sequence.0 as usize].span.end =
-                            (absolute_start + position) as u32;
+                        self.nodes[sequence.as_usize()].span.end =
+                            Span::usize_to_u32(absolute_start + position);
                         return Ok((sequence, position));
                     }
                     return Err(empty_flow_sequence_item(absolute_start + position));
@@ -2116,9 +2172,9 @@ impl<'source> Parser<'source> {
                         }
                         let scalar = self.push_node(
                             NodeKind::Scalar,
-                            Span::new(
-                                (absolute_start + scalar_start) as u32,
-                                (absolute_start + scalar_end) as u32,
+                            Span::from_usize(
+                                absolute_start + scalar_start,
+                                absolute_start + scalar_end,
                             ),
                         );
                         self.nodes[sequence.0 as usize].children.push(scalar);
@@ -2160,17 +2216,11 @@ impl<'source> Parser<'source> {
     ) -> Result<(NodeId, usize), YamlError> {
         let mapping = self.push_node(
             NodeKind::FlowMapping,
-            Span::new(
-                (absolute_start + entry_start) as u32,
-                (absolute_start + entry_start) as u32,
-            ),
+            Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
         );
         let entry = self.push_node(
             NodeKind::MappingEntry,
-            Span::new(
-                (absolute_start + entry_start) as u32,
-                (absolute_start + entry_start) as u32,
-            ),
+            Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
         );
         let key_start = entry_start + leading_flow_whitespace(&text[entry_start..colon]);
         let key_end = colon - trailing_flow_whitespace(&text[entry_start..colon]);
@@ -2179,20 +2229,17 @@ impl<'source> Parser<'source> {
         }
         let key = self.push_node(
             NodeKind::Scalar,
-            Span::new(
-                (absolute_start + key_start) as u32,
-                (absolute_start + key_end) as u32,
-            ),
+            Span::from_usize(absolute_start + key_start, absolute_start + key_end),
         );
         self.nodes[entry.0 as usize].children.push(key);
 
         let mut value_position = skip_flow_whitespace(text, colon + 1);
         match text[value_position..].chars().next() {
-            Some(',') | Some(']') => {
+            Some(',' | ']') => {
                 let value = self.push_empty_scalar(absolute_start + value_position);
                 self.nodes[entry.0 as usize].children.push(value);
             }
-            Some('[') | Some('{') => {
+            Some('[' | '{') => {
                 let (value, consumed) = self
                     .parse_flow_value(&text[value_position..], absolute_start + value_position)?;
                 self.nodes[entry.0 as usize].children.push(value);
@@ -2207,9 +2254,9 @@ impl<'source> Parser<'source> {
                 if value_start < value_trimmed_end {
                     let value = self.push_node(
                         NodeKind::Scalar,
-                        Span::new(
-                            (absolute_start + value_start) as u32,
-                            (absolute_start + value_trimmed_end) as u32,
+                        Span::from_usize(
+                            absolute_start + value_start,
+                            absolute_start + value_trimmed_end,
                         ),
                     );
                     self.nodes[entry.0 as usize].children.push(value);
@@ -2219,8 +2266,9 @@ impl<'source> Parser<'source> {
             None => return Err(missing_flow_sequence_end(absolute_start, text.len())),
         }
 
-        self.nodes[entry.0 as usize].span.end = (absolute_start + value_position) as u32;
-        self.nodes[mapping.0 as usize].span.end = (absolute_start + value_position) as u32;
+        self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + value_position);
+        self.nodes[mapping.as_usize()].span.end =
+            Span::usize_to_u32(absolute_start + value_position);
         self.nodes[mapping.0 as usize].children.push(entry);
         Ok((mapping, value_position))
     }
@@ -2234,7 +2282,7 @@ impl<'source> Parser<'source> {
 
         let mapping = self.push_node(
             NodeKind::FlowMapping,
-            Span::new(absolute_start as u32, (absolute_start + 1) as u32),
+            Span::from_usize(absolute_start, absolute_start + 1),
         );
         let mut position = 1;
         let mut expecting_pair = true;
@@ -2250,8 +2298,8 @@ impl<'source> Parser<'source> {
                 '}' => {
                     if expecting_pair || saw_pair {
                         position += 1;
-                        self.nodes[mapping.0 as usize].span.end =
-                            (absolute_start + position) as u32;
+                        self.nodes[mapping.as_usize()].span.end =
+                            Span::usize_to_u32(absolute_start + position);
                         return Ok((mapping, position));
                     }
                     return Err(empty_flow_mapping_pair(absolute_start + position));
@@ -2263,41 +2311,11 @@ impl<'source> Parser<'source> {
             let entry_start = position;
             let entry = self.push_node(
                 NodeKind::MappingEntry,
-                Span::new(
-                    (absolute_start + entry_start) as u32,
-                    (absolute_start + entry_start) as u32,
-                ),
+                Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
             );
-            let key = if character == '[' || character == '{' {
-                let (key, consumed) =
-                    self.parse_flow_value(&text[position..], absolute_start + position)?;
-                position += consumed;
-                key
-            } else {
-                let key_separator =
-                    flow_mapping_separator(text, position, absolute_start, &[',', '}'])?;
-                let key_end = key_separator.unwrap_or_else(|| {
-                    flow_scalar_end(text, position, absolute_start, &[',', '}'])
-                        .expect("separator scan already validates flow scalar content")
-                });
-                let key_start = position + leading_flow_whitespace(&text[position..key_end]);
-                let key_trimmed_end = key_end - trailing_flow_whitespace(&text[position..key_end]);
-                if key_start >= key_trimmed_end && text[key_end..].starts_with(':') {
-                    position = key_end;
-                    self.push_empty_scalar(absolute_start + key_start)
-                } else if key_start >= key_trimmed_end {
-                    return Err(empty_flow_mapping_key(absolute_start + position));
-                } else {
-                    position = key_end;
-                    self.push_node(
-                        NodeKind::Scalar,
-                        Span::new(
-                            (absolute_start + key_start) as u32,
-                            (absolute_start + key_trimmed_end) as u32,
-                        ),
-                    )
-                }
-            };
+            let (key, key_end) =
+                self.parse_flow_mapping_key(text, position, absolute_start, character)?;
+            position = key_end;
             self.nodes[entry.0 as usize].children.push(key);
 
             position = skip_flow_whitespace(text, position);
@@ -2307,7 +2325,8 @@ impl<'source> Parser<'source> {
             if separator == ',' {
                 let value = self.push_empty_scalar(absolute_start + position);
                 self.nodes[entry.0 as usize].children.push(value);
-                self.nodes[entry.0 as usize].span.end = (absolute_start + position) as u32;
+                self.nodes[entry.as_usize()].span.end =
+                    Span::usize_to_u32(absolute_start + position);
                 self.nodes[mapping.0 as usize].children.push(entry);
                 saw_pair = true;
                 position += 1;
@@ -2322,40 +2341,9 @@ impl<'source> Parser<'source> {
             }
             position += 1;
             position = skip_flow_whitespace(text, position);
+            position = self.parse_flow_mapping_value(text, position, absolute_start, entry)?;
 
-            match text[position..].chars().next() {
-                None => return Err(missing_flow_mapping_end(absolute_start, text.len())),
-                Some(',') | Some('}') => {
-                    let value = self.push_empty_scalar(absolute_start + position);
-                    self.nodes[entry.0 as usize].children.push(value);
-                }
-                Some('[') | Some('{') => {
-                    let (value, consumed) =
-                        self.parse_flow_value(&text[position..], absolute_start + position)?;
-                    self.nodes[entry.0 as usize].children.push(value);
-                    position += consumed;
-                }
-                Some(_) => {
-                    let value_end = flow_scalar_end(text, position, absolute_start, &[',', '}'])?;
-                    let value_start =
-                        position + leading_flow_whitespace(&text[position..value_end]);
-                    let value_trimmed_end =
-                        value_end - trailing_flow_whitespace(&text[position..value_end]);
-                    if value_start < value_trimmed_end {
-                        let value = self.push_node(
-                            NodeKind::Scalar,
-                            Span::new(
-                                (absolute_start + value_start) as u32,
-                                (absolute_start + value_trimmed_end) as u32,
-                            ),
-                        );
-                        self.nodes[entry.0 as usize].children.push(value);
-                    }
-                    position = value_end;
-                }
-            }
-
-            self.nodes[entry.0 as usize].span.end = (absolute_start + position) as u32;
+            self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + position);
             self.nodes[mapping.0 as usize].children.push(entry);
             saw_pair = true;
             position = skip_flow_whitespace(text, position);
@@ -2379,6 +2367,82 @@ impl<'source> Parser<'source> {
                 }
             }
         }
+    }
+
+    fn parse_flow_mapping_key(
+        &mut self,
+        text: &str,
+        position: usize,
+        absolute_start: usize,
+        character: char,
+    ) -> Result<(NodeId, usize), YamlError> {
+        if character == '[' || character == '{' {
+            let (key, consumed) =
+                self.parse_flow_value(&text[position..], absolute_start + position)?;
+            return Ok((key, position + consumed));
+        }
+
+        let key_separator = flow_mapping_separator(text, position, absolute_start, &[',', '}'])?;
+        let key_end = key_separator.unwrap_or_else(|| {
+            flow_scalar_end(text, position, absolute_start, &[',', '}'])
+                .expect("separator scan already validates flow scalar content")
+        });
+        let key_start = position + leading_flow_whitespace(&text[position..key_end]);
+        let key_trimmed_end = key_end - trailing_flow_whitespace(&text[position..key_end]);
+
+        if key_start >= key_trimmed_end && text[key_end..].starts_with(':') {
+            Ok((self.push_empty_scalar(absolute_start + key_start), key_end))
+        } else if key_start >= key_trimmed_end {
+            Err(empty_flow_mapping_key(absolute_start + position))
+        } else {
+            Ok((
+                self.push_node(
+                    NodeKind::Scalar,
+                    Span::from_usize(absolute_start + key_start, absolute_start + key_trimmed_end),
+                ),
+                key_end,
+            ))
+        }
+    }
+
+    fn parse_flow_mapping_value(
+        &mut self,
+        text: &str,
+        mut position: usize,
+        absolute_start: usize,
+        entry: NodeId,
+    ) -> Result<usize, YamlError> {
+        match text[position..].chars().next() {
+            None => return Err(missing_flow_mapping_end(absolute_start, text.len())),
+            Some(',' | '}') => {
+                let value = self.push_empty_scalar(absolute_start + position);
+                self.nodes[entry.0 as usize].children.push(value);
+            }
+            Some('[' | '{') => {
+                let (value, consumed) =
+                    self.parse_flow_value(&text[position..], absolute_start + position)?;
+                self.nodes[entry.0 as usize].children.push(value);
+                position += consumed;
+            }
+            Some(_) => {
+                let value_end = flow_scalar_end(text, position, absolute_start, &[',', '}'])?;
+                let value_start = position + leading_flow_whitespace(&text[position..value_end]);
+                let value_trimmed_end =
+                    value_end - trailing_flow_whitespace(&text[position..value_end]);
+                if value_start < value_trimmed_end {
+                    let value = self.push_node(
+                        NodeKind::Scalar,
+                        Span::from_usize(
+                            absolute_start + value_start,
+                            absolute_start + value_trimmed_end,
+                        ),
+                    );
+                    self.nodes[entry.0 as usize].children.push(value);
+                }
+                position = value_end;
+            }
+        }
+        Ok(position)
     }
 
     fn ensure_mapping(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
@@ -2434,7 +2498,7 @@ impl<'source> Parser<'source> {
             return (span, None, None);
         };
         (
-            Span::new(pending.span_start as u32, span.end),
+            Span::new(Span::usize_to_u32(pending.span_start), span.end),
             pending.properties.tag,
             pending.properties.anchor,
         )
@@ -2472,10 +2536,7 @@ impl<'source> Parser<'source> {
                 Diagnostic::new(
                     DiagnosticKind::Parser,
                     "invalid indentation without a parent collection",
-                    Span::new(
-                        line.content_start as u32,
-                        (line.content_start + indent) as u32,
-                    ),
+                    Span::from_usize(line.content_start, line.content_start + indent),
                 )
                 .with_expected("a parent mapping or sequence at a lower indentation level"),
             ))
@@ -2509,7 +2570,7 @@ impl<'source> Parser<'source> {
     }
 
     fn push_node(&mut self, kind: NodeKind, span: Span) -> NodeId {
-        let id = NodeId(self.nodes.len() as u32);
+        let id = NodeId::from_usize(self.nodes.len());
         self.nodes.push(Node {
             kind,
             span,
@@ -2519,12 +2580,12 @@ impl<'source> Parser<'source> {
     }
 
     fn push_empty_scalar(&mut self, offset: usize) -> NodeId {
-        self.push_node(NodeKind::Scalar, Span::empty(offset as u32))
+        self.push_node(NodeKind::Scalar, Span::empty_from_usize(offset))
     }
 
     fn extend_node_span(&mut self, node: NodeId, end: usize) {
-        let node = &mut self.nodes[node.0 as usize];
-        node.span.end = node.span.end.max(end as u32);
+        let node = &mut self.nodes[node.as_usize()];
+        node.span.end = node.span.end.max(Span::usize_to_u32(end));
     }
 
     fn push_event(&mut self, kind: YamlEventKind, span: Span) {
@@ -2562,7 +2623,7 @@ impl<'source> Parser<'source> {
         let Some((_, collection)) = self.event_collections.pop() else {
             return;
         };
-        let offset = self.source.len() as u32;
+        let offset = Span::usize_to_u32(self.source.len());
         let kind = match collection {
             OpenEventCollection::Mapping => YamlEventKind::MappingEnd,
             OpenEventCollection::Sequence => YamlEventKind::SequenceEnd,
@@ -2638,7 +2699,7 @@ impl<'source> Parser<'source> {
             if properties.tag.is_none() {
                 properties.tag = pending.properties.tag;
             }
-            Span::new(pending.span_start as u32, node.span.end)
+            Span::new(Span::usize_to_u32(pending.span_start), node.span.end)
         } else {
             node.span
         };
@@ -2707,7 +2768,7 @@ struct NodeProperties {
 fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, YamlError> {
     let properties = parse_node_properties(
         body,
-        Span::new(absolute_start as u32, (absolute_start + body.len()) as u32),
+        Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
     let value_start =
         properties.value_start + leading_flow_whitespace(&body[properties.value_start..]);
@@ -2723,7 +2784,7 @@ fn block_scalar_after_node_properties(
 ) -> Result<Option<usize>, YamlError> {
     let properties = parse_node_properties(
         body,
-        Span::new(absolute_start as u32, (absolute_start + body.len()) as u32),
+        Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
     if properties.anchor.is_none() && properties.tag.is_none() {
         return Ok(None);
@@ -2778,15 +2839,12 @@ fn first_non_property_node_after_with_index<'line>(
 ) -> Result<Option<(usize, usize, &'line str)>, YamlError> {
     let mut scan_index = index;
     while let Some((next_index, indent, nested_body)) =
-        next_significant_body_with_index(lines, scan_index)?
+        next_significant_body_with_index(lines, scan_index)
     {
         let nested_body = strip_inline_comment(nested_body).trim_end();
         let nested_properties = parse_node_properties(
             nested_body,
-            Span::new(
-                absolute_start as u32,
-                (absolute_start + nested_body.len()) as u32,
-            ),
+            Span::from_usize(absolute_start, absolute_start + nested_body.len()),
         )?;
         if (nested_properties.anchor.is_some() || nested_properties.tag.is_some())
             && nested_properties.value_start == nested_body.len()
@@ -2808,7 +2866,7 @@ fn property_only_node_indent(
     let body = strip_inline_comment(body).trim_end();
     let properties = parse_node_properties(
         body,
-        Span::new(absolute_start as u32, (absolute_start + body.len()) as u32),
+        Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
     if properties.anchor.is_none() && properties.tag.is_none() {
         return Ok(None);
@@ -2823,17 +2881,17 @@ fn property_only_node_indent(
 fn next_significant_body_with_index<'line>(
     lines: &'line [SourceLine<'_>],
     current_index: usize,
-) -> Result<Option<(usize, usize, &'line str)>, YamlError> {
+) -> Option<(usize, usize, &'line str)> {
     for (index, line) in lines.iter().enumerate().skip(current_index + 1) {
         let trimmed = line.content_without_break.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let indent = content_line_indent(line.content_without_break);
-        return Ok(Some((index, indent, &line.content_without_break[indent..])));
+        return Some((index, indent, &line.content_without_break[indent..]));
     }
 
-    Ok(None)
+    None
 }
 
 fn default_tag_handles() -> BTreeMap<String, String> {
@@ -3020,7 +3078,7 @@ fn node_property_error(message: impl Into<String>, span: Span, offset: usize) ->
     YamlError::new(Diagnostic::new(
         DiagnosticKind::Parser,
         message,
-        Span::empty(span.start + offset as u32),
+        Span::empty(Span::offset_from_usize(span.start, offset)),
     ))
 }
 
@@ -3034,7 +3092,7 @@ fn node_property_error_with_expected(
         Diagnostic::new(
             DiagnosticKind::Parser,
             message,
-            Span::empty(span.start + offset as u32),
+            Span::empty(Span::offset_from_usize(span.start, offset)),
         )
         .with_expected(expected),
     )
@@ -3042,11 +3100,7 @@ fn node_property_error_with_expected(
 
 fn document_marker_rest<'text>(body: &'text str, marker: &str) -> Option<&'text str> {
     let rest = body.strip_prefix(marker)?;
-    if rest
-        .chars()
-        .next()
-        .is_none_or(|character| character.is_whitespace())
-    {
+    if rest.chars().next().is_none_or(char::is_whitespace) {
         Some(rest)
     } else {
         None
@@ -3060,10 +3114,9 @@ fn strip_inline_comment(text: &str) -> &str {
         match quoted {
             Some('"') if character == '"' => quoted = None,
             Some('\'') if character == '\'' => quoted = None,
-            Some(_) => {}
             None if character == '"' || character == '\'' => quoted = Some(character),
             None if character == '#' && previous_was_space => return &text[..offset],
-            None => {}
+            Some(_) | None => {}
         }
         previous_was_space = character.is_whitespace();
     }
@@ -3075,7 +3128,7 @@ fn invalid_directive(line: SourceLine<'_>, message: &'static str) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             message,
-            Span::new(line.content_start as u32, line.content_end as u32),
+            Span::from_usize(line.content_start, line.content_end),
         )
         .with_expected("%YAML or %TAG directive syntax"),
     )
@@ -3149,7 +3202,7 @@ impl<'source> Iterator for SourceLines<'source> {
 
         Some(
             self.source
-                .try_slice(Span::new(start as u32, content_end as u32))
+                .try_slice(Span::from_usize(start, content_end))
                 .map(|content_without_break| SourceLine {
                     content_start: start,
                     content_end,
@@ -3180,7 +3233,7 @@ fn invalid_document_marker(line: SourceLine<'_>) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             "invalid document marker",
-            Span::new(line.content_start as u32, line.content_end as u32),
+            Span::from_usize(line.content_start, line.content_end),
         )
         .with_expected("--- or ... followed by separation or line break"),
     )
@@ -3296,7 +3349,7 @@ fn invalid_block_scalar_header(offset: usize, found: char) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             format!("invalid block scalar header before `{found}`"),
-            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+            Span::from_usize(offset, offset + found.len_utf8()),
         )
         .with_expected("|, >, chomping indicator, or a one-digit indentation indicator"),
     )
@@ -3312,7 +3365,7 @@ fn reject_unexpected_line_start(body: &str, body_start: usize) -> Result<(), Yam
             Diagnostic::new(
                 DiagnosticKind::Parser,
                 format!("unexpected token `{first}`"),
-                Span::new(body_start as u32, (body_start + first.len_utf8()) as u32),
+                Span::from_usize(body_start, body_start + first.len_utf8()),
             )
             .with_expected("mapping entry, sequence entry, or scalar"),
         ))
@@ -3331,10 +3384,7 @@ fn count_indent(content: &str, content_start: usize) -> Result<usize, YamlError>
                     Diagnostic::new(
                         DiagnosticKind::Parser,
                         "tab character is not allowed in indentation",
-                        Span::new(
-                            (content_start + offset) as u32,
-                            (content_start + offset + 1) as u32,
-                        ),
+                        Span::from_usize(content_start + offset, content_start + offset + 1),
                     )
                     .with_expected("spaces for indentation"),
                 ));
@@ -3390,9 +3440,9 @@ fn reject_trailing_flow_content(
         Diagnostic::new(
             DiagnosticKind::Parser,
             format!("unexpected token `{character}` after flow collection"),
-            Span::new(
-                (absolute_start + offset) as u32,
-                (absolute_start + offset + character.len_utf8()) as u32,
+            Span::from_usize(
+                absolute_start + offset,
+                absolute_start + offset + character.len_utf8(),
             ),
         )
         .with_expected("line break or comment"),
@@ -3604,10 +3654,7 @@ fn double_quoted_flow_end(
         Diagnostic::new(
             DiagnosticKind::Parser,
             "unterminated double-quoted scalar in flow sequence",
-            Span::new(
-                (absolute_start + start) as u32,
-                (absolute_start + text.len()) as u32,
-            ),
+            Span::from_usize(absolute_start + start, absolute_start + text.len()),
         )
         .with_expected("closing \""),
     ))
@@ -3639,10 +3686,7 @@ fn single_quoted_flow_end(
         Diagnostic::new(
             DiagnosticKind::Parser,
             "unterminated single-quoted scalar in flow sequence",
-            Span::new(
-                (absolute_start + start) as u32,
-                (absolute_start + text.len()) as u32,
-            ),
+            Span::from_usize(absolute_start + start, absolute_start + text.len()),
         )
         .with_expected("closing '"),
     ))
@@ -3653,7 +3697,7 @@ fn missing_flow_sequence_end(absolute_start: usize, text_len: usize) -> YamlErro
         Diagnostic::new(
             DiagnosticKind::Parser,
             "missing flow sequence closing bracket",
-            Span::empty((absolute_start + text_len) as u32),
+            Span::empty_from_usize(absolute_start + text_len),
         )
         .with_expected("]"),
     )
@@ -3664,7 +3708,7 @@ fn empty_flow_sequence_item(offset: usize) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             "empty flow sequence item",
-            Span::empty(offset as u32),
+            Span::empty_from_usize(offset),
         )
         .with_expected("a scalar or nested flow sequence"),
     )
@@ -3675,7 +3719,7 @@ fn empty_flow_value(offset: usize) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             "empty flow value",
-            Span::empty(offset as u32),
+            Span::empty_from_usize(offset),
         )
         .with_expected("a scalar or nested flow collection"),
     )
@@ -3686,7 +3730,7 @@ fn unexpected_flow_comma(offset: usize) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             "unexpected comma in flow sequence",
-            Span::new(offset as u32, (offset + 1) as u32),
+            Span::from_usize(offset, offset + 1),
         )
         .with_expected("a scalar, nested flow sequence, or ]"),
     )
@@ -3697,7 +3741,7 @@ fn expected_flow_separator(offset: usize, found: char) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             format!("unexpected token `{found}` in flow sequence"),
-            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+            Span::from_usize(offset, offset + found.len_utf8()),
         )
         .with_expected(", or ]"),
     )
@@ -3708,7 +3752,7 @@ fn missing_flow_mapping_end(absolute_start: usize, text_len: usize) -> YamlError
         Diagnostic::new(
             DiagnosticKind::Parser,
             "missing flow mapping closing brace",
-            Span::empty((absolute_start + text_len) as u32),
+            Span::empty_from_usize(absolute_start + text_len),
         )
         .with_expected("}"),
     )
@@ -3719,7 +3763,7 @@ fn empty_flow_mapping_pair(offset: usize) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             "empty flow mapping pair",
-            Span::empty(offset as u32),
+            Span::empty_from_usize(offset),
         )
         .with_expected("a mapping key"),
     )
@@ -3730,7 +3774,7 @@ fn empty_flow_mapping_key(offset: usize) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             "empty flow mapping key",
-            Span::empty(offset as u32),
+            Span::empty_from_usize(offset),
         )
         .with_expected("a mapping key"),
     )
@@ -3741,7 +3785,7 @@ fn unexpected_flow_mapping_comma(offset: usize) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             "unexpected comma in flow mapping",
-            Span::new(offset as u32, (offset + 1) as u32),
+            Span::from_usize(offset, offset + 1),
         )
         .with_expected("a mapping key or }"),
     )
@@ -3752,7 +3796,7 @@ fn missing_flow_mapping_colon(offset: usize, found: char) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             format!("missing colon after flow mapping key before `{found}`"),
-            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+            Span::from_usize(offset, offset + found.len_utf8()),
         )
         .with_expected(":"),
     )
@@ -3763,7 +3807,7 @@ fn expected_flow_mapping_separator(offset: usize, found: char) -> YamlError {
         Diagnostic::new(
             DiagnosticKind::Parser,
             format!("unexpected token `{found}` in flow mapping"),
-            Span::new(offset as u32, (offset + found.len_utf8()) as u32),
+            Span::from_usize(offset, offset + found.len_utf8()),
         )
         .with_expected(", or }"),
     )
@@ -4042,9 +4086,7 @@ fn fold_quoted_scalar_lines(text: &str) -> String {
                 pending_breaks += 1;
             }
         } else {
-            if saw_content_line {
-                push_folded_quoted_breaks(&mut folded, pending_breaks);
-            } else if pending_breaks > 0 {
+            if saw_content_line || pending_breaks > 0 {
                 push_folded_quoted_breaks(&mut folded, pending_breaks);
             }
             folded.push_str(body);
@@ -4298,7 +4340,7 @@ fn next_literal_content_line(text: &str, start: usize) -> (&str, usize) {
     let mut index = start;
     while index < bytes.len() {
         if bytes[index] == b'\n' {
-            return (&text[start..index + 1], index + 1);
+            return (&text[start..=index], index + 1);
         }
         if bytes[index] == b'\r' {
             let end = if bytes.get(index + 1) == Some(&b'\n') {
@@ -4339,12 +4381,10 @@ fn detect_literal_content_indent(content: &str) -> usize {
 }
 
 fn strip_literal_indent(line: &str, indent: usize) -> &str {
-    let mut stripped = 0;
-    for (offset, byte) in line.bytes().enumerate() {
+    for (stripped, (offset, byte)) in line.bytes().enumerate().enumerate() {
         if stripped == indent || byte != b' ' {
             return &line[offset..];
         }
-        stripped += 1;
     }
     ""
 }
@@ -4683,6 +4723,11 @@ impl YamlDoc {
     ///
     /// This bootstrap parser preserves the input text exactly and records a root
     /// stream node. Real lexing and parsing will replace this placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when source validation, lexing, CST parsing, or semantic
+    /// graph composition fails.
     pub fn parse(input: &str) -> Result<Self, YamlError> {
         let source = Source::new(input.to_owned())?;
         let tokens = lex(&source).map_err(|error| error.with_position_from(&source))?;
@@ -4751,11 +4796,21 @@ impl YamlDoc {
     }
 
     /// Returns the root mapping graph node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document has no semantic root, the root is not
+    /// a document, or the document has no root block mapping.
     pub fn root_graph_mapping(&self) -> Result<GraphNodeId, YamlError> {
         self.root_mapping_graph()
     }
 
     /// Returns the first root-level block mapping in the document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no root block mapping exists or when the semantic
+    /// root mapping is not linked back to a CST node.
     pub fn root_mapping(&self) -> Result<NodeId, YamlError> {
         let mapping = self.root_mapping_graph()?;
         self.graph_node_cst(mapping).ok_or_else(|| {
@@ -4772,6 +4827,11 @@ impl YamlDoc {
     }
 
     /// Looks up a mapping entry by key inside `mapping`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the semantic graph contains an unknown graph node
+    /// while resolving the mapping entry.
     pub fn get_mapping_entry(
         &self,
         mapping: NodeId,
@@ -4790,6 +4850,11 @@ impl YamlDoc {
     }
 
     /// Looks up a mapping value by key inside `mapping`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the semantic graph contains an unknown graph node
+    /// while resolving the mapping value.
     pub fn get_mapping_value(
         &self,
         mapping: NodeId,
@@ -4805,14 +4870,20 @@ impl YamlDoc {
     }
 
     /// Looks up a nested path of mapping keys and returns the semantic graph node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document has no root mapping or when graph
+    /// traversal encounters an unknown graph node.
     pub fn get_graph_path(&self, path: &[&str]) -> Result<Option<GraphNodeId>, YamlError> {
         let Some((first, rest)) = path.split_first() else {
             return Ok(None);
         };
 
-        let mut current = match self.get_graph_mapping_entry(self.root_mapping_graph()?, first)? {
-            Some((_, value)) => value,
-            None => return Ok(None),
+        let Some((_, mut current)) =
+            self.get_graph_mapping_entry(self.root_mapping_graph()?, first)?
+        else {
+            return Ok(None);
         };
 
         for segment in rest {
@@ -4826,6 +4897,11 @@ impl YamlDoc {
     }
 
     /// Looks up a nested path of mapping keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when semantic path lookup fails while resolving the
+    /// graph path.
     pub fn get_path(&self, path: &[&str]) -> Result<Option<NodeId>, YamlError> {
         Ok(self
             .get_graph_path(path)?
@@ -4899,7 +4975,7 @@ impl YamlDoc {
             YamlError::new(Diagnostic::new(
                 DiagnosticKind::Semantic,
                 format!("unknown graph node id {}", node.0),
-                Span::empty(self.source.len() as u32),
+                Span::empty_from_usize(self.source.len()),
             ))
         })
     }
@@ -4910,7 +4986,7 @@ impl YamlDoc {
             .iter()
             .enumerate()
             .find(|(_, node)| node.cst == Some(cst))
-            .map(|(index, _)| GraphNodeId(index as u32))
+            .map(|(index, _)| GraphNodeId::from_usize(index))
     }
 
     fn graph_scalar_value(&self, node: NodeId) -> Option<&str> {
@@ -4953,6 +5029,11 @@ impl YamlDoc {
     }
 
     /// Returns the source text for a scalar node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node` is unknown or does not identify a plain CST
+    /// scalar node.
     pub fn scalar_text(&self, node: NodeId) -> Result<&str, YamlError> {
         let node = self.expect_node_kind(node, NodeKind::Scalar)?;
         Ok(self.source.slice(node.span))
@@ -4963,6 +5044,11 @@ impl YamlDoc {
     /// Plain scalars have trailing inline comments stripped, single-quoted
     /// scalars unescape doubled apostrophes, and double-quoted scalars unescape
     /// the common JSON/YAML escapes currently used by the typed overlay MVP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node` is unknown, is not a scalar node, has
+    /// malformed node properties, or contains unsupported scalar escape syntax.
     pub fn scalar_value(&self, node: NodeId) -> Result<String, YamlError> {
         if let Some(value) = self.graph_scalar_value(node) {
             return Ok(value.to_owned());
@@ -4994,6 +5080,13 @@ impl YamlDoc {
     /// Plain scalars remain plain, single-quoted scalars remain single-quoted,
     /// and double-quoted scalars remain double-quoted. Inline comments and
     /// trailing whitespace outside the scalar spelling are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `path` does not resolve to an existing scalar, the
+    /// current scalar style cannot be rewritten safely, `value` cannot be
+    /// represented in that style, or the queued edit conflicts with another
+    /// pending edit.
     pub fn set_scalar(&mut self, path: &[&str], value: &str) -> Result<(), YamlError> {
         let node = self.get_path(path)?.ok_or_else(|| {
             YamlError::new(
@@ -5015,6 +5108,11 @@ impl YamlDoc {
     ///
     /// The CST remains unchanged until the edited text is parsed again; callers
     /// can inspect the pending minimal-diff output through [`YamlDoc::to_string`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node` is unknown, `text` contains invalid YAML
+    /// characters, or the replacement overlaps an existing pending edit.
     pub fn replace_node_text(
         &mut self,
         node: NodeId,
@@ -5028,6 +5126,12 @@ impl YamlDoc {
     ///
     /// This MVP writer intentionally accepts raw plain scalar text. Later scalar
     /// writers will own quoting and schema-aware formatting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `mapping` is not a block mapping, `key` or `value`
+    /// is not valid as a plain mapping fragment, or the insertion conflicts with
+    /// another pending edit.
     pub fn insert_mapping_entry(
         &mut self,
         mapping: NodeId,
@@ -5043,6 +5147,12 @@ impl YamlDoc {
     ///
     /// Comments are emitted only for inserted entries; existing YAML comments are
     /// never overwritten by this helper.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `mapping` is not a block mapping, `key`, `value`, or
+    /// `comment` cannot be emitted as valid YAML text, or the insertion conflicts
+    /// with another pending edit.
     pub fn insert_mapping_entry_with_comment(
         &mut self,
         mapping: NodeId,
@@ -5071,10 +5181,16 @@ impl YamlDoc {
             preserve_paragraph_break,
         )?;
 
-        self.queue_edit(Span::empty(insertion_offset as u32), replacement)
+        self.queue_edit(Span::empty_from_usize(insertion_offset), replacement)
     }
 
     /// Queues insertion of a plain `key: value` entry before `before_entry`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `before_entry` is not a mapping entry, `key`,
+    /// `value`, or `comment` cannot be emitted as valid YAML text, or the
+    /// insertion conflicts with another pending edit.
     pub fn insert_mapping_entry_before_with_comment(
         &mut self,
         before_entry: NodeId,
@@ -5092,7 +5208,7 @@ impl YamlDoc {
         let replacement =
             self.format_mapping_entry_replacement(indent, key, value, comment, false, false)?;
 
-        self.queue_edit(Span::empty(insertion_offset as u32), replacement)
+        self.queue_edit(Span::empty_from_usize(insertion_offset), replacement)
     }
 
     /// Queues insertion according to a declaration-order key list.
@@ -5100,6 +5216,12 @@ impl YamlDoc {
     /// If a later key from `ordered_keys` already exists in `mapping`, the new
     /// entry is inserted before that entry. Otherwise this falls back to append
     /// insertion. This is the MVP primitive behind `insert_order = "struct"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when mapping lookup fails, the selected insertion target
+    /// has the wrong node kind, inserted text is invalid YAML, or the queued edit
+    /// conflicts with another pending edit.
     pub fn insert_mapping_entry_ordered_with_comment(
         &mut self,
         mapping: NodeId,
@@ -5130,6 +5252,11 @@ impl YamlDoc {
     ///
     /// The removal is line-wise, so comments and fields outside the selected entry
     /// remain byte-for-byte unchanged. Missing keys are a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when mapping lookup fails, the selected entry cannot be
+    /// removed, or the removal overlaps an existing pending edit.
     pub fn remove_mapping_entry(&mut self, mapping: NodeId, key: &str) -> Result<(), YamlError> {
         let Some(entry) = self.get_mapping_entry(mapping, key)? else {
             return Ok(());
@@ -5141,6 +5268,12 @@ impl YamlDoc {
     ///
     /// This is the patch-emitter primitive used by typed overlays that choose to
     /// prune unknown fields. It preserves the order and bytes of retained entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `mapping` is not a block mapping, a retained entry
+    /// cannot be inspected as a scalar key, or a removal edit conflicts with
+    /// another pending edit.
     pub fn retain_mapping_entries(
         &mut self,
         mapping: NodeId,
@@ -5175,6 +5308,11 @@ impl YamlDoc {
     ///
     /// Mapping and sequence entries are removed line-wise, including their line
     /// break when one is present. Other nodes use their exact source span.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node` is unknown or the removal overlaps an
+    /// existing pending edit.
     pub fn remove_node(&mut self, node: NodeId) -> Result<(), YamlError> {
         let node = self.expect_node(node)?;
         let span = if matches!(node.kind, NodeKind::MappingEntry | NodeKind::SequenceEntry) {
@@ -5213,7 +5351,10 @@ impl YamlDoc {
                 )
             })?;
             return Ok((
-                Span::new(node.span.start, node.span.start + end as u32),
+                Span::new(
+                    node.span.start,
+                    Span::offset_from_usize(node.span.start, end),
+                ),
                 ScalarStyle::DoubleQuoted,
             ));
         }
@@ -5230,7 +5371,10 @@ impl YamlDoc {
                 )
             })?;
             return Ok((
-                Span::new(node.span.start, node.span.start + end as u32),
+                Span::new(
+                    node.span.start,
+                    Span::offset_from_usize(node.span.start, end),
+                ),
                 ScalarStyle::SingleQuoted,
             ));
         }
@@ -5248,7 +5392,10 @@ impl YamlDoc {
         }
 
         Ok((
-            Span::new(node.span.start, node.span.start + end as u32),
+            Span::new(
+                node.span.start,
+                Span::offset_from_usize(node.span.start, end),
+            ),
             ScalarStyle::Plain,
         ))
     }
@@ -5258,7 +5405,7 @@ impl YamlDoc {
             YamlError::new(Diagnostic::new(
                 DiagnosticKind::Semantic,
                 format!("unknown node id {}", node.0),
-                Span::empty(self.source.len() as u32),
+                Span::empty_from_usize(self.source.len()),
             ))
         })
     }
@@ -5284,8 +5431,8 @@ impl YamlDoc {
         self.nodes.iter().enumerate().find_map(|(index, node)| {
             matches!(node.kind, NodeKind::MappingEntry | NodeKind::SequenceEntry)
                 .then_some(())
-                .filter(|_| node.children.contains(&value))
-                .map(|_| NodeId(index as u32))
+                .filter(|()| node.children.contains(&value))
+                .map(|()| NodeId::from_usize(index))
         })
     }
 
@@ -5364,7 +5511,7 @@ impl YamlDoc {
                     && self.node_indent(node) > parent_indent
             })
             .min_by_key(|(_, node)| node.span.start)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
     }
 
     fn queue_edit(&mut self, span: Span, replacement: String) -> Result<(), YamlError> {
@@ -5430,7 +5577,7 @@ impl YamlDoc {
             }
         }
 
-        Span::new(start as u32, end as u32)
+        Span::from_usize(start, end)
     }
 
     fn preferred_line_ending(&self) -> &str {
@@ -5499,95 +5646,7 @@ impl<'events> GraphComposer<'events> {
 
     fn compose(mut self) -> Result<SemanticGraph, YamlError> {
         for event in self.events {
-            match &event.kind {
-                YamlEventKind::StreamStart | YamlEventKind::StreamEnd => {}
-                YamlEventKind::DocumentStart { .. } => {
-                    let id = self.push_node(GraphNode {
-                        kind: GraphKind::Document {
-                            children: Vec::new(),
-                        },
-                        span: event.span,
-                        cst: self.find_cst_node(NodeKind::Document, event.span),
-                    });
-                    if self.root.is_none() {
-                        self.root = Some(id);
-                    }
-                    self.documents.push(id);
-                    self.stack.push(OpenGraphNode {
-                        id,
-                        kind: OpenGraphKind::Document,
-                    });
-                }
-                YamlEventKind::DocumentEnd { .. } => {
-                    self.close_expected(OpenGraphKind::Document, event.span)?;
-                }
-                YamlEventKind::MappingStart { style, tag, anchor } => {
-                    let id = self.push_node(GraphNode {
-                        kind: GraphKind::Mapping {
-                            style: *style,
-                            tag: tag.clone(),
-                            anchor: anchor.clone(),
-                            entries: Vec::new(),
-                        },
-                        span: event.span,
-                        cst: self.find_cst_node(mapping_node_kind(*style), event.span),
-                    });
-                    self.stack.push(OpenGraphNode {
-                        id,
-                        kind: OpenGraphKind::Mapping,
-                    });
-                }
-                YamlEventKind::MappingEnd => {
-                    let id = self.close_expected(OpenGraphKind::Mapping, event.span)?;
-                    self.attach_node(id, event.span)?;
-                }
-                YamlEventKind::SequenceStart { style, tag, anchor } => {
-                    let id = self.push_node(GraphNode {
-                        kind: GraphKind::Sequence {
-                            style: *style,
-                            tag: tag.clone(),
-                            anchor: anchor.clone(),
-                            items: Vec::new(),
-                        },
-                        span: event.span,
-                        cst: self.find_cst_node(sequence_node_kind(*style), event.span),
-                    });
-                    self.stack.push(OpenGraphNode {
-                        id,
-                        kind: OpenGraphKind::Sequence,
-                    });
-                }
-                YamlEventKind::SequenceEnd => {
-                    let id = self.close_expected(OpenGraphKind::Sequence, event.span)?;
-                    self.attach_node(id, event.span)?;
-                }
-                YamlEventKind::Scalar {
-                    style,
-                    value,
-                    tag,
-                    anchor,
-                } => {
-                    let id = self.push_node(GraphNode {
-                        kind: GraphKind::Scalar {
-                            style: *style,
-                            value: value.clone(),
-                            tag: tag.clone(),
-                            anchor: anchor.clone(),
-                        },
-                        span: event.span,
-                        cst: self.find_cst_node(scalar_node_kind(*style), event.span),
-                    });
-                    self.attach_node(id, event.span)?;
-                }
-                YamlEventKind::Alias { name } => {
-                    let id = self.push_node(GraphNode {
-                        kind: GraphKind::Alias { name: name.clone() },
-                        span: event.span,
-                        cst: self.find_cst_node(NodeKind::Scalar, event.span),
-                    });
-                    self.attach_node(id, event.span)?;
-                }
-            }
+            self.handle_event(event)?;
         }
 
         if !self.stack.is_empty() {
@@ -5613,8 +5672,146 @@ impl<'events> GraphComposer<'events> {
         })
     }
 
+    fn handle_event(&mut self, event: &YamlEvent) -> Result<(), YamlError> {
+        match &event.kind {
+            YamlEventKind::StreamStart | YamlEventKind::StreamEnd => Ok(()),
+            YamlEventKind::DocumentStart { .. } => {
+                self.open_document(event.span);
+                Ok(())
+            }
+            YamlEventKind::DocumentEnd { .. } => {
+                self.close_expected(OpenGraphKind::Document, event.span)?;
+                Ok(())
+            }
+            YamlEventKind::MappingStart { style, tag, anchor } => {
+                self.open_mapping(*style, tag.clone(), anchor.clone(), event.span);
+                Ok(())
+            }
+            YamlEventKind::MappingEnd => self.close_and_attach(OpenGraphKind::Mapping, event.span),
+            YamlEventKind::SequenceStart { style, tag, anchor } => {
+                self.open_sequence(*style, tag.clone(), anchor.clone(), event.span);
+                Ok(())
+            }
+            YamlEventKind::SequenceEnd => {
+                self.close_and_attach(OpenGraphKind::Sequence, event.span)
+            }
+            YamlEventKind::Scalar {
+                style,
+                value,
+                tag,
+                anchor,
+            } => self.attach_scalar(
+                *style,
+                value.clone(),
+                tag.clone(),
+                anchor.clone(),
+                event.span,
+            ),
+            YamlEventKind::Alias { name } => self.attach_alias(name.clone(), event.span),
+        }
+    }
+
+    fn open_document(&mut self, span: Span) {
+        let id = self.push_node(GraphNode {
+            kind: GraphKind::Document {
+                children: Vec::new(),
+            },
+            span,
+            cst: self.find_cst_node(NodeKind::Document, span),
+        });
+        if self.root.is_none() {
+            self.root = Some(id);
+        }
+        self.documents.push(id);
+        self.stack.push(OpenGraphNode {
+            id,
+            kind: OpenGraphKind::Document,
+        });
+    }
+
+    fn open_mapping(
+        &mut self,
+        style: CollectionStyle,
+        tag: Option<String>,
+        anchor: Option<String>,
+        span: Span,
+    ) {
+        let id = self.push_node(GraphNode {
+            kind: GraphKind::Mapping {
+                style,
+                tag,
+                anchor,
+                entries: Vec::new(),
+            },
+            span,
+            cst: self.find_cst_node(mapping_node_kind(style), span),
+        });
+        self.stack.push(OpenGraphNode {
+            id,
+            kind: OpenGraphKind::Mapping,
+        });
+    }
+
+    fn open_sequence(
+        &mut self,
+        style: CollectionStyle,
+        tag: Option<String>,
+        anchor: Option<String>,
+        span: Span,
+    ) {
+        let id = self.push_node(GraphNode {
+            kind: GraphKind::Sequence {
+                style,
+                tag,
+                anchor,
+                items: Vec::new(),
+            },
+            span,
+            cst: self.find_cst_node(sequence_node_kind(style), span),
+        });
+        self.stack.push(OpenGraphNode {
+            id,
+            kind: OpenGraphKind::Sequence,
+        });
+    }
+
+    fn close_and_attach(&mut self, expected: OpenGraphKind, span: Span) -> Result<(), YamlError> {
+        let id = self.close_expected(expected, span)?;
+        self.attach_node(id, span)
+    }
+
+    fn attach_scalar(
+        &mut self,
+        style: YamlScalarStyle,
+        value: String,
+        tag: Option<String>,
+        anchor: Option<String>,
+        span: Span,
+    ) -> Result<(), YamlError> {
+        let id = self.push_node(GraphNode {
+            kind: GraphKind::Scalar {
+                style,
+                value,
+                tag,
+                anchor,
+            },
+            span,
+            cst: self.find_cst_node(scalar_node_kind(style), span),
+        });
+        self.attach_node(id, span)
+    }
+
+    fn attach_alias(&mut self, name: String, span: Span) -> Result<(), YamlError> {
+        let id = self.push_node(GraphNode {
+            kind: GraphKind::Alias { name },
+            span,
+            cst: self.find_cst_node(NodeKind::Scalar, span),
+        });
+        self.attach_node(id, span)
+    }
+
     fn push_node(&mut self, node: GraphNode) -> GraphNodeId {
-        let id = GraphNodeId(self.graph_nodes.len() as u32);
+        let id = GraphNodeId::from_usize(self.graph_nodes.len());
         self.graph_nodes.push(node);
         id
     }
@@ -5637,7 +5834,7 @@ impl<'events> GraphComposer<'events> {
         let Some(parent) = self.stack.last().copied() else {
             return Ok(());
         };
-        match &mut self.graph_nodes[parent.id.0 as usize].kind {
+        match &mut self.graph_nodes[parent.id.as_usize()].kind {
             GraphKind::Document { children } => {
                 children.push(child);
                 Ok(())
@@ -5672,7 +5869,7 @@ impl<'events> GraphComposer<'events> {
                     .enumerate()
                     .find(|(_, node)| node.kind == kind && node.span.start == span.start)
             })
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
     }
 }
 
@@ -5855,21 +6052,44 @@ pub type ParseError = YamlError;
 pub trait FromYamlDoc: Sized {
     /// Reads `Self` from `doc` while preserving the document as the source of
     /// truth for future edits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the implementing overlay cannot be read from the
+    /// document or when required YAML paths, node kinds, or scalar values are
+    /// invalid for that overlay.
     fn from_yaml_doc(doc: &YamlDoc) -> Result<Self, YamlError>;
 }
 
 /// Applies a typed overlay back to a YAML document as minimal patches.
 pub trait ToYamlDoc {
     /// Writes `self` into `doc` without discarding unknown fields or comments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the implementing overlay cannot be written to the
+    /// document, when generated YAML is invalid, or when a queued edit conflicts
+    /// with another pending edit.
     fn apply_to_yaml_doc(&self, doc: &mut YamlDoc) -> Result<(), YamlError>;
 }
 
 /// Reads and writes individual YAML node values.
 pub trait YamlValue: Sized {
     /// Reads a typed value from `node`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node` is unknown, has an unsupported YAML kind, or
+    /// cannot be decoded as `Self`.
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError>;
 
     /// Writes a typed value into an existing node or inserts a new node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be represented in the target YAML
+    /// shape, when insertion requires a missing parent context, or when the edit
+    /// cannot be queued.
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError>;
 }
 
@@ -6055,14 +6275,13 @@ where
     }
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
-        match self {
-            Some(value) => value.write_yaml(doc, node),
-            None => {
-                let node = node.ok_or_else(missing_write_node_error)?;
-                let remove_node = doc.containing_entry(node).unwrap_or(node);
-                doc.remove_node(remove_node)?;
-                Ok(node)
-            }
+        if let Some(value) = self {
+            value.write_yaml(doc, node)
+        } else {
+            let node = node.ok_or_else(missing_write_node_error)?;
+            let remove_node = doc.containing_entry(node).unwrap_or(node);
+            doc.remove_node(remove_node)?;
+            Ok(node)
         }
     }
 }
@@ -7534,7 +7753,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowSequence)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow sequence exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7550,7 +7769,7 @@ ports:
             .iter()
             .enumerate()
             .filter(|(_, node)| node.kind == NodeKind::FlowSequence)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .collect();
 
         assert_eq!(doc.to_string(), input);
@@ -7623,7 +7842,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowMapping)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow mapping exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7658,7 +7877,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowMapping)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow mapping exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7677,7 +7896,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowMapping)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow mapping exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7696,7 +7915,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowMapping)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow mapping exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7728,7 +7947,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowSequence)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow sequence exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7747,7 +7966,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowMapping)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow mapping exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7782,7 +8001,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowSequence)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow sequence exists");
 
         assert_eq!(doc.to_string(), input);
@@ -7802,7 +8021,7 @@ ports:
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FlowMapping)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .expect("flow mapping exists");
 
         assert_eq!(sequence_doc.to_string(), sequence_input);
@@ -7819,7 +8038,7 @@ ports:
             .iter()
             .enumerate()
             .filter(|(_, node)| node.kind == NodeKind::FlowMapping)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
             .next()
             .expect("flow mapping exists");
 
@@ -8304,7 +8523,7 @@ debug: false
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::LiteralScalar)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
     }
 
     fn folded_scalar(doc: &YamlDoc) -> Option<NodeId> {
@@ -8312,7 +8531,7 @@ debug: false
             .iter()
             .enumerate()
             .find(|(_, node)| node.kind == NodeKind::FoldedScalar)
-            .map(|(index, _)| NodeId(index as u32))
+            .map(|(index, _)| NodeId::from_usize(index))
     }
 
     fn flow_sequence_scalar_texts(doc: &YamlDoc, sequence: NodeId) -> Vec<&str> {

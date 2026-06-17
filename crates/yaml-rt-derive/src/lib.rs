@@ -76,203 +76,42 @@ struct FieldOptions {
     flatten: bool,
 }
 
+struct FieldExpansion {
+    reads: Vec<TokenStream2>,
+    writes: Vec<TokenStream2>,
+    known_keys: Vec<String>,
+    has_flatten: bool,
+}
+
 fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
     let struct_options = parse_struct_options(&input.attrs)?;
     let name = input.ident;
-    let fields = match input.data {
-        Data::Struct(struct_data) => match struct_data.fields {
-            Fields::Named(fields) => fields.named,
-            _ => {
-                return Err(syn::Error::new_spanned(
-                    name,
-                    "YamlRoundTrip MVP supports only structs with named fields",
-                ));
-            }
-        },
-        _ => {
-            return Err(syn::Error::new_spanned(
-                name,
-                "YamlRoundTrip can only be derived for structs",
-            ));
-        }
-    };
-
-    let mut field_reads = Vec::new();
-    let mut field_writes = Vec::new();
-    let mut known_keys = Vec::new();
-    let mut has_flatten = false;
-
-    for field in fields {
-        let options = parse_field_options(&field.attrs)?;
-        let Some(field_name) = field.ident else {
-            return Err(syn::Error::new_spanned(
-                field,
-                "YamlRoundTrip MVP supports only named fields",
-            ));
-        };
-        let field_type = field.ty;
-        let insert_order = struct_options.insert_order;
-        if options.flatten {
-            has_flatten = true;
-            if options.skip {
-                return Err(syn::Error::new_spanned(
-                    field_name,
-                    "yaml(flatten) cannot be combined with yaml(skip)",
-                ));
-            }
-            if options.rename.is_some()
-                || !options.aliases.is_empty()
-                || options.default.is_some()
-                || options.comment.is_some()
-                || options.skip_serializing_if.is_some()
-            {
-                return Err(syn::Error::new_spanned(
-                    field_name,
-                    "yaml(flatten) cannot be combined with rename, alias, default, comment, or skip_serializing_if in this milestone",
-                ));
-            }
-
-            field_reads.push(quote! {
-                #field_name: <#field_type as ::yaml_rt::FromYamlDoc>::from_yaml_doc(doc)?
-            });
-            field_writes.push(quote! {
-                ::yaml_rt::ToYamlDoc::apply_to_yaml_doc(&self.#field_name, doc)?;
-            });
-            continue;
-        }
-
-        let yaml_key = options.rename.unwrap_or_else(|| field_name.to_string());
-        known_keys.push(yaml_key.clone());
-        let aliases = options.aliases;
-        known_keys.extend(aliases.iter().cloned());
-        let insert_comment = match options.comment.or(options.doc_comment) {
-            Some(comment) => quote! { Some(#comment) },
-            None => quote! { None },
-        };
-        let skip_serializing_if = options.skip_serializing_if;
-
-        if options.skip {
-            field_reads.push(quote! {
-                #field_name: ::core::default::Default::default()
-            });
-            continue;
-        }
-
-        let missing_read = if let Some(default) = options.default {
-            quote! { #default }
-        } else {
-            quote! {
-                return Err(::yaml_rt::YamlError::new(
-                    ::yaml_rt::Diagnostic::new(
-                        ::yaml_rt::DiagnosticKind::Typed,
-                        concat!("missing required field `", #yaml_key, "`"),
-                        ::yaml_rt::Span::empty(0),
-                    )
-                    .with_expected(#yaml_key)
-                ));
-            }
-        };
-
-        field_reads.push(quote! {
-            #field_name: {
-                let mut node = doc.get_path(&[#yaml_key])?;
-                #(
-                    if node.is_none() {
-                        node = doc.get_path(&[#aliases])?;
-                    }
-                )*
-                match node {
-                    Some(node) => <#field_type as ::yaml_rt::YamlValue>::read_yaml(doc, node)?,
-                    None => { #missing_read }
-                }
-            }
-        });
-
-        let insert_missing_field = match insert_order {
-            InsertOrder::Append => quote! {
-                doc.insert_mapping_entry_with_comment(
-                    root,
-                    #yaml_key,
-                    &self.#field_name.to_string(),
-                    ::yaml_rt::MappingEntryStyle::default(),
-                    #insert_comment,
-                )?;
-            },
-            InsertOrder::Struct => quote! {
-                doc.insert_mapping_entry_ordered_with_comment(
-                    root,
-                    #yaml_key,
-                    &self.#field_name.to_string(),
-                    ::yaml_rt::MappingEntryStyle::default(),
-                    #insert_comment,
-                    __yaml_rt_ordered_keys,
-                )?;
-            },
-        };
-
-        let write_field = quote! {
-            let mut node = doc.get_path(&[#yaml_key])?;
-            #(
-                if node.is_none() {
-                    node = doc.get_path(&[#aliases])?;
-                }
-            )*
-            if let Some(node) = node {
-                <#field_type as ::yaml_rt::YamlValue>::write_yaml(&self.#field_name, doc, Some(node))?;
-            } else {
-                #insert_missing_field
-            }
-        };
-
-        if let Some(predicate) = skip_serializing_if {
-            field_writes.push(quote! {
-                if #predicate(&self.#field_name) {
-                    if doc.get_mapping_entry(root, #yaml_key)?.is_some() {
-                        doc.remove_mapping_entry(root, #yaml_key)?;
-                    } else {
-                        #(
-                            if doc.get_mapping_entry(root, #aliases)?.is_some() {
-                                doc.remove_mapping_entry(root, #aliases)?;
-                            }
-                        )*
-                    }
-                } else {
-                    #write_field
-                }
-            });
-        } else {
-            field_writes.push(write_field);
-        }
-    }
-
-    if struct_options.insert_order == InsertOrder::Struct && has_flatten {
-        return Err(syn::Error::new_spanned(
-            name.clone(),
-            "yaml(insert_order = \"struct\") cannot be combined with yaml(flatten) in this milestone",
-        ));
-    }
-
-    if struct_options.unknown_field_policy == UnknownFieldPolicy::Prune && has_flatten {
-        return Err(syn::Error::new_spanned(
-            name.clone(),
-            "yaml(prune_unknown_fields) cannot be combined with yaml(flatten) in this milestone",
-        ));
-    }
+    let fields = named_struct_fields(input.data, &name)?;
+    let fields = expand_fields(fields, struct_options.insert_order)?;
+    validate_struct_options(&name, &struct_options, fields.has_flatten)?;
 
     let ordered_keys_binding = match struct_options.insert_order {
         InsertOrder::Append => quote! {},
-        InsertOrder::Struct => quote! {
-            let __yaml_rt_ordered_keys = &[#(#known_keys),*];
-        },
+        InsertOrder::Struct => {
+            let known_keys = &fields.known_keys;
+            quote! {
+                let __yaml_rt_ordered_keys = &[#(#known_keys),*];
+            }
+        }
     };
 
     let prune_unknown_fields = match struct_options.unknown_field_policy {
         UnknownFieldPolicy::Preserve => quote! {},
-        UnknownFieldPolicy::Prune => quote! {
-            doc.retain_mapping_entries(root, &[#(#known_keys),*])?;
-        },
+        UnknownFieldPolicy::Prune => {
+            let known_keys = &fields.known_keys;
+            quote! {
+                doc.retain_mapping_entries(root, &[#(#known_keys),*])?;
+            }
+        }
     };
 
+    let field_reads = fields.reads;
+    let field_writes = fields.writes;
     Ok(quote! {
         impl ::yaml_rt::FromYamlDoc for #name {
             fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
@@ -292,6 +131,289 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     })
+}
+
+fn named_struct_fields(
+    data: Data,
+    name: &syn::Ident,
+) -> syn::Result<syn::punctuated::Punctuated<syn::Field, syn::token::Comma>> {
+    match data {
+        Data::Struct(struct_data) => match struct_data.fields {
+            Fields::Named(fields) => Ok(fields.named),
+            _ => Err(syn::Error::new_spanned(
+                name,
+                "YamlRoundTrip MVP supports only structs with named fields",
+            )),
+        },
+        _ => Err(syn::Error::new_spanned(
+            name,
+            "YamlRoundTrip can only be derived for structs",
+        )),
+    }
+}
+
+fn expand_fields(
+    fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+    insert_order: InsertOrder,
+) -> syn::Result<FieldExpansion> {
+    let mut field_reads = Vec::new();
+    let mut field_writes = Vec::new();
+    let mut known_keys = Vec::new();
+    let mut has_flatten = false;
+
+    for field in fields {
+        let options = parse_field_options(&field.attrs)?;
+        let Some(field_name) = field.ident else {
+            return Err(syn::Error::new_spanned(
+                field,
+                "YamlRoundTrip MVP supports only named fields",
+            ));
+        };
+        let field_type = field.ty;
+        if options.flatten {
+            has_flatten = true;
+            push_flatten_field(
+                &mut field_reads,
+                &mut field_writes,
+                &field_name,
+                &field_type,
+                &options,
+            )?;
+            continue;
+        }
+
+        push_regular_field(
+            &mut field_reads,
+            &mut field_writes,
+            &mut known_keys,
+            &field_name,
+            &field_type,
+            &options,
+            insert_order,
+        );
+    }
+
+    Ok(FieldExpansion {
+        reads: field_reads,
+        writes: field_writes,
+        known_keys,
+        has_flatten,
+    })
+}
+
+fn push_flatten_field(
+    field_reads: &mut Vec<TokenStream2>,
+    field_writes: &mut Vec<TokenStream2>,
+    field_name: &syn::Ident,
+    field_type: &syn::Type,
+    options: &FieldOptions,
+) -> syn::Result<()> {
+    if options.skip {
+        return Err(syn::Error::new_spanned(
+            field_name,
+            "yaml(flatten) cannot be combined with yaml(skip)",
+        ));
+    }
+    if options.rename.is_some()
+        || !options.aliases.is_empty()
+        || options.default.is_some()
+        || options.comment.is_some()
+        || options.skip_serializing_if.is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            field_name,
+            "yaml(flatten) cannot be combined with rename, alias, default, comment, or skip_serializing_if in this milestone",
+        ));
+    }
+
+    field_reads.push(quote! {
+        #field_name: <#field_type as ::yaml_rt::FromYamlDoc>::from_yaml_doc(doc)?
+    });
+    field_writes.push(quote! {
+        ::yaml_rt::ToYamlDoc::apply_to_yaml_doc(&self.#field_name, doc)?;
+    });
+    Ok(())
+}
+
+fn push_regular_field(
+    field_reads: &mut Vec<TokenStream2>,
+    field_writes: &mut Vec<TokenStream2>,
+    known_keys: &mut Vec<String>,
+    field_name: &syn::Ident,
+    field_type: &syn::Type,
+    options: &FieldOptions,
+    insert_order: InsertOrder,
+) {
+    let yaml_key = options
+        .rename
+        .clone()
+        .unwrap_or_else(|| field_name.to_string());
+    known_keys.push(yaml_key.clone());
+    let aliases = options.aliases.clone();
+    known_keys.extend(aliases.iter().cloned());
+    let insert_comment = if let Some(comment) = options
+        .comment
+        .clone()
+        .or_else(|| options.doc_comment.clone())
+    {
+        quote! { Some(#comment) }
+    } else {
+        quote! { None }
+    };
+    let skip_serializing_if = options.skip_serializing_if.clone();
+
+    if options.skip {
+        field_reads.push(quote! {
+            #field_name: ::core::default::Default::default()
+        });
+        return;
+    }
+
+    let missing_read = missing_field_read(&yaml_key, options.default.clone());
+    field_reads.push(quote! {
+        #field_name: {
+            let mut node = doc.get_path(&[#yaml_key])?;
+            #(
+                if node.is_none() {
+                    node = doc.get_path(&[#aliases])?;
+                }
+            )*
+            match node {
+                Some(node) => <#field_type as ::yaml_rt::YamlValue>::read_yaml(doc, node)?,
+                None => { #missing_read }
+            }
+        }
+    });
+
+    let write_field = write_field_tokens(
+        field_name,
+        field_type,
+        &yaml_key,
+        &aliases,
+        insert_order,
+        &insert_comment,
+    );
+    push_field_write(
+        field_writes,
+        field_name,
+        &yaml_key,
+        &aliases,
+        skip_serializing_if,
+        write_field,
+    );
+}
+
+fn missing_field_read(yaml_key: &str, default: Option<TokenStream2>) -> TokenStream2 {
+    if let Some(default) = default {
+        quote! { #default }
+    } else {
+        quote! {
+            return Err(::yaml_rt::YamlError::new(
+                ::yaml_rt::Diagnostic::new(
+                    ::yaml_rt::DiagnosticKind::Typed,
+                    concat!("missing required field `", #yaml_key, "`"),
+                    ::yaml_rt::Span::empty(0),
+                )
+                .with_expected(#yaml_key)
+            ));
+        }
+    }
+}
+
+fn write_field_tokens(
+    field_name: &syn::Ident,
+    field_type: &syn::Type,
+    yaml_key: &str,
+    aliases: &[String],
+    insert_order: InsertOrder,
+    insert_comment: &TokenStream2,
+) -> TokenStream2 {
+    let insert_missing_field = match insert_order {
+        InsertOrder::Append => quote! {
+            doc.insert_mapping_entry_with_comment(
+                root,
+                #yaml_key,
+                &self.#field_name.to_string(),
+                ::yaml_rt::MappingEntryStyle::default(),
+                #insert_comment,
+            )?;
+        },
+        InsertOrder::Struct => quote! {
+            doc.insert_mapping_entry_ordered_with_comment(
+                root,
+                #yaml_key,
+                &self.#field_name.to_string(),
+                ::yaml_rt::MappingEntryStyle::default(),
+                #insert_comment,
+                __yaml_rt_ordered_keys,
+            )?;
+        },
+    };
+
+    quote! {
+        let mut node = doc.get_path(&[#yaml_key])?;
+        #(
+            if node.is_none() {
+                node = doc.get_path(&[#aliases])?;
+            }
+        )*
+        if let Some(node) = node {
+            <#field_type as ::yaml_rt::YamlValue>::write_yaml(&self.#field_name, doc, Some(node))?;
+        } else {
+            #insert_missing_field
+        }
+    }
+}
+
+fn push_field_write(
+    field_writes: &mut Vec<TokenStream2>,
+    field_name: &syn::Ident,
+    yaml_key: &str,
+    aliases: &[String],
+    skip_serializing_if: Option<Path>,
+    write_field: TokenStream2,
+) {
+    if let Some(predicate) = skip_serializing_if {
+        field_writes.push(quote! {
+            if #predicate(&self.#field_name) {
+                if doc.get_mapping_entry(root, #yaml_key)?.is_some() {
+                    doc.remove_mapping_entry(root, #yaml_key)?;
+                } else {
+                    #(
+                        if doc.get_mapping_entry(root, #aliases)?.is_some() {
+                            doc.remove_mapping_entry(root, #aliases)?;
+                        }
+                    )*
+                }
+            } else {
+                #write_field
+            }
+        });
+    } else {
+        field_writes.push(write_field);
+    }
+}
+
+fn validate_struct_options(
+    name: &syn::Ident,
+    struct_options: &StructOptions,
+    has_flatten: bool,
+) -> syn::Result<()> {
+    if struct_options.insert_order == InsertOrder::Struct && has_flatten {
+        return Err(syn::Error::new_spanned(
+            name.clone(),
+            "yaml(insert_order = \"struct\") cannot be combined with yaml(flatten) in this milestone",
+        ));
+    }
+
+    if struct_options.unknown_field_policy == UnknownFieldPolicy::Prune && has_flatten {
+        return Err(syn::Error::new_spanned(
+            name.clone(),
+            "yaml(prune_unknown_fields) cannot be combined with yaml(flatten) in this milestone",
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_struct_options(attrs: &[Attribute]) -> syn::Result<StructOptions> {
@@ -336,7 +458,7 @@ fn parse_field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
 
     for attr in attrs {
         if attr.path().is_ident("doc") {
-            collect_doc_comment(attr, &mut options)?;
+            collect_doc_comment(attr, &mut options);
         } else if attr.path().is_ident("yaml") {
             parse_yaml_attr(attr, &mut options)?;
         }
@@ -345,31 +467,28 @@ fn parse_field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
     Ok(options)
 }
 
-fn collect_doc_comment(attr: &Attribute, options: &mut FieldOptions) -> syn::Result<()> {
+fn collect_doc_comment(attr: &Attribute, options: &mut FieldOptions) {
     let Meta::NameValue(meta) = &attr.meta else {
-        return Ok(());
+        return;
     };
     let syn::Expr::Lit(expr) = &meta.value else {
-        return Ok(());
+        return;
     };
     let syn::Lit::Str(text) = &expr.lit else {
-        return Ok(());
+        return;
     };
 
     let text = text.value().trim().to_owned();
     if text.is_empty() {
-        return Ok(());
+        return;
     }
 
-    match &mut options.doc_comment {
-        Some(existing) => {
-            existing.push('\n');
-            existing.push_str(&text);
-        }
-        None => options.doc_comment = Some(text),
+    if let Some(existing) = &mut options.doc_comment {
+        existing.push('\n');
+        existing.push_str(&text);
+    } else {
+        options.doc_comment = Some(text);
     }
-
-    Ok(())
 }
 
 fn parse_yaml_attr(attr: &Attribute, options: &mut FieldOptions) -> syn::Result<()> {

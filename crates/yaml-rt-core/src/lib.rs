@@ -926,6 +926,12 @@ impl<'source> Parser<'source> {
             self.nodes[document.0 as usize].children.push(node);
             self.emit_node_event(node)?;
             Ok(consumed)
+        } else if body.starts_with('"') {
+            let (node, consumed) =
+                self.parse_quoted_scalar_lines(lines, index, absolute_start, '"')?;
+            self.nodes[document.0 as usize].children.push(node);
+            self.emit_scalar_event(node)?;
+            Ok(consumed)
         } else if let Some(colon_byte) = find_mapping_colon(body) {
             self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
         } else {
@@ -936,6 +942,48 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(scalar)?;
             Ok(1)
         }
+    }
+
+    fn parse_quoted_scalar_lines(
+        &mut self,
+        lines: &[SourceLine<'_>],
+        index: usize,
+        absolute_start: usize,
+        quote: char,
+    ) -> Result<(NodeId, usize), YamlError> {
+        let source_tail = &self.source.as_str()[absolute_start..];
+        let end = match quote {
+            '"' => double_quoted_scalar_end(source_tail),
+            '\'' => single_quoted_scalar_end(source_tail),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Typed,
+                    "could not decode quoted scalar",
+                    Span::empty(absolute_start as u32),
+                )
+                .with_expected("a closed quoted scalar"),
+            )
+        })?;
+        let absolute_end = absolute_start + end;
+        let mut consumed = 1;
+        for line in &lines[index + 1..] {
+            if line.content_start < absolute_end {
+                consumed += 1;
+            } else {
+                break;
+            }
+        }
+
+        Ok((
+            self.push_node(
+                NodeKind::Scalar,
+                Span::new(absolute_start as u32, absolute_end as u32),
+            ),
+            consumed,
+        ))
     }
 
     fn flow_collection_text<'lines>(
@@ -3633,7 +3681,8 @@ fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
                 .with_expected("a closed double-quoted scalar"),
             )
         })?;
-        let folded = fold_quoted_scalar_lines(&text[1..end - 1]);
+        let continued = strip_double_quoted_line_continuations(&text[1..end - 1]);
+        let folded = fold_quoted_scalar_lines(&continued);
         return decode_double_quoted_scalar(&folded);
     }
 
@@ -3686,6 +3735,8 @@ fn fold_quoted_scalar_lines(text: &str) -> String {
         } else {
             if saw_content_line {
                 push_folded_quoted_breaks(&mut folded, pending_breaks);
+            } else if pending_breaks > 0 {
+                push_folded_quoted_breaks(&mut folded, pending_breaks);
             }
             folded.push_str(body);
             pending_breaks = usize::from(!break_text.is_empty());
@@ -3696,11 +3747,36 @@ fn fold_quoted_scalar_lines(text: &str) -> String {
         position = next_position;
     }
 
-    if pending_breaks > 0 && !saw_content_line {
+    if pending_breaks > 0 {
         push_folded_quoted_breaks(&mut folded, pending_breaks);
     }
 
     folded
+}
+
+fn strip_double_quoted_line_continuations(text: &str) -> String {
+    let mut output = String::new();
+    let mut position = 0;
+
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        if character == '\\'
+            && text[position + character.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(|next| matches!(next, '\n' | '\r'))
+        {
+            position = skip_escaped_line_break(text, position + character.len_utf8());
+        } else {
+            output.push(character);
+            position += character.len_utf8();
+        }
+    }
+
+    output
 }
 
 fn push_folded_quoted_breaks(output: &mut String, breaks: usize) {
@@ -4058,6 +4134,7 @@ fn escape_event_value(value: &str) -> String {
     for character in value.chars() {
         match character {
             '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
@@ -4069,15 +4146,21 @@ fn escape_event_value(value: &str) -> String {
 
 fn decode_double_quoted_scalar(text: &str) -> Result<String, YamlError> {
     let mut output = String::new();
-    let mut chars = text.chars();
+    let mut position = 0;
 
-    while let Some(character) = chars.next() {
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
         if character != '\\' {
             output.push(character);
+            position += character.len_utf8();
             continue;
         }
 
-        let Some(escaped) = chars.next() else {
+        position += '\\'.len_utf8();
+        let Some(escaped) = text[position..].chars().next() else {
             return Err(YamlError::new(
                 Diagnostic::new(
                     DiagnosticKind::Typed,
@@ -4089,23 +4172,133 @@ fn decode_double_quoted_scalar(text: &str) -> Result<String, YamlError> {
         };
 
         match escaped {
-            '"' => output.push('"'),
-            '\\' => output.push('\\'),
-            '/' => output.push('/'),
-            '0' => output.push('\0'),
-            'a' => output.push('\u{0007}'),
-            'b' => output.push('\u{0008}'),
-            't' | '\t' => output.push('\t'),
-            'n' => output.push('\n'),
-            'v' => output.push('\u{000B}'),
-            'f' => output.push('\u{000C}'),
-            'r' => output.push('\r'),
-            'e' => output.push('\u{001B}'),
-            other => output.push(other),
+            '"' => {
+                output.push('"');
+                position += escaped.len_utf8();
+            }
+            '\\' => {
+                output.push('\\');
+                position += escaped.len_utf8();
+            }
+            '/' => {
+                output.push('/');
+                position += escaped.len_utf8();
+            }
+            '0' => {
+                output.push('\0');
+                position += escaped.len_utf8();
+            }
+            'a' => {
+                output.push('\u{0007}');
+                position += escaped.len_utf8();
+            }
+            'b' => {
+                output.push('\u{0008}');
+                position += escaped.len_utf8();
+            }
+            't' | '\t' => {
+                output.push('\t');
+                position += escaped.len_utf8();
+            }
+            'n' => {
+                output.push('\n');
+                position += escaped.len_utf8();
+            }
+            'v' => {
+                output.push('\u{000B}');
+                position += escaped.len_utf8();
+            }
+            'f' => {
+                output.push('\u{000C}');
+                position += escaped.len_utf8();
+            }
+            'r' => {
+                output.push('\r');
+                position += escaped.len_utf8();
+            }
+            'e' => {
+                output.push('\u{001B}');
+                position += escaped.len_utf8();
+            }
+            'x' => {
+                let (character, next) = decode_hex_escape(text, position + escaped.len_utf8(), 2)?;
+                output.push(character);
+                position = next;
+            }
+            'u' => {
+                let (character, next) = decode_hex_escape(text, position + escaped.len_utf8(), 4)?;
+                output.push(character);
+                position = next;
+            }
+            'U' => {
+                let (character, next) = decode_hex_escape(text, position + escaped.len_utf8(), 8)?;
+                output.push(character);
+                position = next;
+            }
+            '\n' | '\r' => {
+                position = skip_escaped_line_break(text, position);
+            }
+            other => {
+                output.push(other);
+                position += other.len_utf8();
+            }
         }
     }
 
     Ok(output)
+}
+
+fn decode_hex_escape(text: &str, start: usize, digits: usize) -> Result<(char, usize), YamlError> {
+    let end = start + digits;
+    let Some(hex) = text.get(start..end) else {
+        return Err(invalid_double_quoted_escape(
+            "truncated double-quoted hex escape",
+        ));
+    };
+    if !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(invalid_double_quoted_escape(
+            "invalid double-quoted hex escape",
+        ));
+    }
+    let value = u32::from_str_radix(hex, 16)
+        .map_err(|_| invalid_double_quoted_escape("invalid double-quoted hex escape"))?;
+    let Some(character) = char::from_u32(value) else {
+        return Err(invalid_double_quoted_escape(
+            "invalid Unicode scalar value in double-quoted escape",
+        ));
+    };
+
+    Ok((character, end))
+}
+
+fn skip_escaped_line_break(text: &str, position: usize) -> usize {
+    let mut next = if text[position..].starts_with("\r\n") {
+        position + 2
+    } else {
+        position
+            + text[position..]
+                .chars()
+                .next()
+                .expect("position is inside text")
+                .len_utf8()
+    };
+
+    while let Some(character) = text[next..].chars().next() {
+        if matches!(character, ' ' | '\t') {
+            next += character.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    next
+}
+
+fn invalid_double_quoted_escape(message: &'static str) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(DiagnosticKind::Typed, message, Span::empty(0))
+            .with_expected("a valid double-quoted escape"),
+    )
 }
 
 /// Pending source edit used by the patch-based emitter.
@@ -5864,6 +6057,48 @@ single: 'hello'
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :plain\n=VAL :value\n=VAL :single\n=VAL 'Bob's\n=VAL :double\n=VAL \"line\\nnext\n=VAL :literal\n=VAL |one\\ntwo\\n\n=VAL :folded\n=VAL >one two\\n\n-MAP\n-DOC\n-STR\n"
         );
+    }
+
+    #[test]
+    fn events_decode_double_quoted_hex_escapes() {
+        let doc = YamlDoc::parse(
+            "unicode: \"Sosa did fine.\\u263A\"\nhex esc: \"\\x0d\\x0a is \\r\\n\"\nwide: \"\\U0001F600\"\n",
+        )
+        .expect("valid double-quoted hex escapes");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :unicode\n=VAL \"Sosa did fine.☺\n=VAL :hex esc\n=VAL \"\\r\\n is \\r\\n\n=VAL :wide\n=VAL \"😀\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(
+            doc.to_string(),
+            "unicode: \"Sosa did fine.\\u263A\"\nhex esc: \"\\x0d\\x0a is \\r\\n\"\nwide: \"\\U0001F600\"\n"
+        );
+    }
+
+    #[test]
+    fn events_decode_double_quoted_escaped_line_continuation() {
+        let input = concat!("quoted: \"folded \\", "\n  non-content\"\n");
+        let doc = YamlDoc::parse(input).expect("valid escaped line continuation");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :quoted\n=VAL \"folded non-content\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), input);
+    }
+
+    #[test]
+    fn double_quoted_hex_escape_errors_are_typed() {
+        for input in ["\"\\u12\"", "\"\\xZZ\"", "\"\\U00110000\""] {
+            let error = YamlDoc::parse(input).expect_err("invalid escape should fail");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Typed);
+            assert!(
+                error.diagnostic.message.contains("double-quoted"),
+                "{input:?} should report a double-quoted escape error"
+            );
+        }
     }
 
     #[test]

@@ -1067,11 +1067,15 @@ impl<'source> Parser<'source> {
             self.emit_node_event(node)?;
             Ok(consumed)
         } else if body.starts_with('"') {
-            let (node, consumed) =
-                self.parse_quoted_scalar_lines(lines, index, absolute_start, '"')?;
-            self.nodes[document.0 as usize].children.push(node);
-            self.emit_scalar_event(node)?;
-            Ok(consumed)
+            if let Some(colon_byte) = find_mapping_colon(body) {
+                self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
+            } else {
+                let (node, consumed) =
+                    self.parse_quoted_scalar_lines(lines, index, absolute_start, '"')?;
+                self.nodes[document.0 as usize].children.push(node);
+                self.emit_scalar_event(node)?;
+                Ok(consumed)
+            }
         } else if let Some(colon_byte) = find_mapping_colon(body) {
             self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
         } else {
@@ -1459,13 +1463,46 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if is_sequence_entry(key_text) {
-            self.parse_sequence_entry(
-                entry,
-                lines,
-                index,
-                key_start - lines[index].content_start,
-                key_text,
-            )
+            let key_indent = key_start - lines[index].content_start;
+            let mut consumed =
+                self.parse_sequence_entry(entry, lines, index, key_indent, key_text)?;
+            let mut nested_index = index + consumed;
+            while nested_index < lines.len() {
+                let line = lines[nested_index];
+                let trimmed = line.content_without_break.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    consumed += 1;
+                    nested_index += 1;
+                    continue;
+                }
+                let indent = content_line_indent(line.content_without_break);
+                let body = &line.content_without_break[indent..];
+                if indent != key_indent || !is_sequence_entry(body) {
+                    break;
+                }
+                let nested_consumed = self.parse_content_body(
+                    entry,
+                    lines,
+                    nested_index,
+                    indent,
+                    body,
+                    line.content_start + indent,
+                )?;
+                consumed += nested_consumed;
+                nested_index += nested_consumed;
+            }
+            Ok(consumed)
+        } else if let Some(colon_byte) = flow_collection_mapping_key_colon(key_text, key_start)? {
+            self.parse_compact_block_mapping_node(entry, key_text, key_start, colon_byte)
+        } else if body_starts_flow_value(key_text, key_start)? {
+            let (flow_text, consumed) = self.flow_value_text(lines, index, key_start, key_text)?;
+            let (key, end) = self.parse_flow_value(flow_text, key_start)?;
+            reject_trailing_flow_content(flow_text, end, key_start)?;
+            self.nodes[entry.0 as usize].children.push(key);
+            self.emit_node_event(key)?;
+            Ok(consumed)
+        } else if let Some(colon_byte) = find_mapping_colon(key_text) {
+            self.parse_compact_block_mapping_node(entry, key_text, key_start, colon_byte)
         } else {
             let key = self.parse_inline_value(key_text, key_start)?;
             self.nodes[entry.0 as usize].children.push(key);
@@ -1549,6 +1586,9 @@ impl<'source> Parser<'source> {
                 value_start - line.content_start,
                 value_trimmed,
             )
+        } else if let Some(colon_byte) = find_mapping_colon(value_trimmed) {
+            self.parse_compact_block_mapping_node(entry, value_trimmed, value_start, colon_byte)?;
+            Ok(1)
         } else if body_starts_flow_value(raw_value_trimmed, value_start)? {
             let (flow_text, consumed) =
                 self.flow_value_text(lines, index, value_start, raw_value_trimmed)?;
@@ -1934,6 +1974,14 @@ impl<'source> Parser<'source> {
                 self.nodes[entry.0 as usize].children.push(value_node);
                 self.emit_node_event(value_node)?;
                 return Ok(consumed);
+            } else if is_explicit_mapping_key(value) {
+                return self.parse_explicit_mapping_entry(
+                    entry,
+                    lines,
+                    index,
+                    value_start - line.content_start,
+                    value,
+                );
             } else if is_compact_explicit_empty_key_mapping(value) {
                 self.parse_compact_explicit_empty_key_mapping(
                     entry,
@@ -2043,6 +2091,71 @@ impl<'source> Parser<'source> {
             .push(outer_value);
         self.emit_scalar_event(outer_value)?;
         Ok(())
+    }
+
+    fn parse_compact_block_mapping_node(
+        &mut self,
+        parent: NodeId,
+        body: &str,
+        absolute_start: usize,
+        colon_byte: usize,
+    ) -> Result<usize, YamlError> {
+        let mapping = self.push_node(
+            NodeKind::BlockMapping,
+            Span::from_usize(absolute_start, absolute_start + body.len()),
+        );
+        self.nodes[parent.0 as usize].children.push(mapping);
+        self.push_event(
+            YamlEventKind::MappingStart {
+                style: CollectionStyle::Block,
+                tag: None,
+                anchor: None,
+            },
+            Span::from_usize(absolute_start, absolute_start + body.len()),
+        );
+
+        let entry = self.push_node(
+            NodeKind::MappingEntry,
+            Span::from_usize(absolute_start, absolute_start + body.len()),
+        );
+        self.nodes[mapping.0 as usize].children.push(entry);
+
+        let key_text = body[..colon_byte].trim_end();
+        let key = if key_text.is_empty() {
+            self.push_empty_scalar(absolute_start)
+        } else if body_starts_flow_value(key_text, absolute_start)? {
+            let (key, end) = self.parse_flow_value(key_text, absolute_start)?;
+            reject_trailing_flow_content(key_text, end, absolute_start)?;
+            key
+        } else {
+            let key_end = absolute_start + key_text.len();
+            self.push_node(NodeKind::Scalar, Span::from_usize(absolute_start, key_end))
+        };
+        self.nodes[entry.0 as usize].children.push(key);
+        self.emit_node_event(key)?;
+
+        let raw_value = &body[colon_byte + 1..];
+        let value_trimmed = raw_value.trim_start();
+        let value = if value_trimmed.is_empty() {
+            self.push_empty_scalar(absolute_start + body.len())
+        } else {
+            let leading = raw_value.len() - value_trimmed.len();
+            self.push_node(
+                NodeKind::Scalar,
+                Span::from_usize(
+                    absolute_start + colon_byte + 1 + leading,
+                    absolute_start + body.len(),
+                ),
+            )
+        };
+        self.nodes[entry.0 as usize].children.push(value);
+        self.emit_scalar_event(value)?;
+
+        self.push_event(
+            YamlEventKind::MappingEnd,
+            Span::empty_from_usize(absolute_start + body.len()),
+        );
+        Ok(1)
     }
 
     fn parse_nested_sequence_entry_value(
@@ -4672,8 +4785,13 @@ fn find_mapping_colon(body: &str) -> Option<usize> {
     let mut in_double = false;
     let mut escaped = false;
     let mut previous_was_whitespace = false;
+    let start = parse_node_properties(body, Span::empty(0))
+        .ok()
+        .filter(|properties| properties.anchor.is_some() || properties.tag.is_some())
+        .map_or(0, |properties| properties.value_start);
 
-    for (offset, character) in body.char_indices() {
+    for (offset, character) in body[start..].char_indices() {
+        let offset = start + offset;
         if in_double {
             if escaped {
                 escaped = false;
@@ -4692,7 +4810,10 @@ fn find_mapping_colon(body: &str) -> Option<usize> {
             in_single = true;
         } else if character == '#' && previous_was_whitespace {
             return None;
-        } else if character == ':' && is_block_mapping_separator_colon(body, offset) {
+        } else if character == ':'
+            && is_block_mapping_separator_colon(body, offset)
+            && !colon_is_inside_leading_alias(body, offset)
+        {
             return Some(offset);
         }
         previous_was_whitespace = matches!(character, ' ' | '\t');
@@ -4707,6 +4828,10 @@ fn is_block_mapping_separator_colon(text: &str, position: usize) -> bool {
         .chars()
         .next()
         .is_none_or(char::is_whitespace)
+}
+
+fn colon_is_inside_leading_alias(text: &str, position: usize) -> bool {
+    text.starts_with('*') && !text[..position].chars().any(char::is_whitespace)
 }
 
 fn validate_plain_mapping_fragment(text: &str, role: &str) -> Result<(), YamlError> {
@@ -8178,6 +8303,78 @@ ports:
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :sequence\n+SEQ <tag:yaml.org,2002:seq>\n=VAL :entry\n+SEQ <tag:yaml.org,2002:seq>\n=VAL :nested\n-SEQ\n-SEQ\n=VAL :mapping\n+MAP <tag:yaml.org,2002:map>\n=VAL :foo\n=VAL :bar\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_alias_and_anchored_block_mapping_keys() {
+        let input = "\"top1\" : \n  \"key1\" : &alias1 scalar1\n'top2' : \n  'key2' : &alias2 scalar2\ntop3: &node3 \n  *alias1 : scalar3\ntop4: \n  *alias2 : scalar4\ntop5   :    \n  scalar5\ntop6: \n  &anchor6 'key6' : scalar6\n";
+        let doc = YamlDoc::parse(input).expect("valid anchored and alias block keys");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL \"top1\n+MAP\n=VAL \"key1\n=VAL &alias1 :scalar1\n-MAP\n=VAL 'top2\n+MAP\n=VAL 'key2\n=VAL &alias2 :scalar2\n-MAP\n=VAL :top3\n+MAP &node3\n=ALI *alias1\n=VAL :scalar3\n-MAP\n=VAL :top4\n+MAP\n=ALI *alias2\n=VAL :scalar4\n-MAP\n=VAL :top5\n=VAL :scalar5\n=VAL :top6\n+MAP\n=VAL &anchor6 'key6\n=VAL :scalar6\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_flow_sequence_value_with_implicit_mapping_item() {
+        let input = "\"implicit block key\" : [\n  \"implicit flow key\" : value,\n ]\n";
+        let doc = YamlDoc::parse(input).expect("valid flow sequence mapping value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL \"implicit block key\n+SEQ []\n+MAP {}\n=VAL \"implicit flow key\n=VAL :value\n-MAP\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_explicit_block_sequence_and_flow_keys() {
+        let input = "? - Detroit Tigers\n  - Chicago cubs\n:\n  - 2001-07-23\n\n? [ New York Yankees,\n    Atlanta Braves ]\n: [ 2001-07-02, 2001-08-12,\n    2001-08-14 ]\n";
+        let doc = YamlDoc::parse(input).expect("valid explicit sequence and flow keys");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n+SEQ\n=VAL :Detroit Tigers\n=VAL :Chicago cubs\n-SEQ\n+SEQ\n=VAL :2001-07-23\n-SEQ\n+SEQ []\n=VAL :New York Yankees\n=VAL :Atlanta Braves\n-SEQ\n+SEQ []\n=VAL :2001-07-02\n=VAL :2001-08-12\n=VAL :2001-08-14\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_flow_collection_key_after_explicit_indicator() {
+        let input = "? []: x\n";
+        let doc = YamlDoc::parse(input).expect("valid explicit flow collection key");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n+MAP\n+SEQ []\n-SEQ\n=VAL :x\n-MAP\n=VAL :\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_anchor_colon_and_alias_colon_keys() {
+        let input = "&a: key: &a value\nfoo:\n  *a:\n";
+        let doc = YamlDoc::parse(input).expect("valid colon-suffixed anchor and alias keys");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL &a: :key\n=VAL &a :value\n=VAL :foo\n=ALI *a:\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_explicit_compact_mapping_key_and_value() {
+        let input = "- sun: yellow\n- ? earth: blue\n  : moon: white\n";
+        let doc = YamlDoc::parse(input).expect("valid explicit compact mapping key and value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n+MAP\n=VAL :sun\n=VAL :yellow\n-MAP\n+MAP\n+MAP\n=VAL :earth\n=VAL :blue\n-MAP\n+MAP\n=VAL :moon\n=VAL :white\n-MAP\n-MAP\n-SEQ\n-DOC\n-STR\n"
         );
     }
 

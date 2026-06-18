@@ -897,6 +897,19 @@ impl<'source> Parser<'source> {
         } else if self.nodes[stream.0 as usize].children.is_empty() {
             self.open_document(false, Span::from_usize(0, self.source.len()));
             self.close_document(false, Span::empty_from_usize(self.source.len()))?;
+        } else if !self.nodes[stream.0 as usize]
+            .children
+            .iter()
+            .any(|child| self.nodes[child.0 as usize].kind == NodeKind::Document)
+        {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Parser,
+                    "directives must be followed by document content",
+                    Span::empty_from_usize(self.source.len()),
+                )
+                .with_expected("a document start marker or document content"),
+            ));
         }
         self.push_event(
             YamlEventKind::StreamEnd,
@@ -979,10 +992,6 @@ impl<'source> Parser<'source> {
             self.nodes[document.0 as usize].children.push(marker);
             self.close_document(true, Span::from_usize(line.content_start, line.content_end))?;
             return Ok(1);
-        }
-
-        if body.starts_with("---") || body.starts_with("...") {
-            return Err(invalid_document_marker(line));
         }
 
         self.validate_indent(indent, line, body)?;
@@ -1751,11 +1760,8 @@ impl<'source> Parser<'source> {
                         "unexpected YAML directive parameter",
                     ));
                 }
-                if !matches!(version, "1.1" | "1.2") {
-                    return Err(invalid_directive(
-                        line,
-                        "unsupported YAML directive version",
-                    ));
+                if !valid_yaml_directive_version_syntax(version) {
+                    return Err(invalid_directive(line, "invalid YAML directive version"));
                 }
                 self.document_yaml_directive_seen = true;
                 Ok(())
@@ -1778,7 +1784,7 @@ impl<'source> Parser<'source> {
                     .insert(handle.to_owned(), prefix.to_owned());
                 Ok(())
             }
-            _ => Err(invalid_directive(line, "unknown directive")),
+            _ => Ok(()),
         }
     }
 
@@ -3604,6 +3610,16 @@ fn invalid_directive(line: SourceLine<'_>, message: &'static str) -> YamlError {
         )
         .with_expected("%YAML or %TAG directive syntax"),
     )
+}
+
+fn valid_yaml_directive_version_syntax(version: &str) -> bool {
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.chars().all(|character| character.is_ascii_digit())
+        && minor.chars().all(|character| character.is_ascii_digit())
 }
 
 fn validate_tag_handle(handle: &str, line: SourceLine<'_>) -> Result<(), YamlError> {
@@ -7664,6 +7680,28 @@ single: 'hello'
     }
 
     #[test]
+    fn directives_tolerate_reserved_and_unsupported_versions_before_document() {
+        for (input, expected) in [
+            (
+                "%FOO  bar baz # ignored\n---\n\"foo\"\n",
+                "+STR\n+DOC ---\n=VAL \"foo\n-DOC\n-STR\n",
+            ),
+            (
+                "%YAML 1.3 # Attempt parsing\n---\n\"foo\"\n",
+                "+STR\n+DOC ---\n=VAL \"foo\n-DOC\n-STR\n",
+            ),
+            ("%YAM 1.1\n---\n", "+STR\n+DOC ---\n=VAL :\n-DOC\n-STR\n"),
+            ("%YAMLL 1.1\n---\n", "+STR\n+DOC ---\n=VAL :\n-DOC\n-STR\n"),
+        ] {
+            let doc = YamlDoc::parse(input).expect("reserved directive should be tolerated");
+
+            assert_eq!(doc.events_to_test_string(), expected);
+            assert_eq!(doc.to_string(), input);
+            assert_eq!(count_nodes(&doc, NodeKind::Directive), 1);
+        }
+    }
+
+    #[test]
     fn tag_directive_resolves_secondary_handle() {
         let doc = YamlDoc::parse("%TAG !! tag:example.com,2000:app/\n---\n!!int 1 - 3\n")
             .expect("valid tag directive");
@@ -7730,6 +7768,11 @@ single: 'hello'
                 "key: value\n%YAML 1.2\n",
                 "directives must appear before document content",
             ),
+            (
+                "%YAML 1.2\n",
+                "directives must be followed by document content",
+            ),
+            ("%YAML 1.1#...\n---\n", "invalid YAML directive version"),
             (
                 "%TAG !bad tag:example.com,2000:app/\n---\n",
                 "invalid TAG directive handle",
@@ -9299,20 +9342,22 @@ flow: {empty:}
     }
 
     #[test]
-    fn parser_reports_invalid_document_markers() {
-        let error = YamlDoc::parse(
-            "---bad
-",
-        )
-        .expect_err("document marker needs separation");
+    fn parser_treats_marker_like_text_as_plain_scalar() {
+        for (input, expected) in [
+            (
+                "---word1\nword2\n",
+                "+STR\n+DOC\n=VAL :---word1 word2\n-DOC\n-STR\n",
+            ),
+            (
+                "---\n---word1\nword2\n",
+                "+STR\n+DOC ---\n=VAL :---word1 word2\n-DOC\n-STR\n",
+            ),
+        ] {
+            let doc = YamlDoc::parse(input).expect("marker-like text is plain scalar content");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
-        assert_eq!(error.diagnostic.span, Span::new(0, 6));
-        assert_eq!(
-            error.diagnostic.position,
-            Some(LineCol { line: 1, column: 1 })
-        );
-        assert_eq!(error.diagnostic.message, "invalid document marker");
+            assert_eq!(doc.events_to_test_string(), expected);
+            assert_eq!(doc.to_string(), input);
+        }
     }
 
     #[test]

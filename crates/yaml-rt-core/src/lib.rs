@@ -851,6 +851,7 @@ struct Parser<'source> {
     stream: Option<NodeId>,
     document: Option<NodeId>,
     document_has_content: bool,
+    document_was_explicitly_opened: bool,
     document_yaml_directive_seen: bool,
     tag_handles: BTreeMap<String, String>,
     mappings: Vec<(usize, NodeId)>,
@@ -869,6 +870,7 @@ impl<'source> Parser<'source> {
             stream: None,
             document: None,
             document_has_content: false,
+            document_was_explicitly_opened: false,
             document_yaml_directive_seen: false,
             tag_handles: default_tag_handles(),
             mappings: Vec::new(),
@@ -895,8 +897,6 @@ impl<'source> Parser<'source> {
         if self.document.is_some() {
             self.close_document(false, Span::empty_from_usize(self.source.len()))?;
         } else if self.nodes[stream.0 as usize].children.is_empty() {
-            self.open_document(false, Span::from_usize(0, self.source.len()));
-            self.close_document(false, Span::empty_from_usize(self.source.len()))?;
         } else if !self.nodes[stream.0 as usize]
             .children
             .iter()
@@ -976,6 +976,10 @@ impl<'source> Parser<'source> {
                     .any(|child| self.nodes[child.0 as usize].kind == NodeKind::Document)
             });
             if self.document.is_none() && has_prior_document {
+                return Ok(1);
+            }
+            if self.document.is_none() && !has_prior_document && !self.document_yaml_directive_seen
+            {
                 return Ok(1);
             }
             let document = self.ensure_current_document(false, line);
@@ -1689,6 +1693,7 @@ impl<'source> Parser<'source> {
         self.nodes[stream.0 as usize].children.push(document);
         self.document = Some(document);
         self.document_has_content = false;
+        self.document_was_explicitly_opened = explicit;
         self.mappings.clear();
         self.sequences.clear();
         self.event_collections.clear();
@@ -1703,7 +1708,7 @@ impl<'source> Parser<'source> {
         };
         self.close_event_collections_deeper_than(0);
         self.close_all_event_collections();
-        if !self.document_has_content {
+        if !self.document_has_content && self.document_was_explicitly_opened {
             let empty = self.push_empty_scalar(span.start as usize);
             self.nodes[document.0 as usize].children.push(empty);
             self.emit_scalar_event(empty)?;
@@ -1711,6 +1716,7 @@ impl<'source> Parser<'source> {
         self.push_event(YamlEventKind::DocumentEnd { explicit }, span);
         self.document = None;
         self.document_has_content = false;
+        self.document_was_explicitly_opened = false;
         self.document_yaml_directive_seen = false;
         self.tag_handles = default_tag_handles();
         self.mappings.clear();
@@ -7757,6 +7763,38 @@ single: 'hello'
             "+STR\n+DOC ---\n=VAL :\n-DOC ...\n+DOC ---\n=VAL :\n-DOC ...\n-STR\n"
         );
         assert_eq!(doc.graph().documents.len(), 2);
+    }
+
+    #[test]
+    fn parser_keeps_contentless_streams_empty() {
+        for input in [
+            "",
+            "# Comment only.\n",
+            "  # Comment\n   \n\n",
+            "...\n",
+            "# comment\n...\n",
+        ] {
+            let doc = YamlDoc::parse(input).expect("contentless stream is valid");
+
+            assert_eq!(doc.events_to_test_string(), "+STR\n-STR\n");
+            assert_eq!(doc.to_string(), input);
+            assert!(doc.graph().documents.is_empty());
+            assert!(doc.graph().root.is_none());
+        }
+    }
+
+    #[test]
+    fn parser_preserves_explicit_empty_documents() {
+        for (input, expected) in [
+            ("---\n", "+STR\n+DOC ---\n=VAL :\n-DOC\n-STR\n"),
+            ("---\n...\n", "+STR\n+DOC ---\n=VAL :\n-DOC ...\n-STR\n"),
+        ] {
+            let doc = YamlDoc::parse(input).expect("explicit empty document is valid");
+
+            assert_eq!(doc.events_to_test_string(), expected);
+            assert_eq!(doc.to_string(), input);
+            assert_eq!(doc.graph().documents.len(), 1);
+        }
     }
 
     #[test]

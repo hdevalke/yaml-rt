@@ -3021,7 +3021,7 @@ impl<'source> Parser<'source> {
             node.span
         };
         let value_text = &text[properties.value_start..];
-        let trimmed = value_text.trim();
+        let trimmed = strip_inline_comment(value_text).trim();
         if let Some(alias) = trimmed.strip_prefix('*')
             && !alias.is_empty()
             && !alias.chars().any(char::is_whitespace)
@@ -3265,6 +3265,7 @@ fn resolve_tag(
             .with_expected("a matching %TAG directive"),
         ));
     };
+    let suffix = percent_decode_tag_suffix(suffix, span)?;
     Ok(format!("{prefix}{suffix}"))
 }
 
@@ -3398,14 +3399,47 @@ fn parse_tag_property(
 
     let end = property_token_end(text, position);
     if end == position + 1 {
-        return Err(node_property_error_with_expected(
-            "missing tag handle or suffix",
-            span,
-            position,
-            "a tag after `!`",
-        ));
+        return Ok(("!".to_owned(), end));
     }
     Ok((text[position..end].to_owned(), end))
+}
+
+fn percent_decode_tag_suffix(suffix: &str, span: Span) -> Result<String, YamlError> {
+    let mut output = String::new();
+    let mut position = 0;
+    while position < suffix.len() {
+        let character = suffix[position..]
+            .chars()
+            .next()
+            .expect("position is inside suffix");
+        if character != '%' {
+            output.push(character);
+            position += character.len_utf8();
+            continue;
+        }
+
+        let hex_start = position + 1;
+        let hex_end = hex_start + 2;
+        if hex_end > suffix.len()
+            || !suffix[hex_start..hex_end]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Parser,
+                    "malformed tag URI escape",
+                    Span::empty(Span::offset_from_usize(span.start, position)),
+                )
+                .with_expected("two hexadecimal digits after `%`"),
+            ));
+        }
+        let byte =
+            u8::from_str_radix(&suffix[hex_start..hex_end], 16).expect("hex digits were validated");
+        output.push(char::from(byte));
+        position = hex_end;
+    }
+    Ok(output)
 }
 
 fn property_token_end(text: &str, mut position: usize) -> usize {
@@ -7315,6 +7349,34 @@ single: 'hello'
     }
 
     #[test]
+    fn events_render_bare_non_specific_tags() {
+        for (input, expected) in [
+            ("! a\n", "+STR\n+DOC\n=VAL <!> :a\n-DOC\n-STR\n"),
+            (
+                "- ! 12\n",
+                "+STR\n+DOC\n+SEQ\n=VAL <!> :12\n-SEQ\n-DOC\n-STR\n",
+            ),
+            ("!\n", "+STR\n+DOC\n=VAL <!> :\n-DOC\n-STR\n"),
+        ] {
+            let doc = YamlDoc::parse(input).expect("valid bare non-specific tag");
+
+            assert_eq!(doc.events_to_test_string(), expected);
+            assert_eq!(doc.to_string(), input);
+        }
+    }
+
+    #[test]
+    fn events_render_plain_alias_before_inline_comment() {
+        let doc = YamlDoc::parse("rbi:\n  - *SS # Subsequent occurrence\n")
+            .expect("valid alias sequence entry");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :rbi\n+SEQ\n=ALI *SS\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
     fn graph_preserves_scalar_anchors_and_tags() {
         let doc =
             YamlDoc::parse("plain: &anchor !local value\n").expect("valid scalar node properties");
@@ -7390,6 +7452,17 @@ single: 'hello'
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC ---\n=VAL <tag:example.com,2000:app/foo> \"bar\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn tag_directive_percent_decodes_suffix() {
+        let doc = YamlDoc::parse("%TAG !e! tag:example.com,2000:app/\n---\n- !e!tag%21 baz\n")
+            .expect("valid tag directive with URI escape");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n+SEQ\n=VAL <tag:example.com,2000:app/tag!> :baz\n-SEQ\n-DOC\n-STR\n"
         );
     }
 

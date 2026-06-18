@@ -1911,7 +1911,8 @@ impl<'source> Parser<'source> {
         let after_dash = if body == "-" { "" } else { &body[1..] };
         reject_invalid_indicator_tab(body, line.content_start + indent)?;
         let value = after_dash.trim_start();
-        if value.is_empty() {
+        let value_without_comment = strip_inline_comment(after_dash).trim_start();
+        if value.is_empty() || value_without_comment.is_empty() {
             if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
                 let consumed =
                     self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
@@ -2400,16 +2401,26 @@ impl<'source> Parser<'source> {
         let inline_header =
             header_start > lines[index].content_start + parent_indent && !allow_same_indent_content;
         let mut pending_blank_lines = 0usize;
+        let mut pending_blank_end = end;
+        let mut pending_blank_indent = None::<usize>;
+        let mut reached_end = true;
 
         for line in &lines[index + 1..] {
             let trimmed = line.content_without_break.trim();
             if trimmed == "---" || trimmed == "..." {
+                reached_end = false;
                 break;
             }
 
-            if trimmed.is_empty() {
+            let tab_content_line =
+                trimmed.is_empty() && line.content_without_break.as_bytes().contains(&b'\t');
+            if trimmed.is_empty() && !tab_content_line {
                 if content_indent == usize::MAX && inline_header {
                     pending_blank_lines += 1;
+                    pending_blank_end = line.line_end;
+                    let indent = count_literal_content_indent(line.content_without_break);
+                    pending_blank_indent =
+                        Some(pending_blank_indent.map_or(indent, |current| current.min(indent)));
                     continue;
                 }
                 consumed += 1;
@@ -2420,21 +2431,30 @@ impl<'source> Parser<'source> {
             let indent = count_literal_content_indent(line.content_without_break);
             if content_indent == usize::MAX {
                 if indent <= parent_indent && (parent_indent > 0 || inline_header) {
+                    reached_end = false;
                     break;
                 }
                 content_indent = indent;
             }
 
             if indent < content_indent {
+                reached_end = false;
                 break;
             }
 
             if pending_blank_lines > 0 {
-                consumed += pending_blank_lines;
                 pending_blank_lines = 0;
             }
             consumed += 1;
             end = line.line_end;
+        }
+
+        if reached_end && pending_blank_lines > 0 {
+            consumed += pending_blank_lines;
+            end = pending_blank_end;
+            if content_indent == usize::MAX {
+                content_indent = pending_blank_indent.unwrap_or_default();
+            }
         }
 
         let scalar = self.push_node(header.kind.node_kind(), Span::from_usize(header_start, end));
@@ -5212,6 +5232,9 @@ fn decode_literal_scalar_value(
         position = next_position;
     }
 
+    if decoded.is_empty() && !content.is_empty() && header.chomp == BlockChomp::Keep {
+        return Ok("\n".to_owned());
+    }
     Ok(apply_block_chomp(decoded, header.chomp))
 }
 
@@ -5231,6 +5254,9 @@ fn decode_folded_scalar_value(
         return Ok("\n".to_owned());
     }
     let literal = decode_block_scalar_content(content, content_indent);
+    if literal.is_empty() && !content.is_empty() && header.chomp == BlockChomp::Keep {
+        return Ok("\n".to_owned());
+    }
 
     Ok(apply_block_chomp(
         fold_block_scalar_lines(&literal),
@@ -5386,6 +5412,9 @@ fn detect_literal_content_indent(content: &str) -> usize {
 }
 
 fn strip_literal_indent(line: &str, indent: usize) -> &str {
+    if !line.is_empty() && line.bytes().all(|byte| byte == b' ') && line.len() > indent {
+        return &line[indent..];
+    }
     for (stripped, (offset, byte)) in line.bytes().enumerate().enumerate() {
         if stripped == indent || byte != b' ' {
             return &line[offset..];
@@ -5404,7 +5433,7 @@ fn apply_block_chomp(mut value: String, chomp: BlockChomp) -> String {
         BlockChomp::Clip => {
             let had_line_break = ends_with_line_break(&value);
             trim_trailing_line_breaks(&mut value);
-            if had_line_break {
+            if had_line_break || !value.is_empty() {
                 value.push('\n');
             }
             value
@@ -8499,6 +8528,18 @@ ports:
     }
 
     #[test]
+    fn parser_treats_comment_only_sequence_entry_as_empty() {
+        let input = "- # Empty\n- |\n block node\n- - one # Compact\n  - two # sequence\n- one: two # Compact mapping\n";
+        let doc = YamlDoc::parse(input).expect("parser should accept comment-only entry");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n=VAL :\n=VAL |block node\\n\n+SEQ\n=VAL :one\n=VAL :two\n-SEQ\n+MAP\n=VAL :one\n=VAL :two\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
     fn parser_folds_same_line_plain_scalar_continuations() {
         let input = "plain: a\n b\n\n c\n";
         let doc = YamlDoc::parse(input).expect("parser should accept plain scalar continuations");
@@ -8788,6 +8829,30 @@ ports:
     }
 
     #[test]
+    fn parser_preserves_tab_prefixed_literal_content() {
+        let input = "foo: |\n \t\nbar: 1\n";
+        let doc = YamlDoc::parse(input).expect("valid literal scalar with tab content");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :foo\n=VAL |\\t\\n\n=VAL :bar\n=VAL :1\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_keeps_blank_only_literal_keep_content() {
+        let input = "- |+\n\n\n";
+        let doc = YamlDoc::parse(input).expect("valid empty keep literal scalar");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n=VAL |\\n\\n\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
     fn yaml_value_preserves_literal_whitespace_only_lines() {
         let input = "text: |\n  a\n    \n  b\n";
         let doc = YamlDoc::parse(input).expect("valid literal scalar with whitespace line");
@@ -8800,6 +8865,19 @@ ports:
         assert_eq!(
             String::read_yaml(&doc, text).expect("literal reads"),
             "a\n  \nb\n"
+        );
+    }
+
+    #[test]
+    fn parser_preserves_trailing_literal_whitespace_only_line() {
+        let input = "foo: |\n  x\n   ";
+        let doc =
+            YamlDoc::parse(input).expect("valid literal scalar with trailing whitespace line");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :foo\n=VAL |x\\n \\n\n-MAP\n-DOC\n-STR\n"
         );
     }
 

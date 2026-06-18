@@ -941,6 +941,14 @@ impl<'source> Parser<'source> {
             count_indent(content, line.content_start)?
         };
         let body = &content[indent..];
+        if body.as_bytes().first() == Some(&b'\t')
+            && (is_explicit_mapping_key(body)
+                || is_explicit_mapping_value(body)
+                || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
+                || find_mapping_colon(body).is_some())
+        {
+            return Err(tab_indentation_error(line.content_start + indent));
+        }
 
         if let Some(rest) = document_marker_rest(body, "---") {
             if indent != 0 {
@@ -1001,6 +1009,16 @@ impl<'source> Parser<'source> {
         self.validate_indent(indent, line, body)?;
         self.close_collections_deeper_than(indent);
         self.reject_invalid_block_sibling(indent, line, body)?;
+        if self.sequences.iter().any(|(level, _)| *level == indent)
+            && self.mappings.iter().any(|(level, _)| *level == indent)
+            && !is_sequence_entry(body)
+            && (is_explicit_mapping_key(body)
+                || is_explicit_mapping_value(body)
+                || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
+                || find_mapping_colon(body).is_some())
+        {
+            self.close_sequence_at_indent(indent);
+        }
         reject_unexpected_line_start(body, line.content_start + indent)?;
 
         let document = self.ensure_current_document(false, line);
@@ -1275,7 +1293,17 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(node)?;
             return Ok(consumed);
         }
-        let next_significant_indent = next_significant_indent(lines, index)?;
+        let next_significant = next_significant_body_with_index(lines, index);
+        if next_significant.is_some_and(|(_, next_indent, next_body)| {
+            next_indent == indent && is_sequence_entry(next_body)
+        }) {
+            let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
+            let end = lines[index + consumed - 1].content_end;
+            self.extend_node_span(entry, end);
+            self.extend_node_span(mapping, end);
+            return Ok(consumed);
+        }
+        let next_significant_indent = next_significant.map(|(_, next_indent, _)| next_indent);
         if next_significant_indent.is_none_or(|next| next <= indent) {
             let empty = self.push_empty_scalar(line.content_end);
             self.nodes[entry.0 as usize].children.push(empty);
@@ -1595,11 +1623,24 @@ impl<'source> Parser<'source> {
             }
 
             let nested_indent = content_line_indent(line.content_without_break);
-            if nested_indent <= parent_indent {
+            if nested_indent < parent_indent {
                 break;
             }
 
             let body = &line.content_without_break[nested_indent..];
+            if nested_indent == parent_indent
+                && body.as_bytes().first() == Some(&b'\t')
+                && flow_collection_mapping_key_colon(body, line.content_start + nested_indent)?
+                    .is_some()
+            {
+                return Err(tab_indentation_error(line.content_start + nested_indent));
+            }
+            if nested_indent == parent_indent && !is_sequence_entry(body) {
+                break;
+            }
+            if nested_indent == parent_indent {
+                self.close_sequence_at_indent(parent_indent);
+            }
             if property_only_block_collection_indent(
                 body,
                 lines,
@@ -3874,19 +3915,23 @@ fn count_indent(content: &str, content_start: usize) -> Result<usize, YamlError>
         match byte {
             b' ' => indent += 1,
             b'\t' => {
-                return Err(YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Parser,
-                        "tab character is not allowed in indentation",
-                        Span::from_usize(content_start + offset, content_start + offset + 1),
-                    )
-                    .with_expected("spaces for indentation"),
-                ));
+                return Err(tab_indentation_error(content_start + offset));
             }
             _ => break,
         }
     }
     Ok(indent)
+}
+
+fn tab_indentation_error(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "tab character is not allowed in indentation",
+            Span::from_usize(offset, offset + 1),
+        )
+        .with_expected("spaces for indentation"),
+    )
 }
 
 fn content_line_indent(content: &str) -> usize {
@@ -8002,6 +8047,54 @@ ports:
         assert!(scalar_texts(&doc).contains(&"localhost"));
         assert!(scalar_texts(&doc).contains(&"8080"));
         assert!(scalar_texts(&doc).contains(&"9090"));
+    }
+
+    #[test]
+    fn parser_attaches_same_indent_sequence_after_empty_mapping_value() {
+        let input = "one:\n- 2\n- 3\nfour: 5\n";
+        let doc = YamlDoc::parse(input).expect("valid same-indent sequence value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :one\n+SEQ\n=VAL :2\n=VAL :3\n-SEQ\n=VAL :four\n=VAL :5\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_closes_same_indent_sequence_before_next_mapping_entry() {
+        let input = "foo:\n- 42\nbar:\n  - 44\n";
+        let doc = YamlDoc::parse(input).expect("valid sibling sequence values");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :foo\n+SEQ\n=VAL :42\n-SEQ\n=VAL :bar\n+SEQ\n=VAL :44\n-SEQ\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_attaches_sequence_before_nested_mapping_value() {
+        let input = "sequence:\n- one\n- two\nmapping:\n  ? sky\n  : blue\n  sea : green\n";
+        let doc = YamlDoc::parse(input).expect("valid sequence then mapping values");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :sequence\n+SEQ\n=VAL :one\n=VAL :two\n-SEQ\n=VAL :mapping\n+MAP\n=VAL :sky\n=VAL :blue\n=VAL :sea\n=VAL :green\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_preserves_empty_mapping_value_before_sibling_mapping() {
+        let input = "key:\nnext: value\n";
+        let doc = YamlDoc::parse(input).expect("valid empty value before sibling mapping");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :key\n=VAL :\n=VAL :next\n=VAL :value\n-MAP\n-DOC\n-STR\n"
+        );
     }
 
     #[test]

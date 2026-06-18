@@ -1266,9 +1266,13 @@ impl<'source> Parser<'source> {
                 self.nodes[entry.0 as usize].children.push(node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
-            } else if let Some(next_indent) =
-                property_only_block_collection_indent(value_trimmed, lines, index, value_start)?
-            {
+            } else if let Some(next_indent) = property_only_mapping_value_collection_indent(
+                value_trimmed,
+                lines,
+                index,
+                value_start,
+                indent,
+            )? {
                 self.push_pending_node_properties(value_trimmed, value_start, next_indent)?;
                 let consumed =
                     self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
@@ -1528,9 +1532,13 @@ impl<'source> Parser<'source> {
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
-        } else if let Some(next_indent) =
-            property_only_block_collection_indent(value_trimmed, lines, index, value_start)?
-        {
+        } else if let Some(next_indent) = property_only_mapping_value_collection_indent(
+            value_trimmed,
+            lines,
+            index,
+            value_start,
+            indent,
+        )? {
             self.push_pending_node_properties(value_trimmed, value_start, next_indent)?;
             self.parse_nested_mapping_entry_value(entry, lines, index, indent)
         } else if is_sequence_entry(value_trimmed) {
@@ -1901,6 +1909,7 @@ impl<'source> Parser<'source> {
                 return Ok(consumed);
             } else if let Some(next_indent) =
                 property_only_block_collection_indent(value, lines, index, value_start)?
+                    .filter(|next_indent| *next_indent > indent)
             {
                 self.push_pending_node_properties(value, value_start, next_indent)?;
                 let consumed =
@@ -3306,6 +3315,33 @@ fn property_only_block_collection_indent(
         || is_explicit_mapping_key(nested_body)
         || find_mapping_colon(nested_body).is_some()
     {
+        Ok(Some(indent))
+    } else {
+        Ok(None)
+    }
+}
+
+fn property_only_mapping_value_collection_indent(
+    body: &str,
+    lines: &[SourceLine<'_>],
+    index: usize,
+    absolute_start: usize,
+    parent_indent: usize,
+) -> Result<Option<usize>, YamlError> {
+    let Some(indent) = property_only_block_collection_indent(body, lines, index, absolute_start)?
+    else {
+        return Ok(None);
+    };
+    if indent > parent_indent {
+        return Ok(Some(indent));
+    }
+
+    let Some((_, nested_indent, nested_body)) =
+        first_non_property_node_after_with_index(lines, index, absolute_start)?
+    else {
+        return Ok(None);
+    };
+    if nested_indent == parent_indent && is_sequence_entry(nested_body) {
         Ok(Some(indent))
     } else {
         Ok(None)
@@ -8094,6 +8130,54 @@ ports:
         assert_eq!(
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :key\n=VAL :\n=VAL :next\n=VAL :value\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_composes_empty_anchored_mapping_value_before_alias() {
+        let input = "---\na: &anchor\nb: *anchor\n";
+        let doc = YamlDoc::parse(input).expect("valid empty anchored scalar value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n+MAP\n=VAL :a\n=VAL &anchor :\n=VAL :b\n=ALI *anchor\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_composes_empty_tagged_scalars_in_sequence_mappings() {
+        let input = "- !!str\n-\n  !!null : a\n  b: !!str\n- !!str : !!null\n";
+        let doc = YamlDoc::parse(input).expect("valid empty tagged scalar positions");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n=VAL <tag:yaml.org,2002:str> :\n+MAP\n=VAL <tag:yaml.org,2002:null> :\n=VAL :a\n=VAL :b\n=VAL <tag:yaml.org,2002:str> :\n-MAP\n+MAP\n=VAL <tag:yaml.org,2002:str> :\n=VAL <tag:yaml.org,2002:null> :\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_composes_empty_anchored_scalars_in_explicit_entries() {
+        let input = "- &a\n- a\n-\n  &a : a\n  b: &b\n-\n  &c : &a\n-\n  ? &d\n-\n  ? &e\n  : &a\n";
+        let doc = YamlDoc::parse(input).expect("valid empty anchored scalar positions");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n=VAL &a :\n=VAL :a\n+MAP\n=VAL &a :\n=VAL :a\n=VAL :b\n=VAL &b :\n-MAP\n+MAP\n=VAL &c :\n=VAL &a :\n-MAP\n+MAP\n=VAL &d :\n=VAL :\n-MAP\n+MAP\n=VAL &e :\n=VAL &a :\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_applies_tag_to_same_indent_mapping_sequence_value() {
+        let input = "sequence: !!seq\n- entry\n- !!seq\n - nested\nmapping: !!map\n foo: bar\n";
+        let doc = YamlDoc::parse(input).expect("valid tagged same-indent collection values");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :sequence\n+SEQ <tag:yaml.org,2002:seq>\n=VAL :entry\n+SEQ <tag:yaml.org,2002:seq>\n=VAL :nested\n-SEQ\n-SEQ\n=VAL :mapping\n+MAP <tag:yaml.org,2002:map>\n=VAL :foo\n=VAL :bar\n-MAP\n-MAP\n-DOC\n-STR\n"
         );
     }
 

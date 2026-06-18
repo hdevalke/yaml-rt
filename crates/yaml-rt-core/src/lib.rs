@@ -987,6 +987,7 @@ impl<'source> Parser<'source> {
 
         self.validate_indent(indent, line, body)?;
         self.close_collections_deeper_than(indent);
+        self.reject_invalid_block_sibling(indent, line, body)?;
         reject_unexpected_line_start(body, line.content_start + indent)?;
 
         let document = self.ensure_current_document(false, line);
@@ -1050,7 +1051,7 @@ impl<'source> Parser<'source> {
                 indent,
                 absolute_start,
                 allow_same_indent_continuation,
-            );
+            )?;
             self.nodes[document.0 as usize].children.push(scalar);
             self.emit_scalar_event(scalar)?;
             Ok(consumed)
@@ -1253,8 +1254,10 @@ impl<'source> Parser<'source> {
                 self.emit_node_event(node)?;
                 return Ok(consumed);
             }
+            validate_quoted_scalar_trailing_content(value_trimmed, value_start)?;
+            reject_nested_plain_mapping_colon(value_trimmed, value_start)?;
             let (node, consumed) =
-                self.parse_block_plain_scalar(lines, index, indent, value_start, false);
+                self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             return Ok(consumed);
@@ -1506,8 +1509,10 @@ impl<'source> Parser<'source> {
             self.emit_node_event(value_node)?;
             Ok(consumed)
         } else {
+            validate_quoted_scalar_trailing_content(value_trimmed, value_start)?;
+            reject_nested_plain_mapping_colon(value_trimmed, value_start)?;
             let (node, consumed) =
-                self.parse_block_plain_scalar(lines, index, indent, value_start, false);
+                self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
@@ -1615,7 +1620,7 @@ impl<'source> Parser<'source> {
                 parent_indent,
                 line.content_start + nested_indent,
                 false,
-            );
+            )?;
             self.nodes[entry.0 as usize].children.push(scalar);
             self.emit_scalar_event(scalar)?;
             return Ok(nested_index - index + consumed);
@@ -1886,8 +1891,10 @@ impl<'source> Parser<'source> {
                     colon_byte,
                 );
             }
+            validate_quoted_scalar_trailing_content(value, value_start)?;
+            reject_nested_plain_mapping_colon(value, value_start)?;
             let (value_node, consumed) =
-                self.parse_block_plain_scalar(lines, index, indent, value_start, false);
+                self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
             self.nodes[entry.0 as usize].children.push(value_node);
             self.emit_scalar_event(value_node)?;
             return Ok(consumed);
@@ -2089,10 +2096,13 @@ impl<'source> Parser<'source> {
         parent_indent: usize,
         value_start: usize,
         allow_same_indent_continuation: bool,
-    ) -> (NodeId, usize) {
+    ) -> Result<(NodeId, usize), YamlError> {
         let mut consumed = 1;
         let mut end = lines[index].content_end;
         let mut pending_blank_lines = 0usize;
+        let mut scalar_has_inline_comment = plain_scalar_line_has_inline_comment(
+            &self.source.as_str()[value_start..lines[index].content_end],
+        );
 
         for line in &lines[index + 1..] {
             let trimmed = line.content_without_break.trim();
@@ -2112,16 +2122,24 @@ impl<'source> Parser<'source> {
             ) {
                 break;
             }
+            let indent = content_line_indent(line.content_without_break);
+            let body = &line.content_without_break[indent..];
+            if scalar_has_inline_comment || find_mapping_colon(body).is_some() {
+                return Err(invalid_plain_scalar_continuation(
+                    line.content_start + indent,
+                ));
+            }
 
             consumed += pending_blank_lines + 1;
             pending_blank_lines = 0;
             end = line.content_end;
+            scalar_has_inline_comment |= plain_scalar_line_has_inline_comment(body);
         }
 
-        (
+        Ok((
             self.push_node(NodeKind::Scalar, Span::from_usize(value_start, end)),
             consumed,
-        )
+        ))
     }
 
     fn parse_inline_value(
@@ -2856,6 +2874,54 @@ impl<'source> Parser<'source> {
             .iter()
             .chain(self.sequences.iter())
             .any(|(level, _)| *level < indent)
+    }
+
+    fn reject_invalid_block_sibling(
+        &self,
+        indent: usize,
+        line: SourceLine<'_>,
+        body: &str,
+    ) -> Result<(), YamlError> {
+        if self.sequences.iter().any(|(level, _)| *level == indent) && !is_sequence_entry(body) {
+            let has_mapping_at_indent = self.mappings.iter().any(|(level, _)| *level == indent);
+            let is_mapping_sibling = is_explicit_mapping_key(body)
+                || is_explicit_mapping_value(body)
+                || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
+                || find_mapping_colon(body).is_some();
+            if !has_mapping_at_indent || !is_mapping_sibling {
+                return Err(invalid_nested_block_sequence_sibling(
+                    line.content_start + indent,
+                ));
+            }
+        }
+        if self.mappings.iter().any(|(level, _)| *level == indent)
+            && comment_text_contains_mapping_colon(body)
+        {
+            return Err(invalid_orphaned_block_content(
+                line.content_start + indent + separated_comment_offset(body).unwrap_or(0),
+            ));
+        }
+
+        let has_collection_at_indent = self
+            .mappings
+            .iter()
+            .chain(self.sequences.iter())
+            .any(|(level, _)| *level == indent);
+        let is_indented_root_collection = indent > 0
+            && !self.has_parent_collection_below(indent)
+            && (is_sequence_entry(body) || body_starts_flow_value_start(body));
+        if indent > 0
+            && !has_collection_at_indent
+            && !is_indented_root_collection
+            && (is_sequence_entry(body)
+                || is_explicit_mapping_key(body)
+                || is_explicit_mapping_value(body)
+                || find_mapping_colon(body).is_some())
+        {
+            return Err(invalid_orphaned_block_content(line.content_start + indent));
+        }
+
+        Ok(())
     }
 
     fn close_collections_deeper_than(&mut self, indent: usize) {
@@ -3966,6 +4032,114 @@ fn invalid_nested_block_sequence_sibling(offset: usize) -> YamlError {
     )
 }
 
+fn invalid_orphaned_block_content(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "invalid orphaned block content",
+            Span::from_usize(offset, offset + 1),
+        )
+        .with_expected("a valid sibling collection entry or document boundary"),
+    )
+}
+
+fn invalid_plain_scalar_continuation(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "invalid plain scalar continuation",
+            Span::from_usize(offset, offset + 1),
+        )
+        .with_expected("plain scalar content without a mapping separator or prior comment"),
+    )
+}
+
+fn plain_scalar_line_has_inline_comment(text: &str) -> bool {
+    separated_comment_offset(text).is_some()
+}
+
+fn separated_comment_offset(text: &str) -> Option<usize> {
+    let mut previous_was_whitespace = false;
+    for (offset, character) in text.char_indices() {
+        if character == '#' && previous_was_whitespace {
+            return Some(offset);
+        }
+        previous_was_whitespace = matches!(character, ' ' | '\t');
+    }
+    None
+}
+
+fn comment_text_contains_mapping_colon(text: &str) -> bool {
+    let Some(comment) = separated_comment_offset(text) else {
+        return false;
+    };
+    text[comment..].char_indices().any(|(offset, character)| {
+        character == ':' && is_block_mapping_separator_colon(&text[comment..], offset)
+    })
+}
+
+fn validate_quoted_scalar_trailing_content(
+    text: &str,
+    absolute_start: usize,
+) -> Result<(), YamlError> {
+    let Some(quote) = text
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '"' | '\''))
+    else {
+        return Ok(());
+    };
+    let end = match quote {
+        '"' => double_quoted_scalar_end(text),
+        '\'' => single_quoted_scalar_end(text),
+        _ => None,
+    }
+    .unwrap_or(text.len());
+    if end == text.len() {
+        return Ok(());
+    }
+    let trailing = &text[end..];
+    if trailing.is_empty() {
+        return Ok(());
+    }
+    let whitespace = trailing
+        .bytes()
+        .take_while(|byte| matches!(*byte, b' ' | b'\t'))
+        .count();
+    if whitespace == trailing.len() {
+        return Ok(());
+    }
+    if whitespace == 0 || !trailing[whitespace..].starts_with('#') {
+        let offset = absolute_start + end + whitespace;
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "unexpected content after quoted scalar",
+                Span::from_usize(offset, offset + 1),
+            )
+            .with_expected("line break or separated comment"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_nested_plain_mapping_colon(text: &str, absolute_start: usize) -> Result<(), YamlError> {
+    if text.starts_with(['"', '\'']) {
+        return Ok(());
+    }
+    if let Some(colon) = find_mapping_colon(text) {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "plain scalar contains a nested mapping separator",
+                Span::from_usize(absolute_start + colon, absolute_start + colon + 1),
+            )
+            .with_expected("quoted scalar content or a nested mapping on the following line"),
+        ));
+    }
+    Ok(())
+}
+
 fn reject_compact_decorated_document(rest: &str, absolute_start: usize) -> Result<(), YamlError> {
     let properties = parse_node_properties(
         rest,
@@ -4394,6 +4568,7 @@ fn find_mapping_colon(body: &str) -> Option<usize> {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
+    let mut previous_was_whitespace = false;
 
     for (offset, character) in body.char_indices() {
         if in_double {
@@ -4412,9 +4587,12 @@ fn find_mapping_colon(body: &str) -> Option<usize> {
             in_double = true;
         } else if character == '\'' {
             in_single = true;
+        } else if character == '#' && previous_was_whitespace {
+            return None;
         } else if character == ':' && is_block_mapping_separator_colon(body, offset) {
             return Some(offset);
         }
+        previous_was_whitespace = matches!(character, ' ' | '\t');
     }
 
     None
@@ -8991,6 +9169,41 @@ ports:
             let error = YamlDoc::parse(input).expect_err("compact block syntax is invalid");
 
             assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        }
+    }
+
+    #[test]
+    fn parser_rejects_invalid_scalar_termination_and_orphaned_block_content() {
+        for input in [
+            "this\n is\n  invalid: x\n",
+            "- item1\n- item2\ninvalid\n",
+            "k1: v1\n k2: v2\n",
+            "word1  # comment\nword2\n",
+            "key:\n  word1 word2\n  no: key\n",
+            "key2: \"quoted2\" trailing content\n",
+            "key: \"value\"# invalid comment\n",
+            "a: b: c: d\n",
+            "a: 'b': c\n",
+        ] {
+            let error = YamlDoc::parse(input).expect_err("invalid scalar syntax is rejected");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn parser_preserves_valid_scalar_termination_neighbors() {
+        for input in [
+            "---\nscalar\n%YAML 1.2\n",
+            "key: \"value\" # separated comment\n",
+            "url: http://foo.com\n",
+            "{key: value:with:colons}\n",
+        ] {
+            let doc = YamlDoc::parse(input).unwrap_or_else(|error| {
+                panic!("nearby valid scalar syntax remains valid for {input:?}: {error:?}")
+            });
+
+            assert_eq!(doc.to_string(), input);
         }
     }
 

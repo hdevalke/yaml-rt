@@ -365,9 +365,9 @@ impl<'source> Lexer<'source> {
                 self.push(TokenKind::DocumentStart, start);
             } else if self.consume_document_marker("...") {
                 self.push(TokenKind::DocumentEnd, start);
-            } else if self.consume_double_quoted_scalar()? {
+            } else if self.can_start_quoted_scalar() && self.consume_double_quoted_scalar()? {
                 self.push(TokenKind::DoubleQuotedScalar, start);
-            } else if self.consume_single_quoted_scalar()? {
+            } else if self.can_start_quoted_scalar() && self.consume_single_quoted_scalar()? {
                 self.push(TokenKind::SingleQuotedScalar, start);
             } else if self.consume_single_byte_indicator() {
                 let kind = match self.text.as_bytes()[start] {
@@ -529,20 +529,7 @@ impl<'source> Lexer<'source> {
         while let Some(character) = self.current_char() {
             if matches!(
                 character,
-                ' ' | '\t'
-                    | '\r'
-                    | '\n'
-                    | '#'
-                    | ':'
-                    | '-'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | ','
-                    | '?'
-                    | '\''
-                    | '"'
+                ' ' | '\t' | '\r' | '\n' | '#' | ':' | '-' | '[' | ']' | '{' | '}' | ',' | '?'
             ) {
                 break;
             }
@@ -558,6 +545,23 @@ impl<'source> Lexer<'source> {
         {
             self.position += self.current_char().map_or(0, char::len_utf8);
         }
+    }
+
+    fn can_start_quoted_scalar(&self) -> bool {
+        self.tokens.last().is_none_or(|token| {
+            matches!(
+                token.kind,
+                TokenKind::Bom
+                    | TokenKind::Whitespace
+                    | TokenKind::Newline
+                    | TokenKind::Colon
+                    | TokenKind::Dash
+                    | TokenKind::Question
+                    | TokenKind::FlowSequenceStart
+                    | TokenKind::FlowMappingStart
+                    | TokenKind::Comma
+            )
+        })
     }
 
     fn current_char(&self) -> Option<char> {
@@ -4804,9 +4808,9 @@ fn find_mapping_colon(body: &str) -> Option<usize> {
             if character == '\'' {
                 in_single = false;
             }
-        } else if character == '"' {
+        } else if character == '"' && offset == start {
             in_double = true;
-        } else if character == '\'' {
+        } else if character == '\'' && offset == start {
             in_single = true;
         } else if character == '#' && previous_was_whitespace {
             return None;
@@ -5097,13 +5101,31 @@ fn strip_double_quoted_line_continuations(text: &str) -> String {
             .chars()
             .next()
             .expect("position is inside text");
-        if character == '\\'
-            && text[position + character.len_utf8()..]
+        if character == '\\' {
+            let after_backslash = position + character.len_utf8();
+            let whitespace_end = after_backslash
+                + text[after_backslash..]
+                    .bytes()
+                    .take_while(|byte| matches!(*byte, b' ' | b'\t'))
+                    .count();
+            if text[whitespace_end..]
                 .chars()
                 .next()
                 .is_some_and(|next| matches!(next, '\n' | '\r'))
-        {
-            position = skip_escaped_line_break(text, position + character.len_utf8());
+            {
+                for whitespace in text[after_backslash..whitespace_end].chars() {
+                    if whitespace == '\t' {
+                        output.push(whitespace);
+                    }
+                }
+                if whitespace_end > after_backslash {
+                    output.push(' ');
+                }
+                position = skip_escaped_line_break(text, whitespace_end);
+                continue;
+            }
+            output.push(character);
+            position += character.len_utf8();
         } else {
             output.push(character);
             position += character.len_utf8();
@@ -7562,6 +7584,27 @@ single: 'hello'
     }
 
     #[test]
+    fn lexer_keeps_embedded_quotes_inside_plain_scalars() {
+        let input = "a!\"#$%&'()*+,-./09:;<=>?@AZ[\\]^_`az{|}~: safe\n?foo: safe question mark\n:foo: safe colon\n-foo: safe dash\nthis is#not: a comment\n";
+        let doc = YamlDoc::parse(input).expect("embedded quotes are plain mapping key content");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :a!\"#$%&'()*+,-./09:;<=>?@AZ[\\\\]^_`az{|}~\n=VAL :safe\n=VAL :?foo\n=VAL :safe question mark\n=VAL ::foo\n=VAL :safe colon\n=VAL :-foo\n=VAL :safe dash\n=VAL :this is#not\n=VAL :a comment\n-MAP\n-DOC\n-STR\n"
+        );
+
+        let input = "- bla\"keks: foo\n- bla]keks: foo\n";
+        let doc = YamlDoc::parse(input).expect("embedded quotes are plain sequence key content");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n+MAP\n=VAL :bla\"keks\n=VAL :foo\n-MAP\n+MAP\n=VAL :bla]keks\n=VAL :foo\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
     fn events_render_root_scalar() {
         let doc = YamlDoc::parse("value\n").expect("valid scalar");
 
@@ -7641,6 +7684,22 @@ single: 'hello'
             "+STR\n+DOC\n+MAP\n=VAL :quoted\n=VAL \"folded non-content\n-MAP\n-DOC\n-STR\n"
         );
         assert_eq!(doc.to_string(), input);
+    }
+
+    #[test]
+    fn events_decode_double_quoted_escaped_tab_continuation() {
+        for (input, expected) in [
+            ("\"3 trailing\\\t\n    tab\"\n", "3 trailing\\t tab"),
+            ("\"4 trailing\\\t  \n    tab\"\n", "4 trailing\\t tab"),
+        ] {
+            let doc = YamlDoc::parse(input).expect("valid escaped tab continuation");
+
+            assert_eq!(doc.to_string(), input);
+            assert_eq!(
+                doc.events_to_test_string(),
+                format!("+STR\n+DOC\n=VAL \"{expected}\n-DOC\n-STR\n")
+            );
+        }
     }
 
     #[test]
@@ -8820,6 +8879,18 @@ ports:
         assert_eq!(
             String::read_yaml(&doc, folded).expect("folded reads"),
             "folded\n  * bullet\n\n  * list\ntail\n"
+        );
+    }
+
+    #[test]
+    fn parser_keeps_apostrophe_inside_folded_block_scalar_content() {
+        let input = "--- >\n  Mark McGwire's\n  year was crippled\n  by a knee injury.\n";
+        let doc = YamlDoc::parse(input).expect("valid apostrophe in folded scalar content");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL >Mark McGwire's year was crippled by a knee injury.\\n\n-DOC\n-STR\n"
         );
     }
 

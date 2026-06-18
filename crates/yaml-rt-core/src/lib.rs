@@ -947,6 +947,7 @@ impl<'source> Parser<'source> {
             if rest.is_empty() || rest.starts_with('#') {
                 return Ok(1);
             }
+            reject_compact_decorated_document(rest, line.content_end - rest.len())?;
             let rest_start = line.content_end - rest.len();
             return self.parse_content_body(document, lines, index, 0, rest, rest_start);
         }
@@ -955,7 +956,19 @@ impl<'source> Parser<'source> {
             if indent != 0 || !rest.trim().is_empty() && !rest.trim_start().starts_with('#') {
                 return Err(invalid_document_marker(line));
             }
+            let has_prior_document = self.stream.is_some_and(|stream| {
+                self.nodes[stream.0 as usize]
+                    .children
+                    .iter()
+                    .any(|child| self.nodes[child.0 as usize].kind == NodeKind::Document)
+            });
             let document = self.ensure_current_document(false, line);
+            if !has_prior_document
+                && !self.document_has_content
+                && self.document_yaml_directive_seen
+            {
+                return Err(invalid_document_marker(line));
+            }
             let marker = self.push_node(
                 NodeKind::DocumentMarker,
                 Span::from_usize(line.content_start, line.content_start + 3),
@@ -1085,11 +1098,20 @@ impl<'source> Parser<'source> {
     ) -> Result<(&'source str, usize), YamlError> {
         let source_tail = &self.source.as_str()[absolute_start..];
         let end = flow_collection_source_end(source_tail, absolute_start)?;
+        let validate_sequence_indent = source_tail
+            .chars()
+            .find(|character| !character.is_whitespace())
+            == Some('[')
+            && absolute_start > lines[index].content_start + self.source_indent_at(absolute_start);
         let absolute_end = absolute_start + end;
         let mut consumed = 1;
         let mut validation_end = lines[index].content_end;
+        let flow_indent = self.source_indent_at(absolute_start);
         for line in &lines[index + 1..] {
             if line.content_start < absolute_end {
+                if validate_sequence_indent {
+                    reject_invalid_flow_continuation_indent(line, flow_indent)?;
+                }
                 consumed += 1;
                 validation_end = line.content_end;
             } else {
@@ -1171,6 +1193,7 @@ impl<'source> Parser<'source> {
         if !value_trimmed.is_empty() {
             let leading = value.len() - value_trimmed.len();
             let value_start = line.content_start + indent + colon_byte + 1 + leading;
+            reject_invalid_compact_block_collection_value(value_trimmed, value_start)?;
             if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
                 let (node, consumed) = self.parse_block_scalar(
                     lines,
@@ -1266,6 +1289,7 @@ impl<'source> Parser<'source> {
         self.extend_node_span(mapping, line.content_end);
 
         let after_question = if body == "?" { "" } else { &body[1..] };
+        reject_invalid_indicator_tab(body, line.content_start + indent)?;
         let key_text = strip_inline_comment(after_question).trim_start();
         let key_consumed = if key_text.is_empty() {
             if next_significant_body_with_index(lines, index).is_some_and(
@@ -1402,6 +1426,7 @@ impl<'source> Parser<'source> {
     ) -> Result<usize, YamlError> {
         let line = lines[index];
         let raw_value = &body[1..];
+        reject_invalid_indicator_tab(body, line.content_start + indent)?;
         let raw_value_trimmed = raw_value.trim_start();
         let value = strip_inline_comment(raw_value);
         let value_trimmed = value.trim_start();
@@ -1762,6 +1787,7 @@ impl<'source> Parser<'source> {
         self.extend_node_span(sequence, line.content_end);
 
         let after_dash = if body == "-" { "" } else { &body[1..] };
+        reject_invalid_indicator_tab(body, line.content_start + indent)?;
         let value = after_dash.trim_start();
         if value.is_empty() {
             if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
@@ -2019,6 +2045,16 @@ impl<'source> Parser<'source> {
 
             self.close_collections_deeper_than(nested_indent);
             reject_unexpected_line_start(body, line.content_start + nested_indent)?;
+            if self
+                .sequences
+                .iter()
+                .any(|(level, _)| *level == nested_indent)
+                && !is_sequence_entry(body)
+            {
+                return Err(invalid_nested_block_sequence_sibling(
+                    line.content_start + nested_indent,
+                ));
+            }
             let nested_consumed = self.parse_content_body(
                 parent,
                 lines,
@@ -2340,6 +2376,7 @@ impl<'source> Parser<'source> {
             Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
         );
         let key = self.parse_flow_node_segment(text, entry_start, colon, absolute_start)?;
+        reject_split_implicit_flow_mapping_key(text, entry_start, colon, absolute_start)?;
         self.nodes[entry.0 as usize].children.push(key);
 
         let mut value_position = skip_flow_whitespace(text, colon + 1);
@@ -3732,6 +3769,137 @@ fn is_compact_explicit_empty_key_mapping(body: &str) -> bool {
         return false;
     };
     is_explicit_mapping_value(after_question.trim_start())
+}
+
+fn reject_invalid_indicator_tab(body: &str, absolute_start: usize) -> Result<(), YamlError> {
+    let Some(indicator) = body.as_bytes().first().copied() else {
+        return Ok(());
+    };
+    if !matches!(indicator, b'-' | b'?' | b':') || body.as_bytes().get(1) != Some(&b'\t') {
+        return Ok(());
+    }
+
+    let invalid = match indicator {
+        b'-' => {
+            let after_tab = &body[2..];
+            after_tab == "-" || after_tab.starts_with("- ") || after_tab.starts_with("-\t")
+        }
+        b'?' | b':' => true,
+        _ => false,
+    };
+    if !invalid {
+        return Ok(());
+    }
+
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "tab character is not allowed after a block indicator",
+            Span::from_usize(absolute_start + 1, absolute_start + 2),
+        )
+        .with_expected("a space for block indicator separation"),
+    ))
+}
+
+fn reject_invalid_compact_block_collection_value(
+    value: &str,
+    absolute_start: usize,
+) -> Result<(), YamlError> {
+    if is_sequence_entry(value)
+        || is_explicit_mapping_key(value)
+        || is_explicit_mapping_value(value)
+    {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "compact block collection value is not allowed",
+                Span::from_usize(absolute_start, absolute_start + 1),
+            )
+            .with_expected("a nested block collection on the following indented line"),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_invalid_flow_continuation_indent(
+    line: &SourceLine<'_>,
+    flow_indent: usize,
+) -> Result<(), YamlError> {
+    let trimmed = line.content_without_break.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(());
+    }
+    let indent = content_line_indent(line.content_without_break);
+    if line.content_without_break[indent..]
+        .chars()
+        .next()
+        .is_some_and(|character| matches!(character, ',' | '?' | ']' | '}'))
+    {
+        return Ok(());
+    }
+    if indent > flow_indent || line.content_without_break.as_bytes().get(indent) == Some(&b'\t') {
+        return Ok(());
+    }
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "flow collection continuation is not indented",
+            Span::from_usize(line.content_start + indent, line.content_start + indent + 1),
+        )
+        .with_expected("flow content indented deeper than the parent block"),
+    ))
+}
+
+fn reject_split_implicit_flow_mapping_key(
+    text: &str,
+    start: usize,
+    colon: usize,
+    absolute_start: usize,
+) -> Result<(), YamlError> {
+    if text[start..colon].contains('\n') {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "implicit flow mapping key cannot be split before `:`",
+                Span::from_usize(absolute_start + colon, absolute_start + colon + 1),
+            )
+            .with_expected("a mapping separator on the same line as the implicit key"),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_nested_block_sequence_sibling(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "invalid content after nested block sequence",
+            Span::from_usize(offset, offset + 1),
+        )
+        .with_expected("another sequence entry or the end of the nested sequence"),
+    )
+}
+
+fn reject_compact_decorated_document(rest: &str, absolute_start: usize) -> Result<(), YamlError> {
+    let properties = parse_node_properties(
+        rest,
+        Span::from_usize(absolute_start, absolute_start + rest.len()),
+    )?;
+    if properties.anchor.is_none() && properties.tag.is_none() {
+        return Ok(());
+    }
+    let value = rest[properties.value_start..].trim_start();
+    if find_mapping_colon(value).is_some() {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "compact decorated document mapping is not allowed",
+                Span::from_usize(absolute_start, absolute_start + rest.len()),
+            )
+            .with_expected("a document marker followed by a separate block node"),
+        ));
+    }
+    Ok(())
 }
 
 fn reject_trailing_flow_content(
@@ -8604,6 +8772,50 @@ ports:
                 "{input:?} should include source position"
             );
         }
+    }
+
+    #[test]
+    fn parser_rejects_tabs_used_as_block_indicator_separation() {
+        for input in ["-\t-\n", "?\t-\n", "?\tkey:\n", "? key:\n:\tkey:\n"] {
+            let error = YamlDoc::parse(input).expect_err("tab must not enable block structure");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        }
+    }
+
+    #[test]
+    fn parser_preserves_tab_after_sequence_indicator_as_scalar_content() {
+        let input = "-\t-1\n";
+        let doc = YamlDoc::parse(input).expect("tab before plain scalar should be accepted");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n=VAL :-1\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_invalid_compact_block_collection_values() {
+        for input in [
+            "key: - a\n     - b\n",
+            "--- &anchor a: b\n",
+            "key:\n - bar\n - baz\n invalid\n",
+            "---\nflow: [a,\nb,\nc]\n",
+            "---\n[ key\n  : value ]\n",
+        ] {
+            let error = YamlDoc::parse(input).expect_err("compact block syntax is invalid");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        }
+    }
+
+    #[test]
+    fn parser_rejects_directive_followed_by_document_end_without_document() {
+        let error =
+            YamlDoc::parse("%YAML 1.2\n...\n").expect_err("document end cannot start a document");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
     }
 
     #[test]

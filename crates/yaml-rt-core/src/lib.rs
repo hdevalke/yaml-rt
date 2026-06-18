@@ -962,6 +962,9 @@ impl<'source> Parser<'source> {
                     .iter()
                     .any(|child| self.nodes[child.0 as usize].kind == NodeKind::Document)
             });
+            if self.document.is_none() && has_prior_document {
+                return Ok(1);
+            }
             let document = self.ensure_current_document(false, line);
             if !has_prior_document
                 && !self.document_has_content
@@ -982,7 +985,7 @@ impl<'source> Parser<'source> {
             return Err(invalid_document_marker(line));
         }
 
-        self.validate_indent(indent, line)?;
+        self.validate_indent(indent, line, body)?;
         self.close_collections_deeper_than(indent);
         reject_unexpected_line_start(body, line.content_start + indent)?;
 
@@ -1040,11 +1043,17 @@ impl<'source> Parser<'source> {
         } else if let Some(colon_byte) = find_mapping_colon(body) {
             self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
         } else {
-            let scalar_span = Span::from_usize(absolute_start, absolute_start + body.len());
-            let scalar = self.push_node(NodeKind::Scalar, scalar_span);
+            let allow_same_indent_continuation = !self.has_parent_collection_below(indent);
+            let (scalar, consumed) = self.parse_block_plain_scalar(
+                lines,
+                index,
+                indent,
+                absolute_start,
+                allow_same_indent_continuation,
+            );
             self.nodes[document.0 as usize].children.push(scalar);
             self.emit_scalar_event(scalar)?;
-            Ok(1)
+            Ok(consumed)
         }
     }
 
@@ -1244,7 +1253,8 @@ impl<'source> Parser<'source> {
                 self.emit_node_event(node)?;
                 return Ok(consumed);
             }
-            let (node, consumed) = self.parse_block_plain_scalar(lines, index, indent, value_start);
+            let (node, consumed) =
+                self.parse_block_plain_scalar(lines, index, indent, value_start, false);
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             return Ok(consumed);
@@ -1496,7 +1506,8 @@ impl<'source> Parser<'source> {
             self.emit_node_event(value_node)?;
             Ok(consumed)
         } else {
-            let (node, consumed) = self.parse_block_plain_scalar(lines, index, indent, value_start);
+            let (node, consumed) =
+                self.parse_block_plain_scalar(lines, index, indent, value_start, false);
             self.nodes[entry.0 as usize].children.push(node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
@@ -1603,6 +1614,7 @@ impl<'source> Parser<'source> {
                 nested_index,
                 parent_indent,
                 line.content_start + nested_indent,
+                false,
             );
             self.nodes[entry.0 as usize].children.push(scalar);
             self.emit_scalar_event(scalar)?;
@@ -1875,7 +1887,7 @@ impl<'source> Parser<'source> {
                 );
             }
             let (value_node, consumed) =
-                self.parse_block_plain_scalar(lines, index, indent, value_start);
+                self.parse_block_plain_scalar(lines, index, indent, value_start, false);
             self.nodes[entry.0 as usize].children.push(value_node);
             self.emit_scalar_event(value_node)?;
             return Ok(consumed);
@@ -2076,6 +2088,7 @@ impl<'source> Parser<'source> {
         index: usize,
         parent_indent: usize,
         value_start: usize,
+        allow_same_indent_continuation: bool,
     ) -> (NodeId, usize) {
         let mut consumed = 1;
         let mut end = lines[index].content_end;
@@ -2092,7 +2105,11 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            if !is_plain_scalar_continuation(line.content_without_break, parent_indent) {
+            if !is_plain_scalar_continuation(
+                line.content_without_break,
+                parent_indent,
+                allow_same_indent_continuation,
+            ) {
                 break;
             }
 
@@ -2805,18 +2822,22 @@ impl<'source> Parser<'source> {
         content_line_indent(&text[line_start..offset])
     }
 
-    fn validate_indent(&self, indent: usize, line: SourceLine<'_>) -> Result<(), YamlError> {
+    fn validate_indent(
+        &self,
+        indent: usize,
+        line: SourceLine<'_>,
+        body: &str,
+    ) -> Result<(), YamlError> {
         if indent == 0 {
             return Ok(());
         }
 
-        let has_parent_collection = self
-            .mappings
-            .iter()
-            .chain(self.sequences.iter())
-            .any(|(level, _)| *level < indent);
+        let has_parent_collection = self.has_parent_collection_below(indent);
 
-        if has_parent_collection {
+        let is_indented_root_collection = !has_parent_collection
+            && (is_sequence_entry(body) || body_starts_flow_value_start(body));
+
+        if has_parent_collection || is_indented_root_collection {
             Ok(())
         } else {
             Err(YamlError::new(
@@ -2828,6 +2849,13 @@ impl<'source> Parser<'source> {
                 .with_expected("a parent mapping or sequence at a lower indentation level"),
             ))
         }
+    }
+
+    fn has_parent_collection_below(&self, indent: usize) -> bool {
+        self.mappings
+            .iter()
+            .chain(self.sequences.iter())
+            .any(|(level, _)| *level < indent)
     }
 
     fn close_collections_deeper_than(&mut self, indent: usize) {
@@ -3777,9 +3805,33 @@ fn content_line_indent(content: &str) -> usize {
     content.bytes().take_while(|byte| *byte == b' ').count()
 }
 
-fn is_plain_scalar_continuation(content: &str, parent_indent: usize) -> bool {
+fn is_plain_scalar_continuation(
+    content: &str,
+    parent_indent: usize,
+    allow_same_indent: bool,
+) -> bool {
     let indent = content_line_indent(content);
-    indent > parent_indent || content.as_bytes().get(indent) == Some(&b'\t')
+    if indent > parent_indent || content.as_bytes().get(indent) == Some(&b'\t') {
+        return true;
+    }
+    allow_same_indent
+        && indent == parent_indent
+        && !starts_new_same_indent_collection(&content[indent..])
+}
+
+fn starts_new_same_indent_collection(body: &str) -> bool {
+    body.starts_with("---")
+        || body.starts_with("...")
+        || is_sequence_entry(body)
+        || is_explicit_mapping_key(body)
+        || is_explicit_mapping_value(body)
+        || find_mapping_colon(body).is_some()
+        || body_starts_flow_value_start(body)
+}
+
+fn body_starts_flow_value_start(body: &str) -> bool {
+    let body = body.trim_start_matches([' ', '\t']);
+    matches!(body.chars().next(), Some('[' | '{'))
 }
 
 fn count_literal_content_indent(content: &str) -> usize {
@@ -8866,6 +8918,65 @@ ports:
             doc.events_to_test_string(),
             "+STR\n+DOC\n+SEQ\n=VAL :-1\n-SEQ\n-DOC\n-STR\n"
         );
+    }
+
+    #[test]
+    fn parser_accepts_indented_root_block_sequence() {
+        let input = " - !!str a\n - b\n - !!int 42\n - d\n";
+        let doc = YamlDoc::parse(input).expect("valid indented root sequence");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n=VAL <tag:yaml.org,2002:str> :a\n=VAL :b\n=VAL <tag:yaml.org,2002:int> :42\n=VAL :d\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_indented_root_flow_sequence() {
+        let input = "  [1, 2, 3]\n";
+        let doc = YamlDoc::parse(input).expect("valid indented root flow sequence");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ []\n=VAL :1\n=VAL :2\n=VAL :3\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_nested_mappings_in_indented_root_sequence() {
+        let input = " - key: value\n   key2: value2\n -\n   key3: value3\n";
+        let doc = YamlDoc::parse(input).expect("valid indented root sequence mappings");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+SEQ\n+MAP\n=VAL :key\n=VAL :value\n=VAL :key2\n=VAL :value2\n-MAP\n+MAP\n=VAL :key3\n=VAL :value3\n-MAP\n-SEQ\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn parser_folds_root_plain_scalar_continuations() {
+        for (input, expected) in [
+            (
+                "---\nk:#foo\n &a !t s\n",
+                "+STR\n+DOC ---\n=VAL :k:#foo &a !t s\n-DOC\n-STR\n",
+            ),
+            (
+                "---\nscalar\n%YAML 1.2\n",
+                "+STR\n+DOC ---\n=VAL :scalar %YAML 1.2\n-DOC\n-STR\n",
+            ),
+            (
+                "Bare\ndocument\n...\n|\n%!PS-Adobe-2.0 # Not the first line\n",
+                "+STR\n+DOC\n=VAL :Bare document\n-DOC ...\n+DOC\n=VAL |%!PS-Adobe-2.0 # Not the first line\\n\n-DOC\n-STR\n",
+            ),
+        ] {
+            let doc = YamlDoc::parse(input).expect("valid root plain scalar continuation");
+
+            assert_eq!(doc.to_string(), input);
+            assert_eq!(doc.events_to_test_string(), expected);
+        }
     }
 
     #[test]

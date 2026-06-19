@@ -1166,10 +1166,17 @@ impl<'source> Parser<'source> {
         let mut consumed = 1;
         let mut validation_end = lines[index].content_end;
         let flow_indent = self.source_indent_at(absolute_start);
+        let marker_prefix = &lines[index].content_without_break
+            [..absolute_start.saturating_sub(lines[index].content_start)];
+        let allow_tab_continuation = marker_prefix.as_bytes().contains(&b'\t');
         for line in &lines[index + 1..] {
             if line.content_start < absolute_end {
                 if validate_sequence_indent {
-                    reject_invalid_flow_continuation_indent(line, flow_indent)?;
+                    reject_invalid_flow_continuation_indent(
+                        line,
+                        flow_indent,
+                        allow_tab_continuation,
+                    )?;
                 }
                 consumed += 1;
                 validation_end = line.content_end;
@@ -1951,6 +1958,7 @@ impl<'source> Parser<'source> {
 
         let after_dash = if body == "-" { "" } else { &body[1..] };
         reject_invalid_indicator_tab(body, line.content_start + indent)?;
+        reject_invalid_sequence_tab_separated_nested_indicator(body, line.content_start + indent)?;
         let value = after_dash.trim_start();
         let value_without_comment = strip_inline_comment(after_dash).trim_start();
         if value.is_empty() || value_without_comment.is_empty() {
@@ -4391,6 +4399,31 @@ fn reject_invalid_indicator_tab(body: &str, absolute_start: usize) -> Result<(),
     ))
 }
 
+fn reject_invalid_sequence_tab_separated_nested_indicator(
+    body: &str,
+    absolute_start: usize,
+) -> Result<(), YamlError> {
+    let Some(after_dash) = body.strip_prefix('-') else {
+        return Ok(());
+    };
+    let spaces = after_dash.bytes().take_while(|byte| *byte == b' ').count();
+    if spaces == 0 || after_dash.as_bytes().get(spaces) != Some(&b'\t') {
+        return Ok(());
+    }
+    let after_tab = &after_dash[spaces + 1..];
+    if after_tab == "-" || after_tab.starts_with("- ") || after_tab.starts_with("-\t") {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "tab character is not allowed before a nested block sequence indicator",
+                Span::from_usize(absolute_start + 1 + spaces, absolute_start + 2 + spaces),
+            )
+            .with_expected("spaces before a nested block sequence indicator"),
+        ));
+    }
+    Ok(())
+}
+
 fn reject_invalid_compact_block_collection_value(
     value: &str,
     absolute_start: usize,
@@ -4414,6 +4447,7 @@ fn reject_invalid_compact_block_collection_value(
 fn reject_invalid_flow_continuation_indent(
     line: &SourceLine<'_>,
     flow_indent: usize,
+    allow_tab_continuation: bool,
 ) -> Result<(), YamlError> {
     let trimmed = line.content_without_break.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -4427,8 +4461,22 @@ fn reject_invalid_flow_continuation_indent(
     {
         return Ok(());
     }
-    if indent > flow_indent || line.content_without_break.as_bytes().get(indent) == Some(&b'\t') {
+    if indent > flow_indent {
         return Ok(());
+    }
+    if line.content_without_break.as_bytes().get(indent) == Some(&b'\t') {
+        let tabbed = line.content_without_break[indent..].trim_start_matches('\t');
+        if tabbed
+            .chars()
+            .next()
+            .is_some_and(|character| matches!(character, ',' | '?' | ']' | '}'))
+        {
+            return Ok(());
+        }
+        if allow_tab_continuation {
+            return Ok(());
+        }
+        return Err(tab_indentation_error(line.content_start + indent));
     }
     Err(YamlError::new(
         Diagnostic::new(
@@ -10140,6 +10188,15 @@ ports:
     fn parser_rejects_tabs_used_as_block_indicator_separation() {
         for input in ["-\t-\n", "?\t-\n", "?\tkey:\n", "? key:\n:\tkey:\n"] {
             let error = YamlDoc::parse(input).expect_err("tab must not enable block structure");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        }
+    }
+
+    #[test]
+    fn parser_rejects_tabs_enabling_nested_block_structure() {
+        for input in ["- \t-\n", "- [\n\tfoo,\n foo\n ]\n"] {
+            let error = YamlDoc::parse(input).expect_err("tab must not enable nested structure");
 
             assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
         }

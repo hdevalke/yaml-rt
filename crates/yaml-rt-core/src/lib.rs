@@ -2409,6 +2409,12 @@ impl<'source> Parser<'source> {
 
             let tab_content_line =
                 trimmed.is_empty() && line.content_without_break.as_bytes().contains(&b'\t');
+            if tab_content_line
+                && content_indent == usize::MAX
+                && count_literal_content_indent(line.content_without_break) == 0
+            {
+                return Err(tab_indentation_error(line.content_start));
+            }
             if trimmed.is_empty() && !tab_content_line {
                 if content_indent == usize::MAX && inline_header {
                     pending_blank_lines += 1;
@@ -2424,6 +2430,13 @@ impl<'source> Parser<'source> {
             }
 
             let indent = count_literal_content_indent(line.content_without_break);
+            if content_indent == usize::MAX
+                && pending_blank_lines > 0
+                && indent <= pending_blank_indent.unwrap_or(usize::MAX)
+                && line.content_without_break[indent..].starts_with('#')
+            {
+                return Err(invalid_block_scalar_content(line.content_start + indent));
+            }
             if content_indent == usize::MAX {
                 if indent <= parent_indent && (parent_indent > 0 || inline_header) {
                     reached_end = false;
@@ -4060,6 +4073,12 @@ fn parse_block_scalar_header(
                 ));
             }
             '#' => {
+                if offset == 1 {
+                    return Err(invalid_block_scalar_header(
+                        header_start + offset,
+                        character,
+                    ));
+                }
                 return Ok(BlockScalarHeader {
                     kind,
                     chomp,
@@ -4090,6 +4109,17 @@ fn invalid_block_scalar_header(offset: usize, found: char) -> YamlError {
             Span::from_usize(offset, offset + found.len_utf8()),
         )
         .with_expected("|, >, chomping indicator, or a one-digit indentation indicator"),
+    )
+}
+
+fn invalid_block_scalar_content(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "invalid block scalar content indentation",
+            Span::from_usize(offset, offset + 1),
+        )
+        .with_expected("an indented scalar content line"),
     )
 }
 
@@ -9049,6 +9079,19 @@ ports:
             doc.events_to_test_string(),
             "+STR\n+DOC\n+MAP\n=VAL :foo\n=VAL |\\t\\n\n=VAL :bar\n=VAL :1\n-MAP\n-DOC\n-STR\n"
         );
+    }
+
+    #[test]
+    fn parser_rejects_invalid_block_scalar_forms() {
+        for input in [
+            "block: ># comment\n  scalar\n",
+            "empty block scalar: >\n \n  \n   \n # comment\n",
+            "foo: |\n\t\nbar: 1\n",
+        ] {
+            let error = YamlDoc::parse(input).expect_err("invalid block scalar should reject");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        }
     }
 
     #[test]

@@ -1193,6 +1193,7 @@ impl<'source> Parser<'source> {
             value_text,
             Span::from_usize(value_start, value_start + value_text.len()),
         )?;
+        reject_invalid_node_property_placement(value_text, value_start, &properties)?;
         let marker_offset =
             properties.value_start + leading_flow_whitespace(&value_text[properties.value_start..]);
         let marker_start = value_start + marker_offset;
@@ -1228,6 +1229,8 @@ impl<'source> Parser<'source> {
         let key_start = line.content_start + indent;
         let key_text = body[..colon_byte].trim_end();
         let key_end = key_start + key_text.len();
+        let key_properties = parse_node_properties(key_text, Span::from_usize(key_start, key_end))?;
+        reject_invalid_node_property_placement(key_text, key_start, &key_properties)?;
         if key_start < key_end && body_starts_flow_value(key_text, key_start)? {
             let (key, end) = self.parse_flow_value(key_text, key_start)?;
             reject_trailing_flow_content(key_text, end, key_start)?;
@@ -1251,6 +1254,16 @@ impl<'source> Parser<'source> {
         if !value_trimmed.is_empty() {
             let leading = value.len() - value_trimmed.len();
             let value_start = line.content_start + indent + colon_byte + 1 + leading;
+            let value_properties = parse_node_properties(
+                value_trimmed,
+                Span::from_usize(value_start, value_start + value_trimmed.len()),
+            )?;
+            reject_invalid_node_property_placement(value_trimmed, value_start, &value_properties)?;
+            reject_invalid_block_node_property_punctuation(
+                value_trimmed,
+                value_start,
+                &value_properties,
+            )?;
             reject_invalid_compact_block_collection_value(value_trimmed, value_start)?;
             if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
                 let (node, consumed) = self.parse_block_scalar(
@@ -1382,6 +1395,11 @@ impl<'source> Parser<'source> {
         } else {
             let leading = after_question.len() - after_question.trim_start().len();
             let key_start = line.content_start + indent + 1 + leading;
+            let key_properties = parse_node_properties(
+                key_text,
+                Span::from_usize(key_start, key_start + key_text.len()),
+            )?;
+            reject_invalid_node_property_placement(key_text, key_start, &key_properties)?;
             self.parse_explicit_mapping_key_node(entry, lines, index, indent, key_text, key_start)?
         };
 
@@ -1560,6 +1578,16 @@ impl<'source> Parser<'source> {
 
         let leading = value.len() - value_trimmed.len();
         let value_start = line.content_start + indent + 1 + leading;
+        let value_properties = parse_node_properties(
+            value_trimmed,
+            Span::from_usize(value_start, value_start + value_trimmed.len()),
+        )?;
+        reject_invalid_node_property_placement(value_trimmed, value_start, &value_properties)?;
+        reject_invalid_block_node_property_punctuation(
+            value_trimmed,
+            value_start,
+            &value_properties,
+        )?;
         if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, value_start, indent, value_trimmed, false)?;
@@ -1757,6 +1785,7 @@ impl<'source> Parser<'source> {
             text,
             Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
+        reject_invalid_node_property_placement(text, absolute_start, &properties)?;
         self.resolve_node_properties(
             &mut properties,
             Span::from_usize(absolute_start, absolute_start + text.len()),
@@ -1939,6 +1968,12 @@ impl<'source> Parser<'source> {
         } else {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
+            let value_properties = parse_node_properties(
+                value,
+                Span::from_usize(value_start, value_start + value.len()),
+            )?;
+            reject_invalid_node_property_placement(value, value_start, &value_properties)?;
+            reject_invalid_block_node_property_punctuation(value, value_start, &value_properties)?;
             if value.starts_with('|') || value.starts_with('>') {
                 let (node, consumed) =
                     self.parse_block_scalar(lines, index, value_start, indent, value, false)?;
@@ -2348,6 +2383,7 @@ impl<'source> Parser<'source> {
             text,
             Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
+        reject_invalid_node_property_placement(text, absolute_start, &properties)?;
         let value_start =
             properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
         let value_text = &text[value_start..];
@@ -3418,11 +3454,68 @@ struct NodeProperties {
     value_start: usize,
 }
 
+fn reject_invalid_node_property_placement(
+    text: &str,
+    absolute_start: usize,
+    properties: &NodeProperties,
+) -> Result<(), YamlError> {
+    if properties.anchor.is_none() && properties.tag.is_none() {
+        return Ok(());
+    }
+
+    let value_start =
+        properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
+    let value_text = &text[value_start..];
+    let Some(first) = value_text.chars().next() else {
+        return Ok(());
+    };
+
+    if first == '*' || (first == '-' && is_sequence_entry(value_text)) {
+        return Err(invalid_node_property_placement(
+            absolute_start + value_start,
+            first,
+        ));
+    }
+
+    Ok(())
+}
+
+fn reject_invalid_block_node_property_punctuation(
+    text: &str,
+    absolute_start: usize,
+    properties: &NodeProperties,
+) -> Result<(), YamlError> {
+    if properties.anchor.is_none() && properties.tag.is_none() {
+        return Ok(());
+    }
+    let value_start =
+        properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
+    if text[value_start..].starts_with(',') {
+        return Err(invalid_node_property_placement(
+            absolute_start + value_start,
+            ',',
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_node_property_placement(offset: usize, found: char) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("invalid node property placement before `{found}`"),
+            Span::from_usize(offset, offset + found.len_utf8()),
+        )
+        .with_expected("a scalar or collection node"),
+    )
+}
+
 fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, YamlError> {
     let properties = parse_node_properties(
         body,
         Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
+    reject_invalid_node_property_placement(body, absolute_start, &properties)?;
     let value_start =
         properties.value_start + leading_flow_whitespace(&body[properties.value_start..]);
     Ok(matches!(
@@ -3508,6 +3601,7 @@ fn property_only_mapping_value_collection_indent(
     absolute_start: usize,
     parent_indent: usize,
 ) -> Result<Option<usize>, YamlError> {
+    reject_invalid_anchor_only_nested_property_mapping(body, lines, index, absolute_start)?;
     let Some(indent) = property_only_block_collection_indent(body, lines, index, absolute_start)?
     else {
         return Ok(None);
@@ -3526,6 +3620,50 @@ fn property_only_mapping_value_collection_indent(
     } else {
         Ok(None)
     }
+}
+
+fn reject_invalid_anchor_only_nested_property_mapping(
+    body: &str,
+    lines: &[SourceLine<'_>],
+    index: usize,
+    absolute_start: usize,
+) -> Result<(), YamlError> {
+    let body = strip_inline_comment(body).trim_end();
+    let properties = parse_node_properties(
+        body,
+        Span::from_usize(absolute_start, absolute_start + body.len()),
+    )?;
+    if properties.anchor.is_none()
+        || properties.tag.is_some()
+        || properties.value_start < body.len()
+    {
+        return Ok(());
+    }
+
+    let Some((_, _, nested_body)) =
+        first_non_property_node_after_with_index(lines, index, absolute_start)?
+    else {
+        return Ok(());
+    };
+    let nested_body = strip_inline_comment(nested_body).trim_end();
+    let nested_properties = parse_node_properties(
+        nested_body,
+        Span::from_usize(absolute_start, absolute_start + nested_body.len()),
+    )?;
+    if (nested_properties.anchor.is_some() || nested_properties.tag.is_some())
+        && nested_properties.value_start < nested_body.len()
+        && find_mapping_colon(nested_body).is_none()
+    {
+        return Err(invalid_node_property_placement(
+            absolute_start + nested_properties.value_start,
+            nested_body[nested_properties.value_start..]
+                .chars()
+                .next()
+                .unwrap_or(':'),
+        ));
+    }
+
+    Ok(())
 }
 
 fn first_non_property_node_after<'line>(
@@ -8597,6 +8735,34 @@ ports:
             doc.events_to_test_string(),
             "+STR\n+DOC ---\n+MAP\n=VAL :a\n=VAL &anchor :\n=VAL :b\n=ALI *anchor\n-MAP\n-DOC\n-STR\n"
         );
+    }
+
+    #[test]
+    fn parser_rejects_invalid_node_property_placement() {
+        for input in [
+            "key1: &a value\nkey2: &b *a\n",
+            "key1: &alias value1\n&b *alias : value2\n",
+            "&anchor - sequence entry\n",
+            "- !!str, xxx\n",
+            "top1: &node1\n  &k1 key1: val1\ntop2: &node2\n  &v2 val2\n",
+        ] {
+            let error = YamlDoc::parse(input).expect_err("invalid node property should reject");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        }
+    }
+
+    #[test]
+    fn parser_preserves_valid_node_property_neighbors() {
+        for input in [
+            "a: &anchor\nb: *anchor\n",
+            "&a4 !!map\n&a5 !!str key5: value4\n",
+            "top6: \n  &anchor6 'key6' : scalar6\n",
+        ] {
+            let doc = YamlDoc::parse(input).expect("valid node property placement");
+
+            assert_eq!(doc.to_string(), input);
+        }
     }
 
     #[test]

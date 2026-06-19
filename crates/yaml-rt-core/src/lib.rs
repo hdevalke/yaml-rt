@@ -1131,6 +1131,9 @@ impl<'source> Parser<'source> {
         let mut consumed = 1;
         for line in &lines[index + 1..] {
             if line.content_start < absolute_end {
+                if quote == '"' {
+                    validate_double_quoted_continuation_line(line)?;
+                }
                 consumed += 1;
             } else {
                 break;
@@ -2310,6 +2313,11 @@ impl<'source> Parser<'source> {
                 allow_same_indent_continuation,
             ) {
                 break;
+            }
+            if self.source.as_str()[value_start..lines[index].content_end].starts_with('"')
+                && line.content_without_break.starts_with('\t')
+            {
+                return Err(tab_indentation_error(line.content_start));
             }
             let indent = content_line_indent(line.content_without_break);
             let body = &line.content_without_break[indent..];
@@ -5009,6 +5017,24 @@ fn double_quoted_scalar_end(text: &str) -> Option<usize> {
     None
 }
 
+fn validate_double_quoted_continuation_line(line: &SourceLine<'_>) -> Result<(), YamlError> {
+    let trimmed = line.content_without_break.trim();
+    if document_marker_rest(trimmed, "---").is_some()
+        || document_marker_rest(trimmed, "...").is_some()
+    {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "document marker is not allowed inside a double-quoted scalar",
+                Span::from_usize(line.content_start, line.content_end),
+            )
+            .with_expected("double-quoted scalar content"),
+        ));
+    }
+
+    Ok(())
+}
+
 fn single_quoted_scalar_end(text: &str) -> Option<usize> {
     let mut chars = text.char_indices().skip(1).peekable();
     while let Some((offset, character)) = chars.next() {
@@ -5149,7 +5175,9 @@ fn decode_scalar_value_with_content_indent(
                 .with_expected("a closed double-quoted scalar"),
             )
         })?;
-        let continued = strip_double_quoted_line_continuations(&text[1..end - 1]);
+        let raw_content = &text[1..end - 1];
+        validate_double_quoted_scalar_content(raw_content)?;
+        let continued = strip_double_quoted_line_continuations(raw_content);
         let folded = fold_quoted_scalar_lines(&continued);
         return decode_double_quoted_scalar(&folded);
     }
@@ -5218,6 +5246,28 @@ fn fold_quoted_scalar_lines(text: &str) -> String {
     }
 
     folded
+}
+
+fn validate_double_quoted_scalar_content(text: &str) -> Result<(), YamlError> {
+    let mut position = 0;
+    let mut first_line = true;
+    while position < text.len() {
+        let (line, next_position) = next_literal_content_line(text, position);
+        let (body, _) = split_line_break(line);
+        if !first_line {
+            let trimmed = body.trim();
+            if document_marker_rest(trimmed, "---").is_some()
+                || document_marker_rest(trimmed, "...").is_some()
+            {
+                return Err(invalid_double_quoted_escape(
+                    "document marker is not allowed inside a double-quoted scalar",
+                ));
+            }
+        }
+        first_line = false;
+        position = next_position;
+    }
+    Ok(())
 }
 
 fn strip_double_quoted_line_continuations(text: &str) -> String {
@@ -5719,6 +5769,10 @@ fn decode_double_quoted_scalar(text: &str) -> Result<String, YamlError> {
                 output.push('/');
                 position += escaped.len_utf8();
             }
+            ' ' => {
+                output.push(' ');
+                position += escaped.len_utf8();
+            }
             '0' => {
                 output.push('\0');
                 position += escaped.len_utf8();
@@ -5773,9 +5827,8 @@ fn decode_double_quoted_scalar(text: &str) -> Result<String, YamlError> {
             '\n' | '\r' => {
                 position = skip_escaped_line_break(text, position);
             }
-            other => {
-                output.push(other);
-                position += other.len_utf8();
+            _ => {
+                return Err(invalid_double_quoted_escape("invalid double-quoted escape"));
             }
         }
     }
@@ -7848,6 +7901,32 @@ single: 'hello'
             assert!(
                 error.diagnostic.message.contains("double-quoted"),
                 "{input:?} should report a double-quoted escape error"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_rejects_invalid_double_quoted_scalars() {
+        for input in [
+            "---\n\"\\.\"\n",
+            "---\ndouble: \"quoted \\' scalar\"\n",
+            "---\n\"\n---\n\"\n",
+            "--- \"a\n... x\nb\"\n",
+            "foo: \"bar\n\tbaz\"\n",
+        ] {
+            let error =
+                YamlDoc::parse(input).expect_err("invalid double-quoted scalar should fail");
+
+            assert!(
+                matches!(
+                    error.diagnostic.kind,
+                    DiagnosticKind::Parser | DiagnosticKind::Typed
+                ),
+                "{input:?} should report parser or typed validation"
+            );
+            assert!(
+                error.diagnostic.position.is_some(),
+                "{input:?} should include source position"
             );
         }
     }

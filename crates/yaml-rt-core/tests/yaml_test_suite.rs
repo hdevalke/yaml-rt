@@ -16,8 +16,6 @@ const RUN_ALL_ENV: &str = "YAML_TEST_SUITE_RUN_ALL";
 const EXPECTED_FAILURES: &[&str] = &[
     // Parser MVP does not yet handle this nested flow mapping shape.
     "VJP3:01",
-    // Parser MVP does not yet handle this multi-line quoted flow scalar shape.
-    "9SA2",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

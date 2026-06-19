@@ -1869,15 +1869,7 @@ impl<'source> Parser<'source> {
 
     fn parse_directive_line(&mut self, line: SourceLine<'_>) -> Result<(), YamlError> {
         if self.document.is_some() || self.document_has_content {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Parser,
-                    "directives must appear before document content",
-                    Span::from_usize(line.content_start, line.content_end),
-                )
-                .with_expected("a directive before the document start marker or content"),
-            )
-            .with_position_from(self.source));
+            return Err(directive_after_document_content(line).with_position_from(self.source));
         }
 
         let stream = self.stream.expect("stream node exists before directives");
@@ -2338,6 +2330,12 @@ impl<'source> Parser<'source> {
         let mut scalar_has_inline_comment = plain_scalar_line_has_inline_comment(
             &self.source.as_str()[value_start..lines[index].content_end],
         );
+        let initial_properties = parse_node_properties(
+            &self.source.as_str()[value_start..lines[index].content_end],
+            Span::from_usize(value_start, lines[index].content_end),
+        )?;
+        let scalar_has_node_properties =
+            initial_properties.anchor.is_some() || initial_properties.tag.is_some();
 
         for line in &lines[index + 1..] {
             let trimmed = line.content_without_break.trim();
@@ -2356,6 +2354,9 @@ impl<'source> Parser<'source> {
                 allow_same_indent_continuation,
             ) {
                 break;
+            }
+            if scalar_has_node_properties && trimmed.starts_with('%') {
+                return Err(directive_after_document_content(*line).with_position_from(self.source));
             }
             if self.source.as_str()[value_start..lines[index].content_end].starts_with('"')
                 && line.content_without_break.starts_with('\t')
@@ -4018,6 +4019,17 @@ fn invalid_directive(line: SourceLine<'_>, message: &'static str) -> YamlError {
             Span::from_usize(line.content_start, line.content_end),
         )
         .with_expected("%YAML or %TAG directive syntax"),
+    )
+}
+
+fn directive_after_document_content(line: SourceLine<'_>) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "directives must appear before document content",
+            Span::from_usize(line.content_start, line.content_end),
+        )
+        .with_expected("a directive before the document start marker or content"),
     )
 }
 
@@ -8448,6 +8460,46 @@ single: 'hello'
             doc.events_to_test_string(),
             "+STR\n+DOC ---\n=VAL <tag:example.com,2000:app/foo> \"bar\n-DOC\n-STR\n"
         );
+    }
+
+    #[test]
+    fn parser_rejects_directives_after_tagged_implicit_content() {
+        for input in [
+            "!foo \"bar\"\n%TAG ! tag:example.com,2000:app/\n---\n!foo \"bar\"\n",
+            "!foo \"bar\"\n%YAML 1.2\n---\n",
+            "!foo \"bar\"\n%FOO ignored\n---\n",
+        ] {
+            let error = YamlDoc::parse(input).expect_err("directive after content should reject");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+            assert_eq!(
+                error.diagnostic.message,
+                "directives must appear before document content"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_preserves_directive_and_tagged_scalar_neighbors() {
+        for (input, expected) in [
+            (
+                "%TAG ! tag:example.com,2000:app/\n---\n!foo \"bar\"\n",
+                "+STR\n+DOC ---\n=VAL <tag:example.com,2000:app/foo> \"bar\n-DOC\n-STR\n",
+            ),
+            (
+                "%FOO  bar baz # ignored\n---\n\"foo\"\n",
+                "+STR\n+DOC ---\n=VAL \"foo\n-DOC\n-STR\n",
+            ),
+            (
+                "!foo \"bar\"\n",
+                "+STR\n+DOC\n=VAL <!foo> \"bar\n-DOC\n-STR\n",
+            ),
+        ] {
+            let doc = YamlDoc::parse(input).expect("valid directive or tagged scalar neighbor");
+
+            assert_eq!(doc.events_to_test_string(), expected);
+            assert_eq!(doc.to_string(), input);
+        }
     }
 
     #[test]

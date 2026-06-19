@@ -1508,10 +1508,13 @@ impl<'source> Parser<'source> {
         } else if let Some(colon_byte) = find_mapping_colon(key_text) {
             self.parse_compact_block_mapping_node(entry, key_text, key_start, colon_byte)
         } else {
-            let key = self.parse_inline_value(key_text, key_start)?;
+            validate_quoted_scalar_trailing_content(key_text, key_start)?;
+            reject_nested_plain_mapping_colon(key_text, key_start)?;
+            let (key, consumed) =
+                self.parse_block_plain_scalar(lines, index, parent_indent, key_start, false)?;
             self.nodes[entry.0 as usize].children.push(key);
-            self.emit_node_event(key)?;
-            Ok(1)
+            self.emit_scalar_event(key)?;
+            Ok(consumed)
         }
     }
 
@@ -2320,28 +2323,6 @@ impl<'source> Parser<'source> {
             self.push_node(NodeKind::Scalar, Span::from_usize(value_start, end)),
             consumed,
         ))
-    }
-
-    fn parse_inline_value(
-        &mut self,
-        text: &str,
-        absolute_start: usize,
-    ) -> Result<NodeId, YamlError> {
-        let properties = parse_node_properties(
-            text,
-            Span::from_usize(absolute_start, absolute_start + text.len()),
-        )?;
-        let value_text = &text[properties.value_start..];
-        if value_text.starts_with('[') || value_text.starts_with('{') {
-            let (node, end) = self.parse_flow_value(text, absolute_start)?;
-            reject_trailing_flow_content(text, end, absolute_start)?;
-            Ok(node)
-        } else {
-            Ok(self.push_node(
-                NodeKind::Scalar,
-                Span::from_usize(absolute_start, absolute_start + text.len()),
-            ))
-        }
     }
 
     fn parse_flow_value(
@@ -7831,6 +7812,30 @@ single: 'hello'
             "+STR\n+DOC\n+MAP\n=VAL :key\n=VAL :value\n-MAP\n-DOC\n-STR\n"
         );
         assert_eq!(doc.to_string(), "? key\n# comment\n: value\n");
+    }
+
+    #[test]
+    fn events_fold_explicit_plain_scalar_key_continuations() {
+        let input = "? a\n  true\n: null\n  d\n? e\n  42\n";
+        let doc = YamlDoc::parse(input).expect("valid explicit key continuations");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :a true\n=VAL :null d\n=VAL :e 42\n=VAL :\n-MAP\n-DOC\n-STR\n"
+        );
+    }
+
+    #[test]
+    fn events_pair_continued_explicit_plain_key_with_value() {
+        let input = "? key\n  continued\n: value\n";
+        let doc = YamlDoc::parse(input).expect("valid continued explicit key with value");
+
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :key continued\n=VAL :value\n-MAP\n-DOC\n-STR\n"
+        );
     }
 
     #[test]

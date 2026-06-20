@@ -3948,11 +3948,9 @@ fn percent_decode_tag_suffix(suffix: &str, span: Span) -> Result<String, YamlErr
 
         let hex_start = position + 1;
         let hex_end = hex_start + 2;
-        if hex_end > suffix.len()
-            || !suffix[hex_start..hex_end]
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
+        let bytes = suffix.as_bytes();
+        let hex_digits = bytes.get(hex_start..hex_end);
+        if !hex_digits.is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit)) {
             return Err(YamlError::new(
                 Diagnostic::new(
                     DiagnosticKind::Parser,
@@ -3962,8 +3960,9 @@ fn percent_decode_tag_suffix(suffix: &str, span: Span) -> Result<String, YamlErr
                 .with_expected("two hexadecimal digits after `%`"),
             ));
         }
-        let byte =
-            u8::from_str_radix(&suffix[hex_start..hex_end], 16).expect("hex digits were validated");
+        let hex = std::str::from_utf8(hex_digits.expect("hex digits were validated"))
+            .expect("hex digits are ASCII");
+        let byte = u8::from_str_radix(hex, 16).expect("hex digits were validated");
         output.push(char::from(byte));
         position = hex_end;
     }
@@ -4696,6 +4695,10 @@ fn reject_nested_plain_mapping_colon(text: &str, absolute_start: usize) -> Resul
 }
 
 fn reject_compact_decorated_document(rest: &str, absolute_start: usize) -> Result<(), YamlError> {
+    if body_starts_flow_value(rest, absolute_start)? {
+        return Ok(());
+    }
+
     if find_mapping_colon(rest).is_some() {
         return Err(YamlError::new(
             Diagnostic::new(
@@ -10603,6 +10606,40 @@ flow: {empty:}
             "+STR\n+DOC ---\n=VAL :߅foo\n-DOC\n-STR\n"
         );
         assert_eq!(doc.to_string(), input);
+    }
+
+    #[test]
+    fn parser_handles_utf8_in_offset_sensitive_positions_without_panicking() {
+        for input in [
+            "߅foo: bar\n",
+            "key: ߅value\n",
+            "? ߅foo\n: bar\n",
+            "- ߅foo: bar\n",
+            "--- [߅]\n",
+            "--- {߅: v}\n",
+            "--- !tag ߅foo\n",
+            "&a ߅foo\n",
+        ] {
+            let doc = YamlDoc::parse(input).expect("valid UTF-8 scalar content parses");
+            let output = doc.to_string();
+            let reparsed = YamlDoc::parse(&output).expect("round-tripped UTF-8 YAML reparses");
+
+            assert_eq!(output, input);
+            assert_eq!(
+                reparsed.events_to_test_string(),
+                doc.events_to_test_string()
+            );
+        }
+    }
+
+    #[test]
+    fn parser_rejects_malformed_compact_utf8_document_content_without_panicking() {
+        for input in ["--- ߅foo:", "--- \"߅\":", "!%sҦ"] {
+            let error = YamlDoc::parse(input)
+                .expect_err("malformed compact UTF-8 document mapping is rejected");
+
+            assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        }
     }
 
     #[test]

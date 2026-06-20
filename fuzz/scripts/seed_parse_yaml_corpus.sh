@@ -77,6 +77,20 @@ doc: one
 ...
 EOF
 
+cat > "$corpus_dir/edge-unicode-spans.yaml" <<'EOF'
+--- ߅foo:
+--- "߅":
+--- [߅]
+--- {߅: v}
+߅foo: bar
+key: ߅value
+? ߅foo
+: bar
+- ߅foo: bar
+--- !tag ߅foo
+&a ߅foo
+EOF
+
 cat > "$corpus_dir/edge-malformed-flow.yaml" <<'EOF'
 &fl
  { &fl

@@ -1069,7 +1069,15 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if let Some(colon_byte) = flow_collection_mapping_key_colon(body, absolute_start)? {
-            self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
+            self.parse_mapping_entry(
+                document,
+                lines,
+                index,
+                indent,
+                body,
+                colon_byte,
+                absolute_start,
+            )
         } else if body_starts_flow_value(body, absolute_start)? {
             let (flow_text, consumed) = self.flow_value_text(lines, index, absolute_start, body)?;
             let (node, end) = self.parse_flow_value(flow_text, absolute_start)?;
@@ -1079,7 +1087,15 @@ impl<'source> Parser<'source> {
             Ok(consumed)
         } else if body.starts_with('"') {
             if let Some(colon_byte) = find_mapping_colon(body) {
-                self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
+                self.parse_mapping_entry(
+                    document,
+                    lines,
+                    index,
+                    indent,
+                    body,
+                    colon_byte,
+                    absolute_start,
+                )
             } else {
                 let (node, consumed) =
                     self.parse_quoted_scalar_lines(lines, index, absolute_start, '"')?;
@@ -1088,7 +1104,15 @@ impl<'source> Parser<'source> {
                 Ok(consumed)
             }
         } else if let Some(colon_byte) = find_mapping_colon(body) {
-            self.parse_mapping_entry(document, lines, index, indent, body, colon_byte)
+            self.parse_mapping_entry(
+                document,
+                lines,
+                index,
+                indent,
+                body,
+                colon_byte,
+                absolute_start,
+            )
         } else {
             let allow_same_indent_continuation = !self.has_parent_collection_below(indent);
             let (scalar, consumed) = self.parse_block_plain_scalar(
@@ -1219,6 +1243,7 @@ impl<'source> Parser<'source> {
         indent: usize,
         body: &str,
         colon_byte: usize,
+        absolute_start: usize,
     ) -> Result<usize, YamlError> {
         let line = lines[index];
         let mapping = self.ensure_mapping(
@@ -1233,7 +1258,7 @@ impl<'source> Parser<'source> {
         self.nodes[mapping.0 as usize].children.push(entry);
         self.extend_node_span(mapping, line.content_end);
 
-        let key_start = line.content_start + indent;
+        let key_start = absolute_start;
         let key_text = body[..colon_byte].trim_end();
         let key_end = key_start + key_text.len();
         let key_properties = parse_node_properties(key_text, Span::from_usize(key_start, key_end))?;
@@ -1260,7 +1285,7 @@ impl<'source> Parser<'source> {
 
         if !value_trimmed.is_empty() {
             let leading = value.len() - value_trimmed.len();
-            let value_start = line.content_start + indent + colon_byte + 1 + leading;
+            let value_start = absolute_start + colon_byte + 1 + leading;
             let value_properties = parse_node_properties(
                 value_trimmed,
                 Span::from_usize(value_start, value_start + value_trimmed.len()),
@@ -2051,6 +2076,7 @@ impl<'source> Parser<'source> {
                     value_start - line.content_start,
                     value,
                     colon_byte,
+                    value_start,
                 );
             }
             validate_quoted_scalar_trailing_content(value, value_start)?;
@@ -4670,6 +4696,17 @@ fn reject_nested_plain_mapping_colon(text: &str, absolute_start: usize) -> Resul
 }
 
 fn reject_compact_decorated_document(rest: &str, absolute_start: usize) -> Result<(), YamlError> {
+    if find_mapping_colon(rest).is_some() {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "compact document mapping is not allowed",
+                Span::from_usize(absolute_start, absolute_start + rest.len()),
+            )
+            .with_expected("a document marker followed by a separate block node"),
+        ));
+    }
+
     let properties = parse_node_properties(
         rest,
         Span::from_usize(absolute_start, absolute_start + rest.len()),
@@ -10546,6 +10583,26 @@ flow: {empty:}
             assert_eq!(doc.events_to_test_string(), expected);
             assert_eq!(doc.to_string(), input);
         }
+    }
+
+    #[test]
+    fn parser_rejects_compact_document_mapping_with_utf8_key_without_panic() {
+        let error = YamlDoc::parse("--- ߅foo:")
+            .expect_err("malformed compact document mapping is rejected");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+    }
+
+    #[test]
+    fn parser_accepts_non_ascii_plain_scalar_after_explicit_document_start() {
+        let input = "--- ߅foo\n";
+        let doc = YamlDoc::parse(input).expect("non-ASCII plain scalar is valid");
+
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC ---\n=VAL :߅foo\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), input);
     }
 
     #[test]

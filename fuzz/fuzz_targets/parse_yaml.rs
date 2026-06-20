@@ -16,7 +16,10 @@ fuzz_target!(|data: &[u8]| {
 
             let reparsed = YamlDoc::parse(&output).expect("round-tripped YAML should reparse");
             assert_eq!(reparsed.to_string(), output);
-            assert_eq!(reparsed.events_to_test_string(), doc.events_to_test_string());
+            assert_eq!(
+                reparsed.events_to_test_string(),
+                doc.events_to_test_string()
+            );
         }
     }
 });

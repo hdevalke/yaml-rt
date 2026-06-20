@@ -155,8 +155,11 @@ pub trait YamlValue: Sized {
   into the parser core.
 - `yaml-rt` re-exports the core API and `YamlRoundTrip` derive macro.
 - `YamlDoc::parse` now validates source characters, lexes losslessly, builds the
-  MVP block mapping/sequence CST, and preserves byte-identical output for
-  untouched YAML.
+  lossless CST, composes a semantic graph, and preserves byte-identical output
+  for untouched YAML.
+- `yaml-rt-core` passes every discovered YAML Test Suite `data-2022-01-17`
+  `in.yaml` case for parsing, byte-identical round-trip output, parser event
+  rendering, and semantic graph composition.
 
 ## Milestone plan
 
@@ -570,10 +573,13 @@ correct.
 - [x] Support parser-produced event stream checks for currently accepted cases.
 - [x] Compose a CST-linked semantic graph from parser events for the accepted
       subset.
-- [ ] Support JSON-compatible value and emit fixture categories.
+- [ ] Support JSON-compatible value and emit fixture categories. JSON-compatible
+      value checks are available as an opt-in baseline with
+      `YAML_TEST_SUITE_CHECK_JSON=1`; emit fixtures remain future work.
 - [x] Record expected failures while the parser is incomplete and require the
-      list to shrink as phases land.
-- [ ] Classify failures by source validation, lexer, parser, composer, schema,
+      list to shrink as phases land. The expected-failure list is currently
+      empty.
+- [x] Classify failures by source validation, lexer, parser, composer, schema,
       typed overlay, or emitter.
 - Keep focused unit tests for tricky grammar behavior before relying on broad
   conformance tests.
@@ -593,8 +599,8 @@ cargo test -p yaml-rt-core --test yaml_test_suite
 
 `YAML_TEST_SUITE_DIR=/path/to/yaml-test-suite-data` can override the in-repo
 submodule. Set `YAML_TEST_SUITE_RUN_ALL=1` to run every discovered `in.yaml`
-case. Full suite runs are expected to fail until the remaining YAML surface and
-explicit expected-failure tracking are implemented.
+case. The full `in.yaml` suite should pass for the pinned data tag; any expected
+failure should be temporary and tracked explicitly in the harness.
 
 To update the suite when upstream publishes a new data tag:
 

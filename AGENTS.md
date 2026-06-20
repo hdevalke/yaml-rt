@@ -6,7 +6,7 @@ parser. Keep every change aligned with the roadmap in `README.md`.
 ## Project goals
 
 - Target YAML 1.2.2.
-- Work toward passing the YAML Test Suite tag `v2022-01-17` in the core parser.
+- Keep passing the YAML Test Suite tag `v2022-01-17` in the core parser.
 - Preserve presentation details needed for round-trip editing: comments,
   whitespace, line endings, scalar styles, directives, tags, anchors, aliases,
   document markers, and original spelling where practical.
@@ -50,8 +50,9 @@ parser. Keep every change aligned with the roadmap in `README.md`.
   YAML grammar behavior.
 - Core parser changes should add or update YAML Test Suite `v2022-01-17` coverage
   once the harness exists.
-- Track expected YAML Test Suite failures explicitly and shrink the list as
-  phases land.
+- Track expected YAML Test Suite failures explicitly. The list should normally
+  stay empty and only grow for deliberate temporary regressions or unsupported
+  future fixture categories.
 
 ## Documentation guidelines
 

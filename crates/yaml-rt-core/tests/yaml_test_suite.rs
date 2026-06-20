@@ -13,10 +13,7 @@ const CASES_ENV: &str = "YAML_TEST_SUITE_CASES";
 const RUN_ALL_ENV: &str = "YAML_TEST_SUITE_RUN_ALL";
 /// Valid YAML Test Suite cases accepted as known failures while the parser,
 /// composer, and schema layers are incomplete.
-const EXPECTED_FAILURES: &[&str] = &[
-    // Parser MVP does not yet handle this nested flow mapping shape.
-    "VJP3:01",
-];
+const EXPECTED_FAILURES: &[&str] = &[];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SuiteCase {

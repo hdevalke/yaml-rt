@@ -2790,23 +2790,15 @@ impl<'source> Parser<'source> {
                 ));
             }
             position += 1;
-            let value_position = skip_flow_whitespace(text, position);
-            if flow_colon_is_split_from_value(&text[position..value_position])
-                && text[value_position..]
-                    .chars()
-                    .next()
-                    .is_some_and(|character| !matches!(character, ',' | '}'))
-            {
-                return Err(YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Parser,
-                        "flow mapping colon and value must not be split across lines",
-                        Span::from_usize(absolute_start + position - 1, absolute_start + position),
-                    )
-                    .with_expected("a value on the same line as the flow mapping colon"),
-                ));
-            }
-            position = value_position;
+            let value_start = position;
+            position = skip_flow_whitespace(text, position);
+            reject_unindented_split_flow_mapping_value(
+                text,
+                value_start,
+                position,
+                absolute_start,
+                self.source_indent_at(absolute_start),
+            )?;
             position = self.parse_flow_mapping_value(text, position, absolute_start, entry)?;
 
             self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + position);
@@ -4519,6 +4511,45 @@ fn reject_split_implicit_flow_mapping_key(
     Ok(())
 }
 
+fn reject_unindented_split_flow_mapping_value(
+    text: &str,
+    whitespace_start: usize,
+    value_start: usize,
+    absolute_start: usize,
+    flow_indent: usize,
+) -> Result<(), YamlError> {
+    if !text[whitespace_start..value_start].contains('\n')
+        && !text[whitespace_start..value_start].contains('\r')
+    {
+        return Ok(());
+    }
+    if text[value_start..]
+        .chars()
+        .next()
+        .is_none_or(|character| matches!(character, ',' | '}'))
+    {
+        return Ok(());
+    }
+    let line_start = text[..value_start]
+        .rfind(['\n', '\r'])
+        .map_or(0, |offset| offset + 1);
+    let indent = content_line_indent(&text[line_start..]);
+    if indent > flow_indent {
+        return Ok(());
+    }
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "flow mapping value is not indented",
+            Span::from_usize(
+                absolute_start + line_start + indent,
+                absolute_start + line_start + indent + 1,
+            ),
+        )
+        .with_expected("flow mapping value indented deeper than the parent block"),
+    ))
+}
+
 fn invalid_nested_block_sequence_sibling(offset: usize) -> YamlError {
     YamlError::new(
         Diagnostic::new(
@@ -4775,10 +4806,6 @@ fn trailing_flow_whitespace(text: &str) -> usize {
         }
     }
     length
-}
-
-fn flow_colon_is_split_from_value(text: &str) -> bool {
-    (text.contains('\n') || text.contains('\r')) && !text.contains('#')
 }
 
 fn flow_mapping_separator(
@@ -9976,6 +10003,29 @@ ports:
         assert_eq!(
             flow_mapping_scalar_pairs(&mapping_doc, nested_mapping),
             [("hr", "63"), ("avg", "0.288")]
+        );
+    }
+
+    #[test]
+    fn parser_accepts_split_flow_mapping_separator_lines() {
+        let nested_input = "k: {\n k\n :\n v\n }\n";
+        let nested_doc =
+            YamlDoc::parse(nested_input).expect("parser should accept split flow separator");
+
+        assert_eq!(nested_doc.to_string(), nested_input);
+        assert_eq!(
+            nested_doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP\n=VAL :k\n+MAP {}\n=VAL :k\n=VAL :v\n-MAP\n-MAP\n-DOC\n-STR\n"
+        );
+
+        let root_input = "{ key\n :\n value }\n";
+        let root_doc =
+            YamlDoc::parse(root_input).expect("parser should accept root split separator");
+
+        assert_eq!(root_doc.to_string(), root_input);
+        assert_eq!(
+            root_doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP {}\n=VAL :key\n=VAL :value\n-MAP\n-DOC\n-STR\n"
         );
     }
 

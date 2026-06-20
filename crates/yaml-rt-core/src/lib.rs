@@ -2841,10 +2841,10 @@ impl<'source> Parser<'source> {
         }
 
         let key_separator = flow_mapping_separator(text, position, absolute_start, &[',', '}'])?;
-        let key_end = key_separator.unwrap_or_else(|| {
-            flow_scalar_end(text, position, absolute_start, &[',', '}'])
-                .expect("separator scan already validates flow scalar content")
-        });
+        let key_end = match key_separator {
+            Some(separator) => separator,
+            None => flow_scalar_end(text, position, absolute_start, &[',', '}'])?,
+        };
         if body_starts_flow_value(&text[position..key_end], absolute_start + position)? {
             let (key, consumed) =
                 self.parse_flow_value(&text[position..key_end], absolute_start + position)?;
@@ -10226,6 +10226,19 @@ ports:
                 "{input:?} should include source position"
             );
         }
+    }
+
+    #[test]
+    fn parser_rejects_fuzzed_flow_mapping_key_indicator_without_panicking() {
+        let input = "&fl\n { &fl\n { &- |-\n  ab\n...\ne e: f },g: h }\n]\n";
+        let error = YamlDoc::parse(input).expect_err("malformed flow key should be rejected");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        assert_eq!(
+            error.diagnostic.message,
+            "block indicator `...` is not allowed as a flow scalar"
+        );
+        assert!(error.diagnostic.position.is_some());
     }
 
     #[test]

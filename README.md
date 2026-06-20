@@ -573,9 +573,9 @@ correct.
 - [x] Support parser-produced event stream checks for currently accepted cases.
 - [x] Compose a CST-linked semantic graph from parser events for the accepted
       subset.
-- [ ] Support JSON-compatible value and emit fixture categories. JSON-compatible
-      value checks are available as an opt-in baseline with
-      `YAML_TEST_SUITE_CHECK_JSON=1`; emit fixtures remain future work.
+- [x] Support JSON-compatible value fixture checks with
+      `YAML_TEST_SUITE_CHECK_JSON=1`.
+- [ ] Support the emit fixture category with a standalone YAML stream emitter.
 - [x] Record expected failures while the parser is incomplete and require the
       list to shrink as phases land. The expected-failure list is currently
       empty.

@@ -53,6 +53,22 @@ parser. Keep every change aligned with the roadmap in `README.md`.
 - Track expected YAML Test Suite failures explicitly. The list should normally
   stay empty and only grow for deliberate temporary regressions or unsupported
   future fixture categories.
+- For parser fuzzing, work from `fuzz/`. Seed the parser corpus with
+  `scripts/seed_parse_yaml_corpus.sh`, then run
+  `LSAN_OPTIONS=detect_leaks=0 cargo +nightly fuzz run parse_yaml corpus/parse_yaml -- -dict=parse_yaml.dict -max_len=8192`.
+- Minimize the corpus before long runs with
+  `cargo +nightly fuzz cmin parse_yaml corpus/parse_yaml -- -dict=parse_yaml.dict`.
+- Reproduce a crash with
+  `LSAN_OPTIONS=detect_leaks=0 RUST_BACKTRACE=1 cargo +nightly fuzz run parse_yaml artifacts/parse_yaml/<crash-file>`.
+- The corpus seeding script copies YAML Test Suite fixtures using this pattern:
+
+  ```sh
+  find ../third_party/yaml-test-suite \( -name in.yaml -o -name out.yaml -o -name emit.yaml \) | while read f; do
+    id="$(basename "$(dirname "$f")")"
+    name="$(basename "$f" .yaml)"
+    cp "$f" "corpus/parse_yaml/${id}-${name}.yaml"
+  done
+  ```
 
 ## Documentation guidelines
 

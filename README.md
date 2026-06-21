@@ -339,12 +339,13 @@ Add support incrementally:
 - [x] Folded scalars: `>`, including strip/clip/keep chomping and typed
       `String` reads and writes.
 - [x] Anchors: `&name` on scalars and flow collections are preserved in events
-      and the semantic graph. Rewriting anchored values remains a later writer
-      milestone.
+      and the semantic graph. Anchored scalar values can be rewritten while
+      preserving the original anchor spelling and spacing.
 - [x] Aliases: `*name`.
 - [x] Tags: `!tag`, `!!str`, `!<uri>` on scalars and flow collections are
-      preserved in events and the semantic graph. `%TAG` directive resolution
-      and tagged-value rewriting remain later milestones.
+      preserved in events and the semantic graph. `%TAG` directive resolution is
+      supported, and tagged scalar values can be rewritten while preserving the
+      original tag spelling and spacing.
 - [x] Directives: `%YAML` and `%TAG` are parsed before each document. `%TAG`
       handles are resolved into event and semantic tag metadata. Directive
       rewriting remains a later writer milestone.
@@ -356,8 +357,8 @@ Add support incrementally:
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 
-Current editing limits: anchored or tagged value rewriting is still rejected for
-style safety, directives are preserved but not rewritten, nested collection
+Current editing limits: anchored or tagged collection rewriting is still rejected
+for style safety, directives are preserved but not rewritten, nested collection
 fragments are deliberately conservative, and document-selection APIs are still
 future work.
 

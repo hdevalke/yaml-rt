@@ -6995,20 +6995,11 @@ impl YamlDoc {
         let node = self.expect_node_kind(node, NodeKind::Scalar)?;
         let text = self.source.slice(node.span);
         let properties = parse_node_properties(text, node.span)?;
-        if properties.anchor.is_some() || properties.tag.is_some() {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Emitter,
-                    "anchored or tagged scalar rewriting is not implemented yet",
-                    node.span,
-                )
-                .with_expected("an untagged and unanchored scalar"),
-            )
-            .with_position_from(&self.source));
-        }
+        let value_text = &text[properties.value_start..];
+        let value_start = Span::offset_from_usize(node.span.start, properties.value_start);
 
-        if text.starts_with('"') {
-            let end = double_quoted_scalar_end(text).ok_or_else(|| {
+        if value_text.starts_with('"') {
+            let end = double_quoted_scalar_end(value_text).ok_or_else(|| {
                 YamlError::new(
                     Diagnostic::new(
                         DiagnosticKind::Emitter,
@@ -7019,16 +7010,13 @@ impl YamlDoc {
                 )
             })?;
             return Ok((
-                Span::new(
-                    node.span.start,
-                    Span::offset_from_usize(node.span.start, end),
-                ),
+                Span::new(value_start, Span::offset_from_usize(value_start, end)),
                 ScalarStyle::DoubleQuoted,
             ));
         }
 
-        if text.starts_with('\'') {
-            let end = single_quoted_scalar_end(text).ok_or_else(|| {
+        if value_text.starts_with('\'') {
+            let end = single_quoted_scalar_end(value_text).ok_or_else(|| {
                 YamlError::new(
                     Diagnostic::new(
                         DiagnosticKind::Emitter,
@@ -7039,15 +7027,12 @@ impl YamlDoc {
                 )
             })?;
             return Ok((
-                Span::new(
-                    node.span.start,
-                    Span::offset_from_usize(node.span.start, end),
-                ),
+                Span::new(value_start, Span::offset_from_usize(value_start, end)),
                 ScalarStyle::SingleQuoted,
             ));
         }
 
-        let end = plain_scalar_end(text);
+        let end = plain_scalar_end(value_text);
         if end == 0 {
             return Err(YamlError::new(
                 Diagnostic::new(
@@ -7060,12 +7045,24 @@ impl YamlDoc {
         }
 
         Ok((
-            Span::new(
-                node.span.start,
-                Span::offset_from_usize(node.span.start, end),
-            ),
+            Span::new(value_start, Span::offset_from_usize(value_start, end)),
             ScalarStyle::Plain,
         ))
+    }
+
+    fn node_has_anchor_or_tag(&self, node: NodeId) -> bool {
+        let Some(graph) = self
+            .graph_for_cst(node)
+            .and_then(|graph| self.graph_node(graph))
+        else {
+            return false;
+        };
+        match &graph.kind {
+            GraphKind::Mapping { tag, anchor, .. }
+            | GraphKind::Sequence { tag, anchor, .. }
+            | GraphKind::Scalar { tag, anchor, .. } => tag.is_some() || anchor.is_some(),
+            GraphKind::Document { .. } | GraphKind::Alias { .. } => false,
+        }
     }
 
     fn expect_node(&self, node: NodeId) -> Result<&Node, YamlError> {
@@ -8036,9 +8033,14 @@ fn format_block_scalar_replacement(
 ) -> Result<String, YamlError> {
     validate_yaml_chars(value)?;
     let text = doc.source.slice(scalar.span);
-    let header_end = text.find(['\r', '\n']).unwrap_or(text.len());
+    let (header_start, header_end, header_value_start) =
+        block_scalar_header_line(text, scalar.span)?;
     let header = &text[..header_end];
-    let header_info = parse_block_scalar_header(header.trim_start(), scalar.span.start as usize)?;
+    let header_line = &text[header_start..header_end];
+    let header_info = parse_block_scalar_header(
+        header_line[header_value_start..].trim_start(),
+        scalar.span.start as usize + header_start + header_value_start,
+    )?;
     let content_indent = doc
         .block_scalar_content_indent(scalar)
         .unwrap_or_else(|| doc.node_indent(scalar) + header_info.indent.unwrap_or(2));
@@ -8063,6 +8065,46 @@ fn format_block_scalar_replacement(
         }
     }
     Ok(output)
+}
+
+fn block_scalar_header_line(text: &str, span: Span) -> Result<(usize, usize, usize), YamlError> {
+    let mut line_start = 0;
+    while line_start < text.len() {
+        let line_end = text[line_start..]
+            .find(['\r', '\n'])
+            .map_or(text.len(), |offset| line_start + offset);
+        let line = &text[line_start..line_end];
+        let properties = parse_node_properties(
+            line,
+            Span::from_usize(
+                span.start as usize + line_start,
+                span.start as usize + line_end,
+            ),
+        )?;
+        let value = line[properties.value_start..].trim_start();
+        if value.starts_with('|') || value.starts_with('>') {
+            let leading = line[properties.value_start..].len() - value.len();
+            return Ok((line_start, line_end, properties.value_start + leading));
+        }
+
+        line_start = line_end;
+        if text[line_start..].starts_with("\r\n") {
+            line_start += 2;
+        } else if text[line_start..].starts_with(['\r', '\n']) {
+            line_start += 1;
+        } else {
+            break;
+        }
+    }
+
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Emitter,
+            "could not find block scalar header",
+            span,
+        )
+        .with_expected("| or > block scalar header"),
+    ))
 }
 
 fn missing_collection_item_error(doc: &YamlDoc, node: &Node, collection: &str) -> YamlError {
@@ -8342,6 +8384,7 @@ where
         let node = node.ok_or_else(missing_write_node_error)?;
         let sequence = doc.expect_node(node)?;
         if sequence.kind == NodeKind::FlowSequence {
+            reject_anchored_or_tagged_collection_rewrite(doc, node, "flow sequence")?;
             let replacement = format_flow_sequence_replacement(self)?;
             doc.queue_edit(sequence.span, replacement)?;
             return Ok(node);
@@ -8358,6 +8401,7 @@ where
             }
             return Ok(node);
         }
+        reject_anchored_or_tagged_collection_rewrite(doc, node, "block sequence")?;
         let replacement = format_block_sequence_replacement(doc, sequence, self)?;
         doc.queue_edit(sequence.span, replacement)?;
         Ok(node)
@@ -8435,6 +8479,7 @@ where
         let node = node.ok_or_else(missing_write_node_error)?;
         let mapping = doc.expect_node(node)?;
         if mapping.kind == NodeKind::FlowMapping {
+            reject_anchored_or_tagged_collection_rewrite(doc, node, "flow mapping")?;
             let replacement = format_flow_mapping_replacement(self)?;
             doc.queue_edit(mapping.span, replacement)?;
             return Ok(node);
@@ -8454,11 +8499,33 @@ where
             }
         }
         if mapping.children.is_empty() && self.is_empty() {
+            reject_anchored_or_tagged_collection_rewrite(doc, node, "block mapping")?;
             let replacement = format_block_mapping_replacement(doc, &mapping, self)?;
             doc.queue_edit(mapping.span, replacement)?;
         }
         Ok(node)
     }
+}
+
+fn reject_anchored_or_tagged_collection_rewrite(
+    doc: &YamlDoc,
+    node: NodeId,
+    collection: &str,
+) -> Result<(), YamlError> {
+    if !doc.node_has_anchor_or_tag(node) {
+        return Ok(());
+    }
+
+    let span = doc.node(node).map_or(Span::empty(0), |node| node.span);
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Emitter,
+            format!("anchored or tagged {collection} rewriting is not implemented yet"),
+            span,
+        )
+        .with_expected("an unanchored and untagged collection"),
+    )
+    .with_position_from(&doc.source))
 }
 
 impl<T> YamlValue for T
@@ -9199,21 +9266,105 @@ single: 'hello'
     }
 
     #[test]
-    fn yaml_value_rejects_tagged_or_anchored_scalar_writes_for_now() {
+    fn yaml_value_writes_anchored_plain_scalar_preserving_anchor() {
         let mut doc = YamlDoc::parse("plain: &anchor value\n").expect("valid anchor");
         let plain = doc
             .get_path(&["plain"])
             .expect("path lookup succeeds")
             .expect("plain exists");
 
-        let error = String::from("updated")
+        String::from("updated")
             .write_yaml(&mut doc, Some(plain))
-            .expect_err("anchored scalar writes are intentionally not implemented yet");
+            .expect("anchored scalar writes");
+
+        assert_eq!(doc.to_string(), "plain: &anchor updated\n");
+    }
+
+    #[test]
+    fn yaml_value_writes_tagged_double_quoted_scalar_preserving_tag() {
+        let mut doc = YamlDoc::parse("plain: !!str \"value\"\n").expect("valid tag");
+        let plain = doc
+            .get_path(&["plain"])
+            .expect("path lookup succeeds")
+            .expect("plain exists");
+
+        String::from("new \"value\"")
+            .write_yaml(&mut doc, Some(plain))
+            .expect("tagged scalar writes");
+
+        assert_eq!(doc.to_string(), "plain: !!str \"new \\\"value\\\"\"\n");
+    }
+
+    #[test]
+    fn yaml_value_writes_scalar_with_tag_and_anchor_preserving_prefix() {
+        let mut doc = YamlDoc::parse("plain: !local  &anchor value\n").expect("valid properties");
+        let plain = doc
+            .get_path(&["plain"])
+            .expect("path lookup succeeds")
+            .expect("plain exists");
+
+        String::from("updated")
+            .write_yaml(&mut doc, Some(plain))
+            .expect("decorated scalar writes");
+
+        assert_eq!(doc.to_string(), "plain: !local  &anchor updated\n");
+    }
+
+    #[test]
+    fn yaml_value_writes_decorated_block_scalars() {
+        let mut literal = YamlDoc::parse("&msg\n|-\nold\n").expect("valid literal");
+        let message = literal_scalar(&literal).expect("literal exists");
+
+        String::from("new")
+            .write_yaml(&mut literal, Some(message))
+            .expect("anchored literal writes");
+
+        assert_eq!(literal.to_string(), "&msg\n|-\nnew");
+
+        let mut folded = YamlDoc::parse("folded:\n   !foo\n  >1\n old\n").expect("valid folded");
+        let message = folded_scalar(&folded).expect("folded exists");
+
+        String::from("new text")
+            .write_yaml(&mut folded, Some(message))
+            .expect("tagged folded writes");
+
+        assert_eq!(folded.to_string(), "folded:\n   !foo\n  >1\n new text\n");
+    }
+
+    #[test]
+    fn yaml_value_rejects_anchored_or_tagged_collection_rewrites() {
+        let mut sequence = YamlDoc::parse("items: &items [one, two]\n").expect("valid sequence");
+        let items = sequence
+            .get_path(&["items"])
+            .expect("path lookup succeeds")
+            .expect("items exists");
+
+        let error = vec!["three".to_owned()]
+            .write_yaml(&mut sequence, Some(items))
+            .expect_err("anchored flow sequence rewrite rejects");
 
         assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
         assert_eq!(
             error.diagnostic.message,
-            "anchored or tagged scalar rewriting is not implemented yet"
+            "anchored or tagged flow sequence rewriting is not implemented yet"
+        );
+
+        let mut mapping = YamlDoc::parse("settings: !!map {a: b}\n").expect("valid tagged mapping");
+        let settings = mapping
+            .get_path(&["settings"])
+            .expect("path lookup succeeds")
+            .expect("settings exists");
+        let replacement =
+            std::collections::BTreeMap::from([("a".to_owned(), "updated".to_owned())]);
+
+        let error = replacement
+            .write_yaml(&mut mapping, Some(settings))
+            .expect_err("tagged flow mapping rewrite rejects");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(
+            error.diagnostic.message,
+            "anchored or tagged flow mapping rewriting is not implemented yet"
         );
     }
 

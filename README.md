@@ -339,13 +339,13 @@ Add support incrementally:
 - [x] Folded scalars: `>`, including strip/clip/keep chomping and typed
       `String` reads and writes.
 - [x] Anchors: `&name` on scalars and flow collections are preserved in events
-      and the semantic graph. Anchored scalar values can be rewritten while
-      preserving the original anchor spelling and spacing.
+      and the semantic graph. Anchored scalar and collection values can be
+      rewritten while preserving the original anchor spelling and spacing.
 - [x] Aliases: `*name`.
 - [x] Tags: `!tag`, `!!str`, `!<uri>` on scalars and flow collections are
       preserved in events and the semantic graph. `%TAG` directive resolution is
-      supported, and tagged scalar values can be rewritten while preserving the
-      original tag spelling and spacing.
+      supported, and tagged scalar and collection values can be rewritten while
+      preserving the original tag spelling and spacing.
 - [x] Directives: `%YAML` and `%TAG` are parsed before each document. `%TAG`
       handles are resolved into event and semantic tag metadata. Directive
       rewriting remains a later writer milestone.
@@ -356,10 +356,10 @@ Add support incrementally:
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 
-Current editing limits: anchored or tagged collection rewriting is still rejected
-for style safety, directives are preserved but not rewritten, nested collection
-fragments are deliberately conservative, and creating new stream documents is
-future work.
+Current editing limits: directives are preserved but not rewritten, nested
+collection fragments are deliberately conservative, semantic alias propagation is
+not attempted for rewritten anchors, and creating new stream documents is future
+work.
 
 Compatibility note: `root_mapping`, `get_path`, `FromYamlDoc::from_yaml_doc`,
 and `ToYamlDoc::apply_to_yaml_doc` continue to target the first document.

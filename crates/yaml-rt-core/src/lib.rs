@@ -5361,11 +5361,31 @@ fn plain_scalar_end(text: &str) -> usize {
     text[..end].trim_end_matches([' ', '\t']).len()
 }
 
+fn next_line_content_start(text: &str, mut position: usize) -> usize {
+    if text[position..].starts_with("\r\n") {
+        position += 2;
+    } else if text[position..].starts_with(['\r', '\n']) {
+        position += 1;
+    }
+
+    while text[position..].starts_with([' ', '\t']) {
+        position += 1;
+    }
+
+    position
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarStyle {
     Plain,
     SingleQuoted,
     DoubleQuoted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectionTarget {
+    span: Span,
+    indent: usize,
 }
 
 fn format_scalar_value(value: &str, style: ScalarStyle) -> Result<String, YamlError> {
@@ -7149,19 +7169,21 @@ impl YamlDoc {
         ))
     }
 
-    fn node_has_anchor_or_tag(&self, node: NodeId) -> bool {
-        let Some(graph) = self
-            .graph_for_cst(node)
-            .and_then(|graph| self.graph_node(graph))
-        else {
-            return false;
-        };
-        match &graph.kind {
-            GraphKind::Mapping { tag, anchor, .. }
-            | GraphKind::Sequence { tag, anchor, .. }
-            | GraphKind::Scalar { tag, anchor, .. } => tag.is_some() || anchor.is_some(),
-            GraphKind::Document { .. } | GraphKind::Alias { .. } => false,
+    fn collection_replacement_target(&self, node: NodeId) -> Result<CollectionTarget, YamlError> {
+        let node = self.expect_node(node)?;
+        let text = self.source.slice(node.span);
+        let properties = parse_node_properties(text, node.span)?;
+        let mut body_start = properties.value_start;
+
+        if text[body_start..].starts_with(['\r', '\n']) {
+            body_start = next_line_content_start(text, body_start);
         }
+
+        let start = Span::offset_from_usize(node.span.start, body_start);
+        Ok(CollectionTarget {
+            span: Span::new(start, node.span.end),
+            indent: self.line_indent_for_offset(start as usize),
+        })
     }
 
     fn expect_node(&self, node: NodeId) -> Result<&Node, YamlError> {
@@ -7306,6 +7328,14 @@ impl YamlDoc {
     fn node_indent(&self, node: &Node) -> usize {
         let line_start = self.line_start_for_offset(node.span.start as usize);
         self.source.as_str()[line_start..node.span.start as usize]
+            .bytes()
+            .filter(|byte| *byte == b' ')
+            .count()
+    }
+
+    fn line_indent_for_offset(&self, offset: usize) -> usize {
+        let line_start = self.line_start_for_offset(offset);
+        self.source.as_str()[line_start..offset]
             .bytes()
             .filter(|byte| *byte == b' ')
             .count()
@@ -8220,13 +8250,12 @@ fn missing_collection_item_error(doc: &YamlDoc, node: &Node, collection: &str) -
 
 fn format_block_sequence_replacement<T>(
     doc: &YamlDoc,
-    sequence: &Node,
+    indent: usize,
     values: &[T],
 ) -> Result<String, YamlError>
 where
     T: ToYamlFragment,
 {
-    let indent = doc.node_indent(sequence);
     let indent_text = " ".repeat(indent);
     let line_ending = doc.preferred_line_ending();
     let mut output = String::new();
@@ -8258,13 +8287,12 @@ where
 
 fn format_block_mapping_replacement<T>(
     doc: &YamlDoc,
-    mapping: &Node,
+    indent: usize,
     values: &std::collections::BTreeMap<String, T>,
 ) -> Result<String, YamlError>
 where
     T: ToYamlFragment,
 {
-    let indent = doc.node_indent(mapping);
     let indent_text = " ".repeat(indent);
     let line_ending = doc.preferred_line_ending();
     let mut output = String::new();
@@ -8483,9 +8511,9 @@ where
         let node = node.ok_or_else(missing_write_node_error)?;
         let sequence = doc.expect_node(node)?;
         if sequence.kind == NodeKind::FlowSequence {
-            reject_anchored_or_tagged_collection_rewrite(doc, node, "flow sequence")?;
+            let target = doc.collection_replacement_target(node)?;
             let replacement = format_flow_sequence_replacement(self)?;
-            doc.queue_edit(sequence.span, replacement)?;
+            doc.queue_edit(target.span, replacement)?;
             return Ok(node);
         }
         let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?;
@@ -8500,9 +8528,9 @@ where
             }
             return Ok(node);
         }
-        reject_anchored_or_tagged_collection_rewrite(doc, node, "block sequence")?;
-        let replacement = format_block_sequence_replacement(doc, sequence, self)?;
-        doc.queue_edit(sequence.span, replacement)?;
+        let target = doc.collection_replacement_target(node)?;
+        let replacement = format_block_sequence_replacement(doc, target.indent, self)?;
+        doc.queue_edit(target.span, replacement)?;
         Ok(node)
     }
 }
@@ -8578,9 +8606,9 @@ where
         let node = node.ok_or_else(missing_write_node_error)?;
         let mapping = doc.expect_node(node)?;
         if mapping.kind == NodeKind::FlowMapping {
-            reject_anchored_or_tagged_collection_rewrite(doc, node, "flow mapping")?;
+            let target = doc.collection_replacement_target(node)?;
             let replacement = format_flow_mapping_replacement(self)?;
-            doc.queue_edit(mapping.span, replacement)?;
+            doc.queue_edit(target.span, replacement)?;
             return Ok(node);
         }
         let mapping = doc.expect_node_kind(node, NodeKind::BlockMapping)?.clone();
@@ -8598,33 +8626,14 @@ where
             }
         }
         if mapping.children.is_empty() && self.is_empty() {
-            reject_anchored_or_tagged_collection_rewrite(doc, node, "block mapping")?;
-            let replacement = format_block_mapping_replacement(doc, &mapping, self)?;
-            doc.queue_edit(mapping.span, replacement)?;
+            let target = doc.collection_replacement_target(node)?;
+            let replacement = format_block_mapping_replacement(doc, target.indent, self)?;
+            if !replacement.is_empty() {
+                doc.queue_edit(target.span, replacement)?;
+            }
         }
         Ok(node)
     }
-}
-
-fn reject_anchored_or_tagged_collection_rewrite(
-    doc: &YamlDoc,
-    node: NodeId,
-    collection: &str,
-) -> Result<(), YamlError> {
-    if !doc.node_has_anchor_or_tag(node) {
-        return Ok(());
-    }
-
-    let span = doc.node(node).map_or(Span::empty(0), |node| node.span);
-    Err(YamlError::new(
-        Diagnostic::new(
-            DiagnosticKind::Emitter,
-            format!("anchored or tagged {collection} rewriting is not implemented yet"),
-            span,
-        )
-        .with_expected("an unanchored and untagged collection"),
-    )
-    .with_position_from(&doc.source))
 }
 
 impl<T> YamlValue for T
@@ -9431,22 +9440,18 @@ single: 'hello'
     }
 
     #[test]
-    fn yaml_value_rejects_anchored_or_tagged_collection_rewrites() {
+    fn yaml_value_writes_decorated_flow_collections_preserving_properties() {
         let mut sequence = YamlDoc::parse("items: &items [one, two]\n").expect("valid sequence");
         let items = sequence
             .get_path(&["items"])
             .expect("path lookup succeeds")
             .expect("items exists");
 
-        let error = vec!["three".to_owned()]
+        vec!["three".to_owned()]
             .write_yaml(&mut sequence, Some(items))
-            .expect_err("anchored flow sequence rewrite rejects");
+            .expect("anchored flow sequence writes");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-        assert_eq!(
-            error.diagnostic.message,
-            "anchored or tagged flow sequence rewriting is not implemented yet"
-        );
+        assert_eq!(sequence.to_string(), "items: &items [three]\n");
 
         let mut mapping = YamlDoc::parse("settings: !!map {a: b}\n").expect("valid tagged mapping");
         let settings = mapping
@@ -9456,15 +9461,94 @@ single: 'hello'
         let replacement =
             std::collections::BTreeMap::from([("a".to_owned(), "updated".to_owned())]);
 
-        let error = replacement
+        replacement
             .write_yaml(&mut mapping, Some(settings))
-            .expect_err("tagged flow mapping rewrite rejects");
+            .expect("tagged flow mapping writes");
+
+        assert_eq!(mapping.to_string(), "settings: !!map {a: updated}\n");
+    }
+
+    #[test]
+    fn yaml_value_writes_decorated_collections_preserving_property_spacing() {
+        let mut doc =
+            YamlDoc::parse("items: !seq  &items [one, two]\n").expect("valid decorated sequence");
+        let items = doc
+            .get_path(&["items"])
+            .expect("path lookup succeeds")
+            .expect("items exists");
+
+        vec!["three".to_owned()]
+            .write_yaml(&mut doc, Some(items))
+            .expect("decorated flow sequence writes");
+
+        assert_eq!(doc.to_string(), "items: !seq  &items [three]\n");
+    }
+
+    #[test]
+    fn yaml_value_replaces_property_only_block_sequence_body() {
+        let mut doc =
+            YamlDoc::parse("items: &items\n  - one\n  - two\n").expect("valid block sequence");
+        let items = doc
+            .get_path(&["items"])
+            .expect("path lookup succeeds")
+            .expect("items exists");
+
+        vec!["three".to_owned()]
+            .write_yaml(&mut doc, Some(items))
+            .expect("decorated block sequence writes");
+
+        assert_eq!(doc.to_string(), "items: &items\n  - three\n");
+    }
+
+    #[test]
+    fn yaml_value_writes_empty_decorated_mapping_and_preserves_graph_metadata_after_commit() {
+        let mut doc =
+            YamlDoc::parse("settings: &settings !!map {a: b}\n").expect("valid decorated mapping");
+        let settings = doc
+            .get_path(&["settings"])
+            .expect("path lookup succeeds")
+            .expect("settings exists");
+        let replacement = std::collections::BTreeMap::<String, String>::new();
+
+        replacement
+            .write_yaml(&mut doc, Some(settings))
+            .expect("empty decorated mapping writes");
+
+        assert_eq!(doc.to_string(), "settings: &settings !!map {}\n");
+
+        doc.commit_edits().expect("decorated mapping reparses");
+        let settings = doc
+            .get_path(&["settings"])
+            .expect("path lookup succeeds after commit")
+            .expect("settings exists after commit");
+        let graph = doc
+            .graph_for_cst(settings)
+            .and_then(|id| doc.graph_node(id))
+            .expect("settings has graph node");
+        match &graph.kind {
+            GraphKind::Mapping { tag, anchor, .. } => {
+                assert_eq!(tag.as_deref(), Some("tag:yaml.org,2002:map"));
+                assert_eq!(anchor.as_deref(), Some("settings"));
+            }
+            other => panic!("expected mapping graph node, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yaml_value_rejects_invalid_decorated_collection_fragments_without_editing() {
+        let mut doc = YamlDoc::parse("items: &items [one]\n").expect("valid decorated sequence");
+        let items = doc
+            .get_path(&["items"])
+            .expect("path lookup succeeds")
+            .expect("items exists");
+
+        let error = vec!["bad\nvalue".to_owned()]
+            .write_yaml(&mut doc, Some(items))
+            .expect_err("invalid plain fragment rejects");
 
         assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-        assert_eq!(
-            error.diagnostic.message,
-            "anchored or tagged flow mapping rewriting is not implemented yet"
-        );
+        assert_eq!(doc.to_string(), "items: &items [one]\n");
+        assert!(doc.edits.is_empty());
     }
 
     #[test]

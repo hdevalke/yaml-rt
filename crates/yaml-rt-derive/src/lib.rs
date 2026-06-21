@@ -330,19 +330,19 @@ fn write_field_tokens(
 ) -> TokenStream2 {
     let insert_missing_field = match insert_order {
         InsertOrder::Append => quote! {
-            doc.insert_mapping_entry_with_comment(
+            doc.insert_mapping_value_with_comment(
                 root,
                 #yaml_key,
-                &self.#field_name.to_string(),
+                &self.#field_name,
                 ::yaml_rt::MappingEntryStyle::default(),
                 #insert_comment,
             )?;
         },
         InsertOrder::Struct => quote! {
-            doc.insert_mapping_entry_ordered_with_comment(
+            doc.insert_mapping_value_ordered_with_comment(
                 root,
                 #yaml_key,
-                &self.#field_name.to_string(),
+                &self.#field_name,
                 ::yaml_rt::MappingEntryStyle::default(),
                 #insert_comment,
                 __yaml_rt_ordered_keys,

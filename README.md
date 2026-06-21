@@ -279,15 +279,22 @@ Implemented for the MVP block-syntax subset:
 - [x] `doc.replace_node_text(node, text)` queues exact-span replacement edits.
 - [x] `doc.insert_mapping_entry(mapping, key, value, style)` appends plain
       `key: value` entries while inheriting indentation and line endings.
+- [x] `doc.insert_mapping_value_with_comment(mapping, key, value, style, comment)`
+      inserts typed scalar, sequence, mapping, and nested struct fragments with
+      inherited indentation and line endings.
 - [x] `doc.remove_node(node)` removes mapping/sequence entry lines and exact
       spans for other nodes.
 - [x] `doc.remove_mapping_entry(mapping, key)` removes an existing mapping entry
       line by key and treats missing keys as a no-op.
 - [x] `doc.to_string()` renders the original source plus pending patches.
+- [x] `doc.commit_edits()` reparses the rendered YAML into a fresh CST and
+      semantic graph, then clears pending edits.
 
 Patch application rule: sort edits from highest offset to lowest offset before
 applying them. The writer validates replacement text as YAML-printable text and
 rejects overlapping pending edits so minimal patches remain deterministic.
+`to_string()` is a non-mutating preview; `commit_edits()` is the validation
+boundary for low-level edits that may render invalid YAML.
 
 ### 8. Scalar-preserving edits
 
@@ -322,17 +329,15 @@ name: "new"
 Add support incrementally:
 
 - [x] Single-line flow sequences: `[a, b, c]`, including nested flow sequences
-      and typed `Vec<T>` reads. Flow sequence patch writing remains a later
-      writer milestone.
+      and typed `Vec<T>` reads. Typed writes can replace the existing flow
+      sequence span for single-line values.
 - [x] Single-line flow mappings: `{a: 1, b: 2}`, including nested flow
-      collections and typed `BTreeMap<String, T>` reads. Flow mapping patch
-      writing remains a later writer milestone.
+      collections and typed `BTreeMap<String, T>` reads. Typed writes can
+      replace the existing flow mapping span for single-line values.
 - [x] Literal scalars: `|`, including strip/clip/keep chomping and typed
-      `String` reads. Literal scalar patch writing remains a later writer
-      milestone.
+      `String` reads and writes.
 - [x] Folded scalars: `>`, including strip/clip/keep chomping and typed
-      `String` reads. Folded scalar patch writing remains a later writer
-      milestone.
+      `String` reads and writes.
 - [x] Anchors: `&name` on scalars and flow collections are preserved in events
       and the semantic graph. Rewriting anchored values remains a later writer
       milestone.
@@ -350,6 +355,11 @@ Add support incrementally:
 - Explicit keys: `? key`.
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
+
+Current editing limits: anchored or tagged value rewriting is still rejected for
+style safety, directives are preserved but not rewritten, nested collection
+fragments are deliberately conservative, and document-selection APIs are still
+future work.
 
 ### 10. Manual typed traits
 
@@ -370,10 +380,13 @@ subset:
 - [x] `YamlValue for BTreeMap<String, T>`.
 
 `Option<T>` reads present nodes as `Some(T)` and removes the containing mapping
-or sequence entry when written as `None`. `Vec<T>` reads and replaces existing
-block sequences. `BTreeMap<String, T>` reads and replaces existing block mappings.
-Container insertion without an existing collection node remains a later typed
-writer milestone because it needs parent collection context.
+or sequence entry when written as `None`. `Vec<T>` reads block and flow sequences,
+patches same-length block sequences item-by-item, replaces different-length block
+sequences, and can replace single-line flow sequence spans. `BTreeMap<String, T>`
+reads block and flow mappings, patches existing block mapping keys in place,
+inserts missing block mapping keys, preserves unknown keys by default, and can
+replace single-line flow mapping spans. Parent-aware typed insertion now supports
+missing scalar, `Vec<T>`, `BTreeMap<String, T>`, and nested struct fields.
 
 The manual `Config` fixture proves that typed overlays can read decoded scalar
 values, apply patch-based scalar updates, insert missing fields, and preserve
@@ -394,13 +407,14 @@ struct Config {
 
 - [x] Generate `FromYamlDoc` implementations using `YamlValue::read_yaml`.
 - [x] Generate `ToYamlDoc` implementations that patch existing fields and append
-      missing fields through the MVP mapping writer.
+      missing fields through the typed mapping writer.
 - [x] Validate that the MVP derive preserves unknown fields and existing scalar
       style in facade integration tests.
 
 Attribute handling for defaults, comments, renames, aliases, skips, and flattening
 now has MVP coverage. Struct-level unknown-field policy now has MVP coverage.
-Custom insertion order now has MVP coverage for root mapping insertions.
+Custom insertion order now has MVP coverage for root mapping insertions, including
+missing nested struct fields.
 
 ### 12. Derive attributes
 

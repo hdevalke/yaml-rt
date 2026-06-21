@@ -6249,6 +6249,27 @@ impl YamlDoc {
         })
     }
 
+    /// Applies pending edits, reparses the rendered YAML, and clears the edit queue.
+    ///
+    /// `YamlDoc::to_string` only previews the original source with queued byte
+    /// patches applied. It does not prove that the patched stream is still
+    /// valid YAML, because low-level edit APIs can replace arbitrary node spans
+    /// or insert conservative-but-raw fragments. Reparse on commit is the point
+    /// where the document regains a validated CST and semantic graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the patched YAML cannot be parsed.
+    pub fn commit_edits(&mut self) -> Result<(), YamlError> {
+        if self.edits.is_empty() {
+            return Ok(());
+        }
+
+        let edited = self.to_string();
+        *self = Self::parse(&edited)?;
+        Ok(())
+    }
+
     /// Returns the original source text.
     #[must_use]
     pub fn as_source(&self) -> &str {
@@ -6530,6 +6551,46 @@ impl YamlDoc {
         )
     }
 
+    fn rerooted_at_mapping(&self, mapping: NodeId) -> Result<Self, YamlError> {
+        self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
+        let Some(mapping_graph) = self.graph_for_cst(mapping) else {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    "mapping is not linked to the semantic graph",
+                    self.expect_node(mapping)?.span,
+                )
+                .with_expected("a graph-backed mapping"),
+            )
+            .with_position_from(&self.source));
+        };
+        let mut doc = self.clone();
+        let root = doc.graph.root.ok_or_else(|| {
+            YamlError::new(Diagnostic::new(
+                DiagnosticKind::Semantic,
+                "document does not contain a semantic root",
+                Span::empty(0),
+            ))
+        })?;
+        let GraphKind::Document { children } = &mut doc.graph.nodes[root.as_usize()].kind else {
+            return Err(YamlError::new(Diagnostic::new(
+                DiagnosticKind::Semantic,
+                "semantic root is not a document",
+                Span::empty(0),
+            )));
+        };
+        *children = vec![mapping_graph];
+        doc.edits.clear();
+        Ok(doc)
+    }
+
+    fn queue_edits_from(&mut self, other: &YamlDoc) -> Result<(), YamlError> {
+        for edit in &other.edits {
+            self.queue_edit(edit.span, edit.replacement.clone())?;
+        }
+        Ok(())
+    }
+
     /// Returns the source text for a scalar node.
     ///
     /// # Errors
@@ -6686,6 +6747,82 @@ impl YamlDoc {
         self.queue_edit(Span::empty_from_usize(insertion_offset), replacement)
     }
 
+    /// Queues insertion of a typed YAML value under `key` in a block mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `mapping` is not a block mapping, the value cannot
+    /// be formatted as a block YAML fragment, or the insertion conflicts with an
+    /// existing pending edit.
+    pub fn insert_mapping_value_with_comment<T>(
+        &mut self,
+        mapping: NodeId,
+        key: &str,
+        value: &T,
+        style: MappingEntryStyle,
+        comment: Option<&str>,
+    ) -> Result<(), YamlError>
+    where
+        T: ToYamlFragment,
+    {
+        let mapping_node = self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
+        let indent = match style {
+            MappingEntryStyle::Inherit => self.node_indent(mapping_node),
+            MappingEntryStyle::Indent(indent) => indent,
+        };
+        let insertion_offset = self.mapping_insertion_offset(mapping_node);
+        let needs_leading_break =
+            insertion_offset == self.source.len() && !self.source_ends_with_line_break();
+        let preserve_paragraph_break = comment.is_some()
+            && insertion_offset == self.source.len()
+            && self.mapping_has_blank_line(mapping_node);
+        let replacement = self.format_mapping_value_replacement(
+            indent,
+            key,
+            value,
+            comment,
+            needs_leading_break,
+            preserve_paragraph_break,
+        )?;
+
+        self.queue_edit(Span::empty_from_usize(insertion_offset), replacement)
+    }
+
+    /// Queues insertion of a typed YAML value according to declaration order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when mapping lookup fails or the selected insertion
+    /// cannot be formatted or queued.
+    pub fn insert_mapping_value_ordered_with_comment<T>(
+        &mut self,
+        mapping: NodeId,
+        key: &str,
+        value: &T,
+        style: MappingEntryStyle,
+        comment: Option<&str>,
+        ordered_keys: &[&str],
+    ) -> Result<(), YamlError>
+    where
+        T: ToYamlFragment,
+    {
+        let mut next_entry = None;
+        if let Some(position) = ordered_keys.iter().position(|ordered| *ordered == key) {
+            for later_key in &ordered_keys[position + 1..] {
+                if let Some(entry) = self.get_mapping_entry(mapping, later_key)? {
+                    next_entry = Some(entry);
+                    break;
+                }
+            }
+        }
+
+        if let Some(next_entry) = next_entry {
+            self.insert_mapping_value_before_with_comment(next_entry, key, value, style, comment)
+        } else {
+            self.insert_mapping_value_with_comment(mapping, key, value, style, comment)
+        }
+    }
+
     /// Queues insertion of a plain `key: value` entry before `before_entry`.
     ///
     /// # Errors
@@ -6709,6 +6846,35 @@ impl YamlDoc {
         let insertion_offset = self.line_start_for_offset(before_node.span.start as usize);
         let replacement =
             self.format_mapping_entry_replacement(indent, key, value, comment, false, false)?;
+
+        self.queue_edit(Span::empty_from_usize(insertion_offset), replacement)
+    }
+
+    /// Queues insertion of a typed YAML value before an existing mapping entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the insertion target is invalid, the value cannot
+    /// be formatted, or the insertion conflicts with an existing pending edit.
+    pub fn insert_mapping_value_before_with_comment<T>(
+        &mut self,
+        before_entry: NodeId,
+        key: &str,
+        value: &T,
+        style: MappingEntryStyle,
+        comment: Option<&str>,
+    ) -> Result<(), YamlError>
+    where
+        T: ToYamlFragment,
+    {
+        let before_node = self.expect_node_kind(before_entry, NodeKind::MappingEntry)?;
+        let indent = match style {
+            MappingEntryStyle::Inherit => self.node_indent(before_node),
+            MappingEntryStyle::Indent(indent) => indent,
+        };
+        let insertion_offset = self.line_start_for_offset(before_node.span.start as usize);
+        let replacement =
+            self.format_mapping_value_replacement(indent, key, value, comment, false, false)?;
 
         self.queue_edit(Span::empty_from_usize(insertion_offset), replacement)
     }
@@ -6988,6 +7154,59 @@ impl YamlDoc {
         Ok(replacement)
     }
 
+    fn format_mapping_value_replacement<T>(
+        &self,
+        indent: usize,
+        key: &str,
+        value: &T,
+        comment: Option<&str>,
+        needs_leading_break: bool,
+        preserve_paragraph_break: bool,
+    ) -> Result<String, YamlError>
+    where
+        T: ToYamlFragment,
+    {
+        validate_plain_mapping_fragment(key, "mapping key")?;
+        if let Some(comment) = comment {
+            validate_yaml_chars(comment)?;
+        }
+
+        let line_ending = self.preferred_line_ending();
+        let indent_text = " ".repeat(indent);
+        let child_indent = indent + 2;
+        let fragment = value.to_yaml_fragment(child_indent, line_ending)?;
+        let mut replacement = String::new();
+        if needs_leading_break {
+            replacement.push_str(line_ending);
+        }
+        if preserve_paragraph_break {
+            replacement.push_str(line_ending);
+        }
+        if let Some(comment) = comment {
+            for line in comment.lines() {
+                replacement.push_str(&indent_text);
+                replacement.push('#');
+                if !line.is_empty() {
+                    replacement.push(' ');
+                    replacement.push_str(line.trim());
+                }
+                replacement.push_str(line_ending);
+            }
+        }
+        replacement.push_str(&indent_text);
+        replacement.push_str(key);
+        if fragment.contains('\n') || fragment.starts_with(' ') {
+            replacement.push(':');
+            replacement.push_str(line_ending);
+            replacement.push_str(&fragment);
+        } else {
+            replacement.push_str(": ");
+            replacement.push_str(&fragment);
+        }
+        replacement.push_str(line_ending);
+        Ok(replacement)
+    }
+
     fn node_indent(&self, node: &Node) -> usize {
         let line_start = self.line_start_for_offset(node.span.start as usize);
         self.source.as_str()[line_start..node.span.start as usize]
@@ -7014,6 +7233,22 @@ impl YamlDoc {
             })
             .min_by_key(|(_, node)| node.span.start)
             .map(|(index, _)| NodeId::from_usize(index))
+    }
+
+    fn block_scalar_content_indent(&self, scalar: &Node) -> Option<usize> {
+        let text = self.source.slice(scalar.span);
+        let header_end = text.find(['\r', '\n'])?;
+        let mut rest = &text[header_end..];
+        while let Some(stripped) = rest.strip_prefix('\r').or_else(|| rest.strip_prefix('\n')) {
+            rest = stripped;
+        }
+        for line in rest.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            return Some(line.bytes().take_while(|byte| *byte == b' ').count());
+        }
+        None
     }
 
     fn queue_edit(&mut self, span: Span, replacement: String) -> Result<(), YamlError> {
@@ -7595,6 +7830,174 @@ pub trait YamlValue: Sized {
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError>;
 }
 
+/// Formats a typed value as a YAML fragment for parent-aware insertions.
+pub trait ToYamlFragment {
+    /// Formats `self` using `indent` spaces for nested block lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be represented by the current
+    /// conservative block-style formatter.
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError>;
+}
+
+fn plain_yaml_fragment(value: &str, role: &str) -> Result<String, YamlError> {
+    validate_plain_mapping_fragment(value, role)?;
+    Ok(value.to_owned())
+}
+
+macro_rules! impl_plain_yaml_fragment {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl ToYamlFragment for $type {
+                fn to_yaml_fragment(
+                    &self,
+                    _indent: usize,
+                    _line_ending: &str,
+                ) -> Result<String, YamlError> {
+                    plain_yaml_fragment(&self.to_string(), "YAML value")
+                }
+            }
+        )*
+    };
+}
+
+impl ToYamlFragment for String {
+    fn to_yaml_fragment(&self, _indent: usize, _line_ending: &str) -> Result<String, YamlError> {
+        plain_yaml_fragment(self, "YAML value")
+    }
+}
+
+impl ToYamlFragment for &str {
+    fn to_yaml_fragment(&self, _indent: usize, _line_ending: &str) -> Result<String, YamlError> {
+        plain_yaml_fragment(self, "YAML value")
+    }
+}
+
+impl ToYamlFragment for bool {
+    fn to_yaml_fragment(&self, _indent: usize, _line_ending: &str) -> Result<String, YamlError> {
+        Ok(if *self { "true" } else { "false" }.to_owned())
+    }
+}
+
+impl_plain_yaml_fragment!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
+
+impl<T> ToYamlFragment for Option<T>
+where
+    T: ToYamlFragment,
+{
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        match self {
+            Some(value) => value.to_yaml_fragment(indent, line_ending),
+            None => Ok("null".to_owned()),
+        }
+    }
+}
+
+impl<T> ToYamlFragment for Vec<T>
+where
+    T: ToYamlFragment,
+{
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        if self.is_empty() {
+            return Ok("[]".to_owned());
+        }
+        let indent_text = " ".repeat(indent);
+        let mut output = String::new();
+        for (index, value) in self.iter().enumerate() {
+            if index > 0 {
+                output.push_str(line_ending);
+            }
+            output.push_str(&indent_text);
+            output.push_str("- ");
+            let value = value.to_yaml_fragment(indent + 2, line_ending)?;
+            if value.contains('\n') {
+                return Err(YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Emitter,
+                        "nested collection sequence insertion is not implemented yet",
+                        Span::empty(0),
+                    )
+                    .with_expected("single-line sequence values"),
+                ));
+            }
+            output.push_str(&value);
+        }
+        Ok(output)
+    }
+}
+
+impl<T> ToYamlFragment for std::collections::BTreeMap<String, T>
+where
+    T: ToYamlFragment,
+{
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        if self.is_empty() {
+            return Ok("{}".to_owned());
+        }
+        let indent_text = " ".repeat(indent);
+        let mut output = String::new();
+        for (index, (key, value)) in self.iter().enumerate() {
+            validate_plain_mapping_fragment(key, "mapping key")?;
+            if index > 0 {
+                output.push_str(line_ending);
+            }
+            output.push_str(&indent_text);
+            output.push_str(key);
+            let value = value.to_yaml_fragment(indent + 2, line_ending)?;
+            if value.contains('\n') {
+                output.push(':');
+                output.push_str(line_ending);
+                output.push_str(&value);
+            } else {
+                output.push_str(": ");
+                output.push_str(&value);
+            }
+        }
+        Ok(output)
+    }
+}
+
+impl<T> ToYamlFragment for T
+where
+    T: ToYamlDoc,
+{
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        let mut doc = YamlDoc::parse("root:\n  __rty_placeholder: null\n")?;
+        let root = doc.get_path(&["root"])?.ok_or_else(|| {
+            YamlError::new(Diagnostic::new(
+                DiagnosticKind::Emitter,
+                "temporary nested mapping root was not created",
+                Span::empty(0),
+            ))
+        })?;
+        let mut nested = doc.rerooted_at_mapping(root)?;
+        self.apply_to_yaml_doc(&mut nested)?;
+        doc.queue_edits_from(&nested)?;
+        let rendered = doc.to_string();
+        let nested_indent = "  ";
+        let output_indent = " ".repeat(indent);
+        let mut output = String::new();
+
+        for line in rendered.lines().skip(1) {
+            if line.trim_start().starts_with("__rty_placeholder:") {
+                continue;
+            }
+            if !output.is_empty() {
+                output.push_str(line_ending);
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let line = line.strip_prefix(nested_indent).unwrap_or(line);
+            output.push_str(&output_indent);
+            output.push_str(line);
+        }
+
+        Ok(output)
+    }
+}
+
 fn missing_write_node_error() -> YamlError {
     YamlError::new(
         Diagnostic::new(
@@ -7612,25 +8015,54 @@ fn write_existing_scalar(
     value: &str,
 ) -> Result<NodeId, YamlError> {
     let node = node.ok_or_else(missing_write_node_error)?;
-    if doc
+    if let Some(block_scalar) = doc
         .node(node)
-        .is_some_and(|node| matches!(node.kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar))
+        .filter(|node| matches!(node.kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar))
     {
-        let block_scalar = doc.expect_node(node)?;
-        return Err(YamlError::new(
-            Diagnostic::new(
-                DiagnosticKind::Emitter,
-                "block scalar rewriting is not implemented yet",
-                block_scalar.span,
-            )
-            .with_expected("an existing plain, single-quoted, or double-quoted scalar"),
-        )
-        .with_position_from(&doc.source));
+        let replacement = format_block_scalar_replacement(doc, block_scalar, value)?;
+        doc.queue_edit(block_scalar.span, replacement)?;
+        return Ok(node);
     }
     let (span, style) = doc.scalar_replacement_target(node)?;
     let replacement = format_scalar_value(value, style)?;
     doc.queue_edit(span, replacement)?;
     Ok(node)
+}
+
+fn format_block_scalar_replacement(
+    doc: &YamlDoc,
+    scalar: &Node,
+    value: &str,
+) -> Result<String, YamlError> {
+    validate_yaml_chars(value)?;
+    let text = doc.source.slice(scalar.span);
+    let header_end = text.find(['\r', '\n']).unwrap_or(text.len());
+    let header = &text[..header_end];
+    let header_info = parse_block_scalar_header(header.trim_start(), scalar.span.start as usize)?;
+    let content_indent = doc
+        .block_scalar_content_indent(scalar)
+        .unwrap_or_else(|| doc.node_indent(scalar) + header_info.indent.unwrap_or(2));
+    let indent_text = " ".repeat(content_indent);
+    let line_ending = doc.preferred_line_ending();
+    let mut output = String::new();
+    output.push_str(header);
+    output.push_str(line_ending);
+    for line in value.split('\n') {
+        if line.is_empty() {
+            output.push_str(line_ending);
+        } else {
+            output.push_str(&indent_text);
+            output.push_str(line);
+            output.push_str(line_ending);
+        }
+    }
+    if matches!(header_info.chomp, BlockChomp::Strip) {
+        while output.ends_with(line_ending) {
+            let new_len = output.len() - line_ending.len();
+            output.truncate(new_len);
+        }
+    }
+    Ok(output)
 }
 
 fn missing_collection_item_error(doc: &YamlDoc, node: &Node, collection: &str) -> YamlError {
@@ -7651,7 +8083,7 @@ fn format_block_sequence_replacement<T>(
     values: &[T],
 ) -> Result<String, YamlError>
 where
-    T: ToString,
+    T: ToYamlFragment,
 {
     let indent = doc.node_indent(sequence);
     let indent_text = " ".repeat(indent);
@@ -7662,8 +8094,17 @@ where
         if index > 0 {
             output.push_str(line_ending);
         }
-        let value = value.to_string();
-        validate_plain_mapping_fragment(&value, "sequence value")?;
+        let value = value.to_yaml_fragment(indent + 2, line_ending)?;
+        if value.contains('\n') {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Emitter,
+                    "nested collection sequence rewriting is not implemented yet",
+                    Span::empty(0),
+                )
+                .with_expected("single-line sequence values"),
+            ));
+        }
         if index > 0 {
             output.push_str(&indent_text);
         }
@@ -7680,7 +8121,7 @@ fn format_block_mapping_replacement<T>(
     values: &std::collections::BTreeMap<String, T>,
 ) -> Result<String, YamlError>
 where
-    T: ToString,
+    T: ToYamlFragment,
 {
     let indent = doc.node_indent(mapping);
     let indent_text = " ".repeat(indent);
@@ -7691,17 +8132,79 @@ where
         if index > 0 {
             output.push_str(line_ending);
         }
-        let value = value.to_string();
         validate_plain_mapping_fragment(key, "mapping key")?;
-        validate_plain_mapping_fragment(&value, "mapping value")?;
+        let value = value.to_yaml_fragment(indent + 2, line_ending)?;
         if index > 0 {
             output.push_str(&indent_text);
+        }
+        output.push_str(key);
+        if value.contains('\n') {
+            output.push(':');
+            output.push_str(line_ending);
+            output.push_str(&value);
+        } else {
+            output.push_str(": ");
+            output.push_str(&value);
+        }
+    }
+
+    Ok(output)
+}
+
+fn format_flow_sequence_replacement<T>(values: &[T]) -> Result<String, YamlError>
+where
+    T: ToYamlFragment,
+{
+    let mut output = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push_str(", ");
+        }
+        let value = value.to_yaml_fragment(0, "\n")?;
+        if value.contains('\n') {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Emitter,
+                    "nested flow sequence rewriting is not implemented yet",
+                    Span::empty(0),
+                )
+                .with_expected("single-line flow sequence values"),
+            ));
+        }
+        output.push_str(&value);
+    }
+    output.push(']');
+    Ok(output)
+}
+
+fn format_flow_mapping_replacement<T>(
+    values: &std::collections::BTreeMap<String, T>,
+) -> Result<String, YamlError>
+where
+    T: ToYamlFragment,
+{
+    let mut output = String::from("{");
+    for (index, (key, value)) in values.iter().enumerate() {
+        validate_plain_mapping_fragment(key, "mapping key")?;
+        if index > 0 {
+            output.push_str(", ");
+        }
+        let value = value.to_yaml_fragment(0, "\n")?;
+        if value.contains('\n') {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Emitter,
+                    "nested flow mapping rewriting is not implemented yet",
+                    Span::empty(0),
+                )
+                .with_expected("single-line flow mapping values"),
+            ));
         }
         output.push_str(key);
         output.push_str(": ");
         output.push_str(&value);
     }
-
+    output.push('}');
     Ok(output)
 }
 
@@ -7790,7 +8293,7 @@ where
 
 impl<T> YamlValue for Vec<T>
 where
-    T: YamlValue + ToString,
+    T: YamlValue + ToYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         if let Some(items) = doc.graph_sequence_items(node) {
@@ -7839,17 +8342,22 @@ where
         let node = node.ok_or_else(missing_write_node_error)?;
         let sequence = doc.expect_node(node)?;
         if sequence.kind == NodeKind::FlowSequence {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Emitter,
-                    "flow sequence rewriting is not implemented yet",
-                    sequence.span,
-                )
-                .with_expected("an existing block sequence"),
-            )
-            .with_position_from(&doc.source));
+            let replacement = format_flow_sequence_replacement(self)?;
+            doc.queue_edit(sequence.span, replacement)?;
+            return Ok(node);
         }
         let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?;
+        if sequence.children.len() == self.len() {
+            let children = sequence.children.clone();
+            for (entry, value) in children.iter().copied().zip(self) {
+                let entry_node = doc.expect_node(entry)?;
+                let Some(value_node) = entry_node.children.first().copied() else {
+                    return Err(missing_collection_item_error(doc, entry_node, "sequence"));
+                };
+                value.write_yaml(doc, Some(value_node))?;
+            }
+            return Ok(node);
+        }
         let replacement = format_block_sequence_replacement(doc, sequence, self)?;
         doc.queue_edit(sequence.span, replacement)?;
         Ok(node)
@@ -7858,7 +8366,7 @@ where
 
 impl<T> YamlValue for std::collections::BTreeMap<String, T>
 where
-    T: YamlValue + ToString,
+    T: YamlValue + ToYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         if let Some(entries) = doc.graph_mapping_entries(node) {
@@ -7927,19 +8435,46 @@ where
         let node = node.ok_or_else(missing_write_node_error)?;
         let mapping = doc.expect_node(node)?;
         if mapping.kind == NodeKind::FlowMapping {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Emitter,
-                    "flow mapping rewriting is not implemented yet",
-                    mapping.span,
-                )
-                .with_expected("an existing block mapping"),
-            )
-            .with_position_from(&doc.source));
+            let replacement = format_flow_mapping_replacement(self)?;
+            doc.queue_edit(mapping.span, replacement)?;
+            return Ok(node);
         }
-        let mapping = doc.expect_node_kind(node, NodeKind::BlockMapping)?;
-        let replacement = format_block_mapping_replacement(doc, mapping, self)?;
-        doc.queue_edit(mapping.span, replacement)?;
+        let mapping = doc.expect_node_kind(node, NodeKind::BlockMapping)?.clone();
+        for (key, value) in self {
+            if let Some(value_node) = doc.get_mapping_value(node, key)? {
+                value.write_yaml(doc, Some(value_node))?;
+            } else {
+                doc.insert_mapping_value_with_comment(
+                    node,
+                    key,
+                    value,
+                    MappingEntryStyle::Inherit,
+                    None,
+                )?;
+            }
+        }
+        if mapping.children.is_empty() && self.is_empty() {
+            let replacement = format_block_mapping_replacement(doc, &mapping, self)?;
+            doc.queue_edit(mapping.span, replacement)?;
+        }
+        Ok(node)
+    }
+}
+
+impl<T> YamlValue for T
+where
+    T: FromYamlDoc + ToYamlDoc,
+{
+    fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        let nested = doc.rerooted_at_mapping(node)?;
+        Self::from_yaml_doc(&nested)
+    }
+
+    fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
+        let node = node.ok_or_else(missing_write_node_error)?;
+        let mut nested = doc.rerooted_at_mapping(node)?;
+        self.apply_to_yaml_doc(&mut nested)?;
+        doc.queue_edits_from(&nested)?;
         Ok(node)
     }
 }
@@ -9686,43 +10221,35 @@ ports:
     }
 
     #[test]
-    fn yaml_value_rejects_literal_scalar_writes_for_now() {
+    fn yaml_value_writes_literal_scalar_values() {
         let mut doc = YamlDoc::parse("message: |\n  hello\n").expect("valid literal scalar");
         let message = doc
             .get_path(&["message"])
             .expect("lookup succeeds")
             .expect("message exists");
 
-        let error = "updated"
+        "updated"
             .to_owned()
             .write_yaml(&mut doc, Some(message))
-            .expect_err("literal scalar writes are intentionally not implemented yet");
+            .expect("literal scalar writes");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-        assert_eq!(
-            error.diagnostic.message,
-            "block scalar rewriting is not implemented yet"
-        );
+        assert_eq!(doc.to_string(), "message: |\n  updated\n");
     }
 
     #[test]
-    fn yaml_value_rejects_folded_scalar_writes_for_now() {
+    fn yaml_value_writes_folded_scalar_values() {
         let mut doc = YamlDoc::parse("message: >\n  hello\n").expect("valid folded scalar");
         let message = doc
             .get_path(&["message"])
             .expect("lookup succeeds")
             .expect("message exists");
 
-        let error = "updated"
+        "updated"
             .to_owned()
             .write_yaml(&mut doc, Some(message))
-            .expect_err("folded scalar writes are intentionally not implemented yet");
+            .expect("folded scalar writes");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-        assert_eq!(
-            error.diagnostic.message,
-            "block scalar rewriting is not implemented yet"
-        );
+        assert_eq!(doc.to_string(), "message: >\n  updated\n");
     }
 
     #[test]
@@ -9793,22 +10320,18 @@ ports:
     }
 
     #[test]
-    fn yaml_value_rejects_flow_sequence_writes_for_now() {
+    fn yaml_value_writes_flow_sequence_values() {
         let mut doc = YamlDoc::parse("items: [one, two]\n").expect("valid flow sequence mapping");
         let items = doc
             .get_path(&["items"])
             .expect("lookup succeeds")
             .expect("items exists");
 
-        let error = vec!["three".to_owned()]
+        vec!["three".to_owned()]
             .write_yaml(&mut doc, Some(items))
-            .expect_err("flow sequence writes are intentionally not implemented yet");
+            .expect("flow sequence writes");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-        assert_eq!(
-            error.diagnostic.message,
-            "flow sequence rewriting is not implemented yet"
-        );
+        assert_eq!(doc.to_string(), "items: [three]\n");
     }
 
     #[test]
@@ -10219,7 +10742,7 @@ ports:
     }
 
     #[test]
-    fn yaml_value_rejects_flow_mapping_writes_for_now() {
+    fn yaml_value_writes_flow_mapping_values() {
         let mut doc = YamlDoc::parse("settings: {a: b}\n").expect("valid flow mapping");
         let settings = doc
             .get_path(&["settings"])
@@ -10227,15 +10750,11 @@ ports:
             .expect("settings exists");
         let values = std::collections::BTreeMap::from([("a".to_owned(), "updated".to_owned())]);
 
-        let error = values
+        values
             .write_yaml(&mut doc, Some(settings))
-            .expect_err("flow mapping writes are intentionally not implemented yet");
+            .expect("flow mapping writes");
 
-        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-        assert_eq!(
-            error.diagnostic.message,
-            "flow mapping rewriting is not implemented yet"
-        );
+        assert_eq!(doc.to_string(), "settings: {a: updated}\n");
     }
 
     #[test]
@@ -10728,6 +11247,48 @@ port: 9090
     }
 
     #[test]
+    fn commit_edits_reparses_and_clears_pending_edits() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+
+        doc.insert_mapping_entry(root, "port", "8080", MappingEntryStyle::default())
+            .expect("insert queues");
+        assert!(doc.get_path(&["port"]).expect("old graph lookup").is_none());
+
+        doc.commit_edits().expect("edited YAML reparses");
+
+        assert!(doc.edits.is_empty());
+        let port = doc
+            .get_path(&["port"])
+            .expect("new graph lookup")
+            .expect("port exists after commit");
+        assert_eq!(doc.scalar_text(port).expect("port scalar"), "8080");
+        assert_eq!(doc.to_string(), "host: localhost\nport: 8080\n");
+    }
+
+    #[test]
+    fn commit_edits_returns_parse_error_without_replacing_document() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+
+        doc.replace_node_text(root, "host: [\n")
+            .expect("invalid replacement still queues");
+        let error = doc
+            .commit_edits()
+            .expect_err("invalid edited YAML should not commit");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        assert_eq!(doc.as_source(), "host: localhost\n");
+        assert_eq!(doc.to_string(), "host: [\n\n");
+        assert_eq!(doc.edits.len(), 1);
+        assert!(
+            doc.get_path(&["host"])
+                .expect("old graph still works")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn patch_writer_inserts_mapping_entry_with_inherited_style() {
         let mut doc = YamlDoc::parse(
             "server:
@@ -10768,6 +11329,99 @@ other: keep
 port: 8080
 "
         );
+    }
+
+    #[test]
+    fn patch_writer_inserts_block_sequence_value() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+
+        doc.insert_mapping_value_with_comment(
+            root,
+            "ports",
+            &vec![8080_u16, 9090],
+            MappingEntryStyle::default(),
+            None,
+        )
+        .expect("sequence insert queues");
+
+        assert_eq!(
+            doc.to_string(),
+            "host: localhost\nports:\n  - 8080\n  - 9090\n"
+        );
+        YamlDoc::parse(&doc.to_string()).expect("inserted sequence reparses");
+    }
+
+    #[test]
+    fn patch_writer_inserts_block_mapping_value() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+        let limits = std::collections::BTreeMap::from([
+            ("high".to_owned(), 5_u16),
+            ("low".to_owned(), 1_u16),
+        ]);
+
+        doc.insert_mapping_value_with_comment(
+            root,
+            "limits",
+            &limits,
+            MappingEntryStyle::default(),
+            None,
+        )
+        .expect("mapping insert queues");
+
+        assert_eq!(
+            doc.to_string(),
+            "host: localhost\nlimits:\n  high: 5\n  low: 1\n"
+        );
+        YamlDoc::parse(&doc.to_string()).expect("inserted mapping reparses");
+    }
+
+    #[test]
+    fn patch_writer_inserts_empty_collection_values() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+        let empty_map = std::collections::BTreeMap::<String, u16>::new();
+
+        doc.insert_mapping_value_with_comment(
+            root,
+            "ports",
+            &Vec::<u16>::new(),
+            MappingEntryStyle::default(),
+            None,
+        )
+        .expect("empty sequence insert queues");
+        doc.insert_mapping_value_with_comment(
+            root,
+            "limits",
+            &empty_map,
+            MappingEntryStyle::default(),
+            None,
+        )
+        .expect("empty mapping insert queues");
+
+        assert_eq!(doc.to_string(), "host: localhost\nports: []\nlimits: {}\n");
+        YamlDoc::parse(&doc.to_string()).expect("empty collections reparse");
+    }
+
+    #[test]
+    fn patch_writer_rejects_invalid_plain_collection_fragments() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+
+        let error = doc
+            .insert_mapping_value_with_comment(
+                root,
+                "names",
+                &vec!["bad\nvalue".to_owned()],
+                MappingEntryStyle::default(),
+                None,
+            )
+            .expect_err("multi-line plain sequence value should reject");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert!(error.diagnostic.message.contains("single-line plain text"));
+        assert_eq!(doc.to_string(), "host: localhost\n");
     }
 
     #[test]
@@ -10856,6 +11510,38 @@ debug: false
             .expect("scalar replacement queues");
 
         assert_eq!(doc.to_string(), "port: 9090 # chosen port\n");
+    }
+
+    #[test]
+    fn string_write_rewrites_literal_block_scalar() {
+        let mut doc = YamlDoc::parse("message: |\n  old\n").expect("valid literal scalar");
+        let message = doc
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        "new\ntext"
+            .to_owned()
+            .write_yaml(&mut doc, Some(message))
+            .expect("literal scalar rewrite queues");
+
+        assert_eq!(doc.to_string(), "message: |\n  new\n  text\n");
+    }
+
+    #[test]
+    fn string_write_rewrites_folded_block_scalar() {
+        let mut doc = YamlDoc::parse("message: >\n  old\n").expect("valid folded scalar");
+        let message = doc
+            .get_path(&["message"])
+            .expect("lookup succeeds")
+            .expect("message exists");
+
+        "new text"
+            .to_owned()
+            .write_yaml(&mut doc, Some(message))
+            .expect("folded scalar rewrite queues");
+
+        assert_eq!(doc.to_string(), "message: >\n  new text\n");
     }
 
     #[test]
@@ -11139,6 +11825,54 @@ keep: yes
     }
 
     #[test]
+    fn yaml_value_patches_same_length_block_sequence_items() {
+        let mut doc = YamlDoc::parse(
+            "ports:
+  - 8080 # first
+  - 9090 # second
+",
+        )
+        .expect("valid sequence");
+        let ports = doc
+            .get_path(&["ports"])
+            .expect("lookup succeeds")
+            .expect("ports exists");
+
+        vec![3000_u16, 3001]
+            .write_yaml(&mut doc, Some(ports))
+            .expect("vec patches existing sequence items");
+
+        assert_eq!(
+            doc.to_string(),
+            "ports:
+  - 3000 # first
+  - 3001 # second
+"
+        );
+    }
+
+    #[test]
+    fn yaml_value_replaces_different_length_block_sequences() {
+        let mut doc = YamlDoc::parse(
+            "ports:
+  - 8080 # first
+  - 9090 # second
+",
+        )
+        .expect("valid sequence");
+        let ports = doc
+            .get_path(&["ports"])
+            .expect("lookup succeeds")
+            .expect("ports exists");
+
+        vec![3000_u16]
+            .write_yaml(&mut doc, Some(ports))
+            .expect("vec falls back to whole sequence replacement");
+
+        assert_eq!(doc.to_string(), "ports:\n  - 3000\n");
+    }
+
+    #[test]
     fn yaml_value_reads_and_writes_btree_map_values() {
         let mut doc = YamlDoc::parse(
             "limits:
@@ -11167,8 +11901,75 @@ keep: yes
         assert_eq!(
             doc.to_string(),
             "limits:
-  high: 7
   low: 2
+  high: 7
+"
+        );
+    }
+
+    #[test]
+    fn yaml_value_updates_block_mapping_keys_and_preserves_unknown_entries() {
+        let mut doc = YamlDoc::parse(
+            "limits:
+  low: 1 # keep low
+  extra: keep
+",
+        )
+        .expect("valid mapping");
+        let limits = doc
+            .get_path(&["limits"])
+            .expect("lookup succeeds")
+            .expect("limits exists");
+        let replacement = std::collections::BTreeMap::from([
+            ("high".to_owned(), 7_u16),
+            ("low".to_owned(), 2_u16),
+        ]);
+
+        replacement
+            .write_yaml(&mut doc, Some(limits))
+            .expect("map patches and inserts");
+
+        assert_eq!(
+            doc.to_string(),
+            "limits:
+  low: 2 # keep low
+  extra: keep
+  high: 7
+"
+        );
+    }
+
+    #[test]
+    fn yaml_value_updates_block_mapping_keys_preserving_order_and_comments() {
+        let mut doc = YamlDoc::parse(
+            "limits:
+  # low limit
+  low: 1
+  mid: keep
+  high: 5 # upper
+",
+        )
+        .expect("valid mapping");
+        let limits = doc
+            .get_path(&["limits"])
+            .expect("lookup succeeds")
+            .expect("limits exists");
+        let replacement = std::collections::BTreeMap::from([
+            ("high".to_owned(), 7_u16),
+            ("low".to_owned(), 2_u16),
+        ]);
+
+        replacement
+            .write_yaml(&mut doc, Some(limits))
+            .expect("map patches existing keys only");
+
+        assert_eq!(
+            doc.to_string(),
+            "limits:
+  # low limit
+  low: 2
+  mid: keep
+  high: 7 # upper
 "
         );
     }

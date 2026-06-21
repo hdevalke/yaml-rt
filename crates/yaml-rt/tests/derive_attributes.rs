@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
@@ -267,6 +268,144 @@ fn flatten_attribute_writes_nested_overlay_to_root_mapping() {
         doc.to_string(),
         "name: app\nhost: \"example.com\"\nextra: keep\nport: 9090\n"
     );
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct NestedConfig {
+    name: String,
+    server: ServerFields,
+}
+
+#[test]
+fn nested_struct_field_reads_and_updates_existing_mapping() {
+    let mut doc = YamlDoc::parse("name: app\nserver:\n  host: \"localhost\"\n  extra: keep\n")
+        .expect("valid nested YAML");
+    let mut config = NestedConfig::from_yaml_doc(&doc).expect("derive reads nested config");
+
+    assert_eq!(
+        config.server,
+        ServerFields {
+            host: "localhost".to_owned(),
+            port: 8080,
+        }
+    );
+
+    config.server.host = "example.com".to_owned();
+    config.server.port = 9090;
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive writes nested config");
+
+    assert_eq!(
+        doc.to_string(),
+        "name: app\nserver:\n  host: \"example.com\"\n  extra: keep\n  port: 9090\n"
+    );
+}
+
+#[test]
+fn nested_struct_field_inserts_missing_mapping() {
+    let mut doc = YamlDoc::parse("name: app\n").expect("valid YAML");
+    let config = NestedConfig {
+        name: "app".to_owned(),
+        server: ServerFields {
+            host: "localhost".to_owned(),
+            port: 8080,
+        },
+    };
+
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive inserts nested config");
+
+    assert_eq!(
+        doc.to_string(),
+        "name: app\nserver:\n  host: localhost\n  port: 8080\n"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[yaml(insert_order = "struct")]
+struct OrderedNestedConfig {
+    name: String,
+    /// Server settings.
+    server: ServerFields,
+    tail: String,
+}
+
+#[test]
+fn nested_struct_field_inserts_with_comment_and_struct_order() {
+    let mut doc = YamlDoc::parse("name: app\ntail: keep\n").expect("valid YAML");
+    let config = OrderedNestedConfig {
+        name: "app".to_owned(),
+        server: ServerFields {
+            host: "localhost".to_owned(),
+            port: 8080,
+        },
+        tail: "keep".to_owned(),
+    };
+
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive inserts ordered nested config");
+
+    assert_eq!(
+        doc.to_string(),
+        "name: app\n# Server settings.\nserver:\n  host: localhost\n  port: 8080\ntail: keep\n"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct CollectionConfig {
+    name: String,
+    #[yaml(default)]
+    ports: Vec<u16>,
+    #[yaml(default)]
+    limits: BTreeMap<String, u16>,
+}
+
+#[test]
+fn derive_inserts_missing_collection_fields() {
+    let mut doc = YamlDoc::parse("name: app\n").expect("valid YAML");
+    let mut limits = BTreeMap::new();
+    limits.insert("high".to_owned(), 5);
+    limits.insert("low".to_owned(), 1);
+    let config = CollectionConfig {
+        name: "app".to_owned(),
+        ports: vec![8080, 9090],
+        limits,
+    };
+
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive inserts collections");
+
+    assert_eq!(
+        doc.to_string(),
+        "name: app\nports:\n  - 8080\n  - 9090\nlimits:\n  high: 5\n  low: 1\n"
+    );
+}
+
+#[test]
+fn repeated_apply_can_commit_between_passes() {
+    let mut doc = YamlDoc::parse("name: app\n").expect("valid YAML");
+    let config = CollectionConfig {
+        name: "app".to_owned(),
+        ports: vec![8080],
+        limits: BTreeMap::new(),
+    };
+
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("first apply inserts ports");
+    doc.commit_edits().expect("commit inserted fields");
+
+    let mut config = CollectionConfig::from_yaml_doc(&doc).expect("derive reads committed fields");
+    config.ports = vec![9090];
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("second apply updates committed field");
+
+    assert_eq!(doc.to_string(), "name: app\nports:\n  - 9090\nlimits: {}\n");
 }
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]

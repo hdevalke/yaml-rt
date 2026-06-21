@@ -350,17 +350,21 @@ Add support incrementally:
       handles are resolved into event and semantic tag metadata. Directive
       rewriting remains a later writer milestone.
 - [x] Multi-document streams: explicit document starts and ends produce
-      per-document events and semantic graph document nodes. Path lookup and
-      typed overlays continue to target the first document until document
-      selection APIs are added.
+      per-document events and semantic graph document nodes. Document-selection
+      APIs can read, look up, and write a selected document by zero-based index.
 - Explicit keys: `? key`.
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 
 Current editing limits: anchored or tagged collection rewriting is still rejected
 for style safety, directives are preserved but not rewritten, nested collection
-fragments are deliberately conservative, and document-selection APIs are still
+fragments are deliberately conservative, and creating new stream documents is
 future work.
+
+Compatibility note: `root_mapping`, `get_path`, `FromYamlDoc::from_yaml_doc`,
+and `ToYamlDoc::apply_to_yaml_doc` continue to target the first document.
+Use `document_count`, `document_root_mapping`, `get_path_in_document`,
+`read_document`, and `write_document` for explicit multi-document workflows.
 
 ### 10. Manual typed traits
 

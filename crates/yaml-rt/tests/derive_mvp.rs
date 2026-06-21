@@ -45,3 +45,29 @@ fn derive_inserts_missing_fields_at_the_end() {
 
     assert_eq!(doc.to_string(), "host: localhost\nport: 8080\n");
 }
+
+#[test]
+fn derive_reads_and_writes_selected_document() {
+    let mut doc = YamlDoc::parse(
+        "---\nhost: first\nport: 1000\n---\n# selected\nhost: \"second\"\nport: 2000\nextra: keep\n",
+    )
+    .expect("valid multi-document stream");
+    let mut config: Config = doc.read_document(1).expect("derive reads second document");
+
+    assert_eq!(
+        config,
+        Config {
+            host: "second".to_owned(),
+            port: 2000,
+        }
+    );
+
+    config.port = 9090;
+    doc.write_document(1, &config)
+        .expect("derive writes second document");
+
+    assert_eq!(
+        doc.to_string(),
+        "---\nhost: first\nport: 1000\n---\n# selected\nhost: \"second\"\nport: 9090\nextra: keep\n"
+    );
+}

@@ -6300,6 +6300,12 @@ impl YamlDoc {
         &self.graph
     }
 
+    /// Returns the number of documents in this YAML stream.
+    #[must_use]
+    pub fn document_count(&self) -> usize {
+        self.graph.documents.len()
+    }
+
     /// Returns a semantic graph node by identifier.
     #[must_use]
     pub fn graph_node(&self, node: GraphNodeId) -> Option<&GraphNode> {
@@ -6325,7 +6331,20 @@ impl YamlDoc {
     /// Returns an error when the document has no semantic root, the root is not
     /// a document, or the document has no root block mapping.
     pub fn root_graph_mapping(&self) -> Result<GraphNodeId, YamlError> {
-        self.root_mapping_graph()
+        self.document_root_mapping_graph(0)
+    }
+
+    /// Returns a document graph node by zero-based document index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `index` does not identify an existing document.
+    pub fn document_graph(&self, index: usize) -> Result<GraphNodeId, YamlError> {
+        self.graph
+            .documents
+            .get(index)
+            .copied()
+            .ok_or_else(|| self.document_index_error(index))
     }
 
     /// Returns the first root-level block mapping in the document.
@@ -6335,7 +6354,17 @@ impl YamlDoc {
     /// Returns an error when no root block mapping exists or when the semantic
     /// root mapping is not linked back to a CST node.
     pub fn root_mapping(&self) -> Result<NodeId, YamlError> {
-        let mapping = self.root_mapping_graph()?;
+        self.document_root_mapping(0)
+    }
+
+    /// Returns the root-level block mapping in a selected document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected document does not exist, has no block
+    /// mapping root, or the root mapping is not linked back to the CST.
+    pub fn document_root_mapping(&self, index: usize) -> Result<NodeId, YamlError> {
+        let mapping = self.document_root_mapping_graph(index)?;
         self.graph_node_cst(mapping).ok_or_else(|| {
             YamlError::new(
                 Diagnostic::new(
@@ -6347,6 +6376,37 @@ impl YamlDoc {
                 .with_expected("a CST-backed block mapping"),
             )
         })
+    }
+
+    /// Reads a typed overlay from a selected document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected document is missing, does not contain
+    /// a root block mapping, or the typed overlay cannot be read.
+    pub fn read_document<T>(&self, index: usize) -> Result<T, YamlError>
+    where
+        T: FromYamlDoc,
+    {
+        let root = self.document_root_mapping(index)?;
+        let nested = self.rerooted_at_mapping(root)?;
+        T::from_yaml_doc(&nested)
+    }
+
+    /// Writes a typed overlay to a selected document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected document is missing, does not contain
+    /// a root block mapping, or the typed overlay cannot be written.
+    pub fn write_document<T>(&mut self, index: usize, value: &T) -> Result<(), YamlError>
+    where
+        T: ToYamlDoc,
+    {
+        let root = self.document_root_mapping(index)?;
+        let mut nested = self.rerooted_at_mapping(root)?;
+        value.apply_to_yaml_doc(&mut nested)?;
+        self.queue_edits_from(&nested)
     }
 
     /// Looks up a mapping entry by key inside `mapping`.
@@ -6399,12 +6459,27 @@ impl YamlDoc {
     /// Returns an error when the document has no root mapping or when graph
     /// traversal encounters an unknown graph node.
     pub fn get_graph_path(&self, path: &[&str]) -> Result<Option<GraphNodeId>, YamlError> {
+        self.get_graph_path_in_document(0, path)
+    }
+
+    /// Looks up a nested path of mapping keys in a selected document and returns
+    /// the semantic graph node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected document does not exist, has no root
+    /// mapping, or graph traversal encounters an unknown graph node.
+    pub fn get_graph_path_in_document(
+        &self,
+        index: usize,
+        path: &[&str],
+    ) -> Result<Option<GraphNodeId>, YamlError> {
         let Some((first, rest)) = path.split_first() else {
             return Ok(None);
         };
 
         let Some((_, mut current)) =
-            self.get_graph_mapping_entry(self.root_mapping_graph()?, first)?
+            self.get_graph_mapping_entry(self.document_root_mapping_graph(index)?, first)?
         else {
             return Ok(None);
         };
@@ -6426,20 +6501,32 @@ impl YamlDoc {
     /// Returns an error when semantic path lookup fails while resolving the
     /// graph path.
     pub fn get_path(&self, path: &[&str]) -> Result<Option<NodeId>, YamlError> {
+        self.get_path_in_document(0, path)
+    }
+
+    /// Looks up a nested path of mapping keys in a selected document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when semantic path lookup fails while resolving the
+    /// graph path.
+    pub fn get_path_in_document(
+        &self,
+        index: usize,
+        path: &[&str],
+    ) -> Result<Option<NodeId>, YamlError> {
         Ok(self
-            .get_graph_path(path)?
+            .get_graph_path_in_document(index, path)?
             .and_then(|node| self.graph_node_cst(node)))
     }
 
-    fn root_mapping_graph(&self) -> Result<GraphNodeId, YamlError> {
-        let root = self.graph.root.ok_or_else(|| {
-            YamlError::new(Diagnostic::new(
-                DiagnosticKind::Semantic,
-                "document does not contain a semantic root",
-                Span::empty(0),
-            ))
-        })?;
-        let root = self.expect_graph_node(root)?;
+    fn document_root_mapping_graph(&self, index: usize) -> Result<GraphNodeId, YamlError> {
+        let root = self.document_graph(index)?;
+        self.document_mapping_child(root)
+    }
+
+    fn document_mapping_child(&self, document: GraphNodeId) -> Result<GraphNodeId, YamlError> {
+        let root = self.expect_graph_node(document)?;
         let GraphKind::Document { children } = &root.kind else {
             return Err(YamlError::new(Diagnostic::new(
                 DiagnosticKind::Semantic,
@@ -6464,11 +6551,22 @@ impl YamlDoc {
                     Diagnostic::new(
                         DiagnosticKind::Semantic,
                         "document does not contain a root mapping",
-                        Span::empty(0),
+                        root.span,
                     )
                     .with_expected("a mapping graph node"),
                 )
             })
+    }
+
+    fn document_index_error(&self, index: usize) -> YamlError {
+        YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Semantic,
+                format!("document index {index} is out of range"),
+                Span::empty_from_usize(self.source.len()),
+            )
+            .with_expected("an existing document index"),
+        )
     }
 
     fn get_graph_mapping_entry(
@@ -6580,6 +6678,7 @@ impl YamlDoc {
             )));
         };
         *children = vec![mapping_graph];
+        doc.graph.documents = vec![root];
         doc.edits.clear();
         Ok(doc)
     }
@@ -11370,6 +11469,94 @@ port: 8080
             doc.node(ports).map(|node| node.kind),
             Some(NodeKind::BlockSequence)
         );
+    }
+
+    #[test]
+    fn document_selection_counts_stream_documents() {
+        assert_eq!(
+            YamlDoc::parse("").expect("empty stream").document_count(),
+            0
+        );
+        assert_eq!(
+            YamlDoc::parse("host: localhost\n")
+                .expect("single document")
+                .document_count(),
+            1
+        );
+        assert_eq!(
+            YamlDoc::parse("---\nname: first\n---\nname: second\n")
+                .expect("multi document")
+                .document_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn document_selection_reads_second_document_mapping() {
+        let doc = YamlDoc::parse("---\nname: first\n---\nname: second\n")
+            .expect("valid multi-document stream");
+        let second_root = doc
+            .document_root_mapping(1)
+            .expect("second document root mapping exists");
+        let second_name = doc
+            .get_mapping_value(second_root, "name")
+            .expect("mapping lookup succeeds")
+            .expect("second name exists");
+        let path_name = doc
+            .get_path_in_document(1, &["name"])
+            .expect("path lookup succeeds")
+            .expect("path name exists");
+
+        assert_eq!(doc.scalar_text(second_name).expect("name scalar"), "second");
+        assert_eq!(doc.scalar_text(path_name).expect("name scalar"), "second");
+        assert_eq!(
+            doc.scalar_text(
+                doc.get_path(&["name"])
+                    .expect("first path lookup succeeds")
+                    .expect("first name exists")
+            )
+            .expect("first name scalar"),
+            "first"
+        );
+    }
+
+    #[test]
+    fn document_selection_reports_out_of_range_indexes() {
+        let doc = YamlDoc::parse("---\nname: first\n").expect("valid document");
+        let error = doc
+            .document_graph(1)
+            .expect_err("second document does not exist");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Semantic);
+        assert_eq!(error.diagnostic.expected, ["an existing document index"]);
+    }
+
+    #[test]
+    fn document_selection_edit_survives_commit() {
+        let mut doc = YamlDoc::parse("---\nname: first\n---\nname: second\n")
+            .expect("valid multi-document stream");
+        let second_name = doc
+            .get_path_in_document(1, &["name"])
+            .expect("second path lookup succeeds")
+            .expect("second name exists");
+
+        "updated"
+            .to_owned()
+            .write_yaml(&mut doc, Some(second_name))
+            .expect("second document edit queues");
+        doc.commit_edits().expect("edited stream reparses");
+
+        let first = doc
+            .get_path_in_document(0, &["name"])
+            .expect("first path lookup succeeds")
+            .expect("first name exists");
+        let second = doc
+            .get_path_in_document(1, &["name"])
+            .expect("second path lookup succeeds")
+            .expect("second name exists");
+
+        assert_eq!(doc.scalar_text(first).expect("first name"), "first");
+        assert_eq!(doc.scalar_text(second).expect("second name"), "updated");
     }
 
     #[test]

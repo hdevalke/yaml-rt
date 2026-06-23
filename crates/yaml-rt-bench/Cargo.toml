@@ -1,0 +1,18 @@
+[package]
+name = "yaml-rt-bench"
+description = "Parse benchmarks for RTY and YAML parser baselines"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bench]]
+name = "parse"
+harness = false
+
+[dev-dependencies]
+criterion = "0.5"
+fyaml = "0.5.0"
+saphyr = "0.0.6"
+yaml-rt-core.workspace = true

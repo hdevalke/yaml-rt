@@ -4060,20 +4060,67 @@ fn valid_yaml_directive_version_syntax(version: &str) -> bool {
         && minor.chars().all(|character| character.is_ascii_digit())
 }
 
-fn validate_tag_handle(handle: &str, line: SourceLine<'_>) -> Result<(), YamlError> {
-    let valid = handle == "!"
+fn validate_yaml_directive_version_for_emit(version: &str) -> Result<(), YamlError> {
+    validate_yaml_chars(version)?;
+    if version.chars().any(char::is_whitespace) || !valid_yaml_directive_version_syntax(version) {
+        return Err(directive_emit_error(
+            "invalid YAML directive version",
+            Span::empty(0),
+            "major.minor version digits",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_tag_handle(handle: &str) -> bool {
+    handle == "!"
         || handle == "!!"
         || (handle.starts_with('!')
             && handle.ends_with('!')
             && handle.len() > 2
             && handle[1..handle.len() - 1].chars().all(|character| {
                 character.is_ascii_alphanumeric() || character == '-' || character == '_'
-            }));
-    if valid {
+            }))
+}
+
+fn validate_tag_handle(handle: &str, line: SourceLine<'_>) -> Result<(), YamlError> {
+    if valid_tag_handle(handle) {
         Ok(())
     } else {
         Err(invalid_directive(line, "invalid TAG directive handle"))
     }
+}
+
+fn validate_tag_directive_parts_for_emit(handle: &str, prefix: &str) -> Result<(), YamlError> {
+    validate_yaml_chars(handle)?;
+    validate_yaml_chars(prefix)?;
+    if !valid_tag_handle(handle) {
+        return Err(directive_emit_error(
+            "invalid TAG directive handle",
+            Span::empty(0),
+            "!, !!, or !name!",
+        ));
+    }
+    if prefix.is_empty()
+        || prefix
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n') || character.is_whitespace())
+    {
+        return Err(directive_emit_error(
+            "invalid TAG directive prefix",
+            Span::empty(0),
+            "non-empty single-line tag prefix without whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn directive_emit_error(
+    message: impl Into<String>,
+    span: Span,
+    expected: impl Into<String>,
+) -> YamlError {
+    YamlError::new(Diagnostic::new(DiagnosticKind::Emitter, message, span).with_expected(expected))
 }
 
 #[derive(Clone, Copy)]
@@ -6213,6 +6260,44 @@ pub struct Edit {
     pub replacement: String,
 }
 
+/// Parsed `%YAML` directive metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YamlDirective {
+    /// Directive version text, such as `1.2`.
+    pub version: String,
+    /// CST directive node.
+    pub node: NodeId,
+}
+
+/// Parsed `%TAG` directive metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagDirective {
+    /// Tag handle, such as `!` or `!e!`.
+    pub handle: String,
+    /// Tag prefix text.
+    pub prefix: String,
+    /// CST directive node.
+    pub node: NodeId,
+}
+
+/// Parsed reserved directive metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReservedDirective {
+    /// Directive name, including the leading `%`.
+    pub name: String,
+    /// Whitespace-separated directive parameters.
+    pub parameters: Vec<String>,
+    /// CST directive node.
+    pub node: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedDirective {
+    Yaml(YamlDirective),
+    Tag(TagDirective),
+    Reserved(ReservedDirective),
+}
+
 /// Formatting controls for inserting an MVP block mapping entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MappingEntryStyle {
@@ -6324,6 +6409,107 @@ impl YamlDoc {
     #[must_use]
     pub fn document_count(&self) -> usize {
         self.graph.documents.len()
+    }
+
+    /// Returns the `%YAML` directive when one is present in the stream prologue.
+    #[must_use]
+    pub fn yaml_directive(&self) -> Option<YamlDirective> {
+        self.directive_nodes()
+            .filter_map(|node| self.parse_directive_node(node).ok())
+            .find_map(|directive| match directive {
+                ParsedDirective::Yaml(directive) => Some(directive),
+                ParsedDirective::Tag(_) | ParsedDirective::Reserved(_) => None,
+            })
+    }
+
+    /// Returns `%TAG` directives from the stream prologue in source order.
+    #[must_use]
+    pub fn tag_directives(&self) -> Vec<TagDirective> {
+        self.directive_nodes()
+            .filter_map(|node| self.parse_directive_node(node).ok())
+            .filter_map(|directive| match directive {
+                ParsedDirective::Tag(directive) => Some(directive),
+                ParsedDirective::Yaml(_) | ParsedDirective::Reserved(_) => None,
+            })
+            .collect()
+    }
+
+    /// Returns reserved directives from the stream prologue in source order.
+    #[must_use]
+    pub fn reserved_directives(&self) -> Vec<ReservedDirective> {
+        self.directive_nodes()
+            .filter_map(|node| self.parse_directive_node(node).ok())
+            .filter_map(|directive| match directive {
+                ParsedDirective::Reserved(directive) => Some(directive),
+                ParsedDirective::Yaml(_) | ParsedDirective::Tag(_) => None,
+            })
+            .collect()
+    }
+
+    /// Queues insertion or update of the stream `%YAML` directive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `version` is not valid YAML directive version
+    /// syntax or when the edit overlaps an existing pending edit.
+    pub fn set_yaml_directive(&mut self, version: &str) -> Result<(), YamlError> {
+        validate_yaml_directive_version_for_emit(version)?;
+        let replacement = format!("%YAML {version}");
+        if let Some(directive) = self.yaml_directive() {
+            let span = self.directive_content_span(directive.node)?;
+            self.queue_edit(span, replacement)
+        } else {
+            self.insert_directive_line(replacement)
+        }
+    }
+
+    /// Queues insertion or update of a stream `%TAG` directive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `handle` or `prefix` is invalid or when the edit
+    /// overlaps an existing pending edit.
+    pub fn set_tag_directive(&mut self, handle: &str, prefix: &str) -> Result<(), YamlError> {
+        validate_tag_directive_parts_for_emit(handle, prefix)?;
+        let replacement = format!("%TAG {handle} {prefix}");
+        if let Some(directive) = self
+            .tag_directives()
+            .into_iter()
+            .find(|directive| directive.handle == handle)
+        {
+            let span = self.directive_content_span(directive.node)?;
+            self.queue_edit(span, replacement)
+        } else {
+            self.insert_directive_line(replacement)
+        }
+    }
+
+    /// Queues removal of the stream `%YAML` directive when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the removal edit overlaps an existing pending edit.
+    pub fn remove_yaml_directive(&mut self) -> Result<(), YamlError> {
+        if let Some(directive) = self.yaml_directive() {
+            self.remove_directive_node(directive.node)?;
+        }
+        Ok(())
+    }
+
+    /// Queues removal of the stream `%TAG` directive with `handle` when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the removal edit overlaps an existing pending edit.
+    pub fn remove_tag_directive(&mut self, handle: &str) -> Result<(), YamlError> {
+        if let Some(directive) = self
+            .tag_directives()
+            .into_iter()
+            .find(|directive| directive.handle == handle)
+        {
+            self.remove_directive_node(directive.node)?;
+        }
+        Ok(())
     }
 
     /// Returns a semantic graph node by identifier.
@@ -7184,6 +7370,90 @@ impl YamlDoc {
             span: Span::new(start, node.span.end),
             indent: self.line_indent_for_offset(start as usize),
         })
+    }
+
+    fn directive_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.root()
+            .and_then(|root| self.node(root))
+            .into_iter()
+            .flat_map(|stream| stream.children.iter().copied())
+            .filter(|node| {
+                self.node(*node)
+                    .is_some_and(|node| node.kind == NodeKind::Directive)
+            })
+    }
+
+    fn parse_directive_node(&self, node: NodeId) -> Result<ParsedDirective, YamlError> {
+        let node_ref = self.expect_node_kind(node, NodeKind::Directive)?;
+        let body = strip_inline_comment(self.source.slice(node_ref.span)).trim();
+        let mut parts = body.split_whitespace();
+        let Some(name) = parts.next() else {
+            return Err(directive_emit_error(
+                "directive is missing a name",
+                node_ref.span,
+                "%YAML, %TAG, or reserved directive syntax",
+            )
+            .with_position_from(&self.source));
+        };
+
+        Ok(match name {
+            "%YAML" => ParsedDirective::Yaml(YamlDirective {
+                version: parts.next().unwrap_or_default().to_owned(),
+                node,
+            }),
+            "%TAG" => ParsedDirective::Tag(TagDirective {
+                handle: parts.next().unwrap_or_default().to_owned(),
+                prefix: parts.next().unwrap_or_default().to_owned(),
+                node,
+            }),
+            _ => ParsedDirective::Reserved(ReservedDirective {
+                name: name.to_owned(),
+                parameters: parts.map(str::to_owned).collect(),
+                node,
+            }),
+        })
+    }
+
+    fn directive_content_span(&self, node: NodeId) -> Result<Span, YamlError> {
+        let node = self.expect_node_kind(node, NodeKind::Directive)?;
+        let text = self.source.slice(node.span);
+        let end = strip_inline_comment(text)
+            .trim_end_matches([' ', '\t'])
+            .len();
+        Ok(Span::new(
+            node.span.start,
+            Span::offset_from_usize(node.span.start, end),
+        ))
+    }
+
+    fn insert_directive_line(&mut self, replacement: String) -> Result<(), YamlError> {
+        let insertion_offset = self.directive_insertion_offset();
+        let mut line = replacement;
+        line.push_str(self.preferred_line_ending());
+        self.queue_edit(Span::empty_from_usize(insertion_offset), line)
+    }
+
+    fn remove_directive_node(&mut self, node: NodeId) -> Result<(), YamlError> {
+        let node = self.expect_node_kind(node, NodeKind::Directive)?;
+        self.queue_edit(self.line_span_including_break(node.span), String::new())
+    }
+
+    fn directive_insertion_offset(&self) -> usize {
+        if let Some(last_directive) = self
+            .directive_nodes()
+            .filter_map(|node| self.node(node))
+            .max_by_key(|node| node.span.start)
+        {
+            return self.line_span_including_break(last_directive.span).end as usize;
+        }
+
+        self.root()
+            .and_then(|root| self.node(root))
+            .and_then(|stream| stream.children.first().copied())
+            .and_then(|node| self.node(node))
+            .map_or(0, |node| {
+                self.line_start_for_offset(node.span.start as usize)
+            })
     }
 
     fn expect_node(&self, node: NodeId) -> Result<&Node, YamlError> {
@@ -9215,6 +9485,140 @@ single: 'hello'
             assert_eq!(doc.to_string(), input);
             assert_eq!(count_nodes(&doc, NodeKind::Directive), 1);
         }
+    }
+
+    #[test]
+    fn directives_expose_metadata_with_cst_nodes() {
+        let doc = YamlDoc::parse(
+            "%YAML 1.2\n%TAG !e! tag:example.com,2000:app/\n%FOO bar baz\n---\nvalue\n",
+        )
+        .expect("valid directives");
+
+        let yaml = doc.yaml_directive().expect("YAML directive exists");
+        assert_eq!(yaml.version, "1.2");
+        assert_eq!(
+            doc.node(yaml.node).expect("yaml node exists").kind,
+            NodeKind::Directive
+        );
+
+        let tags = doc.tag_directives();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].handle, "!e!");
+        assert_eq!(tags[0].prefix, "tag:example.com,2000:app/");
+        assert_eq!(
+            doc.node(tags[0].node).expect("tag node exists").kind,
+            NodeKind::Directive
+        );
+
+        let reserved = doc.reserved_directives();
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].name, "%FOO");
+        assert_eq!(reserved[0].parameters, ["bar", "baz"]);
+    }
+
+    #[test]
+    fn directive_editor_updates_existing_directives_preserving_comments() {
+        let mut doc = YamlDoc::parse(
+            "%YAML 1.2 # keep yaml\n%TAG !e! tag:old/ # keep tag\n---\n!e!foo value\n",
+        )
+        .expect("valid directives");
+
+        doc.set_yaml_directive("1.3").expect("YAML directive edits");
+        doc.set_tag_directive("!e!", "tag:new/")
+            .expect("TAG directive edits");
+
+        assert_eq!(
+            doc.to_string(),
+            "%YAML 1.3 # keep yaml\n%TAG !e! tag:new/ # keep tag\n---\n!e!foo value\n"
+        );
+    }
+
+    #[test]
+    fn directive_editor_inserts_before_explicit_and_implicit_documents() {
+        let mut explicit = YamlDoc::parse("---\nvalue\n").expect("valid explicit document");
+        explicit
+            .set_yaml_directive("1.2")
+            .expect("YAML directive inserts");
+        explicit
+            .set_tag_directive("!e!", "tag:example.com,2000:app/")
+            .expect("TAG directive inserts");
+        assert_eq!(
+            explicit.to_string(),
+            "%YAML 1.2\n%TAG !e! tag:example.com,2000:app/\n---\nvalue\n"
+        );
+
+        let mut implicit = YamlDoc::parse("value\n").expect("valid implicit document");
+        implicit
+            .set_tag_directive("!e!", "tag:example.com,2000:app/")
+            .expect("TAG directive inserts");
+        assert_eq!(
+            implicit.to_string(),
+            "%TAG !e! tag:example.com,2000:app/\nvalue\n"
+        );
+    }
+
+    #[test]
+    fn directive_editor_removes_directive_lines() {
+        let mut doc = YamlDoc::parse(
+            "%YAML 1.2\n%TAG !e! tag:example.com,2000:app/\n%TAG !f! tag:foo/\n---\nvalue\n",
+        )
+        .expect("valid directives");
+
+        doc.remove_yaml_directive().expect("YAML directive removes");
+        doc.remove_tag_directive("!e!")
+            .expect("selected TAG directive removes");
+
+        assert_eq!(doc.to_string(), "%TAG !f! tag:foo/\n---\nvalue\n");
+    }
+
+    #[test]
+    fn directive_editor_commit_reparses_tag_resolution() {
+        let mut doc =
+            YamlDoc::parse("%TAG !e! tag:old/\n---\n!e!foo value\n").expect("valid directives");
+
+        doc.set_tag_directive("!e!", "tag:new/")
+            .expect("TAG directive edits");
+        doc.commit_edits().expect("edited directive reparses");
+
+        let graph = doc
+            .graph
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.kind,
+                    GraphKind::Scalar {
+                        value,
+                        tag: Some(tag),
+                        ..
+                    } if value == "value" && tag == "tag:new/foo"
+                )
+            })
+            .expect("tag resolution updates after commit");
+        assert!(graph.cst.is_some());
+    }
+
+    #[test]
+    fn directive_editor_rejects_invalid_inputs_without_editing() {
+        let mut doc = YamlDoc::parse("---\nvalue\n").expect("valid document");
+
+        let error = doc
+            .set_yaml_directive("1.x")
+            .expect_err("invalid YAML version rejects");
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert!(doc.edits.is_empty());
+
+        let error = doc
+            .set_tag_directive("bad", "tag:example.com/")
+            .expect_err("invalid TAG handle rejects");
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert!(doc.edits.is_empty());
+
+        let error = doc
+            .set_tag_directive("!e!", "tag:bad prefix/")
+            .expect_err("invalid TAG prefix rejects");
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(doc.to_string(), "---\nvalue\n");
     }
 
     #[test]

@@ -348,7 +348,8 @@ Add support incrementally:
       preserving the original tag spelling and spacing.
 - [x] Directives: `%YAML` and `%TAG` are parsed before each document. `%TAG`
       handles are resolved into event and semantic tag metadata. Directive
-      rewriting remains a later writer milestone.
+      metadata can be inspected, inserted, updated, and removed before document
+      content.
 - [x] Multi-document streams: explicit document starts and ends produce
       per-document events and semantic graph document nodes. Document-selection
       APIs can read, look up, and write a selected document by zero-based index.
@@ -356,10 +357,9 @@ Add support incrementally:
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 
-Current editing limits: directives are preserved but not rewritten, nested
-collection fragments are deliberately conservative, semantic alias propagation is
-not attempted for rewritten anchors, and creating new stream documents is future
-work.
+Current editing limits: nested collection fragments are deliberately
+conservative, semantic alias propagation is not attempted for rewritten anchors,
+and creating new stream documents is future work.
 
 Compatibility note: `root_mapping`, `get_path`, `FromYamlDoc::from_yaml_doc`,
 and `ToYamlDoc::apply_to_yaml_doc` continue to target the first document.

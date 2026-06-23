@@ -8352,6 +8352,116 @@ impl ToYamlFragment for bool {
 
 impl_plain_yaml_fragment!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
 
+trait ToFlowYamlFragment {
+    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError>;
+}
+
+fn flow_plain_yaml_fragment(value: &str, role: &str) -> Result<String, YamlError> {
+    let value = plain_yaml_fragment(value, role)?;
+    if value.contains(['[', ']', '{', '}', ',']) {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Emitter,
+                "plain flow fragment cannot contain flow collection indicators",
+                Span::empty(0),
+            )
+            .with_expected("plain scalar text without flow indicators"),
+        ));
+    }
+    Ok(value)
+}
+
+macro_rules! impl_plain_flow_yaml_fragment {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl ToFlowYamlFragment for $type {
+                fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
+                    flow_plain_yaml_fragment(&self.to_string(), "YAML value")
+                }
+            }
+        )*
+    };
+}
+
+impl ToFlowYamlFragment for String {
+    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
+        flow_plain_yaml_fragment(self, "YAML value")
+    }
+}
+
+impl ToFlowYamlFragment for &str {
+    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
+        flow_plain_yaml_fragment(self, "YAML value")
+    }
+}
+
+impl ToFlowYamlFragment for bool {
+    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
+        Ok(if *self { "true" } else { "false" }.to_owned())
+    }
+}
+
+impl_plain_flow_yaml_fragment!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
+
+impl<T> ToFlowYamlFragment for Option<T>
+where
+    T: ToFlowYamlFragment,
+{
+    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
+        match self {
+            Some(value) => value.to_flow_yaml_fragment(),
+            None => Ok("null".to_owned()),
+        }
+    }
+}
+
+impl<T> ToFlowYamlFragment for Vec<T>
+where
+    T: ToFlowYamlFragment,
+{
+    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
+        let mut output = String::from("[");
+        for (index, value) in self.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(&value.to_flow_yaml_fragment()?);
+        }
+        output.push(']');
+        Ok(output)
+    }
+}
+
+impl<T> ToFlowYamlFragment for std::collections::BTreeMap<String, T>
+where
+    T: ToFlowYamlFragment,
+{
+    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
+        let mut output = String::from("{");
+        for (index, (key, value)) in self.iter().enumerate() {
+            validate_plain_mapping_fragment(key, "mapping key")?;
+            if key.contains(['[', ']', '{', '}', ',']) {
+                return Err(YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Emitter,
+                        "plain flow mapping key cannot contain flow collection indicators",
+                        Span::empty(0),
+                    )
+                    .with_expected("plain mapping key without flow indicators"),
+                ));
+            }
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(key);
+            output.push_str(": ");
+            output.push_str(&value.to_flow_yaml_fragment()?);
+        }
+        output.push('}');
+        Ok(output)
+    }
+}
+
 impl<T> ToYamlFragment for Option<T>
 where
     T: ToYamlFragment,
@@ -8658,25 +8768,14 @@ where
 
 fn format_flow_sequence_replacement<T>(values: &[T]) -> Result<String, YamlError>
 where
-    T: ToYamlFragment,
+    T: ToFlowYamlFragment,
 {
     let mut output = String::from("[");
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             output.push_str(", ");
         }
-        let value = value.to_yaml_fragment(0, "\n")?;
-        if value.contains('\n') {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Emitter,
-                    "nested flow sequence rewriting is not implemented yet",
-                    Span::empty(0),
-                )
-                .with_expected("single-line flow sequence values"),
-            ));
-        }
-        output.push_str(&value);
+        output.push_str(&value.to_flow_yaml_fragment()?);
     }
     output.push(']');
     Ok(output)
@@ -8686,28 +8785,17 @@ fn format_flow_mapping_replacement<T>(
     values: &std::collections::BTreeMap<String, T>,
 ) -> Result<String, YamlError>
 where
-    T: ToYamlFragment,
+    T: ToFlowYamlFragment,
 {
     let mut output = String::from("{");
     for (index, (key, value)) in values.iter().enumerate() {
-        validate_plain_mapping_fragment(key, "mapping key")?;
+        flow_plain_yaml_fragment(key, "mapping key")?;
         if index > 0 {
             output.push_str(", ");
         }
-        let value = value.to_yaml_fragment(0, "\n")?;
-        if value.contains('\n') {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Emitter,
-                    "nested flow mapping rewriting is not implemented yet",
-                    Span::empty(0),
-                )
-                .with_expected("single-line flow mapping values"),
-            ));
-        }
         output.push_str(key);
         output.push_str(": ");
-        output.push_str(&value);
+        output.push_str(&value.to_flow_yaml_fragment()?);
     }
     output.push('}');
     Ok(output)
@@ -8798,7 +8886,7 @@ where
 
 impl<T> YamlValue for Vec<T>
 where
-    T: YamlValue + ToYamlFragment,
+    T: YamlValue + ToYamlFragment + ToFlowYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         if let Some(items) = doc.graph_sequence_items(node) {
@@ -8873,7 +8961,7 @@ where
 
 impl<T> YamlValue for std::collections::BTreeMap<String, T>
 where
-    T: YamlValue + ToYamlFragment,
+    T: YamlValue + ToYamlFragment + ToFlowYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         if let Some(entries) = doc.graph_mapping_entries(node) {
@@ -12981,23 +13069,99 @@ keep: yes
     }
 
     #[test]
-    fn yaml_value_keeps_flow_sequence_nested_fragments_rejected() {
+    fn yaml_value_writes_nested_flow_sequence_values() {
         let mut doc = YamlDoc::parse("matrix: [[0]]\n").expect("valid flow sequence");
         let matrix = doc
             .get_path(&["matrix"])
             .expect("lookup succeeds")
             .expect("matrix exists");
+        let replacement = vec![vec![1_u16, 2], vec![3]];
 
-        let error = vec![vec![1_u16, 2], vec![3]]
+        replacement
             .write_yaml(&mut doc, Some(matrix))
-            .expect_err("nested flow sequence replacement rejects");
+            .expect("nested flow sequence replacement writes");
+
+        assert_eq!(doc.to_string(), "matrix: [[1, 2], [3]]\n");
+        doc.commit_edits().expect("nested flow sequence commits");
+        let matrix = doc
+            .get_path(&["matrix"])
+            .expect("lookup succeeds")
+            .expect("matrix exists");
+        assert_eq!(
+            Vec::<Vec<u16>>::read_yaml(&doc, matrix).expect("matrix reads"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn yaml_value_writes_nested_flow_mapping_values() {
+        let mut doc = YamlDoc::parse("settings: {old: value}\n").expect("valid flow mapping");
+        let settings = doc
+            .get_path(&["settings"])
+            .expect("lookup succeeds")
+            .expect("settings exists");
+        let replacement = std::collections::BTreeMap::from([
+            ("a".to_owned(), vec![1_u16, 2]),
+            ("b".to_owned(), vec![3]),
+        ]);
+
+        replacement
+            .write_yaml(&mut doc, Some(settings))
+            .expect("nested flow mapping values write");
+
+        assert_eq!(doc.to_string(), "settings: {a: [1, 2], b: [3]}\n");
+    }
+
+    #[test]
+    fn yaml_value_writes_flow_sequence_of_mappings() {
+        let mut doc = YamlDoc::parse("items: [{old: 0}]\n").expect("valid flow sequence");
+        let items = doc
+            .get_path(&["items"])
+            .expect("lookup succeeds")
+            .expect("items exists");
+        let replacement = vec![
+            std::collections::BTreeMap::from([("a".to_owned(), 1_u16)]),
+            std::collections::BTreeMap::from([("b".to_owned(), 2_u16)]),
+        ];
+
+        replacement
+            .write_yaml(&mut doc, Some(items))
+            .expect("flow sequence of mappings writes");
+
+        assert_eq!(doc.to_string(), "items: [{a: 1}, {b: 2}]\n");
+    }
+
+    #[test]
+    fn yaml_value_writes_decorated_nested_flow_collections() {
+        let mut doc =
+            YamlDoc::parse("matrix: !seq  &matrix [[0]]\n").expect("valid decorated flow");
+        let matrix = doc
+            .get_path(&["matrix"])
+            .expect("lookup succeeds")
+            .expect("matrix exists");
+
+        vec![vec![1_u16, 2], vec![3]]
+            .write_yaml(&mut doc, Some(matrix))
+            .expect("decorated nested flow writes");
+
+        assert_eq!(doc.to_string(), "matrix: !seq  &matrix [[1, 2], [3]]\n");
+    }
+
+    #[test]
+    fn yaml_value_rejects_invalid_flow_fragments_without_editing() {
+        let mut doc = YamlDoc::parse("items: [ok]\n").expect("valid flow sequence");
+        let items = doc
+            .get_path(&["items"])
+            .expect("lookup succeeds")
+            .expect("items exists");
+
+        let error = vec!["bad,item".to_owned()]
+            .write_yaml(&mut doc, Some(items))
+            .expect_err("invalid flow scalar rejects");
 
         assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-        assert_eq!(
-            error.diagnostic.message,
-            "nested flow sequence rewriting is not implemented yet"
-        );
-        assert_eq!(doc.to_string(), "matrix: [[0]]\n");
+        assert_eq!(doc.to_string(), "items: [ok]\n");
+        assert!(doc.edits.is_empty());
     }
 
     #[test]

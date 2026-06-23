@@ -109,6 +109,22 @@ fn derive_inserts_and_rewrites_nested_collection_field() {
 }
 
 #[test]
+fn derive_rewrites_existing_nested_flow_collection_field() {
+    let mut doc = YamlDoc::parse("host: localhost\nmatrix: [[0]]\n").expect("valid YAML");
+    let mut config = MatrixConfig::from_yaml_doc(&doc).expect("derive reads flow matrix");
+
+    config.matrix = vec![vec![1, 2], vec![3]];
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive rewrites flow matrix");
+
+    assert_eq!(doc.to_string(), "host: localhost\nmatrix: [[1, 2], [3]]\n");
+    doc.commit_edits().expect("flow matrix commits");
+    let read = MatrixConfig::from_yaml_doc(&doc).expect("derive reads updated flow matrix");
+    assert_eq!(read, config);
+}
+
+#[test]
 fn derive_writes_appended_empty_mapping_document() {
     let mut doc = YamlDoc::parse("host: first\nport: 1000\n").expect("valid YAML");
 

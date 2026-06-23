@@ -6411,6 +6411,39 @@ impl YamlDoc {
         self.graph.documents.len()
     }
 
+    /// Queues an explicit document append at the end of this YAML stream.
+    ///
+    /// The appended document becomes visible to document-indexed lookup after
+    /// [`YamlDoc::commit_edits`] reparses the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `value` cannot be formatted as a YAML fragment or
+    /// the append conflicts with another pending edit at the stream end.
+    pub fn append_document<T>(&mut self, value: &T) -> Result<(), YamlError>
+    where
+        T: ToYamlFragment,
+    {
+        let line_ending = self.preferred_line_ending();
+        let mut replacement = self.document_append_prefix(line_ending);
+        replacement.push_str("---");
+        replacement.push_str(line_ending);
+        let fragment = value.to_yaml_fragment(0, line_ending)?;
+        replacement.push_str(&fragment);
+        replacement.push_str(line_ending);
+        self.queue_edit(Span::empty_from_usize(self.source.len()), replacement)
+    }
+
+    /// Queues an explicit empty mapping document append.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the append conflicts with another pending edit at
+    /// the stream end.
+    pub fn append_empty_mapping_document(&mut self) -> Result<(), YamlError> {
+        self.append_document(&std::collections::BTreeMap::<String, String>::new())
+    }
+
     /// Returns the `%YAML` directive when one is present in the stream prologue.
     #[must_use]
     pub fn yaml_directive(&self) -> Option<YamlDirective> {
@@ -6609,7 +6642,16 @@ impl YamlDoc {
     where
         T: ToYamlDoc,
     {
-        let root = self.document_root_mapping(index)?;
+        let root = match self.document_root_mapping(index) {
+            Ok(root) => root,
+            Err(error) => {
+                if let Some(root) = self.empty_flow_mapping_document_root(index)? {
+                    let replacement = value.to_yaml_fragment(0, self.preferred_line_ending())?;
+                    return self.replace_node_text(root, replacement);
+                }
+                return Err(error);
+            }
+        };
         let mut nested = self.rerooted_at_mapping(root)?;
         value.apply_to_yaml_doc(&mut nested)?;
         self.queue_edits_from(&nested)
@@ -6762,6 +6804,30 @@ impl YamlDoc {
                     .with_expected("a mapping graph node"),
                 )
             })
+    }
+
+    fn empty_flow_mapping_document_root(&self, index: usize) -> Result<Option<NodeId>, YamlError> {
+        let root = self.document_graph(index)?;
+        let root = self.expect_graph_node(root)?;
+        let GraphKind::Document { children } = &root.kind else {
+            return Ok(None);
+        };
+        let Some(child) = children.first().copied() else {
+            return Ok(None);
+        };
+        let Some(graph) = self.graph_node(child) else {
+            return Ok(None);
+        };
+        let GraphKind::Mapping { style, entries, .. } = &graph.kind else {
+            return Ok(None);
+        };
+        if *style != CollectionStyle::Flow || !entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(graph.cst.filter(|cst| {
+            self.node(*cst)
+                .is_some_and(|node| node.kind == NodeKind::FlowMapping)
+        }))
     }
 
     fn document_index_error(&self, index: usize) -> YamlError {
@@ -7736,6 +7802,14 @@ impl YamlDoc {
             .as_bytes()
             .last()
             .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    }
+
+    fn document_append_prefix(&self, line_ending: &str) -> String {
+        if self.source.as_str().is_empty() || self.source_ends_with_line_break() {
+            String::new()
+        } else {
+            line_ending.to_owned()
+        }
     }
 }
 
@@ -12037,6 +12111,90 @@ port: 8080
 
         assert_eq!(doc.scalar_text(first).expect("first name"), "first");
         assert_eq!(doc.scalar_text(second).expect("second name"), "updated");
+    }
+
+    #[test]
+    fn document_append_empty_mapping_to_empty_stream() {
+        let mut doc = YamlDoc::parse("").expect("empty stream parses");
+
+        doc.append_empty_mapping_document()
+            .expect("empty mapping document append queues");
+
+        assert_eq!(doc.to_string(), "---\n{}\n");
+        assert_eq!(doc.document_count(), 0);
+
+        doc.commit_edits().expect("appended stream reparses");
+        assert_eq!(doc.document_count(), 1);
+    }
+
+    #[test]
+    fn document_append_mapping_is_visible_after_commit() {
+        let mut doc = YamlDoc::parse("name: first\n").expect("valid document");
+        let second = std::collections::BTreeMap::from([("name".to_owned(), "second".to_owned())]);
+
+        doc.append_document(&second)
+            .expect("mapping document append queues");
+
+        assert_eq!(doc.document_count(), 1);
+        assert_eq!(doc.to_string(), "name: first\n---\nname: second\n");
+
+        doc.commit_edits().expect("appended mapping reparses");
+        assert_eq!(doc.document_count(), 2);
+        let name = doc
+            .get_path_in_document(1, &["name"])
+            .expect("second document lookup succeeds")
+            .expect("second name exists");
+        assert_eq!(doc.scalar_text(name).expect("name scalar"), "second");
+    }
+
+    #[test]
+    fn document_append_after_explicit_end_marker() {
+        let mut doc = YamlDoc::parse("---\nname: first\n...\n").expect("valid ended stream");
+        let second = std::collections::BTreeMap::from([("name".to_owned(), "second".to_owned())]);
+
+        doc.append_document(&second)
+            .expect("append after end marker queues");
+
+        assert_eq!(
+            doc.to_string(),
+            "---\nname: first\n...\n---\nname: second\n"
+        );
+        doc.commit_edits().expect("stream reparses");
+        assert_eq!(doc.document_count(), 2);
+    }
+
+    #[test]
+    fn document_append_adds_separator_after_missing_final_newline() {
+        let mut doc = YamlDoc::parse("name: first").expect("valid document");
+        let second = std::collections::BTreeMap::from([("name".to_owned(), "second".to_owned())]);
+
+        doc.append_document(&second)
+            .expect("append after no trailing newline queues");
+
+        assert_eq!(doc.to_string(), "name: first\n---\nname: second\n");
+        YamlDoc::parse(&doc.to_string()).expect("preview reparses");
+    }
+
+    #[test]
+    fn document_append_nested_collection_document() {
+        let mut doc = YamlDoc::parse("name: first\n").expect("valid document");
+        let matrix = std::collections::BTreeMap::from([(
+            "matrix".to_owned(),
+            vec![vec![1_u16, 2], vec![3]],
+        )]);
+
+        doc.append_document(&matrix)
+            .expect("nested collection document append queues");
+        doc.commit_edits().expect("nested document reparses");
+
+        let matrix_node = doc
+            .get_path_in_document(1, &["matrix"])
+            .expect("second document lookup succeeds")
+            .expect("matrix exists");
+        assert_eq!(
+            Vec::<Vec<u16>>::read_yaml(&doc, matrix_node).expect("matrix reads"),
+            vec![vec![1, 2], vec![3]]
+        );
     }
 
     #[test]

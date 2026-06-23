@@ -353,15 +353,16 @@ Add support incrementally:
       content.
 - [x] Multi-document streams: explicit document starts and ends produce
       per-document events and semantic graph document nodes. Document-selection
-      APIs can read, look up, and write a selected document by zero-based index.
+      APIs can read, look up, and write a selected document by zero-based index,
+      and editor APIs can append new explicit stream documents.
 - Explicit keys: `? key`.
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 
 Current editing limits: flow-style nested collection replacement is deliberately
 conservative, richer style-preserving nested formatting is future work, semantic
-alias propagation is not attempted for rewritten anchors, and creating new stream
-documents is future work.
+alias propagation is not attempted for rewritten anchors, and inserting new
+documents at arbitrary stream positions is future work.
 
 Compatibility note: `root_mapping`, `get_path`, `FromYamlDoc::from_yaml_doc`,
 and `ToYamlDoc::apply_to_yaml_doc` continue to target the first document.

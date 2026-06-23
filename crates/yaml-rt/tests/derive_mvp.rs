@@ -107,3 +107,45 @@ fn derive_inserts_and_rewrites_nested_collection_field() {
         "host: localhost\nmatrix:\n  -\n    - 4\n  -\n    - 5\n    - 6\n  -\n    - 7\n"
     );
 }
+
+#[test]
+fn derive_writes_appended_empty_mapping_document() {
+    let mut doc = YamlDoc::parse("host: first\nport: 1000\n").expect("valid YAML");
+
+    doc.append_empty_mapping_document()
+        .expect("append empty document queues");
+    doc.commit_edits().expect("appended document commits");
+
+    let config = Config {
+        host: "second".to_owned(),
+        port: 2000,
+    };
+    doc.write_document(1, &config)
+        .expect("derive writes appended document");
+    doc.commit_edits().expect("written document commits");
+
+    let read: Config = doc
+        .read_document(1)
+        .expect("derive reads appended document");
+    assert_eq!(read, config);
+    assert_eq!(
+        doc.to_string(),
+        "host: first\nport: 1000\n---\nhost: second\nport: 2000\n"
+    );
+}
+
+#[test]
+fn derive_appends_config_document_directly() {
+    let mut doc = YamlDoc::parse("host: first\nport: 1000\n").expect("valid YAML");
+    let config = Config {
+        host: "second".to_owned(),
+        port: 2000,
+    };
+
+    doc.append_document(&config)
+        .expect("derive config document append queues");
+    doc.commit_edits().expect("appended config commits");
+
+    let read: Config = doc.read_document(1).expect("derive reads appended config");
+    assert_eq!(read, config);
+}

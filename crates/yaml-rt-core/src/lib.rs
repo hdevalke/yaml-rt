@@ -8304,20 +8304,8 @@ where
             if index > 0 {
                 output.push_str(line_ending);
             }
-            output.push_str(&indent_text);
-            output.push_str("- ");
             let value = value.to_yaml_fragment(indent + 2, line_ending)?;
-            if value.contains('\n') {
-                return Err(YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Emitter,
-                        "nested collection sequence insertion is not implemented yet",
-                        Span::empty(0),
-                    )
-                    .with_expected("single-line sequence values"),
-                ));
-            }
-            output.push_str(&value);
+            push_block_sequence_item(&mut output, &indent_text, &value, line_ending);
         }
         Ok(output)
     }
@@ -8341,7 +8329,7 @@ where
             output.push_str(&indent_text);
             output.push_str(key);
             let value = value.to_yaml_fragment(indent + 2, line_ending)?;
-            if value.contains('\n') {
+            if value.contains('\n') || value.starts_with(' ') {
                 output.push(':');
                 output.push_str(line_ending);
                 output.push_str(&value);
@@ -8506,6 +8494,23 @@ fn block_scalar_header_line(text: &str, span: Span) -> Result<(usize, usize, usi
     ))
 }
 
+fn push_block_sequence_item(
+    output: &mut String,
+    indent_text: &str,
+    fragment: &str,
+    line_ending: &str,
+) {
+    output.push_str(indent_text);
+    if fragment.contains('\n') || fragment.starts_with(' ') {
+        output.push('-');
+        output.push_str(line_ending);
+        output.push_str(fragment);
+    } else {
+        output.push_str("- ");
+        output.push_str(fragment);
+    }
+}
+
 fn missing_collection_item_error(doc: &YamlDoc, node: &Node, collection: &str) -> YamlError {
     YamlError::new(
         Diagnostic::new(
@@ -8535,21 +8540,8 @@ where
             output.push_str(line_ending);
         }
         let value = value.to_yaml_fragment(indent + 2, line_ending)?;
-        if value.contains('\n') {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Emitter,
-                    "nested collection sequence rewriting is not implemented yet",
-                    Span::empty(0),
-                )
-                .with_expected("single-line sequence values"),
-            ));
-        }
-        if index > 0 {
-            output.push_str(&indent_text);
-        }
-        output.push_str("- ");
-        output.push_str(&value);
+        let item_indent = if index == 0 { "" } else { &indent_text };
+        push_block_sequence_item(&mut output, item_indent, &value, line_ending);
     }
 
     Ok(output)
@@ -8577,7 +8569,7 @@ where
             output.push_str(&indent_text);
         }
         output.push_str(key);
-        if value.contains('\n') {
+        if value.contains('\n') || value.starts_with(' ') {
             output.push(':');
             output.push_str(line_ending);
             output.push_str(&value);
@@ -12179,6 +12171,70 @@ port: 8080
     }
 
     #[test]
+    fn patch_writer_inserts_nested_block_sequence_values() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+        let matrix = vec![vec![1_u16, 2], vec![3]];
+
+        doc.insert_mapping_value_with_comment(
+            root,
+            "matrix",
+            &matrix,
+            MappingEntryStyle::default(),
+            None,
+        )
+        .expect("nested sequence insert queues");
+
+        assert_eq!(
+            doc.to_string(),
+            "host: localhost\nmatrix:\n  -\n    - 1\n    - 2\n  -\n    - 3\n"
+        );
+        let reparsed = YamlDoc::parse(&doc.to_string()).expect("nested sequence reparses");
+        let matrix_node = reparsed
+            .get_path(&["matrix"])
+            .expect("lookup succeeds")
+            .expect("matrix exists");
+        assert_eq!(
+            Vec::<Vec<u16>>::read_yaml(&reparsed, matrix_node).expect("matrix reads"),
+            matrix
+        );
+    }
+
+    #[test]
+    fn patch_writer_inserts_sequence_of_block_mappings() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+        let limits = vec![
+            std::collections::BTreeMap::from([("high".to_owned(), 5_u16)]),
+            std::collections::BTreeMap::from([("low".to_owned(), 1_u16)]),
+        ];
+
+        doc.insert_mapping_value_with_comment(
+            root,
+            "limits",
+            &limits,
+            MappingEntryStyle::default(),
+            None,
+        )
+        .expect("sequence of mappings insert queues");
+
+        assert_eq!(
+            doc.to_string(),
+            "host: localhost\nlimits:\n  -\n    high: 5\n  -\n    low: 1\n"
+        );
+        let reparsed = YamlDoc::parse(&doc.to_string()).expect("nested mappings reparse");
+        let limits_node = reparsed
+            .get_path(&["limits"])
+            .expect("lookup succeeds")
+            .expect("limits exists");
+        assert_eq!(
+            Vec::<std::collections::BTreeMap<String, u16>>::read_yaml(&reparsed, limits_node)
+                .expect("limits reads"),
+            limits
+        );
+    }
+
+    #[test]
     fn patch_writer_inserts_block_mapping_value() {
         let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
         let root = doc.root_mapping().expect("root mapping exists");
@@ -12201,6 +12257,40 @@ port: 8080
             "host: localhost\nlimits:\n  high: 5\n  low: 1\n"
         );
         YamlDoc::parse(&doc.to_string()).expect("inserted mapping reparses");
+    }
+
+    #[test]
+    fn patch_writer_inserts_mapping_with_nested_sequence_values() {
+        let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
+        let root = doc.root_mapping().expect("root mapping exists");
+        let routes = std::collections::BTreeMap::from([
+            ("primary".to_owned(), vec![80_u16, 443]),
+            ("secondary".to_owned(), vec![8080_u16]),
+        ]);
+
+        doc.insert_mapping_value_with_comment(
+            root,
+            "routes",
+            &routes,
+            MappingEntryStyle::default(),
+            None,
+        )
+        .expect("mapping with nested sequences insert queues");
+
+        assert_eq!(
+            doc.to_string(),
+            "host: localhost\nroutes:\n  primary:\n    - 80\n    - 443\n  secondary:\n    - 8080\n"
+        );
+        let reparsed = YamlDoc::parse(&doc.to_string()).expect("nested map reparses");
+        let routes_node = reparsed
+            .get_path(&["routes"])
+            .expect("lookup succeeds")
+            .expect("routes exists");
+        assert_eq!(
+            std::collections::BTreeMap::<String, Vec<u16>>::read_yaml(&reparsed, routes_node)
+                .expect("routes reads"),
+            routes
+        );
     }
 
     #[test]
@@ -12696,6 +12786,60 @@ keep: yes
             .expect("vec falls back to whole sequence replacement");
 
         assert_eq!(doc.to_string(), "ports:\n  - 3000\n");
+    }
+
+    #[test]
+    fn yaml_value_replaces_block_sequence_with_nested_sequence_items() {
+        let mut doc = YamlDoc::parse(
+            "matrix:
+  - 0
+",
+        )
+        .expect("valid sequence");
+        let matrix = doc
+            .get_path(&["matrix"])
+            .expect("lookup succeeds")
+            .expect("matrix exists");
+        let replacement = vec![vec![1_u16, 2], vec![3]];
+
+        replacement
+            .write_yaml(&mut doc, Some(matrix))
+            .expect("nested block sequence replacement writes");
+
+        assert_eq!(
+            doc.to_string(),
+            "matrix:\n  -\n    - 1\n    - 2\n  -\n    - 3\n"
+        );
+        doc.commit_edits()
+            .expect("nested sequence replacement commits");
+        let matrix = doc
+            .get_path(&["matrix"])
+            .expect("lookup succeeds")
+            .expect("matrix exists");
+        assert_eq!(
+            Vec::<Vec<u16>>::read_yaml(&doc, matrix).expect("matrix reads"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn yaml_value_keeps_flow_sequence_nested_fragments_rejected() {
+        let mut doc = YamlDoc::parse("matrix: [[0]]\n").expect("valid flow sequence");
+        let matrix = doc
+            .get_path(&["matrix"])
+            .expect("lookup succeeds")
+            .expect("matrix exists");
+
+        let error = vec![vec![1_u16, 2], vec![3]]
+            .write_yaml(&mut doc, Some(matrix))
+            .expect_err("nested flow sequence replacement rejects");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
+        assert_eq!(
+            error.diagnostic.message,
+            "nested flow sequence rewriting is not implemented yet"
+        );
+        assert_eq!(doc.to_string(), "matrix: [[0]]\n");
     }
 
     #[test]

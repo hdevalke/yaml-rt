@@ -6,6 +6,12 @@ struct Config {
     port: u16,
 }
 
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct MatrixConfig {
+    host: String,
+    matrix: Vec<Vec<u16>>,
+}
+
 #[test]
 fn derive_reads_and_updates_root_mapping_fields() {
     let mut doc =
@@ -69,5 +75,35 @@ fn derive_reads_and_writes_selected_document() {
     assert_eq!(
         doc.to_string(),
         "---\nhost: first\nport: 1000\n---\n# selected\nhost: \"second\"\nport: 9090\nextra: keep\n"
+    );
+}
+
+#[test]
+fn derive_inserts_and_rewrites_nested_collection_field() {
+    let mut doc = YamlDoc::parse("host: localhost\n").expect("valid YAML");
+    let config = MatrixConfig {
+        host: "localhost".to_owned(),
+        matrix: vec![vec![1, 2], vec![3]],
+    };
+
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive inserts nested collection");
+
+    assert_eq!(
+        doc.to_string(),
+        "host: localhost\nmatrix:\n  -\n    - 1\n    - 2\n  -\n    - 3\n"
+    );
+
+    doc.commit_edits().expect("inserted matrix commits");
+    let mut updated = MatrixConfig::from_yaml_doc(&doc).expect("derive reads inserted matrix");
+    updated.matrix = vec![vec![4], vec![5, 6], vec![7]];
+    updated
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive rewrites nested collection");
+
+    assert_eq!(
+        doc.to_string(),
+        "host: localhost\nmatrix:\n  -\n    - 4\n  -\n    - 5\n    - 6\n  -\n    - 7\n"
     );
 }

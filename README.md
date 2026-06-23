@@ -330,7 +330,8 @@ Add support incrementally:
 
 - [x] Single-line flow sequences: `[a, b, c]`, including nested flow sequences
       and typed `Vec<T>` reads. Typed writes can replace the existing flow
-      sequence span for single-line values.
+      sequence span for single-line values, while generated block sequence
+      fragments support nested collection items.
 - [x] Single-line flow mappings: `{a: 1, b: 2}`, including nested flow
       collections and typed `BTreeMap<String, T>` reads. Typed writes can
       replace the existing flow mapping span for single-line values.
@@ -357,9 +358,10 @@ Add support incrementally:
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 
-Current editing limits: nested collection fragments are deliberately
-conservative, semantic alias propagation is not attempted for rewritten anchors,
-and creating new stream documents is future work.
+Current editing limits: flow-style nested collection replacement is deliberately
+conservative, richer style-preserving nested formatting is future work, semantic
+alias propagation is not attempted for rewritten anchors, and creating new stream
+documents is future work.
 
 Compatibility note: `root_mapping`, `get_path`, `FromYamlDoc::from_yaml_doc`,
 and `ToYamlDoc::apply_to_yaml_doc` continue to target the first document.

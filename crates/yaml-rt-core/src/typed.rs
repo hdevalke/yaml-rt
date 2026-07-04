@@ -456,7 +456,7 @@ fn missing_collection_item_error(doc: &YamlDoc, node: &Node, collection: &str) -
     .with_position_from(&doc.source)
 }
 
-fn format_block_sequence_replacement<T>(
+fn format_block_sequence_tail<T>(
     doc: &YamlDoc,
     indent: usize,
     values: &[T],
@@ -468,13 +468,10 @@ where
     let line_ending = doc.preferred_line_ending();
     let mut output = String::new();
 
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            output.push_str(line_ending);
-        }
+    for value in values {
         let value = value.to_yaml_fragment(indent + 2, line_ending)?;
-        let item_indent = if index == 0 { "" } else { &indent_text };
-        push_block_sequence_item(&mut output, item_indent, &value, line_ending);
+        push_block_sequence_item(&mut output, &indent_text, &value, line_ending);
+        output.push_str(line_ending);
     }
 
     Ok(output)
@@ -689,21 +686,30 @@ where
             doc.queue_edit(target.span, replacement)?;
             return Ok(node);
         }
-        let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?;
-        if sequence.children.len() == self.len() {
-            let children = sequence.children.clone();
-            for (entry, value) in children.iter().copied().zip(self) {
-                let entry_node = doc.expect_node(entry)?;
-                let Some(value_node) = entry_node.children.first().copied() else {
-                    return Err(missing_collection_item_error(doc, entry_node, "sequence"));
-                };
-                value.write_yaml(doc, Some(value_node))?;
-            }
+        let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?.clone();
+        let children = sequence.children.clone();
+        let tail_indent = doc.node_indent(&sequence);
+        let insertion_offset = doc.sequence_insertion_offset(&sequence);
+        let common_len = children.len().min(self.len());
+        for (entry, value) in children.iter().copied().take(common_len).zip(self) {
+            let entry_node = doc.expect_node(entry)?;
+            let Some(value_node) = entry_node.children.first().copied() else {
+                return Err(missing_collection_item_error(doc, entry_node, "sequence"));
+            };
+            value.write_yaml(doc, Some(value_node))?;
+        }
+
+        if self.len() > children.len() {
+            let replacement =
+                format_block_sequence_tail(doc, tail_indent, &self[children.len()..])?;
+            doc.queue_edit(Span::empty_from_usize(insertion_offset), replacement)?;
             return Ok(node);
         }
-        let target = doc.collection_replacement_target(node)?;
-        let replacement = format_block_sequence_replacement(doc, target.indent, self)?;
-        doc.queue_edit(target.span, replacement)?;
+
+        for entry in children.iter().copied().skip(self.len()) {
+            doc.remove_node(entry)?;
+        }
+
         Ok(node)
     }
 }

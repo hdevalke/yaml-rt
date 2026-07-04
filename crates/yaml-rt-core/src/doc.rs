@@ -1534,6 +1534,16 @@ impl YamlDoc {
             })
     }
 
+    pub(crate) fn sequence_insertion_offset(&self, sequence: &Node) -> usize {
+        sequence
+            .children
+            .last()
+            .and_then(|child| self.node(*child))
+            .map_or(sequence.span.end as usize, |last_child| {
+                self.line_span_including_break(last_child.span).end as usize
+            })
+    }
+
     fn line_span_including_break(&self, span: Span) -> Span {
         let start = self.line_start_for_offset(span.start as usize);
         let mut end = span.end as usize;
@@ -1556,15 +1566,19 @@ impl YamlDoc {
     pub(crate) fn preferred_line_ending(&self) -> &str {
         let bytes = self.source.as_str().as_bytes();
         for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'\r' {
+                return if bytes.get(index + 1) == Some(&b'\n') {
+                    "\r\n"
+                } else {
+                    "\r"
+                };
+            }
             if *byte == b'\n' {
                 return if index > 0 && bytes[index - 1] == b'\r' {
                     "\r\n"
                 } else {
                     "\n"
                 };
-            }
-            if *byte == b'\r' {
-                return "\r";
             }
         }
         "\n"

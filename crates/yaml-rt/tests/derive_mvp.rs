@@ -12,6 +12,12 @@ struct MatrixConfig {
     matrix: Vec<Vec<u16>>,
 }
 
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct PortsConfig {
+    host: String,
+    ports: Vec<u16>,
+}
+
 #[test]
 fn derive_reads_and_updates_root_mapping_fields() {
     let mut doc =
@@ -105,6 +111,25 @@ fn derive_inserts_and_rewrites_nested_collection_field() {
     assert_eq!(
         doc.to_string(),
         "host: localhost\nmatrix:\n  -\n    - 4\n  -\n    - 5\n    - 6\n  -\n    - 7\n"
+    );
+}
+
+#[test]
+fn derive_resizes_block_sequence_field_with_minimal_diff() {
+    let mut doc = YamlDoc::parse(
+        "host: localhost\nports:\n  - 8080 # first\n  - 9090 # second\nextra: keep\n",
+    )
+    .expect("valid YAML");
+    let mut config = PortsConfig::from_yaml_doc(&doc).expect("derive reads ports");
+
+    config.ports = vec![3000, 3001, 3002];
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive grows ports sequence");
+
+    assert_eq!(
+        doc.to_string(),
+        "host: localhost\nports:\n  - 3000 # first\n  - 3001 # second\n  - 3002\nextra: keep\n"
     );
 }
 

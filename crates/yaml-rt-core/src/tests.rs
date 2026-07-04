@@ -3914,7 +3914,7 @@ fn yaml_value_patches_same_length_block_sequence_items() {
 }
 
 #[test]
-fn yaml_value_replaces_different_length_block_sequences() {
+fn yaml_value_shrinks_block_sequences_by_removing_tail_entries() {
     let mut doc = YamlDoc::parse(
         "ports:
   - 8080 # first
@@ -3929,16 +3929,60 @@ fn yaml_value_replaces_different_length_block_sequences() {
 
     vec![3000_u16]
         .write_yaml(&mut doc, Some(ports))
-        .expect("vec falls back to whole sequence replacement");
+        .expect("vec patches prefix and removes tail");
 
-    assert_eq!(doc.to_string(), "ports:\n  - 3000\n");
+    assert_eq!(doc.to_string(), "ports:\n  - 3000 # first\n");
 }
 
 #[test]
-fn yaml_value_replaces_block_sequence_with_nested_sequence_items() {
+fn yaml_value_grows_block_sequences_by_appending_tail_entries() {
+    let mut doc = YamlDoc::parse(
+        "ports:
+  - 8080 # first
+  - 9090 # second
+",
+    )
+    .expect("valid sequence");
+    let ports = doc
+        .get_path(&["ports"])
+        .expect("lookup succeeds")
+        .expect("ports exists");
+
+    vec![3000_u16, 3001, 3002]
+        .write_yaml(&mut doc, Some(ports))
+        .expect("vec patches prefix and appends tail");
+
+    assert_eq!(
+        doc.to_string(),
+        "ports:\n  - 3000 # first\n  - 3001 # second\n  - 3002\n"
+    );
+}
+
+#[test]
+fn yaml_value_preserves_crlf_when_appending_block_sequence_entries() {
+    let mut doc = YamlDoc::parse("ports:\r\n  - 8080 # first\r\n").expect("valid CRLF sequence");
+    let ports = doc
+        .get_path(&["ports"])
+        .expect("lookup succeeds")
+        .expect("ports exists");
+
+    vec![3000_u16, 3001]
+        .write_yaml(&mut doc, Some(ports))
+        .expect("vec appends with inherited line endings");
+
+    assert_eq!(
+        doc.to_string(),
+        "ports:\r\n  - 3000 # first\r\n  - 3001\r\n"
+    );
+}
+
+#[test]
+fn yaml_value_grows_block_sequence_with_nested_sequence_items() {
     let mut doc = YamlDoc::parse(
         "matrix:
-  - 0
+  # first row
+  -
+    - \"0\" # keep style
 ",
     )
     .expect("valid sequence");
@@ -3950,14 +3994,13 @@ fn yaml_value_replaces_block_sequence_with_nested_sequence_items() {
 
     replacement
         .write_yaml(&mut doc, Some(matrix))
-        .expect("nested block sequence replacement writes");
+        .expect("nested block sequence appends tail");
 
     assert_eq!(
         doc.to_string(),
-        "matrix:\n  -\n    - 1\n    - 2\n  -\n    - 3\n"
+        "matrix:\n  # first row\n  -\n    - \"1\" # keep style\n    - 2\n  -\n    - 3\n"
     );
-    doc.commit_edits()
-        .expect("nested sequence replacement commits");
+    doc.commit_edits().expect("nested sequence append commits");
     let matrix = doc
         .get_path(&["matrix"])
         .expect("lookup succeeds")
@@ -4036,6 +4079,33 @@ fn yaml_value_patches_nested_block_mapping_sequence_items_in_place() {
     assert_eq!(
         doc.to_string(),
         "items:\n  -\n    name: \"new\" # keep name comment\n    extra: keep\n  -\n    name: 'newer'\n    extra: keep-too\n"
+    );
+}
+
+#[test]
+fn yaml_value_grows_nested_block_mapping_sequence_items_by_appending_tail() {
+    let mut doc =
+        YamlDoc::parse("items:\n  -\n    name: \"old\" # keep name comment\n    extra: keep\n")
+            .expect("valid sequence of mappings");
+    let items = doc
+        .get_path(&["items"])
+        .expect("lookup succeeds")
+        .expect("items exists");
+    let replacement = vec![
+        std::collections::BTreeMap::from([("name".to_owned(), "new".to_owned())]),
+        std::collections::BTreeMap::from([
+            ("name".to_owned(), "newer".to_owned()),
+            ("port".to_owned(), "9090".to_owned()),
+        ]),
+    ];
+
+    replacement
+        .write_yaml(&mut doc, Some(items))
+        .expect("nested mapping tail appends");
+
+    assert_eq!(
+        doc.to_string(),
+        "items:\n  -\n    name: \"new\" # keep name comment\n    extra: keep\n  -\n    name: newer\n    port: 9090\n"
     );
 }
 

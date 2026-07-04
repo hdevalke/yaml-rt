@@ -3994,6 +3994,52 @@ fn yaml_value_writes_nested_flow_sequence_values() {
 }
 
 #[test]
+fn yaml_value_patches_same_length_nested_block_sequences_in_place() {
+    let mut doc = YamlDoc::parse(
+        "matrix:\n  # first row\n  -\n    - \"1\" # keep style\n    - 2\n  # second row\n  -\n    - '3'\n",
+    )
+    .expect("valid nested block sequence");
+    let matrix = doc
+        .get_path(&["matrix"])
+        .expect("lookup succeeds")
+        .expect("matrix exists");
+
+    vec![vec![10_u16, 20], vec![30]]
+        .write_yaml(&mut doc, Some(matrix))
+        .expect("same-length nested sequence patches in place");
+
+    assert_eq!(
+        doc.to_string(),
+        "matrix:\n  # first row\n  -\n    - \"10\" # keep style\n    - 20\n  # second row\n  -\n    - '30'\n"
+    );
+}
+
+#[test]
+fn yaml_value_patches_nested_block_mapping_sequence_items_in_place() {
+    let mut doc = YamlDoc::parse(
+        "items:\n  -\n    name: \"old\" # keep name comment\n    extra: keep\n  -\n    name: 'older'\n    extra: keep-too\n",
+    )
+    .expect("valid sequence of mappings");
+    let items = doc
+        .get_path(&["items"])
+        .expect("lookup succeeds")
+        .expect("items exists");
+    let replacement = vec![
+        std::collections::BTreeMap::from([("name".to_owned(), "new".to_owned())]),
+        std::collections::BTreeMap::from([("name".to_owned(), "newer".to_owned())]),
+    ];
+
+    replacement
+        .write_yaml(&mut doc, Some(items))
+        .expect("nested mapping items patch in place");
+
+    assert_eq!(
+        doc.to_string(),
+        "items:\n  -\n    name: \"new\" # keep name comment\n    extra: keep\n  -\n    name: 'newer'\n    extra: keep-too\n"
+    );
+}
+
+#[test]
 fn yaml_value_writes_nested_flow_mapping_values() {
     let mut doc = YamlDoc::parse("settings: {old: value}\n").expect("valid flow mapping");
     let settings = doc

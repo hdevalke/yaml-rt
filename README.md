@@ -355,13 +355,14 @@ Add support incrementally:
       per-document events and semantic graph document nodes. Document-selection
       APIs can read, look up, and write a selected document by zero-based index,
       and editor APIs can append new explicit stream documents.
-- Explicit keys: `? key`.
+- [x] Explicit keys: `? key`.
 
 At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 
-Current editing limits: richer style-preserving nested formatting is future
-work, semantic alias propagation is not attempted for rewritten anchors, and
-inserting new documents at arbitrary stream positions is future work.
+Current editing limits: semantic alias propagation is not attempted for rewritten
+anchors, and inserting new documents at arbitrary stream positions is future
+work. Canonical semantic re-emission is not a primary conformance target because
+it discards the presentation details RTY is designed to preserve.
 
 Compatibility note: `root_mapping`, `get_path`, `FromYamlDoc::from_yaml_doc`,
 and `ToYamlDoc::apply_to_yaml_doc` continue to target the first document.
@@ -596,7 +597,11 @@ correct.
       subset.
 - [x] Support JSON-compatible value fixture checks with
       `YAML_TEST_SUITE_CHECK_JSON=1`.
-- [ ] Support the emit fixture category with a standalone YAML stream emitter.
+- [ ] Expand round-trip editing conformance with focused fixtures that prove
+      edited YAML preserves untouched comments, whitespace, scalar style,
+      indentation, line endings, and key order. YAML Test Suite `emit.yaml`
+      fixtures are intentionally not a core target because they validate
+      canonical semantic emission rather than lossless round-trip behavior.
 - [x] Record expected failures while the parser is incomplete and require the
       list to shrink as phases land. The expected-failure list is currently
       empty.

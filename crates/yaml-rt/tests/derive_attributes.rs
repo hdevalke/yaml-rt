@@ -303,6 +303,26 @@ fn nested_struct_field_reads_and_updates_existing_mapping() {
 }
 
 #[test]
+fn nested_struct_field_preserves_comments_and_unknown_siblings() {
+    let mut doc = YamlDoc::parse(
+        "name: app\nserver:\n  # selected host\n  host: \"localhost\" # inline\n  extra: keep\n",
+    )
+    .expect("valid nested YAML");
+    let mut config = NestedConfig::from_yaml_doc(&doc).expect("derive reads nested config");
+
+    config.server.host = "example.com".to_owned();
+    config.server.port = 9090;
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive writes nested config");
+
+    assert_eq!(
+        doc.to_string(),
+        "name: app\nserver:\n  # selected host\n  host: \"example.com\" # inline\n  extra: keep\n  port: 9090\n"
+    );
+}
+
+#[test]
 fn nested_struct_field_inserts_missing_mapping() {
     let mut doc = YamlDoc::parse("name: app\n").expect("valid YAML");
     let config = NestedConfig {

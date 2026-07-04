@@ -46,6 +46,24 @@ cfg.apply_to_yaml_doc(&mut doc)?;
 let output = doc.to_string();
 ```
 
+## Examples
+
+Run examples from the workspace root with `cargo run -p yaml-rt --example NAME`,
+or from `crates/yaml-rt` with `cargo run --example NAME`.
+
+```sh
+cargo run -p yaml-rt --example typed_config
+cargo run -p yaml-rt --example nested_edit
+cargo run -p yaml-rt --example multi_document
+```
+
+- `typed_config` shows the basic derive workflow: parse YAML, read a typed
+  overlay, update fields, insert a defaulted field, and print the minimal patch.
+- `nested_edit` updates a nested struct and resizes a block sequence while
+  preserving comments, scalar style, unknown fields, and inline comments.
+- `multi_document` reads and writes a selected document in a YAML stream without
+  changing the other document.
+
 Required guarantees:
 
 - Untouched YAML re-emits byte-for-byte identically, including original line

@@ -1,3 +1,4 @@
+use crate::semantic::SemanticStore;
 use crate::{NodeId, Parser, Source, Span, YamlError};
 
 /// Lossless syntax node produced by the CST parser MVP.
@@ -206,5 +207,5 @@ pub fn parse_cst(source: &Source) -> Result<Vec<Node>, YamlError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedYaml {
     pub(crate) nodes: Vec<Node>,
-    pub(crate) events: Vec<YamlEvent>,
+    pub(crate) semantics: SemanticStore,
 }

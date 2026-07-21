@@ -35,7 +35,7 @@ pub(crate) use parser::{
     single_quoted_scalar_end, strip_inline_comment, validate_plain_mapping_fragment,
     validate_tag_directive_parts_for_emit, validate_yaml_directive_version_for_emit,
 };
-pub(crate) use semantic::SemanticStore;
+pub(crate) use semantic::{SemanticBuilder, SemanticStore};
 pub(crate) use source::validate_yaml_chars;
 
 #[cfg(test)]

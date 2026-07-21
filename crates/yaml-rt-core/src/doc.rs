@@ -125,13 +125,10 @@ impl YamlDoc {
         let parsed = Parser::new(&source)
             .parse()
             .map_err(|error| error.with_position_from(&source))?;
-        let semantics = SemanticStore::from_events(&parsed.nodes, parsed.events)
-            .map_err(|error| error.with_position_from(&source))?;
-
         Ok(Self {
             source,
             nodes: parsed.nodes,
-            semantics,
+            semantics: parsed.semantics,
             root_override: None,
             edits: Vec::new(),
         })

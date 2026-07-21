@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::syntax::{Children, NO_NODE, node_link};
 use crate::{
-    CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, ParsedYaml, Source, Span,
-    YamlError, YamlEvent, YamlEventKind, YamlScalarStyle, validate_yaml_chars,
+    CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, ParsedYaml,
+    SemanticBuilder, Source, Span, YamlError, YamlEvent, YamlEventKind, YamlScalarStyle,
+    validate_yaml_chars,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +23,7 @@ struct PendingNodeProperties {
 pub(crate) struct Parser<'source> {
     source: &'source Source,
     nodes: Vec<Node>,
-    events: Vec<YamlEvent>,
+    semantics: SemanticBuilder,
     stream: Option<NodeId>,
     document: Option<NodeId>,
     document_has_content: bool,
@@ -44,7 +45,7 @@ impl<'source> Parser<'source> {
         Self {
             source,
             nodes: Vec::with_capacity(estimated_nodes),
-            events: Vec::with_capacity(estimated_events),
+            semantics: SemanticBuilder::with_capacity(estimated_nodes, estimated_events),
             stream: None,
             document: None,
             document_has_content: false,
@@ -92,9 +93,10 @@ impl<'source> Parser<'source> {
             Span::from_usize(self.source.len(), self.source.len()),
         );
 
+        let semantics = self.semantics.finish(self.nodes.len())?;
         Ok(ParsedYaml {
             nodes: self.nodes,
-            events: self.events,
+            semantics,
         })
     }
 
@@ -2461,21 +2463,21 @@ impl<'source> Parser<'source> {
     }
 
     fn push_event(&mut self, kind: YamlEventKind, span: Span) {
-        self.events.push(YamlEvent {
-            kind,
-            span,
-            cst: None,
-            content_indent: None,
-        });
+        self.semantics.push(kind, span, None, None);
     }
 
     fn push_node_event(&mut self, kind: YamlEventKind, span: Span, cst: NodeId) {
-        self.events.push(YamlEvent {
-            kind,
-            span,
-            cst: Some(cst),
-            content_indent: None,
-        });
+        self.semantics.push(kind, span, Some(cst), None);
+    }
+
+    fn push_node_event_with_content_indent(
+        &mut self,
+        kind: YamlEventKind,
+        span: Span,
+        cst: NodeId,
+        content_indent: Option<u32>,
+    ) {
+        self.semantics.push(kind, span, Some(cst), content_indent);
     }
 
     fn open_event_collection(
@@ -2679,7 +2681,11 @@ impl<'source> Parser<'source> {
         } else if style != YamlScalarStyle::Plain {
             let _ = decode_scalar_value(value_text)?;
         }
-        self.push_node_event(
+        let content_indent = self
+            .block_scalar_content_indents
+            .get(&node_id)
+            .map(|indent| Span::usize_to_u32(*indent));
+        self.push_node_event_with_content_indent(
             YamlEventKind::Scalar {
                 style,
                 value: String::new(),
@@ -2688,14 +2694,8 @@ impl<'source> Parser<'source> {
             },
             span,
             node,
+            content_indent,
         );
-        self.events
-            .last_mut()
-            .expect("scalar event was just pushed")
-            .content_indent = self
-            .block_scalar_content_indents
-            .get(&node_id)
-            .map(|indent| Span::usize_to_u32(*indent));
         Ok(())
     }
 

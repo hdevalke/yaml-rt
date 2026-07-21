@@ -1036,7 +1036,7 @@ impl<'source> Parser<'source> {
         self.sequences.clear();
         self.event_collections.clear();
         self.pending_node_properties.clear();
-        self.push_event(YamlEventKind::DocumentStart { explicit }, span);
+        self.push_node_event(YamlEventKind::DocumentStart { explicit }, span, document);
         document
     }
 
@@ -1289,13 +1289,14 @@ impl<'source> Parser<'source> {
         self.nodes[outer_entry.0 as usize]
             .children
             .push(inner_mapping);
-        self.push_event(
+        self.push_node_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Block,
                 tag: None,
                 anchor: None,
             },
             Span::from_usize(absolute_start, line.content_end),
+            inner_mapping,
         );
 
         let inner_entry = self.push_node(
@@ -1355,13 +1356,14 @@ impl<'source> Parser<'source> {
             Span::from_usize(absolute_start, absolute_start + body.len()),
         );
         self.nodes[parent.0 as usize].children.push(mapping);
-        self.push_event(
+        self.push_node_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Block,
                 tag: None,
                 anchor: None,
             },
             Span::from_usize(absolute_start, absolute_start + body.len()),
+            mapping,
         );
 
         let entry = self.push_node(
@@ -2249,6 +2251,7 @@ impl<'source> Parser<'source> {
                     anchor,
                 },
                 span,
+                mapping,
             );
             mapping
         }
@@ -2283,6 +2286,7 @@ impl<'source> Parser<'source> {
                     anchor,
                 },
                 span,
+                sequence,
             );
             sequence
         }
@@ -2447,7 +2451,19 @@ impl<'source> Parser<'source> {
     }
 
     fn push_event(&mut self, kind: YamlEventKind, span: Span) {
-        self.events.push(YamlEvent { kind, span });
+        self.events.push(YamlEvent {
+            kind,
+            span,
+            cst: None,
+        });
+    }
+
+    fn push_node_event(&mut self, kind: YamlEventKind, span: Span, cst: NodeId) {
+        self.events.push(YamlEvent {
+            kind,
+            span,
+            cst: Some(cst),
+        });
     }
 
     fn open_event_collection(
@@ -2456,9 +2472,10 @@ impl<'source> Parser<'source> {
         collection: OpenEventCollection,
         kind: YamlEventKind,
         span: Span,
+        cst: NodeId,
     ) {
         self.event_collections.push((indent, collection));
-        self.push_event(kind, span);
+        self.push_node_event(kind, span, cst);
     }
 
     fn close_event_collections_deeper_than(&mut self, indent: usize) {
@@ -2505,13 +2522,14 @@ impl<'source> Parser<'source> {
         let mut properties = self.flow_event_properties(sequence.span)?;
         self.resolve_node_properties(&mut properties, sequence.span)?;
         let span = self.apply_pending_event_properties(&mut properties, sequence.span);
-        self.push_event(
+        self.push_node_event(
             YamlEventKind::SequenceStart {
                 style: CollectionStyle::Flow,
                 tag: properties.tag,
                 anchor: properties.anchor,
             },
             span,
+            node,
         );
         for child in sequence.children {
             self.emit_node_event(child)?;
@@ -2525,13 +2543,14 @@ impl<'source> Parser<'source> {
         let mut properties = self.flow_event_properties(mapping.span)?;
         self.resolve_node_properties(&mut properties, mapping.span)?;
         let span = self.apply_pending_event_properties(&mut properties, mapping.span);
-        self.push_event(
+        self.push_node_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Flow,
                 tag: properties.tag,
                 anchor: properties.anchor,
             },
             span,
+            node,
         );
         for entry in mapping.children {
             let entry = self.nodes[entry.0 as usize].clone();
@@ -2607,11 +2626,12 @@ impl<'source> Parser<'source> {
                 && !alias.is_empty()
                 && !alias.chars().any(char::is_whitespace)
             {
-                self.push_event(
+                self.push_node_event(
                     YamlEventKind::Alias {
                         name: alias.to_owned(),
                     },
                     span,
+                    node,
                 );
                 return Ok(());
             }
@@ -2624,7 +2644,7 @@ impl<'source> Parser<'source> {
         } else {
             decode_scalar_value(value_text)?
         };
-        self.push_event(
+        self.push_node_event(
             YamlEventKind::Scalar {
                 style,
                 value,
@@ -2632,6 +2652,7 @@ impl<'source> Parser<'source> {
                 anchor: properties.anchor,
             },
             span,
+            node,
         );
         Ok(())
     }

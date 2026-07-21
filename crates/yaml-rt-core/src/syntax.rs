@@ -69,6 +69,8 @@ pub struct YamlEvent {
     pub kind: YamlEventKind,
     /// Source span associated with this event.
     pub span: Span,
+    /// CST node that originated this semantic event, when applicable.
+    pub(crate) cst: Option<NodeId>,
 }
 
 /// YAML collection spelling.

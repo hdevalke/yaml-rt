@@ -1059,6 +1059,26 @@ fn parser_events_carry_source_spans() {
 }
 
 #[test]
+fn semantic_events_link_directly_to_originating_cst_nodes() {
+    let doc = YamlDoc::parse("---\nroot:\n  - {key: &anchor value}\n  - *anchor\n")
+        .expect("valid nested block and flow collections");
+
+    for event in doc.events() {
+        if matches!(
+            event.kind,
+            YamlEventKind::DocumentStart { .. }
+                | YamlEventKind::MappingStart { .. }
+                | YamlEventKind::SequenceStart { .. }
+                | YamlEventKind::Scalar { .. }
+                | YamlEventKind::Alias { .. }
+        ) {
+            let cst = event.cst.expect("semantic node event has a CST link");
+            assert!(doc.node(cst).is_some(), "CST link points into the arena");
+        }
+    }
+}
+
+#[test]
 fn graph_builds_root_scalar_with_cst_link() {
     let doc = YamlDoc::parse("value\n").expect("valid scalar");
     let root = doc.graph().root.expect("graph root exists");

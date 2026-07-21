@@ -101,8 +101,8 @@ impl YamlDoc {
         let parsed = Parser::new(&source, &tokens)
             .parse()
             .map_err(|error| error.with_position_from(&source))?;
-        let graph = compose_graph(&parsed.events, &parsed.nodes)
-            .map_err(|error| error.with_position_from(&source))?;
+        let graph =
+            compose_graph(&parsed.events).map_err(|error| error.with_position_from(&source))?;
 
         Ok(Self {
             source,

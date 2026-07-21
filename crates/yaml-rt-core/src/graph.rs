@@ -1,6 +1,6 @@
 use crate::{
-    CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, Span, YamlError,
-    YamlEvent, YamlEventKind, YamlScalarStyle,
+    CollectionStyle, Diagnostic, DiagnosticKind, NodeId, Span, YamlError, YamlEvent, YamlEventKind,
+    YamlScalarStyle,
 };
 
 /// Identifier for a semantic graph node.
@@ -95,17 +95,12 @@ pub struct SemanticGraph {
     pub documents: Vec<GraphNodeId>,
 }
 
-pub(crate) fn compose_graph(
-    events: &[YamlEvent],
-    nodes: &[Node],
-) -> Result<SemanticGraph, YamlError> {
-    GraphComposer::new(events, nodes).compose()
+pub(crate) fn compose_graph(events: &[YamlEvent]) -> Result<SemanticGraph, YamlError> {
+    GraphComposer::new(events).compose()
 }
 
 struct GraphComposer<'events> {
     events: &'events [YamlEvent],
-    exact_cst_nodes: Vec<((NodeKind, Span), NodeId)>,
-    start_cst_nodes: Vec<((NodeKind, u32), NodeId)>,
     graph_nodes: Vec<GraphNode>,
     stack: Vec<OpenGraphNode>,
     root: Option<GraphNodeId>,
@@ -126,12 +121,9 @@ enum OpenGraphKind {
 }
 
 impl<'events> GraphComposer<'events> {
-    fn new(events: &'events [YamlEvent], cst_nodes: &'events [Node]) -> Self {
-        let (exact_cst_nodes, start_cst_nodes) = cst_node_indexes(cst_nodes);
+    fn new(events: &'events [YamlEvent]) -> Self {
         Self {
             events,
-            exact_cst_nodes,
-            start_cst_nodes,
             graph_nodes: Vec::with_capacity(events.len()),
             stack: Vec::with_capacity(8),
             root: None,
@@ -171,7 +163,7 @@ impl<'events> GraphComposer<'events> {
         match &event.kind {
             YamlEventKind::StreamStart | YamlEventKind::StreamEnd => Ok(()),
             YamlEventKind::DocumentStart { .. } => {
-                self.open_document(event.span);
+                self.open_document(event.cst, event.span);
                 Ok(())
             }
             YamlEventKind::DocumentEnd { .. } => {
@@ -179,12 +171,12 @@ impl<'events> GraphComposer<'events> {
                 Ok(())
             }
             YamlEventKind::MappingStart { style, tag, anchor } => {
-                self.open_mapping(*style, tag.clone(), anchor.clone(), event.span);
+                self.open_mapping(event.cst, *style, tag.clone(), anchor.clone(), event.span);
                 Ok(())
             }
             YamlEventKind::MappingEnd => self.close_and_attach(OpenGraphKind::Mapping, event.span),
             YamlEventKind::SequenceStart { style, tag, anchor } => {
-                self.open_sequence(*style, tag.clone(), anchor.clone(), event.span);
+                self.open_sequence(event.cst, *style, tag.clone(), anchor.clone(), event.span);
                 Ok(())
             }
             YamlEventKind::SequenceEnd => {
@@ -200,19 +192,20 @@ impl<'events> GraphComposer<'events> {
                 value.clone(),
                 tag.clone(),
                 anchor.clone(),
+                event.cst,
                 event.span,
             ),
-            YamlEventKind::Alias { name } => self.attach_alias(name.clone(), event.span),
+            YamlEventKind::Alias { name } => self.attach_alias(name.clone(), event.cst, event.span),
         }
     }
 
-    fn open_document(&mut self, span: Span) {
+    fn open_document(&mut self, cst: Option<NodeId>, span: Span) {
         let id = self.push_node(GraphNode {
             kind: GraphKind::Document {
                 children: Vec::with_capacity(1),
             },
             span,
-            cst: self.find_cst_node(NodeKind::Document, span),
+            cst,
         });
         if self.root.is_none() {
             self.root = Some(id);
@@ -226,6 +219,7 @@ impl<'events> GraphComposer<'events> {
 
     fn open_mapping(
         &mut self,
+        cst: Option<NodeId>,
         style: CollectionStyle,
         tag: Option<String>,
         anchor: Option<String>,
@@ -239,7 +233,7 @@ impl<'events> GraphComposer<'events> {
                 entries: Vec::with_capacity(2),
             },
             span,
-            cst: self.find_cst_node(mapping_node_kind(style), span),
+            cst,
         });
         self.stack.push(OpenGraphNode {
             id,
@@ -249,6 +243,7 @@ impl<'events> GraphComposer<'events> {
 
     fn open_sequence(
         &mut self,
+        cst: Option<NodeId>,
         style: CollectionStyle,
         tag: Option<String>,
         anchor: Option<String>,
@@ -262,7 +257,7 @@ impl<'events> GraphComposer<'events> {
                 items: Vec::with_capacity(2),
             },
             span,
-            cst: self.find_cst_node(sequence_node_kind(style), span),
+            cst,
         });
         self.stack.push(OpenGraphNode {
             id,
@@ -281,6 +276,7 @@ impl<'events> GraphComposer<'events> {
         value: String,
         tag: Option<String>,
         anchor: Option<String>,
+        cst: Option<NodeId>,
         span: Span,
     ) -> Result<(), YamlError> {
         let id = self.push_node(GraphNode {
@@ -291,16 +287,21 @@ impl<'events> GraphComposer<'events> {
                 anchor,
             },
             span,
-            cst: self.find_cst_node(scalar_node_kind(style), span),
+            cst,
         });
         self.attach_node(id, span)
     }
 
-    fn attach_alias(&mut self, name: String, span: Span) -> Result<(), YamlError> {
+    fn attach_alias(
+        &mut self,
+        name: String,
+        cst: Option<NodeId>,
+        span: Span,
+    ) -> Result<(), YamlError> {
         let id = self.push_node(GraphNode {
             kind: GraphKind::Alias { name },
             span,
-            cst: self.find_cst_node(NodeKind::Scalar, span),
+            cst,
         });
         self.attach_node(id, span)
     }
@@ -352,39 +353,6 @@ impl<'events> GraphComposer<'events> {
             _ => Err(graph_error("scalar nodes cannot contain children", span)),
         }
     }
-
-    fn find_cst_node(&self, kind: NodeKind, span: Span) -> Option<NodeId> {
-        self.exact_cst_nodes
-            .binary_search_by_key(&(kind, span), |(key, _)| *key)
-            .ok()
-            .map(|index| self.exact_cst_nodes[index].1)
-            .or_else(|| {
-                self.start_cst_nodes
-                    .binary_search_by_key(&(kind, span.start), |(key, _)| *key)
-                    .ok()
-                    .map(|index| self.start_cst_nodes[index].1)
-            })
-    }
-}
-
-fn cst_node_indexes(
-    nodes: &[Node],
-) -> (
-    Vec<((NodeKind, Span), NodeId)>,
-    Vec<((NodeKind, u32), NodeId)>,
-) {
-    let mut exact = Vec::with_capacity(nodes.len());
-    let mut start = Vec::with_capacity(nodes.len());
-    for (index, node) in nodes.iter().enumerate() {
-        let id = NodeId::from_usize(index);
-        exact.push(((node.kind, node.span), id));
-        start.push(((node.kind, node.span.start), id));
-    }
-    exact.sort_by_key(|(key, _)| *key);
-    exact.dedup_by_key(|(key, _)| *key);
-    start.sort_by_key(|(key, _)| *key);
-    start.dedup_by_key(|(key, _)| *key);
-    (exact, start)
 }
 
 fn document_event_count(events: &[YamlEvent]) -> usize {
@@ -397,28 +365,4 @@ fn document_event_count(events: &[YamlEvent]) -> usize {
 
 fn graph_error(message: impl Into<String>, span: Span) -> YamlError {
     YamlError::new(Diagnostic::new(DiagnosticKind::Semantic, message, span))
-}
-
-const fn mapping_node_kind(style: CollectionStyle) -> NodeKind {
-    match style {
-        CollectionStyle::Block => NodeKind::BlockMapping,
-        CollectionStyle::Flow => NodeKind::FlowMapping,
-    }
-}
-
-const fn sequence_node_kind(style: CollectionStyle) -> NodeKind {
-    match style {
-        CollectionStyle::Block => NodeKind::BlockSequence,
-        CollectionStyle::Flow => NodeKind::FlowSequence,
-    }
-}
-
-const fn scalar_node_kind(style: YamlScalarStyle) -> NodeKind {
-    match style {
-        YamlScalarStyle::Literal => NodeKind::LiteralScalar,
-        YamlScalarStyle::Folded => NodeKind::FoldedScalar,
-        YamlScalarStyle::Plain | YamlScalarStyle::SingleQuoted | YamlScalarStyle::DoubleQuoted => {
-            NodeKind::Scalar
-        }
-    }
 }

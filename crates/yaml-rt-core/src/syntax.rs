@@ -109,6 +109,7 @@ pub struct YamlEvent {
     pub span: Span,
     /// CST node that originated this semantic event, when applicable.
     pub(crate) cst: Option<NodeId>,
+    pub(crate) content_indent: Option<u32>,
 }
 
 /// YAML collection spelling.

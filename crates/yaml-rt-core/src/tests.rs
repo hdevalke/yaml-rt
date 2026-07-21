@@ -425,11 +425,10 @@ fn events_render_explicit_folded_scalar_key_with_empty_value() {
 
 #[test]
 fn parser_events_render_explicit_following_sequence_key() {
-    let source = Source::new("---\n?\n- a\n- b\n:\n- c\n- d\n".to_owned()).expect("valid source");
-    let parsed = Parser::new(&source).parse().expect("valid parser");
+    let doc = YamlDoc::parse("---\n?\n- a\n- b\n:\n- c\n- d\n").expect("valid parser");
 
     assert_eq!(
-        events_to_test_string(&parsed.events),
+        doc.events_to_test_string(),
         "+STR\n+DOC ---\n+MAP\n+SEQ\n=VAL :a\n=VAL :b\n-SEQ\n+SEQ\n=VAL :c\n=VAL :d\n-SEQ\n-MAP\n-DOC\n-STR\n"
     );
 }
@@ -509,7 +508,6 @@ fn semantics_preserve_scalar_anchors_and_tags() {
         doc.semantic_kind(value),
         Some(&SemanticKind::Scalar {
             style: YamlScalarStyle::Plain,
-            value: "value".to_owned(),
             tag: Some("!local".to_owned()),
             anchor: Some("anchor".to_owned()),
         })
@@ -673,10 +671,10 @@ fn directive_editor_commit_reparses_tag_resolution() {
             matches!(
                 doc.semantic_kind(node),
                 Some(SemanticKind::Scalar {
-                    value,
                     tag: Some(tag),
                     ..
-                }) if value == "value" && tag == "tag:new/foo"
+                }) if doc.scalar_value(node).is_ok_and(|value| value == "value")
+                    && tag == "tag:new/foo"
             )
             .then_some(node)
         })
@@ -1088,7 +1086,6 @@ fn semantic_metadata_is_keyed_by_cst_node() {
         doc.semantic_kind(scalar),
         Some(&SemanticKind::Scalar {
             style: YamlScalarStyle::Plain,
-            value: "value".to_owned(),
             tag: None,
             anchor: None,
         })
@@ -1129,7 +1126,6 @@ fn path_lookup_returns_semantic_cst_node() {
         doc.semantic_kind(host),
         Some(&SemanticKind::Scalar {
             style: YamlScalarStyle::Plain,
-            value: "localhost".to_owned(),
             tag: None,
             anchor: None,
         })

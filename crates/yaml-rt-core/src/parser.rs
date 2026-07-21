@@ -39,14 +39,8 @@ pub(crate) struct Parser<'source> {
 impl<'source> Parser<'source> {
     pub(crate) fn new(source: &'source Source) -> Self {
         let line_estimate = source.line_starts().len();
-        let estimated_nodes = line_estimate
-            .saturating_mul(3)
-            .max(source.len().saturating_div(4))
-            .saturating_add(4);
-        let estimated_events = line_estimate
-            .saturating_mul(2)
-            .max(source.len().saturating_div(6))
-            .saturating_add(8);
+        let estimated_nodes = line_estimate.saturating_mul(3).saturating_add(4);
+        let estimated_events = line_estimate.saturating_mul(2).saturating_add(8);
         Self {
             source,
             nodes: Vec::with_capacity(estimated_nodes),
@@ -56,7 +50,7 @@ impl<'source> Parser<'source> {
             document_has_content: false,
             document_was_explicitly_opened: false,
             document_yaml_directive_seen: false,
-            tag_handles: default_tag_handles(),
+            tag_handles: BTreeMap::new(),
             mappings: Vec::with_capacity(8),
             sequences: Vec::with_capacity(8),
             event_collections: Vec::with_capacity(8),
@@ -1065,7 +1059,7 @@ impl<'source> Parser<'source> {
         self.document_has_content = false;
         self.document_was_explicitly_opened = false;
         self.document_yaml_directive_seen = false;
-        self.tag_handles = default_tag_handles();
+        self.tag_handles.clear();
         self.mappings.clear();
         self.sequences.clear();
         self.event_collections.clear();
@@ -2471,6 +2465,7 @@ impl<'source> Parser<'source> {
             kind,
             span,
             cst: None,
+            content_indent: None,
         });
     }
 
@@ -2479,6 +2474,7 @@ impl<'source> Parser<'source> {
             kind,
             span,
             cst: Some(cst),
+            content_indent: None,
         });
     }
 
@@ -2675,24 +2671,31 @@ impl<'source> Parser<'source> {
                 return Ok(());
             }
         }
-        let value = if matches!(node_kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
-            decode_scalar_value_with_content_indent(
+        if matches!(node_kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
+            let _ = decode_scalar_value_with_content_indent(
                 value_text,
                 self.block_scalar_content_indents.get(&node_id).copied(),
-            )?
-        } else {
-            decode_scalar_value(value_text)?
-        };
+            )?;
+        } else if style != YamlScalarStyle::Plain {
+            let _ = decode_scalar_value(value_text)?;
+        }
         self.push_node_event(
             YamlEventKind::Scalar {
                 style,
-                value,
+                value: String::new(),
                 tag: properties.tag,
                 anchor: properties.anchor,
             },
             span,
             node,
         );
+        self.events
+            .last_mut()
+            .expect("scalar event was just pushed")
+            .content_indent = self
+            .block_scalar_content_indents
+            .get(&node_id)
+            .map(|indent| Span::usize_to_u32(*indent));
         Ok(())
     }
 
@@ -3016,13 +3019,6 @@ fn next_significant_body_with_index<'line>(
     None
 }
 
-pub(crate) fn default_tag_handles() -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("!".to_owned(), "!".to_owned()),
-        ("!!".to_owned(), "tag:yaml.org,2002:".to_owned()),
-    ])
-}
-
 pub(crate) fn resolve_tag(
     tag: &str,
     handles: &BTreeMap<String, String>,
@@ -3033,7 +3029,15 @@ pub(crate) fn resolve_tag(
     }
 
     let (handle, suffix) = tag_handle_and_suffix(tag);
-    let Some(prefix) = handles.get(handle) else {
+    let prefix = handles
+        .get(handle)
+        .map(String::as_str)
+        .or_else(|| match handle {
+            "!" => Some("!"),
+            "!!" => Some("tag:yaml.org,2002:"),
+            _ => None,
+        });
+    let Some(prefix) = prefix else {
         return Err(YamlError::new(
             Diagnostic::new(
                 DiagnosticKind::Parser,
@@ -3443,10 +3447,10 @@ impl<'source> Iterator for SourceLines<'source> {
             return None;
         }
 
-        let start = starts[self.index];
+        let start = starts[self.index] as usize;
         let next_start = starts
             .get(self.index + 1)
-            .copied()
+            .map(|start| *start as usize)
             .unwrap_or(self.source.len());
         self.index += 1;
 
@@ -3476,7 +3480,18 @@ impl<'source> Iterator for SourceLines<'source> {
                 }),
         )
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let starts = self.source.line_starts();
+        let mut remaining = starts.len().saturating_sub(self.index);
+        if starts.last().copied() == Some(Span::usize_to_u32(self.source.len())) {
+            remaining = remaining.saturating_sub(1);
+        }
+        (remaining, Some(remaining))
+    }
 }
+
+impl std::iter::ExactSizeIterator for SourceLines<'_> {}
 
 fn next_significant_indent(
     lines: &[SourceLine<'_>],

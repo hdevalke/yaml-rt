@@ -28,12 +28,10 @@ pub enum SemanticKind {
         /// Anchor name.
         anchor: Option<String>,
     },
-    /// Scalar with decoded text and node properties.
+    /// Scalar with presentation style and node properties.
     Scalar {
         /// Scalar spelling style.
         style: YamlScalarStyle,
-        /// Decoded scalar text.
-        value: String,
         /// Resolved explicit tag.
         tag: Option<String>,
         /// Anchor name.
@@ -53,6 +51,7 @@ pub(crate) struct SemanticNode {
     pub(crate) end_span: Span,
     pub(crate) explicit_start: bool,
     pub(crate) explicit_end: bool,
+    pub(crate) content_indent: Option<u32>,
     first_child: u32,
     last_child: u32,
     next_sibling: u32,
@@ -102,16 +101,10 @@ impl SemanticStore {
                 }
                 YamlEventKind::Scalar {
                     style,
-                    value,
+                    value: _,
                     tag,
                     anchor,
-                } => SemanticKind::Scalar {
-                    style,
-                    value,
-                    tag,
-                    anchor,
-                }
-                .closed(),
+                } => SemanticKind::Scalar { style, tag, anchor }.closed(),
                 YamlEventKind::Alias { name } => SemanticKind::Alias { name }.closed(),
                 YamlEventKind::StreamStart
                 | YamlEventKind::StreamEnd
@@ -127,6 +120,7 @@ impl SemanticStore {
                     end_span: event.span,
                     explicit_start,
                     explicit_end: false,
+                    content_indent: event.content_indent,
                     first_child: NO_SEMANTIC_NODE,
                     last_child: NO_SEMANTIC_NODE,
                     next_sibling: NO_SEMANTIC_NODE,

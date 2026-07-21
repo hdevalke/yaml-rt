@@ -117,7 +117,7 @@ pub struct LineCol {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     text: String,
-    line_starts: Vec<usize>,
+    line_starts: Vec<u32>,
 }
 
 impl Source {
@@ -131,25 +131,23 @@ impl Source {
     pub fn new(text: String) -> Result<Self, YamlError> {
         let mut line_starts = Vec::with_capacity(text.len() / 32 + 1);
         line_starts.push(0);
-        for (offset, character) in text.char_indices() {
-            if !is_yaml_printable(character) {
-                let span = Span::from_usize(offset, offset + character.len_utf8());
-                return Err(YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Source,
-                        format!(
-                            "invalid YAML 1.2.2 character U+{:04X}",
-                            character as u32
-                        ),
-                        span,
-                    )
-                    .with_note(
-                        "YAML streams may contain tab, line feeds, carriage returns, printable Unicode characters, and non-breaking spaces",
-                    ),
-                ));
+        if text.is_ascii() {
+            for (offset, byte) in text.bytes().enumerate() {
+                if !matches!(byte, b'\t' | b'\n' | b'\r' | b' '..=b'~') {
+                    return Err(invalid_yaml_character(offset, char::from(byte)));
+                }
+                if byte == b'\n' {
+                    line_starts.push(Span::usize_to_u32(offset + 1));
+                }
             }
-            if character == '\n' {
-                line_starts.push(offset + 1);
+        } else {
+            for (offset, character) in text.char_indices() {
+                if !is_yaml_printable(character) {
+                    return Err(invalid_yaml_character(offset, character));
+                }
+                if character == '\n' {
+                    line_starts.push(Span::usize_to_u32(offset + 1));
+                }
             }
         }
 
@@ -176,7 +174,7 @@ impl Source {
 
     /// Returns the recorded line-start byte offsets.
     #[must_use]
-    pub fn line_starts(&self) -> &[usize] {
+    pub fn line_starts(&self) -> &[u32] {
         &self.line_starts
     }
 
@@ -222,7 +220,7 @@ impl Source {
     /// Converts a byte offset into a one-based line/column pair.
     #[must_use]
     pub fn line_col(&self, offset: usize) -> LineCol {
-        let offset = offset.min(self.text.len());
+        let offset = Span::usize_to_u32(offset.min(self.text.len()));
         let line_index = match self.line_starts.binary_search(&offset) {
             Ok(index) => index,
             Err(index) => index.saturating_sub(1),
@@ -231,7 +229,7 @@ impl Source {
 
         LineCol {
             line: line_index + 1,
-            column: offset - line_start + 1,
+            column: (offset - line_start) as usize + 1,
         }
     }
 
@@ -240,6 +238,20 @@ impl Source {
     pub fn diagnostic_position(&self, diagnostic: &Diagnostic) -> LineCol {
         self.line_col(diagnostic.span.start as usize)
     }
+}
+
+fn invalid_yaml_character(offset: usize, character: char) -> YamlError {
+    let span = Span::from_usize(offset, offset + character.len_utf8());
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Source,
+            format!("invalid YAML 1.2.2 character U+{:04X}", character as u32),
+            span,
+        )
+        .with_note(
+            "YAML streams may contain tab, line feeds, carriage returns, printable Unicode characters, and non-breaking spaces",
+        ),
+    )
 }
 
 pub(crate) fn validate_yaml_chars(text: &str) -> Result<(), YamlError> {

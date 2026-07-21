@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -126,11 +127,8 @@ fn bench_input(
 fn flat_mapping(entries: usize) -> String {
     let mut input = String::with_capacity(entries.saturating_mul(24));
     for index in 0..entries {
-        input.push_str("key_");
-        input.push_str(&index.to_string());
-        input.push_str(": value_");
-        input.push_str(&index.to_string());
-        input.push('\n');
+        writeln!(input, "key_{index:05}: value_{index:05}")
+            .expect("writing to a String cannot fail");
     }
     input
 }

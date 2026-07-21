@@ -494,16 +494,12 @@ fn graph_node_to_json(
                 .collect::<Result<Vec<_>, _>>()
                 .map(JsonValue::Array)
         }
-        SemanticKind::Scalar {
-            style,
-            value,
-            tag,
-            anchor,
-        } => {
+        SemanticKind::Scalar { style, tag, anchor } => {
             if let Some(anchor) = anchor {
                 context.anchors.insert(anchor.clone(), node);
             }
-            scalar_to_json(*style, value, tag.as_deref())
+            let value = doc.scalar_value(node).map_err(|error| error.to_string())?;
+            scalar_to_json(*style, &value, tag.as_deref())
         }
         SemanticKind::Alias { name } => {
             let target = context
@@ -525,11 +521,13 @@ fn graph_key_to_json_key(
         .semantic_kind(node)
         .ok_or_else(|| format!("missing semantic key node {}", node.as_usize()))?;
     match semantic {
-        SemanticKind::Scalar { anchor, value, .. } => {
+        SemanticKind::Scalar { anchor, .. } => {
             if let Some(anchor) = anchor {
                 context.anchors.insert(anchor.clone(), node);
             }
-            Ok(value.clone())
+            doc.scalar_value(node)
+                .map(|value| value.into_owned())
+                .map_err(|error| error.to_string())
         }
         SemanticKind::Alias { name } => {
             let target = context

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::{
     BlockChomp, Diagnostic, DiagnosticKind, MappingEntryStyle, Node, NodeId, NodeKind, Span,
     YamlDoc, YamlError, format_scalar_value, parse_block_scalar_header, parse_node_properties,
@@ -562,7 +564,7 @@ fn typed_parse_error(doc: &YamlDoc, node: NodeId, type_name: &str, value: &str) 
 
 impl YamlValue for String {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        doc.scalar_value(node)
+        doc.scalar_value(node).map(Cow::into_owned)
     }
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
@@ -573,7 +575,7 @@ impl YamlValue for String {
 impl YamlValue for bool {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         let value = doc.scalar_value(node)?;
-        match value.as_str() {
+        match value.as_ref() {
             "true" | "True" | "TRUE" => Ok(true),
             "false" | "False" | "FALSE" => Ok(false),
             _ => Err(typed_parse_error(doc, node, "bool", &value)),

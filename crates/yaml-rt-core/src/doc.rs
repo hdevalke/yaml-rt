@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -5,11 +6,12 @@ use crate::syntax::node_link;
 use crate::{
     Children, CollectionStyle, CollectionTarget, Diagnostic, DiagnosticKind, FromYamlDoc, Node,
     NodeId, NodeKind, Parser, ScalarStyle, SemanticKind, SemanticStore, Source, Span, ToYamlDoc,
-    ToYamlFragment, Token, YamlError, YamlEvent, decode_scalar_value, directive_emit_error,
-    double_quoted_scalar_end, edits_conflict, events_to_test_string, format_scalar_value, lex,
-    next_line_content_start, parse_node_properties, plain_scalar_end, single_quoted_scalar_end,
-    strip_inline_comment, validate_plain_mapping_fragment, validate_tag_directive_parts_for_emit,
-    validate_yaml_chars, validate_yaml_directive_version_for_emit,
+    ToYamlFragment, Token, YamlError, YamlEvent, decode_scalar_value_with_content_indent,
+    directive_emit_error, double_quoted_scalar_end, edits_conflict, events_to_test_string,
+    format_scalar_value, lex, next_line_content_start, parse_node_properties, plain_scalar_end,
+    single_quoted_scalar_end, strip_inline_comment, validate_plain_mapping_fragment,
+    validate_tag_directive_parts_for_emit, validate_yaml_chars,
+    validate_yaml_directive_version_for_emit,
 };
 
 /// Pending source edit used by the patch-based emitter.
@@ -207,6 +209,7 @@ impl YamlDoc {
             kind: crate::YamlEventKind::StreamStart,
             span: Span::from_usize(0, self.source.len()),
             cst: None,
+            content_indent: None,
         });
         for document in &self.semantics.documents {
             let Some(metadata) = self.semantics.get(*document) else {
@@ -218,6 +221,7 @@ impl YamlDoc {
                 },
                 span: metadata.span,
                 cst: Some(*document),
+                content_indent: None,
             });
             for child in self.semantics.children(*document) {
                 self.collect_node_events(child, &mut events);
@@ -228,12 +232,14 @@ impl YamlDoc {
                 },
                 span: metadata.end_span,
                 cst: None,
+                content_indent: None,
             });
         }
         events.push(YamlEvent {
             kind: crate::YamlEventKind::StreamEnd,
             span: Span::empty_from_usize(self.source.len()),
             cst: None,
+            content_indent: None,
         });
         events
     }
@@ -253,6 +259,7 @@ impl YamlDoc {
                     },
                     span: metadata.span,
                     cst: Some(node),
+                    content_indent: None,
                 });
                 for (key, value) in self.mapping_entries(node) {
                     self.collect_node_events(key, events);
@@ -262,6 +269,7 @@ impl YamlDoc {
                     kind: crate::YamlEventKind::MappingEnd,
                     span: metadata.end_span,
                     cst: None,
+                    content_indent: None,
                 });
             }
             SemanticKind::Sequence { style, tag, anchor } => {
@@ -273,6 +281,7 @@ impl YamlDoc {
                     },
                     span: metadata.span,
                     cst: Some(node),
+                    content_indent: None,
                 });
                 for item in self.sequence_items(node) {
                     self.collect_node_events(item, events);
@@ -281,27 +290,31 @@ impl YamlDoc {
                     kind: crate::YamlEventKind::SequenceEnd,
                     span: metadata.end_span,
                     cst: None,
+                    content_indent: None,
                 });
             }
-            SemanticKind::Scalar {
-                style,
-                value,
-                tag,
-                anchor,
-            } => events.push(YamlEvent {
-                kind: crate::YamlEventKind::Scalar {
-                    style: *style,
-                    value: value.clone(),
-                    tag: tag.clone(),
-                    anchor: anchor.clone(),
-                },
-                span: metadata.span,
-                cst: Some(node),
-            }),
+            SemanticKind::Scalar { style, tag, anchor } => {
+                let value = self
+                    .scalar_value(node)
+                    .map(Cow::into_owned)
+                    .unwrap_or_default();
+                events.push(YamlEvent {
+                    kind: crate::YamlEventKind::Scalar {
+                        style: *style,
+                        value,
+                        tag: tag.clone(),
+                        anchor: anchor.clone(),
+                    },
+                    span: metadata.span,
+                    cst: Some(node),
+                    content_indent: metadata.content_indent,
+                });
+            }
             SemanticKind::Alias { name } => events.push(YamlEvent {
                 kind: crate::YamlEventKind::Alias { name: name.clone() },
                 span: metadata.span,
                 cst: Some(node),
+                content_indent: None,
             }),
         }
     }
@@ -749,29 +762,43 @@ impl YamlDoc {
     ///
     /// Returns an error when `node` is unknown, is not a scalar node, has
     /// malformed node properties, or contains unsupported scalar escape syntax.
-    pub fn scalar_value(&self, node: NodeId) -> Result<String, YamlError> {
-        if let Some(SemanticKind::Scalar { value, .. }) = self.semantic_kind(node) {
-            return Ok(value.clone());
-        }
-
-        let node = self.expect_node(node)?;
+    pub fn scalar_value(&self, node: NodeId) -> Result<Cow<'_, str>, YamlError> {
+        let node_ref = self.expect_node(node)?;
         if !matches!(
-            node.kind,
+            node_ref.kind,
             NodeKind::Scalar | NodeKind::LiteralScalar | NodeKind::FoldedScalar
         ) {
             return Err(YamlError::new(
                 Diagnostic::new(
                     DiagnosticKind::Semantic,
-                    format!("expected scalar value, found {:?}", node.kind),
-                    node.span,
+                    format!("expected scalar value, found {:?}", node_ref.kind),
+                    node_ref.span,
                 )
                 .with_expected("Scalar, LiteralScalar, or FoldedScalar"),
             )
             .with_position_from(&self.source));
         }
-        let text = self.source.slice(node.span);
-        let properties = parse_node_properties(text, node.span)?;
-        decode_scalar_value(&text[properties.value_start..])
+        let text = self.source.slice(node_ref.span);
+        let properties = parse_node_properties(text, node_ref.span)?;
+        let value_text = &text[properties.value_start..];
+        if matches!(
+            self.semantic_kind(node),
+            Some(SemanticKind::Scalar {
+                style: crate::YamlScalarStyle::Plain,
+                ..
+            })
+        ) && !value_text.contains(['\n', '\r'])
+        {
+            return Ok(Cow::Borrowed(&value_text[..plain_scalar_end(value_text)]));
+        }
+        decode_scalar_value_with_content_indent(
+            value_text,
+            self.semantics
+                .get(node)
+                .and_then(|metadata| metadata.content_indent)
+                .map(|indent| indent as usize),
+        )
+        .map(Cow::Owned)
     }
 
     /// Queues a scalar value replacement at `path` while preserving the existing
@@ -1451,9 +1478,10 @@ impl YamlDoc {
     }
 
     fn line_start_for_offset(&self, offset: usize) -> usize {
+        let offset = Span::usize_to_u32(offset);
         match self.source.line_starts().binary_search(&offset) {
-            Ok(index) => self.source.line_starts()[index],
-            Err(index) => self.source.line_starts()[index.saturating_sub(1)],
+            Ok(index) => self.source.line_starts()[index] as usize,
+            Err(index) => self.source.line_starts()[index.saturating_sub(1)] as usize,
         }
     }
 

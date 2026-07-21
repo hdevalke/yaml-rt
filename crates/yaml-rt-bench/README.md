@@ -46,7 +46,7 @@ cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
 cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
 ```
 
-The current layouts are 28 bytes for `Node`, 56 bytes for `SemanticKind`, and
+The current layouts are 28 bytes for `Node`, 2 bytes for `SemanticKind`, and
 104 bytes for the on-demand public `YamlEvent`. The allocation profiler prints
 these sizes so future layout changes are visible in benchmark logs.
 
@@ -95,6 +95,44 @@ live bytes, and retains 112,948 bytes. The 204,412-byte retained gap isolates
 the current semantic storage, while the full/CST allocation and peak gaps also
 include semantic construction work. These measurements use a 1,000-entry
 fixed-width mapping and the release allocation profiler above.
+
+## Direct compact parser result
+
+Final machine-local results on 2026-07-21 use the median of the three medians
+reported by three complete, default-sampling Criterion runs. Lower ratios are
+better.
+
+| fixture | RTY median | Saphyr median | RTY / Saphyr |
+| --- | ---: | ---: | ---: |
+| small config | 2.185 us | 3.713 us | 0.59x |
+| medium nested | 14.865 us | 17.990 us | 0.83x |
+| block scalars | 2.942 us | 3.395 us | 0.87x |
+| multi-document | 4.707 us | 6.709 us | 0.70x |
+| 100 mapping entries | 32.057 us | 100.320 us | 0.32x |
+| 1,000 mapping entries | 0.31088 ms | 0.98680 ms | 0.32x |
+| 5,000 mapping entries | 1.5119 ms | 5.1792 ms | 0.29x |
+
+The geometric mean across the four source fixtures is **0.737x Saphyr**. RTY
+is faster on every fixture and generated size. Its 5,000/1,000-entry scaling is
+**4.86x**, below the 5.5x gate.
+
+At 1,000 fixed-width entries, a full document uses 9 allocations, allocates
+160,912 bytes, peaks at 158,036 live bytes, and retains 157,140 bytes. The
+CST-only measurement has the same construction figures and retains 112,948
+bytes; the remaining compact semantic state accounts for a 44,192-byte retained
+gap.
+
+Compared with the second-stage starting point above, the direct parser reduces
+allocation count by 60.9%, allocated bytes by 73.7%, peak live bytes by 70.0%,
+and retained bytes by 50.5%. Compared with the original pre-compact reference,
+the reductions are 99.9%, 89.0%, and 86.0% for allocation count, allocated
+bytes, and peak live bytes respectively.
+
+The final parser constructs semantic metadata directly from parser callbacks,
+uses CST wrappers as the semantic topology, reads lines through the source
+index, keeps decorated-node properties sparse and span-backed, and specializes
+ordinary property-free plain nodes. Tokens are lexed on request and events are
+streamed from CST topology without a retained or transient event arena.
 
 ## RTY-only perf profiling
 

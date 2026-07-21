@@ -95,11 +95,12 @@ Required guarantees:
 ```text
 Owned Source + u32 line index
   ↓
-Parser
+Indexed-line parser + unified ContextFrame stack
   ↓
-Lossless CST arena + compact semantic side metadata
+Lossless CST arena ← direct SemanticBuilder callbacks
+  + sparse span-backed semantic metadata
   ├─→ lazy tokenization
-  ├─→ lazy YAML event iterator
+  ├─→ streaming YAML event state machine
   ├─→ typed derive overlays
   └─→ patch-based emitter
 ```
@@ -107,6 +108,16 @@ Lossless CST arena + compact semantic side metadata
 The CST is the source of truth. Semantic metadata is keyed by the same `NodeId`
 used by syntax and stores only information that cannot be recovered cheaply
 from CST topology and source spans. There is no second graph node arena.
+Parser callbacks populate the compact semantic side arena directly; parsing
+does not construct a transient public-event representation.
+
+Lines are random-access views over `Source::line_starts`, so the parser does not
+retain a second line arena. A single `ContextFrame` stack carries indentation,
+block collection state, pending properties, semantic collection state, and
+block-scalar indentation. Ordinary property-free plain mapping entries use a
+narrow specialized path whose separator and value offsets are analyzed once;
+all decorated or structurally ambiguous forms continue through the full YAML
+validators.
 
 ### Core data model
 
@@ -156,6 +167,18 @@ arena links instead of one `Vec` per node. `documents`, `mapping_entries`,
 single-line scalar values return a borrowed `Cow<str>`; decoding allocates only
 for quoted, escaped, folded, block, or multiline content.
 
+Each semantic node is a compact record of at most 16 bytes. Tags, anchors,
+aliases, and explicit block indentation live in a sparse property arena as
+source spans and therefore cost nothing per undecorated scalar. Custom `%TAG`
+bindings and anchor indexes are document-local. `YamlDoc::raw_tag`,
+`resolved_tag`, `anchor`, `alias_name`, and `resolve_alias` expose those lazy
+views without restoring a graph representation.
+
+`YamlEvents` walks CST topology with an explicit depth-first task stack. It
+creates owned `YamlEvent` values, resolves properties, and decodes scalar text
+one item at a time. Calling `events()` no longer allocates an event-sized vector
+or decodes the complete stream up front.
+
 ### Public traits
 
 ```rust
@@ -181,8 +204,9 @@ pub trait YamlValue: Sized {
   into the parser core.
 - `yaml-rt` re-exports the core API and `YamlRoundTrip` derive macro.
 - `YamlDoc::parse` validates source characters, builds one lossless CST arena
-  with compact semantic metadata, and preserves byte-identical output for
-  untouched YAML. Tokens and events are produced on demand.
+  with direct, sparse semantic metadata, and preserves byte-identical output
+  for untouched YAML. Tokens and events are produced on demand and are never
+  retained by ordinary parsing.
 - `yaml-rt-core` passes every discovered YAML Test Suite `data-2022-01-17`
   `in.yaml` case for parsing, byte-identical round-trip output, parser event
   rendering, and semantic view construction.
@@ -673,7 +697,8 @@ Use the upstream data tag corresponding to the desired source tag, for example
 - Block scalar indentation detection, chomping, and folding are easy to get
   subtly wrong.
 - Comments are presentation-only, but round-trip editing must retain them.
-- Anchors and aliases operate in the serialization graph, not just syntax.
+- Anchors and aliases are document-scoped semantic relationships indexed from
+  CST `NodeId`s, not merely syntax spellings.
 - Tags can be verbatim, shorthand, local, or resolved via directives.
 - YAML supports streams with multiple documents, not only single documents.
 - Schema resolution must not erase original scalar spelling.

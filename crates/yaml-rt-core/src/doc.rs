@@ -364,7 +364,7 @@ impl YamlDoc {
     ///
     /// # Errors
     ///
-    /// Returns an error when source validation, CST parsing, or semantic graph
+    /// Returns an error when source validation, CST parsing, or semantic view
     /// composition fails.
     pub fn parse(input: &str) -> Result<Self, YamlError> {
         Self::parse_owned(input.to_owned())
@@ -374,7 +374,7 @@ impl YamlDoc {
     ///
     /// # Errors
     ///
-    /// Returns an error when source validation, CST parsing, or semantic graph
+    /// Returns an error when source validation, CST parsing, or semantic view
     /// composition fails.
     pub fn parse_owned(input: String) -> Result<Self, YamlError> {
         let source = Source::new(input)?;
@@ -396,7 +396,7 @@ impl YamlDoc {
     /// patches applied. It does not prove that the patched stream is still
     /// valid YAML, because low-level edit APIs can replace arbitrary node spans
     /// or insert conservative-but-raw fragments. Reparse on commit is the point
-    /// where the document regains a validated CST and semantic graph.
+    /// where the document regains a validated CST and semantic view.
     ///
     /// # Errors
     ///

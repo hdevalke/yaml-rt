@@ -15,8 +15,7 @@ struct Config {
 }
 
 fn main() -> Result<(), YamlError> {
-    let input =
-        r#"# main server
+    let input = r#"# main server
 host: "localhost"
 
 # chosen port

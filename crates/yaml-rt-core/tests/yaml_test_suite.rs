@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use yaml_rt_core::{DiagnosticKind, GraphKind, GraphNodeId, YamlDoc, YamlError, YamlScalarStyle};
+use yaml_rt_core::{DiagnosticKind, NodeId, SemanticKind, YamlDoc, YamlError, YamlScalarStyle};
 
 /// Environment variable overriding the in-repo YAML Test Suite data checkout.
 const SUITE_DIR_ENV: &str = "YAML_TEST_SUITE_DIR";
@@ -433,7 +433,8 @@ impl JsonValue {
 
 fn graph_to_json(doc: &YamlDoc) -> Result<JsonValue, String> {
     let mut context = JsonRenderContext::default();
-    match doc.graph().documents.as_slice() {
+    let documents = doc.documents().collect::<Vec<_>>();
+    match documents.as_slice() {
         [] => Ok(JsonValue::Stream(Vec::new())),
         [document] => graph_node_to_json(doc, *document, &mut context),
         documents => documents
@@ -446,49 +447,54 @@ fn graph_to_json(doc: &YamlDoc) -> Result<JsonValue, String> {
 
 #[derive(Debug, Default)]
 struct JsonRenderContext {
-    anchors: BTreeMap<String, GraphNodeId>,
+    anchors: BTreeMap<String, NodeId>,
 }
 
 fn graph_node_to_json(
     doc: &YamlDoc,
-    node: GraphNodeId,
+    node: NodeId,
     context: &mut JsonRenderContext,
 ) -> Result<JsonValue, String> {
-    let graph_node = doc
-        .graph_node(node)
-        .ok_or_else(|| format!("missing graph node {}", node.as_usize()))?;
-    match &graph_node.kind {
-        GraphKind::Document { children } => match children.as_slice() {
-            [] => Ok(JsonValue::Null),
-            [child] => graph_node_to_json(doc, *child, context),
-            _ => Err("JSON fixture comparison only supports single-document content".to_owned()),
-        },
-        GraphKind::Mapping {
-            entries, anchor, ..
-        } => {
+    let semantic = doc
+        .semantic_kind(node)
+        .ok_or_else(|| format!("missing semantic node {}", node.as_usize()))?;
+    match semantic {
+        SemanticKind::Document => {
+            let children = doc
+                .children(node)
+                .filter(|child| doc.semantic_kind(*child).is_some())
+                .collect::<Vec<_>>();
+            match children.as_slice() {
+                [] => Ok(JsonValue::Null),
+                [child] => graph_node_to_json(doc, *child, context),
+                _ => {
+                    Err("JSON fixture comparison only supports single-document content".to_owned())
+                }
+            }
+        }
+        SemanticKind::Mapping { anchor, .. } => {
             if let Some(anchor) = anchor {
                 context.anchors.insert(anchor.clone(), node);
             }
-            let mut object = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
+            let mut object = Vec::new();
+            for (key, value) in doc.mapping_entries(node) {
                 object.push((
-                    graph_key_to_json_key(doc, *key, context)?,
-                    graph_node_to_json(doc, *value, context)?,
+                    graph_key_to_json_key(doc, key, context)?,
+                    graph_node_to_json(doc, value, context)?,
                 ));
             }
             Ok(JsonValue::Object(sort_json_object_entries(object)))
         }
-        GraphKind::Sequence { items, anchor, .. } => {
+        SemanticKind::Sequence { anchor, .. } => {
             if let Some(anchor) = anchor {
                 context.anchors.insert(anchor.clone(), node);
             }
-            items
-                .iter()
-                .map(|item| graph_node_to_json(doc, *item, context))
+            doc.sequence_items(node)
+                .map(|item| graph_node_to_json(doc, item, context))
                 .collect::<Result<Vec<_>, _>>()
                 .map(JsonValue::Array)
         }
-        GraphKind::Scalar {
+        SemanticKind::Scalar {
             style,
             value,
             tag,
@@ -499,7 +505,7 @@ fn graph_node_to_json(
             }
             scalar_to_json(*style, value, tag.as_deref())
         }
-        GraphKind::Alias { name } => {
+        SemanticKind::Alias { name } => {
             let target = context
                 .anchors
                 .get(name)
@@ -512,20 +518,20 @@ fn graph_node_to_json(
 
 fn graph_key_to_json_key(
     doc: &YamlDoc,
-    node: GraphNodeId,
+    node: NodeId,
     context: &mut JsonRenderContext,
 ) -> Result<String, String> {
-    let graph_node = doc
-        .graph_node(node)
-        .ok_or_else(|| format!("missing graph key node {}", node.as_usize()))?;
-    match &graph_node.kind {
-        GraphKind::Scalar { anchor, value, .. } => {
+    let semantic = doc
+        .semantic_kind(node)
+        .ok_or_else(|| format!("missing semantic key node {}", node.as_usize()))?;
+    match semantic {
+        SemanticKind::Scalar { anchor, value, .. } => {
             if let Some(anchor) = anchor {
                 context.anchors.insert(anchor.clone(), node);
             }
             Ok(value.clone())
         }
-        GraphKind::Alias { name } => {
+        SemanticKind::Alias { name } => {
             let target = context
                 .anchors
                 .get(name)

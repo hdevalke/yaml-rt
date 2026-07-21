@@ -635,14 +635,6 @@ where
     T: YamlValue + ToYamlFragment + ToFlowYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        if let Some(items) = doc.graph_sequence_items(node) {
-            let mut values = Vec::new();
-            for item in items {
-                values.push(T::read_yaml(doc, item)?);
-            }
-            return Ok(values);
-        }
-
         let sequence = doc.expect_node(node)?;
         let mut values = Vec::new();
 
@@ -719,15 +711,6 @@ where
     T: YamlValue + ToYamlFragment + ToFlowYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        if let Some(entries) = doc.graph_mapping_entries(node) {
-            let mut values = std::collections::BTreeMap::new();
-            for (key_node, value_node) in entries {
-                let key = doc.scalar_value(key_node)?;
-                values.insert(key, T::read_yaml(doc, value_node)?);
-            }
-            return Ok(values);
-        }
-
         let mapping = doc.expect_node(node)?;
         let mut values = std::collections::BTreeMap::new();
 

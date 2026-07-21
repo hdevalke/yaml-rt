@@ -498,17 +498,17 @@ fn events_only_classify_plain_scalars_as_aliases() {
 }
 
 #[test]
-fn graph_preserves_scalar_anchors_and_tags() {
+fn semantics_preserve_scalar_anchors_and_tags() {
     let doc =
         YamlDoc::parse("plain: &anchor !local value\n").expect("valid scalar node properties");
     let value = doc
-        .get_graph_path(&["plain"])
-        .expect("graph path succeeds")
+        .get_path(&["plain"])
+        .expect("path succeeds")
         .expect("value exists");
 
     assert_eq!(
-        doc.graph_node(value).map(|node| &node.kind),
-        Some(&GraphKind::Scalar {
+        doc.semantic_kind(value),
+        Some(&SemanticKind::Scalar {
             style: YamlScalarStyle::Plain,
             value: "value".to_owned(),
             tag: Some("!local".to_owned()),
@@ -528,16 +528,15 @@ fn parser_builds_anchored_and_tagged_flow_collection_values() {
         "+STR\n+DOC\n+MAP\n=VAL :items\n+SEQ [] &seq <tag:yaml.org,2002:seq>\n=VAL :one\n=VAL :two\n-SEQ\n=VAL :settings\n+MAP {} <tag:yaml.org,2002:map>\n=VAL :a\n=VAL :b\n-MAP\n-MAP\n-DOC\n-STR\n"
     );
     let items = doc
-        .get_graph_path(&["items"])
-        .expect("graph path succeeds")
+        .get_path(&["items"])
+        .expect("path succeeds")
         .expect("items exists");
     assert_eq!(
-        doc.graph_node(items).map(|node| &node.kind),
-        Some(&GraphKind::Sequence {
+        doc.semantic_kind(items),
+        Some(&SemanticKind::Sequence {
             style: CollectionStyle::Flow,
             tag: Some("tag:yaml.org,2002:seq".to_owned()),
             anchor: Some("seq".to_owned()),
-            items: vec![GraphNodeId(items.0 + 1), GraphNodeId(items.0 + 2),],
         })
     );
 }
@@ -666,22 +665,24 @@ fn directive_editor_commit_reparses_tag_resolution() {
         .expect("TAG directive edits");
     doc.commit_edits().expect("edited directive reparses");
 
-    let graph = doc
-        .graph
+    let semantic = doc
         .nodes
         .iter()
-        .find(|node| {
+        .enumerate()
+        .find_map(|(index, _)| {
+            let node = NodeId::from_usize(index);
             matches!(
-                &node.kind,
-                GraphKind::Scalar {
+                doc.semantic_kind(node),
+                Some(SemanticKind::Scalar {
                     value,
                     tag: Some(tag),
                     ..
-                } if value == "value" && tag == "tag:new/foo"
+                }) if value == "value" && tag == "tag:new/foo"
             )
+            .then_some(node)
         })
         .expect("tag resolution updates after commit");
-    assert!(graph.cst.is_some());
+    assert!(doc.node(semantic).is_some());
 }
 
 #[test]
@@ -790,8 +791,7 @@ fn events_render_multi_document_stream_with_explicit_end() {
         doc.events_to_test_string(),
         "+STR\n+DOC ---\n=VAL |%!PS-Adobe-2.0\\n\n-DOC ...\n+DOC ---\n=VAL :\n-DOC ...\n-STR\n"
     );
-    assert_eq!(doc.graph().documents.len(), 2);
-    assert_eq!(doc.graph().root, doc.graph().documents.first().copied());
+    assert_eq!(doc.documents().count(), 2);
 }
 
 #[test]
@@ -802,7 +802,7 @@ fn parser_builds_empty_documents_in_stream() {
         doc.events_to_test_string(),
         "+STR\n+DOC ---\n=VAL :\n-DOC ...\n+DOC ---\n=VAL :\n-DOC ...\n-STR\n"
     );
-    assert_eq!(doc.graph().documents.len(), 2);
+    assert_eq!(doc.documents().count(), 2);
 }
 
 #[test]
@@ -818,8 +818,7 @@ fn parser_keeps_contentless_streams_empty() {
 
         assert_eq!(doc.events_to_test_string(), "+STR\n-STR\n");
         assert_eq!(doc.to_string(), input);
-        assert!(doc.graph().documents.is_empty());
-        assert!(doc.graph().root.is_none());
+        assert_eq!(doc.documents().count(), 0);
     }
 }
 
@@ -833,7 +832,7 @@ fn parser_preserves_explicit_empty_documents() {
 
         assert_eq!(doc.events_to_test_string(), expected);
         assert_eq!(doc.to_string(), input);
-        assert_eq!(doc.graph().documents.len(), 1);
+        assert_eq!(doc.documents().count(), 1);
     }
 }
 
@@ -990,7 +989,7 @@ fn yaml_value_replaces_property_only_block_sequence_body() {
 }
 
 #[test]
-fn yaml_value_writes_empty_decorated_mapping_and_preserves_graph_metadata_after_commit() {
+fn yaml_value_writes_empty_decorated_mapping_and_preserves_semantic_metadata_after_commit() {
     let mut doc =
         YamlDoc::parse("settings: &settings !!map {a: b}\n").expect("valid decorated mapping");
     let settings = doc
@@ -1010,16 +1009,12 @@ fn yaml_value_writes_empty_decorated_mapping_and_preserves_graph_metadata_after_
         .get_path(&["settings"])
         .expect("path lookup succeeds after commit")
         .expect("settings exists after commit");
-    let graph = doc
-        .graph_for_cst(settings)
-        .and_then(|id| doc.graph_node(id))
-        .expect("settings has graph node");
-    match &graph.kind {
-        GraphKind::Mapping { tag, anchor, .. } => {
+    match doc.semantic_kind(settings).expect("settings is semantic") {
+        SemanticKind::Mapping { tag, anchor, .. } => {
             assert_eq!(tag.as_deref(), Some("tag:yaml.org,2002:map"));
             assert_eq!(anchor.as_deref(), Some("settings"));
         }
-        other => panic!("expected mapping graph node, found {other:?}"),
+        other => panic!("expected semantic mapping, found {other:?}"),
     }
 }
 
@@ -1079,46 +1074,34 @@ fn semantic_events_link_directly_to_originating_cst_nodes() {
 }
 
 #[test]
-fn graph_builds_root_scalar_with_cst_link() {
+fn semantic_metadata_is_keyed_by_cst_node() {
     let doc = YamlDoc::parse("value\n").expect("valid scalar");
-    let root = doc.graph().root.expect("graph root exists");
-    let root = doc.graph_node(root).expect("root graph node exists");
-    let GraphKind::Document { children } = &root.kind else {
-        panic!("root should be document");
-    };
-    let scalar = doc
-        .graph_node(children[0])
-        .expect("scalar graph node exists");
+    let document = doc.documents().next().expect("document exists");
+    let scalar = doc.children(document).next().expect("scalar exists");
 
-    assert_eq!(scalar.span, Span::new(0, 5));
     assert_eq!(
-        scalar
-            .cst
-            .and_then(|node| doc.node(node))
-            .map(|node| node.kind),
-        Some(NodeKind::Scalar)
+        doc.node(scalar).map(|node| node.span),
+        Some(Span::new(0, 5))
     );
     assert_eq!(
-        scalar.kind,
-        GraphKind::Scalar {
+        doc.semantic_kind(scalar),
+        Some(&SemanticKind::Scalar {
             style: YamlScalarStyle::Plain,
             value: "value".to_owned(),
             tag: None,
             anchor: None,
-        }
+        })
     );
 }
 
 #[test]
-fn graph_builds_mapping_sequence_and_preserves_path_lookup() {
+fn semantic_sequence_items_preserve_path_lookup() {
     let doc = YamlDoc::parse("ports:\n  - 8080\n  - 9090\n").expect("valid sequence");
     let ports = doc
         .get_path(&["ports"])
         .expect("path lookup succeeds")
         .expect("ports exists");
-    let items = doc
-        .graph_sequence_items(ports)
-        .expect("ports is graph-backed sequence");
+    let items = doc.sequence_items(ports).collect::<Vec<_>>();
 
     assert_eq!(
         doc.node(ports).map(|node| node.kind),
@@ -1134,17 +1117,16 @@ fn graph_builds_mapping_sequence_and_preserves_path_lookup() {
 }
 
 #[test]
-fn graph_path_lookup_returns_semantic_node_with_cst_bridge() {
+fn path_lookup_returns_semantic_cst_node() {
     let doc = YamlDoc::parse("server:\n  host: localhost\n").expect("valid nested mapping");
-    let host_graph = doc
-        .get_graph_path(&["server", "host"])
-        .expect("graph path lookup succeeds")
-        .expect("host graph node exists");
-    let host_cst = doc.graph_node_cst(host_graph).expect("host has CST link");
+    let host = doc
+        .get_path(&["server", "host"])
+        .expect("path lookup succeeds")
+        .expect("host exists");
 
     assert_eq!(
-        doc.graph_node(host_graph).map(|node| &node.kind),
-        Some(&GraphKind::Scalar {
+        doc.semantic_kind(host),
+        Some(&SemanticKind::Scalar {
             style: YamlScalarStyle::Plain,
             value: "localhost".to_owned(),
             tag: None,
@@ -1154,20 +1136,18 @@ fn graph_path_lookup_returns_semantic_node_with_cst_bridge() {
     assert_eq!(
         doc.get_path(&["server", "host"])
             .expect("CST path lookup succeeds"),
-        Some(host_cst)
+        Some(host)
     );
 }
 
 #[test]
-fn graph_builds_flow_mapping_and_sequence() {
+fn semantic_mapping_entries_build_flow_mapping_and_sequence() {
     let doc = YamlDoc::parse("settings: {a: [b, c]}\n").expect("valid flow collections");
     let settings = doc
         .get_path(&["settings"])
         .expect("path lookup succeeds")
         .expect("settings exists");
-    let entries = doc
-        .graph_mapping_entries(settings)
-        .expect("settings is graph-backed mapping");
+    let entries = doc.mapping_entries(settings).collect::<Vec<_>>();
 
     assert_eq!(
         doc.node(settings).map(|node| node.kind),
@@ -1182,7 +1162,7 @@ fn graph_builds_flow_mapping_and_sequence() {
 }
 
 #[test]
-fn graph_builds_literal_and_folded_scalars() {
+fn semantic_values_build_literal_and_folded_scalars() {
     let doc = YamlDoc::parse("literal: |\n  one\nfolded: >\n  one\n  two\n")
         .expect("valid block scalars");
     let literal = doc
@@ -1560,7 +1540,7 @@ fn parser_accepts_tab_prefixed_sequence_entry_continuation() {
         .get_path(&["x"])
         .expect("lookup succeeds")
         .expect("x exists");
-    let sequence = doc.graph_sequence_items(items).expect("sequence items");
+    let sequence = doc.sequence_items(items).collect::<Vec<_>>();
 
     assert_eq!(doc.to_string(), input);
     assert_eq!(sequence.len(), 1);
@@ -3113,7 +3093,7 @@ fn document_selection_reads_second_document_mapping() {
 fn document_selection_reports_out_of_range_indexes() {
     let doc = YamlDoc::parse("---\nname: first\n").expect("valid document");
     let error = doc
-        .document_graph(1)
+        .document_root_mapping(1)
         .expect_err("second document does not exist");
 
     assert_eq!(error.diagnostic.kind, DiagnosticKind::Semantic);

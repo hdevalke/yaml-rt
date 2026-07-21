@@ -2,14 +2,13 @@ use std::fmt;
 
 use crate::syntax::node_link;
 use crate::{
-    Children, CollectionStyle, CollectionTarget, Diagnostic, DiagnosticKind, FromYamlDoc,
-    GraphKind, GraphNode, GraphNodeId, Node, NodeId, NodeKind, Parser, ScalarStyle, SemanticGraph,
-    Source, Span, ToYamlDoc, ToYamlFragment, Token, YamlError, YamlEvent, compose_graph,
-    decode_scalar_value, directive_emit_error, double_quoted_scalar_end, edits_conflict,
-    events_to_test_string, format_scalar_value, lex, next_line_content_start,
-    parse_node_properties, plain_scalar_end, single_quoted_scalar_end, strip_inline_comment,
-    validate_plain_mapping_fragment, validate_tag_directive_parts_for_emit, validate_yaml_chars,
-    validate_yaml_directive_version_for_emit,
+    Children, CollectionStyle, CollectionTarget, Diagnostic, DiagnosticKind, FromYamlDoc, Node,
+    NodeId, NodeKind, Parser, ScalarStyle, SemanticKind, SemanticStore, Source, Span, ToYamlDoc,
+    ToYamlFragment, Token, YamlError, YamlEvent, decode_scalar_value, directive_emit_error,
+    double_quoted_scalar_end, edits_conflict, events_to_test_string, format_scalar_value, lex,
+    next_line_content_start, parse_node_properties, plain_scalar_end, single_quoted_scalar_end,
+    strip_inline_comment, validate_plain_mapping_fragment, validate_tag_directive_parts_for_emit,
+    validate_yaml_chars, validate_yaml_directive_version_for_emit,
 };
 
 /// Pending source edit used by the patch-based emitter.
@@ -78,8 +77,10 @@ pub struct YamlDoc {
     pub(crate) nodes: Vec<Node>,
     /// Semantic YAML event stream produced by the parser.
     pub(crate) events: Vec<YamlEvent>,
-    /// CST-linked semantic graph composed from parser events.
-    pub(crate) graph: SemanticGraph,
+    /// Compact semantic metadata keyed by CST node IDs.
+    pub(crate) semantics: SemanticStore,
+    /// Optional mapping root used by nested typed overlays.
+    pub(crate) root_override: Option<NodeId>,
     /// Pending patch edits applied from highest offset to lowest offset.
     pub(crate) edits: Vec<Edit>,
 }
@@ -109,14 +110,15 @@ impl YamlDoc {
         let parsed = Parser::new(&source)
             .parse()
             .map_err(|error| error.with_position_from(&source))?;
-        let graph =
-            compose_graph(&parsed.events).map_err(|error| error.with_position_from(&source))?;
+        let semantics = SemanticStore::from_events(&parsed.nodes, &parsed.events)
+            .map_err(|error| error.with_position_from(&source))?;
 
         Ok(Self {
             source,
             nodes: parsed.nodes,
             events: parsed.events,
-            graph,
+            semantics,
+            root_override: None,
             edits: Vec::new(),
         })
     }
@@ -184,16 +186,11 @@ impl YamlDoc {
         events_to_test_string(&self.events)
     }
 
-    /// Returns the CST-linked semantic graph.
-    #[must_use]
-    pub fn graph(&self) -> &SemanticGraph {
-        &self.graph
-    }
-
     /// Returns the number of documents in this YAML stream.
     #[must_use]
     pub fn document_count(&self) -> usize {
-        self.graph.documents.len()
+        self.root_override
+            .map_or(self.semantics.documents.len(), |_| 1)
     }
 
     /// Queues an explicit document append at the end of this YAML stream.
@@ -330,18 +327,6 @@ impl YamlDoc {
         Ok(())
     }
 
-    /// Returns a semantic graph node by identifier.
-    #[must_use]
-    pub fn graph_node(&self, node: GraphNodeId) -> Option<&GraphNode> {
-        self.graph.nodes.get(node.0 as usize)
-    }
-
-    /// Returns the CST node linked to `node`, when one exists.
-    #[must_use]
-    pub fn graph_node_cst(&self, node: GraphNodeId) -> Option<NodeId> {
-        self.graph_node(node).and_then(|node| node.cst)
-    }
-
     /// Returns a node by identifier.
     #[must_use]
     pub fn node(&self, node: NodeId) -> Option<&Node> {
@@ -354,27 +339,48 @@ impl YamlDoc {
         Children::new(&self.nodes, node)
     }
 
-    /// Returns the root mapping graph node.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the document has no semantic root, the root is not
-    /// a document, or the document has no root block mapping.
-    pub fn root_graph_mapping(&self) -> Result<GraphNodeId, YamlError> {
-        self.document_root_mapping_graph(0)
+    /// Returns a node's semantic interpretation.
+    #[must_use]
+    pub fn semantic_kind(&self, node: NodeId) -> Option<&SemanticKind> {
+        self.semantics.get(node).map(|node| &node.kind)
     }
 
-    /// Returns a document graph node by zero-based document index.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when `index` does not identify an existing document.
-    pub fn document_graph(&self, index: usize) -> Result<GraphNodeId, YamlError> {
-        self.graph
-            .documents
-            .get(index)
-            .copied()
-            .ok_or_else(|| self.document_index_error(index))
+    /// Iterates over semantic document CST nodes in stream order.
+    pub fn documents(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.semantics.documents.iter().copied()
+    }
+
+    /// Iterates over mapping key/value CST node pairs in source order.
+    pub fn mapping_entries(&self, mapping: NodeId) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+        let is_mapping = matches!(
+            self.semantic_kind(mapping),
+            Some(SemanticKind::Mapping { .. })
+        );
+        self.children(mapping).filter_map(move |entry| {
+            if !is_mapping || self.node(entry)?.kind != NodeKind::MappingEntry {
+                return None;
+            }
+            let mut children = self.children(entry);
+            Some((children.next()?, children.next()?))
+        })
+    }
+
+    /// Iterates over sequence item CST nodes in source order.
+    pub fn sequence_items(&self, sequence: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        let is_sequence = matches!(
+            self.semantic_kind(sequence),
+            Some(SemanticKind::Sequence { .. })
+        );
+        self.children(sequence).filter_map(move |child| {
+            if !is_sequence {
+                return None;
+            }
+            if self.node(child)?.kind == NodeKind::SequenceEntry {
+                self.children(child).next()
+            } else {
+                Some(child)
+            }
+        })
     }
 
     /// Returns the first root-level block mapping in the document.
@@ -394,18 +400,36 @@ impl YamlDoc {
     /// Returns an error when the selected document does not exist, has no block
     /// mapping root, or the root mapping is not linked back to the CST.
     pub fn document_root_mapping(&self, index: usize) -> Result<NodeId, YamlError> {
-        let mapping = self.document_root_mapping_graph(index)?;
-        self.graph_node_cst(mapping).ok_or_else(|| {
-            YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Semantic,
-                    "root mapping is not linked to the CST",
-                    self.graph_node(mapping)
-                        .map_or(Span::empty(0), |node| node.span),
+        if let Some(root) = self.root_override {
+            return (index == 0)
+                .then_some(root)
+                .ok_or_else(|| self.document_index_error(index));
+        }
+        let document = self
+            .semantics
+            .documents
+            .get(index)
+            .copied()
+            .ok_or_else(|| self.document_index_error(index))?;
+        self.children(document)
+            .find(|child| {
+                self.node(*child)
+                    .is_some_and(|node| node.kind == NodeKind::BlockMapping)
+                    && matches!(
+                        self.semantic_kind(*child),
+                        Some(SemanticKind::Mapping { .. })
+                    )
+            })
+            .ok_or_else(|| {
+                YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Semantic,
+                        "document does not contain a root mapping",
+                        self.node(document).map_or(Span::empty(0), |node| node.span),
+                    )
+                    .with_expected("a block mapping node"),
                 )
-                .with_expected("a CST-backed block mapping"),
-            )
-        })
+            })
     }
 
     /// Reads a typed overlay from a selected document.
@@ -452,93 +476,37 @@ impl YamlDoc {
     ///
     /// # Errors
     ///
-    /// Returns an error when the semantic graph contains an unknown graph node
-    /// while resolving the mapping entry.
+    /// Returns an error when a scalar key cannot be decoded.
     pub fn get_mapping_entry(
         &self,
         mapping: NodeId,
         key: &str,
     ) -> Result<Option<NodeId>, YamlError> {
-        let Some(mapping_graph) = self.graph_for_cst(mapping) else {
-            return Ok(None);
-        };
-        let Some((key_graph, _)) = self.get_graph_mapping_entry(mapping_graph, key)? else {
-            return Ok(None);
-        };
-        let Some(key_node) = self.graph_node_cst(key_graph) else {
-            return Ok(None);
-        };
-        Ok(self.containing_entry(key_node))
+        Ok(self
+            .find_mapping_pair(mapping, key)?
+            .and_then(|(key, _)| self.containing_entry(key)))
     }
 
     /// Looks up a mapping value by key inside `mapping`.
     ///
     /// # Errors
     ///
-    /// Returns an error when the semantic graph contains an unknown graph node
-    /// while resolving the mapping value.
+    /// Returns an error when a scalar key cannot be decoded.
     pub fn get_mapping_value(
         &self,
         mapping: NodeId,
         key: &str,
     ) -> Result<Option<NodeId>, YamlError> {
-        let Some(mapping_graph) = self.graph_for_cst(mapping) else {
-            return Ok(None);
-        };
-        let Some((_, value_graph)) = self.get_graph_mapping_entry(mapping_graph, key)? else {
-            return Ok(None);
-        };
-        Ok(self.graph_node_cst(value_graph))
-    }
-
-    /// Looks up a nested path of mapping keys and returns the semantic graph node.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the document has no root mapping or when graph
-    /// traversal encounters an unknown graph node.
-    pub fn get_graph_path(&self, path: &[&str]) -> Result<Option<GraphNodeId>, YamlError> {
-        self.get_graph_path_in_document(0, path)
-    }
-
-    /// Looks up a nested path of mapping keys in a selected document and returns
-    /// the semantic graph node.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the selected document does not exist, has no root
-    /// mapping, or graph traversal encounters an unknown graph node.
-    pub fn get_graph_path_in_document(
-        &self,
-        index: usize,
-        path: &[&str],
-    ) -> Result<Option<GraphNodeId>, YamlError> {
-        let Some((first, rest)) = path.split_first() else {
-            return Ok(None);
-        };
-
-        let Some((_, mut current)) =
-            self.get_graph_mapping_entry(self.document_root_mapping_graph(index)?, first)?
-        else {
-            return Ok(None);
-        };
-
-        for segment in rest {
-            current = match self.get_graph_mapping_entry(current, segment)? {
-                Some((_, value)) => value,
-                None => return Ok(None),
-            };
-        }
-
-        Ok(Some(current))
+        Ok(self
+            .find_mapping_pair(mapping, key)?
+            .map(|(_, value)| value))
     }
 
     /// Looks up a nested path of mapping keys.
     ///
     /// # Errors
     ///
-    /// Returns an error when semantic path lookup fails while resolving the
-    /// graph path.
+    /// Returns an error when semantic path lookup cannot decode a mapping key.
     pub fn get_path(&self, path: &[&str]) -> Result<Option<NodeId>, YamlError> {
         self.get_path_in_document(0, path)
     }
@@ -554,71 +522,46 @@ impl YamlDoc {
         index: usize,
         path: &[&str],
     ) -> Result<Option<NodeId>, YamlError> {
-        Ok(self
-            .get_graph_path_in_document(index, path)?
-            .and_then(|node| self.graph_node_cst(node)))
-    }
-
-    fn document_root_mapping_graph(&self, index: usize) -> Result<GraphNodeId, YamlError> {
-        let root = self.document_graph(index)?;
-        self.document_mapping_child(root)
-    }
-
-    fn document_mapping_child(&self, document: GraphNodeId) -> Result<GraphNodeId, YamlError> {
-        let root = self.expect_graph_node(document)?;
-        let GraphKind::Document { children } = &root.kind else {
-            return Err(YamlError::new(Diagnostic::new(
-                DiagnosticKind::Semantic,
-                "semantic root is not a document",
-                root.span,
-            )));
+        let Some((first, rest)) = path.split_first() else {
+            return Ok(None);
         };
-        children
-            .iter()
-            .copied()
-            .find(|child| {
-                self.graph_node(*child).is_some_and(|node| {
-                    matches!(node.kind, GraphKind::Mapping { .. })
-                        && node
-                            .cst
-                            .and_then(|cst| self.node(cst))
-                            .is_some_and(|node| node.kind == NodeKind::BlockMapping)
-                })
-            })
-            .ok_or_else(|| {
-                YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Semantic,
-                        "document does not contain a root mapping",
-                        root.span,
-                    )
-                    .with_expected("a mapping graph node"),
-                )
-            })
+        let Some((_, mut current)) =
+            self.find_mapping_pair(self.document_root_mapping(index)?, first)?
+        else {
+            return Ok(None);
+        };
+        for segment in rest {
+            let Some((_, value)) = self.find_mapping_pair(current, segment)? else {
+                return Ok(None);
+            };
+            current = value;
+        }
+        Ok(Some(current))
     }
 
     fn empty_flow_mapping_document_root(&self, index: usize) -> Result<Option<NodeId>, YamlError> {
-        let root = self.document_graph(index)?;
-        let root = self.expect_graph_node(root)?;
-        let GraphKind::Document { children } = &root.kind else {
+        let document = self
+            .semantics
+            .documents
+            .get(index)
+            .copied()
+            .ok_or_else(|| self.document_index_error(index))?;
+        let Some(child) = self
+            .children(document)
+            .find(|child| self.semantic_kind(*child).is_some())
+        else {
             return Ok(None);
         };
-        let Some(child) = children.first().copied() else {
+        let Some(SemanticKind::Mapping { style, .. }) = self.semantic_kind(child) else {
             return Ok(None);
         };
-        let Some(graph) = self.graph_node(child) else {
-            return Ok(None);
-        };
-        let GraphKind::Mapping { style, entries, .. } = &graph.kind else {
-            return Ok(None);
-        };
-        if *style != CollectionStyle::Flow || !entries.is_empty() {
+        if *style != CollectionStyle::Flow || self.mapping_entries(child).next().is_some() {
             return Ok(None);
         }
-        Ok(graph.cst.filter(|cst| {
-            self.node(*cst)
-                .is_some_and(|node| node.kind == NodeKind::FlowMapping)
-        }))
+        Ok(self
+            .node(child)
+            .is_some_and(|node| node.kind == NodeKind::FlowMapping)
+            .then_some(child))
     }
 
     fn document_index_error(&self, index: usize) -> YamlError {
@@ -632,116 +575,37 @@ impl YamlDoc {
         )
     }
 
-    fn get_graph_mapping_entry(
+    fn find_mapping_pair(
         &self,
-        mapping: GraphNodeId,
+        mapping: NodeId,
         key: &str,
-    ) -> Result<Option<(GraphNodeId, GraphNodeId)>, YamlError> {
-        let mapping_node = self.expect_graph_node(mapping)?;
-        let GraphKind::Mapping { entries, .. } = &mapping_node.kind else {
-            return Ok(None);
-        };
-
-        for (key_node, value_node) in entries {
-            let key_graph = self.expect_graph_node(*key_node)?;
-            if let GraphKind::Scalar { value, .. } = &key_graph.kind
-                && value == key
-            {
-                return Ok(Some((*key_node, *value_node)));
+    ) -> Result<Option<(NodeId, NodeId)>, YamlError> {
+        for (key_node, value_node) in self.mapping_entries(mapping) {
+            if self.scalar_value(key_node)? == key {
+                return Ok(Some((key_node, value_node)));
             }
         }
-
         Ok(None)
-    }
-
-    fn expect_graph_node(&self, node: GraphNodeId) -> Result<&GraphNode, YamlError> {
-        self.graph_node(node).ok_or_else(|| {
-            YamlError::new(Diagnostic::new(
-                DiagnosticKind::Semantic,
-                format!("unknown graph node id {}", node.0),
-                Span::empty_from_usize(self.source.len()),
-            ))
-        })
-    }
-
-    pub(crate) fn graph_for_cst(&self, cst: NodeId) -> Option<GraphNodeId> {
-        self.graph
-            .nodes
-            .iter()
-            .enumerate()
-            .find(|(_, node)| node.cst == Some(cst))
-            .map(|(index, _)| GraphNodeId::from_usize(index))
-    }
-
-    fn graph_scalar_value(&self, node: NodeId) -> Option<&str> {
-        let graph = self.graph_for_cst(node)?;
-        let graph = self.graph_node(graph)?;
-        match &graph.kind {
-            GraphKind::Scalar { value, .. } => Some(value),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn graph_sequence_items(&self, node: NodeId) -> Option<Vec<NodeId>> {
-        let graph = self.graph_for_cst(node)?;
-        let graph = self.graph_node(graph)?;
-        let GraphKind::Sequence { items, .. } = &graph.kind else {
-            return None;
-        };
-        Some(
-            items
-                .iter()
-                .filter_map(|item| self.graph_node_cst(*item))
-                .collect(),
-        )
-    }
-
-    pub(crate) fn graph_mapping_entries(&self, node: NodeId) -> Option<Vec<(NodeId, NodeId)>> {
-        let graph = self.graph_for_cst(node)?;
-        let graph = self.graph_node(graph)?;
-        let GraphKind::Mapping { entries, .. } = &graph.kind else {
-            return None;
-        };
-        Some(
-            entries
-                .iter()
-                .filter_map(|(key, value)| {
-                    Some((self.graph_node_cst(*key)?, self.graph_node_cst(*value)?))
-                })
-                .collect(),
-        )
     }
 
     pub(crate) fn rerooted_at_mapping(&self, mapping: NodeId) -> Result<Self, YamlError> {
         self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
-        let Some(mapping_graph) = self.graph_for_cst(mapping) else {
+        if !matches!(
+            self.semantic_kind(mapping),
+            Some(SemanticKind::Mapping { .. })
+        ) {
             return Err(YamlError::new(
                 Diagnostic::new(
                     DiagnosticKind::Semantic,
-                    "mapping is not linked to the semantic graph",
+                    "mapping does not have semantic metadata",
                     self.expect_node(mapping)?.span,
                 )
-                .with_expected("a graph-backed mapping"),
+                .with_expected("a semantic mapping"),
             )
             .with_position_from(&self.source));
-        };
+        }
         let mut doc = self.clone();
-        let root = doc.graph.root.ok_or_else(|| {
-            YamlError::new(Diagnostic::new(
-                DiagnosticKind::Semantic,
-                "document does not contain a semantic root",
-                Span::empty(0),
-            ))
-        })?;
-        let GraphKind::Document { children } = &mut doc.graph.nodes[root.as_usize()].kind else {
-            return Err(YamlError::new(Diagnostic::new(
-                DiagnosticKind::Semantic,
-                "semantic root is not a document",
-                Span::empty(0),
-            )));
-        };
-        *children = vec![mapping_graph];
-        doc.graph.documents = vec![root];
+        doc.root_override = Some(mapping);
         doc.edits.clear();
         Ok(doc)
     }
@@ -775,8 +639,8 @@ impl YamlDoc {
     /// Returns an error when `node` is unknown, is not a scalar node, has
     /// malformed node properties, or contains unsupported scalar escape syntax.
     pub fn scalar_value(&self, node: NodeId) -> Result<String, YamlError> {
-        if let Some(value) = self.graph_scalar_value(node) {
-            return Ok(value.to_owned());
+        if let Some(SemanticKind::Scalar { value, .. }) = self.semantic_kind(node) {
+            return Ok(value.clone());
         }
 
         let node = self.expect_node(node)?;

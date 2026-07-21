@@ -950,7 +950,7 @@ impl<'source> Parser<'source> {
             )?
             .is_some()
             {
-                return self.parse_nested_block_value(entry, lines, index, parent_indent);
+                return self.parse_nested_block_value(entry, lines, index, parent_indent, true);
             }
             if property_only_node_indent(
                 body,
@@ -960,13 +960,13 @@ impl<'source> Parser<'source> {
             )?
             .is_some()
             {
-                return self.parse_nested_block_value(entry, lines, index, parent_indent);
+                return self.parse_nested_block_value(entry, lines, index, parent_indent, true);
             }
             if is_sequence_entry(body)
                 || is_explicit_mapping_key(body)
                 || find_mapping_colon(body).is_some()
             {
-                return self.parse_nested_block_value(entry, lines, index, parent_indent);
+                return self.parse_nested_block_value(entry, lines, index, parent_indent, true);
             }
 
             let (scalar, consumed) = self.parse_block_plain_scalar(
@@ -1416,7 +1416,7 @@ impl<'source> Parser<'source> {
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
-        self.parse_nested_block_value(entry, lines, index, parent_indent)
+        self.parse_nested_block_value(entry, lines, index, parent_indent, false)
     }
 
     fn parse_nested_block_value(
@@ -1425,6 +1425,7 @@ impl<'source> Parser<'source> {
         lines: &[SourceLine<'_>],
         index: usize,
         parent_indent: usize,
+        allow_same_indent_sequence: bool,
     ) -> Result<usize, YamlError> {
         let mut consumed = 1;
         let mut nested_index = index + 1;
@@ -1439,11 +1440,16 @@ impl<'source> Parser<'source> {
             }
 
             let nested_indent = content_line_indent(line.content_without_break);
-            if nested_indent <= parent_indent {
+            if nested_indent < parent_indent {
                 break;
             }
 
             let body = &line.content_without_break[nested_indent..];
+            if nested_indent == parent_indent
+                && (!allow_same_indent_sequence || !is_sequence_entry(body))
+            {
+                break;
+            }
             if property_only_node_indent(
                 body,
                 lines,
@@ -1741,23 +1747,28 @@ impl<'source> Parser<'source> {
                 return Err(missing_flow_sequence_end(absolute_start, text.len()));
             };
 
+            if character == ']' {
+                if expecting_value || saw_item {
+                    position += 1;
+                    self.nodes[sequence.as_usize()].span.end =
+                        Span::usize_to_u32(absolute_start + position);
+                    return Ok((sequence, position));
+                }
+                return Err(empty_flow_sequence_item(absolute_start + position));
+            }
+            if character == ',' {
+                return Err(unexpected_flow_comma(absolute_start + position));
+            }
+
+            let entry = self.push_node(
+                NodeKind::SequenceEntry,
+                Span::empty_from_usize(absolute_start + position),
+            );
             match character {
-                ']' => {
-                    if expecting_value || saw_item {
-                        position += 1;
-                        self.nodes[sequence.as_usize()].span.end =
-                            Span::usize_to_u32(absolute_start + position);
-                        return Ok((sequence, position));
-                    }
-                    return Err(empty_flow_sequence_item(absolute_start + position));
-                }
-                ',' => {
-                    return Err(unexpected_flow_comma(absolute_start + position));
-                }
                 '?' if is_flow_explicit_key_indicator(text, position) => {
                     let (mapping, consumed) =
                         self.parse_explicit_flow_mapping_item(text, position, absolute_start, ']')?;
-                    self.attach_child_at(sequence.0 as usize, mapping);
+                    self.attach_child_at(entry.0 as usize, mapping);
                     position = consumed;
                 }
                 '[' | '{' => {
@@ -1770,13 +1781,13 @@ impl<'source> Parser<'source> {
                             colon,
                             absolute_start,
                         )?;
-                        self.attach_child_at(sequence.0 as usize, mapping);
+                        self.attach_child_at(entry.0 as usize, mapping);
                         position = consumed;
                     } else {
                         let child_start = absolute_start + position;
                         let (child, consumed) =
                             self.parse_flow_value(&text[position..], child_start)?;
-                        self.attach_child_at(sequence.0 as usize, child);
+                        self.attach_child_at(entry.0 as usize, child);
                         position += consumed;
                     }
                 }
@@ -1791,13 +1802,13 @@ impl<'source> Parser<'source> {
                             colon,
                             absolute_start,
                         )?;
-                        self.attach_child_at(sequence.0 as usize, mapping);
+                        self.attach_child_at(entry.0 as usize, mapping);
                         position = consumed;
                     } else if body_starts_flow_value(&text[position..], absolute_start + position)?
                     {
                         let (value, consumed) =
                             self.parse_flow_value(&text[position..], absolute_start + position)?;
-                        self.attach_child_at(sequence.0 as usize, value);
+                        self.attach_child_at(entry.0 as usize, value);
                         position += consumed;
                     } else {
                         let value_end =
@@ -1816,11 +1827,14 @@ impl<'source> Parser<'source> {
                                 absolute_start + scalar_end,
                             ),
                         );
-                        self.attach_child_at(sequence.0 as usize, scalar);
+                        self.attach_child_at(entry.0 as usize, scalar);
                         position = value_end;
                     }
                 }
             }
+
+            self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + position);
+            self.attach_child_at(sequence.0 as usize, entry);
 
             saw_item = true;
             position = skip_flow_whitespace(text, position);
@@ -2545,10 +2559,14 @@ impl<'source> Parser<'source> {
             span,
             node,
         );
-        let mut child = node_link(self.nodes[node.as_usize()].first_child);
-        while let Some(current) = child {
-            child = node_link(self.nodes[current.as_usize()].next_sibling);
-            self.emit_node_event(current)?;
+        let mut entry = node_link(self.nodes[node.as_usize()].first_child);
+        while let Some(current_entry) = entry {
+            entry = node_link(self.nodes[current_entry.as_usize()].next_sibling);
+            let mut child = node_link(self.nodes[current_entry.as_usize()].first_child);
+            while let Some(current_child) = child {
+                child = node_link(self.nodes[current_child.as_usize()].next_sibling);
+                self.emit_node_event(current_child)?;
+            }
         }
         self.push_event(YamlEventKind::SequenceEnd, span);
         Ok(())

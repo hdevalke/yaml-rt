@@ -1159,6 +1159,61 @@ fn semantic_mapping_entries_build_flow_mapping_and_sequence() {
 }
 
 #[test]
+fn collection_values_have_logical_cst_wrapper_parents() {
+    let doc = YamlDoc::parse(
+        "same:\n- item\nnested:\n  key: value\ncompact:\n  - child: value\nflow: [{a: b}, [c]]\nprops: &node\n  value: yes\n",
+    )
+    .expect("nested collection forms are valid");
+
+    for path in [
+        &["same"][..],
+        &["nested"][..],
+        &["compact"][..],
+        &["flow"][..],
+        &["props"][..],
+    ] {
+        let value = doc
+            .get_path(path)
+            .expect("path lookup succeeds")
+            .expect("value exists");
+        let parent = doc
+            .node(value)
+            .and_then(Node::parent)
+            .expect("value parent");
+        assert_eq!(
+            doc.node(parent).map(Node::kind),
+            Some(NodeKind::MappingEntry)
+        );
+    }
+
+    let compact = doc
+        .get_path(&["compact"])
+        .expect("path lookup succeeds")
+        .expect("compact sequence exists");
+    let compact_mapping = doc.sequence_items(compact).next().expect("compact item");
+    let compact_parent = doc
+        .node(compact_mapping)
+        .and_then(Node::parent)
+        .expect("compact mapping parent");
+    assert_eq!(
+        doc.node(compact_parent).map(Node::kind),
+        Some(NodeKind::SequenceEntry)
+    );
+
+    let flow = doc
+        .get_path(&["flow"])
+        .expect("path lookup succeeds")
+        .expect("flow sequence exists");
+    for item in doc.sequence_items(flow) {
+        let parent = doc.node(item).and_then(Node::parent).expect("flow parent");
+        assert_eq!(
+            doc.node(parent).map(Node::kind),
+            Some(NodeKind::SequenceEntry)
+        );
+    }
+}
+
+#[test]
 fn semantic_values_build_literal_and_folded_scalars() {
     let doc = YamlDoc::parse("literal: |\n  one\nfolded: >\n  one\n  two\n")
         .expect("valid block scalars");
@@ -2128,7 +2183,6 @@ fn yaml_value_reads_flow_sequence_values() {
         .get_path(&["items"])
         .expect("lookup succeeds")
         .expect("items exists");
-
     assert_eq!(
         Vec::<String>::read_yaml(&doc, items).expect("flow sequence reads"),
         ["one".to_owned(), "two".to_owned()]
@@ -3708,10 +3762,10 @@ fn folded_scalar(doc: &YamlDoc) -> Option<NodeId> {
 }
 
 fn flow_sequence_scalar_texts(doc: &YamlDoc, sequence: NodeId) -> Vec<&str> {
-    doc.children(sequence)
-        .filter_map(|child| {
-            let child = doc.node(child)?;
-            (child.kind == NodeKind::Scalar).then(|| doc.source.slice(child.span))
+    doc.sequence_items(sequence)
+        .filter_map(|item| {
+            let item = doc.node(item)?;
+            (item.kind == NodeKind::Scalar).then(|| doc.source.slice(item.span))
         })
         .collect()
 }

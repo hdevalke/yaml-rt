@@ -651,7 +651,7 @@ where
                 }
             }
             NodeKind::FlowSequence => {
-                for value_node in doc.children(node) {
+                for value_node in doc.sequence_items(node) {
                     values.push(T::read_yaml(doc, value_node)?);
                 }
             }

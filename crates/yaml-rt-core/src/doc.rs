@@ -220,7 +220,7 @@ impl YamlDoc {
                 cst: Some(*document),
                 content_indent: None,
             });
-            for child in self.semantics.children(*document) {
+            for child in self.semantic_children(*document) {
                 self.collect_node_events(child, &mut events);
             }
             events.push(YamlEvent {
@@ -469,6 +469,11 @@ impl YamlDoc {
         Children::new(&self.nodes, node)
     }
 
+    fn semantic_children(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        self.children(node)
+            .filter(|child| self.semantics.get(*child).is_some())
+    }
+
     /// Returns a node's semantic interpretation.
     #[must_use]
     pub fn semantic_kind(&self, node: NodeId) -> Option<&SemanticKind> {
@@ -486,11 +491,11 @@ impl YamlDoc {
             self.semantic_kind(mapping),
             Some(SemanticKind::Mapping { .. })
         );
-        let mut children = self.semantics.children(mapping);
-        std::iter::from_fn(move || {
-            if !is_mapping {
+        self.children(mapping).filter_map(move |entry| {
+            if !is_mapping || self.node(entry)?.kind != NodeKind::MappingEntry {
                 return None;
             }
+            let mut children = self.semantic_children(entry);
             Some((children.next()?, children.next()?))
         })
     }
@@ -501,9 +506,12 @@ impl YamlDoc {
             self.semantic_kind(sequence),
             Some(SemanticKind::Sequence { .. })
         );
-        self.semantics
-            .children(sequence)
-            .filter(move |_| is_sequence)
+        self.children(sequence).filter_map(move |entry| {
+            if !is_sequence || self.node(entry)?.kind != NodeKind::SequenceEntry {
+                return None;
+            }
+            self.semantic_children(entry).next()
+        })
     }
 
     /// Returns the first root-level block mapping in the document.
@@ -534,8 +542,7 @@ impl YamlDoc {
             .get(index)
             .copied()
             .ok_or_else(|| self.document_index_error(index))?;
-        self.semantics
-            .children(document)
+        self.semantic_children(document)
             .find(|child| {
                 self.node(*child)
                     .is_some_and(|node| node.kind == NodeKind::BlockMapping)
@@ -670,7 +677,7 @@ impl YamlDoc {
             .get(index)
             .copied()
             .ok_or_else(|| self.document_index_error(index))?;
-        let Some(child) = self.semantics.children(document).next() else {
+        let Some(child) = self.semantic_children(document).next() else {
             return Ok(None);
         };
         let Some(SemanticKind::Mapping { style, .. }) = self.semantic_kind(child) else {

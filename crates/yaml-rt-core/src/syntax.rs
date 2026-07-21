@@ -87,7 +87,7 @@ pub enum NodeKind {
     MappingEntry,
     /// Block sequence collection.
     BlockSequence,
-    /// One sequence entry line.
+    /// One block or flow sequence item wrapper.
     SequenceEntry,
     /// Single-line flow sequence collection.
     FlowSequence,

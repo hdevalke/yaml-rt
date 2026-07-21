@@ -52,9 +52,6 @@ pub(crate) struct SemanticNode {
     pub(crate) explicit_start: bool,
     pub(crate) explicit_end: bool,
     pub(crate) content_indent: Option<u32>,
-    first_child: u32,
-    last_child: u32,
-    next_sibling: u32,
 }
 
 /// Compact semantic side arena indexed through CST `NodeId`s.
@@ -84,30 +81,9 @@ impl SemanticStore {
         }
     }
 
-    fn attach(&mut self, parent: NodeId, child: NodeId) {
-        let parent_index = self.slots[parent.as_usize()] as usize;
-        let child_index = self.slots[child.as_usize()] as usize;
-        let previous = self.nodes[parent_index].last_child;
-        if previous == NO_SEMANTIC_NODE {
-            self.nodes[parent_index].first_child = child.0;
-        } else {
-            let previous_index = self.slots[previous as usize] as usize;
-            self.nodes[previous_index].next_sibling = child.0;
-        }
-        self.nodes[parent_index].last_child = child.0;
-        debug_assert_eq!(self.nodes[child_index].next_sibling, NO_SEMANTIC_NODE);
-    }
-
     pub(crate) fn get(&self, cst: NodeId) -> Option<&SemanticNode> {
         let index = *self.slots.get(cst.as_usize())?;
         (index != NO_SEMANTIC_NODE).then(|| &self.nodes[index as usize])
-    }
-
-    pub(crate) fn children(&self, parent: NodeId) -> SemanticChildren<'_> {
-        let next = self
-            .get(parent)
-            .map_or(NO_SEMANTIC_NODE, |node| node.first_child);
-        SemanticChildren { store: self, next }
     }
 }
 
@@ -255,12 +231,12 @@ impl SemanticBuilder {
         }
     }
 
-    fn attach_child(&mut self, child: NodeId, span: Span) -> Result<(), YamlError> {
+    fn attach_child(&mut self, _child: NodeId, span: Span) -> Result<(), YamlError> {
         let Some(parent) = self.open.last_mut() else {
             return Ok(());
         };
-        let parent_cst = match parent {
-            OpenNode::Document { cst, children } => {
+        match parent {
+            OpenNode::Document { children, .. } => {
                 *children += 1;
                 if *children > 1 {
                     return Err(structure_error(
@@ -268,18 +244,14 @@ impl SemanticBuilder {
                         span,
                     ));
                 }
-                *cst
             }
             OpenNode::Mapping {
-                cst,
-                waiting_for_value,
+                waiting_for_value, ..
             } => {
                 *waiting_for_value = !*waiting_for_value;
-                *cst
             }
-            OpenNode::Sequence { cst } => *cst,
-        };
-        self.store.attach(parent_cst, child);
+            OpenNode::Sequence { .. } => {}
+        }
         Ok(())
     }
 
@@ -309,33 +281,12 @@ impl SemanticNode {
             explicit_start,
             explicit_end: false,
             content_indent,
-            first_child: NO_SEMANTIC_NODE,
-            last_child: NO_SEMANTIC_NODE,
-            next_sibling: NO_SEMANTIC_NODE,
         }
     }
 }
 
 fn required_cst(cst: Option<NodeId>, span: Span) -> Result<NodeId, YamlError> {
     cst.ok_or_else(|| structure_error("semantic node is missing its CST origin", span))
-}
-
-pub(crate) struct SemanticChildren<'a> {
-    store: &'a SemanticStore,
-    next: u32,
-}
-
-impl Iterator for SemanticChildren<'_> {
-    type Item = NodeId;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next == NO_SEMANTIC_NODE {
-            return None;
-        }
-        let node = NodeId(self.next);
-        self.next = self.store.get(node)?.next_sibling;
-        Some(node)
-    }
 }
 
 #[derive(Clone, Copy)]

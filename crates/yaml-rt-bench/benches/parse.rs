@@ -1,7 +1,9 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+#[cfg(feature = "fyaml-baseline")]
 use fyaml::Document;
+#[cfg(feature = "saphyr-baseline")]
 use saphyr::{LoadableYamlNode, Yaml};
 use yaml_rt_core::YamlDoc;
 
@@ -74,43 +76,63 @@ fn bench_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse");
 
     for fixture in FIXTURES {
-        group.bench_with_input(
-            BenchmarkId::new("rty", fixture.name),
-            fixture.input,
-            |bencher, input| {
-                bencher.iter(|| {
-                    let doc = YamlDoc::parse(black_box(input)).expect("RTY fixture should parse");
-                    black_box(doc);
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("fyaml", fixture.name),
-            fixture.input,
-            |bencher, input| {
-                bencher.iter(|| {
-                    let doc =
-                        Document::parse_str(black_box(input)).expect("fyaml fixture should parse");
-                    black_box(doc);
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("saphyr", fixture.name),
-            fixture.input,
-            |bencher, input| {
-                bencher.iter(|| {
-                    let docs =
-                        Yaml::load_from_str(black_box(input)).expect("saphyr fixture should parse");
-                    black_box(docs);
-                });
-            },
-        );
+        bench_input(&mut group, fixture.name, fixture.input);
     }
 
     group.finish();
+
+    let generated = [100, 1_000, 5_000].map(|entries| (entries, flat_mapping(entries)));
+    let mut scaling = c.benchmark_group("parse_scaling");
+    for (entries, input) in &generated {
+        bench_input(&mut scaling, entries, input);
+    }
+    scaling.finish();
+}
+
+fn bench_input(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    name: impl std::fmt::Display,
+    input: &str,
+) {
+    group.bench_with_input(BenchmarkId::new("rty", &name), input, |bencher, input| {
+        bencher.iter(|| {
+            let doc = YamlDoc::parse(black_box(input)).expect("RTY fixture should parse");
+            black_box(doc);
+        });
+    });
+
+    #[cfg(feature = "fyaml-baseline")]
+    group.bench_with_input(BenchmarkId::new("fyaml", &name), input, |bencher, input| {
+        bencher.iter(|| {
+            let doc = Document::parse_str(black_box(input)).expect("fyaml fixture should parse");
+            black_box(doc);
+        });
+    });
+
+    #[cfg(feature = "saphyr-baseline")]
+    group.bench_with_input(
+        BenchmarkId::new("saphyr", &name),
+        input,
+        |bencher, input| {
+            bencher.iter(|| {
+                let docs =
+                    Yaml::load_from_str(black_box(input)).expect("saphyr fixture should parse");
+                black_box(docs);
+            });
+        },
+    );
+}
+
+fn flat_mapping(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(24));
+    for index in 0..entries {
+        input.push_str("key_");
+        input.push_str(&index.to_string());
+        input.push_str(": value_");
+        input.push_str(&index.to_string());
+        input.push('\n');
+    }
+    input
 }
 
 criterion_group!(benches, bench_parse);

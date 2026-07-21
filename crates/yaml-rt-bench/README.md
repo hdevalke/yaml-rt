@@ -8,11 +8,47 @@ useful parser baselines, but they are not feature-equivalent to RTY's
 round-trip model. Treat benchmark results as contextual parse-throughput data,
 not as a complete product comparison.
 
-Run with:
+Run RTY against Saphyr without requiring the native fyaml build:
+
+```sh
+cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
+```
+
+Run every available baseline with:
 
 ```sh
 cargo bench -p yaml-rt-bench --features baselines --bench parse
 ```
+
+The `parse_scaling` group generates flat mappings containing 100, 1,000, and
+5,000 entries. Use the standalone allocation profiler to measure allocation
+count, total allocated bytes, and peak live bytes for the same shape:
+
+```sh
+cargo bench -p yaml-rt-bench --bench profile_alloc -- 1000 100
+```
+
+The two positional arguments are mapping entries and parse iterations.
+
+## Reference baseline
+
+The compact-arena refactor started from this machine-local reference on
+2026-07-21. Criterion was run with `--quick`, so these numbers are orientation
+data rather than a portable performance guarantee.
+
+| fixture | RTY median | Saphyr median | RTY / Saphyr |
+| --- | ---: | ---: | ---: |
+| small config | 7.56 us | 3.86 us | 1.96x |
+| medium nested | 37.87 us | 18.26 us | 2.07x |
+| block scalars | 5.91 us | 3.33 us | 1.78x |
+| multi-document | 14.52 us | 7.11 us | 2.04x |
+| 100 mapping entries | 184.76 us | 95.91 us | 1.93x |
+| 1,000 mapping entries | 2.05 ms | 1.10 ms | 1.85x |
+| 5,000 mapping entries | 12.73 ms | 5.72 ms | 2.23x |
+
+The counting allocator reported 7,061 allocations, 1,467,792 allocated bytes,
+and 1,126,672 peak live bytes per 1,000-entry RTY parse. Atomic counter updates
+make its timing unsuitable for throughput comparison; use Criterion for time.
 
 ## RTY-only perf profiling
 

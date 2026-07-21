@@ -2593,20 +2593,6 @@ impl<'source> Parser<'source> {
             node_span
         };
         let value_text = &text[properties.value_start..];
-        let trimmed = strip_inline_comment(value_text).trim();
-        if let Some(alias) = trimmed.strip_prefix('*')
-            && !alias.is_empty()
-            && !alias.chars().any(char::is_whitespace)
-        {
-            self.push_event(
-                YamlEventKind::Alias {
-                    name: alias.to_owned(),
-                },
-                span,
-            );
-            return Ok(());
-        }
-
         let style = match node_kind {
             NodeKind::LiteralScalar => YamlScalarStyle::Literal,
             NodeKind::FoldedScalar => YamlScalarStyle::Folded,
@@ -2615,6 +2601,21 @@ impl<'source> Parser<'source> {
             NodeKind::Scalar => YamlScalarStyle::Plain,
             _ => unreachable!("emit_scalar_event only receives scalar nodes"),
         };
+        if style == YamlScalarStyle::Plain {
+            let trimmed = strip_inline_comment(value_text).trim();
+            if let Some(alias) = trimmed.strip_prefix('*')
+                && !alias.is_empty()
+                && !alias.chars().any(char::is_whitespace)
+            {
+                self.push_event(
+                    YamlEventKind::Alias {
+                        name: alias.to_owned(),
+                    },
+                    span,
+                );
+                return Ok(());
+            }
+        }
         let value = if matches!(node_kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
             decode_scalar_value_with_content_indent(
                 value_text,

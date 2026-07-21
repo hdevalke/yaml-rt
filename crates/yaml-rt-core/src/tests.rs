@@ -475,6 +475,29 @@ fn events_render_plain_alias_before_inline_comment() {
 }
 
 #[test]
+fn events_only_classify_plain_scalars_as_aliases() {
+    let input = "plain: *alias\nsingle: '*alias'\ndouble: \"*alias\"\nliteral: |\n  *alias\nfolded: >\n  *alias\n";
+    let doc = YamlDoc::parse(input).expect("valid scalar styles beginning with an asterisk");
+
+    let aliases = doc
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind, YamlEventKind::Alias { .. }))
+        .count();
+    let scalar_values: Vec<_> = doc
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            YamlEventKind::Scalar { value, .. } if value.starts_with('*') => Some(value.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(aliases, 1);
+    assert_eq!(scalar_values, ["*alias", "*alias", "*alias\n", "*alias\n"]);
+}
+
+#[test]
 fn graph_preserves_scalar_anchors_and_tags() {
     let doc =
         YamlDoc::parse("plain: &anchor !local value\n").expect("valid scalar node properties");

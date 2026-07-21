@@ -68,7 +68,7 @@ impl<'source> Parser<'source> {
             Span::from_usize(0, self.source.len()),
         );
 
-        let lines = SourceLines::new(self.source).collect::<Result<Vec<_>, _>>()?;
+        let lines = LineTable::new(self.source);
         let mut index = 0;
         while index < lines.len() {
             index += self.parse_line(&lines, index)?;
@@ -100,8 +100,8 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn parse_line(&mut self, lines: &[SourceLine<'_>], index: usize) -> Result<usize, YamlError> {
-        let line = lines[index];
+    fn parse_line(&mut self, lines: &LineTable<'_>, index: usize) -> Result<usize, YamlError> {
+        let line = lines.line(index);
         let content = line.content_without_break;
         let trimmed = content.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -211,7 +211,7 @@ impl<'source> Parser<'source> {
     fn parse_content_body(
         &mut self,
         document: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -302,7 +302,7 @@ impl<'source> Parser<'source> {
 
     fn parse_quoted_scalar_lines(
         &mut self,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         absolute_start: usize,
         quote: char,
@@ -330,10 +330,10 @@ impl<'source> Parser<'source> {
         })?;
         let absolute_end = absolute_start + end;
         let mut consumed = 1;
-        for line in &lines[index + 1..] {
+        for line in lines.iter_from(index + 1) {
             if line.content_start < absolute_end {
                 if quote == '"' {
-                    validate_double_quoted_continuation_line(line)?;
+                    validate_double_quoted_continuation_line(&line)?;
                 }
                 consumed += 1;
             } else {
@@ -352,7 +352,7 @@ impl<'source> Parser<'source> {
 
     fn flow_collection_text<'lines>(
         &self,
-        lines: &'lines [SourceLine<'_>],
+        lines: &'lines LineTable<'_>,
         index: usize,
         absolute_start: usize,
     ) -> Result<(&'source str, usize), YamlError> {
@@ -362,19 +362,21 @@ impl<'source> Parser<'source> {
             .chars()
             .find(|character| !character.is_whitespace())
             == Some('[')
-            && absolute_start > lines[index].content_start + self.source_indent_at(absolute_start);
+            && absolute_start
+                > lines.line(index).content_start + self.source_indent_at(absolute_start);
         let absolute_end = absolute_start + end;
         let mut consumed = 1;
-        let mut validation_end = lines[index].content_end;
+        let mut validation_end = lines.line(index).content_end;
         let flow_indent = self.source_indent_at(absolute_start);
-        let marker_prefix = &lines[index].content_without_break
-            [..absolute_start.saturating_sub(lines[index].content_start)];
+        let current_line = lines.line(index);
+        let marker_prefix = &current_line.content_without_break
+            [..absolute_start.saturating_sub(current_line.content_start)];
         let allow_tab_continuation = marker_prefix.as_bytes().contains(&b'\t');
-        for line in &lines[index + 1..] {
+        for line in lines.iter_from(index + 1) {
             if line.content_start < absolute_end {
                 if validate_sequence_indent {
                     reject_invalid_flow_continuation_indent(
-                        line,
+                        &line,
                         flow_indent,
                         allow_tab_continuation,
                     )?;
@@ -392,7 +394,7 @@ impl<'source> Parser<'source> {
 
     fn flow_value_text<'lines>(
         &self,
-        lines: &'lines [SourceLine<'_>],
+        lines: &'lines LineTable<'_>,
         index: usize,
         value_start: usize,
         value_text: &str,
@@ -415,14 +417,14 @@ impl<'source> Parser<'source> {
     fn parse_mapping_entry(
         &mut self,
         document: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
         colon_byte: usize,
         absolute_start: usize,
     ) -> Result<usize, YamlError> {
-        let line = lines[index];
+        let line = lines.line(index);
         let mapping = self.ensure_mapping(
             document,
             indent,
@@ -515,7 +517,7 @@ impl<'source> Parser<'source> {
                 self.push_pending_node_properties(value_trimmed, value_start, next_indent)?;
                 let consumed =
                     self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-                let end = lines[index + consumed - 1].content_end;
+                let end = lines.line(index + consumed - 1).content_end;
                 self.extend_node_span(entry, end);
                 self.extend_node_span(mapping, end);
                 return Ok(consumed);
@@ -541,7 +543,7 @@ impl<'source> Parser<'source> {
             next_indent == indent && is_sequence_entry(next_body)
         }) {
             let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-            let end = lines[index + consumed - 1].content_end;
+            let end = lines.line(index + consumed - 1).content_end;
             self.extend_node_span(entry, end);
             self.extend_node_span(mapping, end);
             return Ok(consumed);
@@ -555,7 +557,7 @@ impl<'source> Parser<'source> {
         }
         if next_significant_indent.is_some_and(|next| next > indent) {
             let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-            let end = lines[index + consumed - 1].content_end;
+            let end = lines.line(index + consumed - 1).content_end;
             self.extend_node_span(entry, end);
             self.extend_node_span(mapping, end);
             return Ok(consumed);
@@ -567,12 +569,12 @@ impl<'source> Parser<'source> {
     fn parse_explicit_mapping_entry(
         &mut self,
         document: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
     ) -> Result<usize, YamlError> {
-        let line = lines[index];
+        let line = lines.line(index);
         let mapping = self.ensure_mapping(
             document,
             indent,
@@ -636,7 +638,7 @@ impl<'source> Parser<'source> {
         self.close_collections_deeper_than(indent);
         let value_consumed =
             self.parse_explicit_mapping_value(entry, lines, value_index, indent, value_body)?;
-        let end = lines[value_index + value_consumed - 1].content_end;
+        let end = lines.line(value_index + value_consumed - 1).content_end;
         self.extend_node_span(entry, end);
         self.extend_node_span(mapping, end);
         Ok(value_index - index + value_consumed)
@@ -645,7 +647,7 @@ impl<'source> Parser<'source> {
     fn parse_following_explicit_key_block(
         &mut self,
         entry: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
@@ -653,7 +655,7 @@ impl<'source> Parser<'source> {
         let mut nested_index = index + 1;
 
         while nested_index < lines.len() {
-            let line = lines[nested_index];
+            let line = lines.line(nested_index);
             let trimmed = line.content_without_break.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 consumed += 1;
@@ -690,7 +692,7 @@ impl<'source> Parser<'source> {
     fn parse_explicit_mapping_key_node(
         &mut self,
         entry: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         parent_indent: usize,
         key_text: &str,
@@ -703,12 +705,12 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if is_sequence_entry(key_text) {
-            let key_indent = key_start - lines[index].content_start;
+            let key_indent = key_start - lines.line(index).content_start;
             let mut consumed =
                 self.parse_sequence_entry(entry, lines, index, key_indent, key_text)?;
             let mut nested_index = index + consumed;
             while nested_index < lines.len() {
-                let line = lines[nested_index];
+                let line = lines.line(nested_index);
                 let trimmed = line.content_without_break.trim();
                 if trimmed.is_empty() || trimmed.starts_with('#') {
                     consumed += 1;
@@ -757,12 +759,12 @@ impl<'source> Parser<'source> {
     fn parse_explicit_mapping_value(
         &mut self,
         entry: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
     ) -> Result<usize, YamlError> {
-        let line = lines[index];
+        let line = lines.line(index);
         let raw_value = &body[1..];
         reject_invalid_indicator_tab(body, line.content_start + indent)?;
         let raw_value_trimmed = raw_value.trim_start();
@@ -864,7 +866,7 @@ impl<'source> Parser<'source> {
     fn parse_following_explicit_value_block(
         &mut self,
         entry: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
@@ -872,7 +874,7 @@ impl<'source> Parser<'source> {
         let mut nested_index = index + 1;
 
         while nested_index < lines.len() {
-            let line = lines[nested_index];
+            let line = lines.line(nested_index);
             let trimmed = line.content_without_break.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 consumed += 1;
@@ -910,13 +912,13 @@ impl<'source> Parser<'source> {
     fn parse_nested_mapping_entry_value(
         &mut self,
         entry: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
         let mut nested_index = index + 1;
         while nested_index < lines.len() {
-            let line = lines[nested_index];
+            let line = lines.line(nested_index);
             let trimmed = line.content_without_break.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 nested_index += 1;
@@ -1150,12 +1152,12 @@ impl<'source> Parser<'source> {
     fn parse_sequence_entry(
         &mut self,
         document: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
     ) -> Result<usize, YamlError> {
-        let line = lines[index];
+        let line = lines.line(index);
         let sequence = self.ensure_sequence(
             document,
             indent,
@@ -1177,7 +1179,7 @@ impl<'source> Parser<'source> {
             if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
                 let consumed =
                     self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
-                let end = lines[index + consumed - 1].content_end;
+                let end = lines.line(index + consumed - 1).content_end;
                 self.extend_node_span(entry, end);
                 self.extend_node_span(sequence, end);
                 return Ok(consumed);
@@ -1226,7 +1228,7 @@ impl<'source> Parser<'source> {
                 self.push_pending_node_properties(value, value_start, next_indent)?;
                 let consumed =
                     self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
-                let end = lines[index + consumed - 1].content_end;
+                let end = lines.line(index + consumed - 1).content_end;
                 self.extend_node_span(entry, end);
                 self.extend_node_span(sequence, end);
                 return Ok(consumed);
@@ -1430,7 +1432,7 @@ impl<'source> Parser<'source> {
     fn parse_nested_sequence_entry_value(
         &mut self,
         entry: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
@@ -1440,7 +1442,7 @@ impl<'source> Parser<'source> {
     fn parse_nested_block_value(
         &mut self,
         parent: NodeId,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         parent_indent: usize,
         allow_same_indent_sequence: bool,
@@ -1449,7 +1451,7 @@ impl<'source> Parser<'source> {
         let mut nested_index = index + 1;
 
         while nested_index < lines.len() {
-            let line = lines[nested_index];
+            let line = lines.line(nested_index);
             let trimmed = line.content_without_break.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 consumed += 1;
@@ -1483,7 +1485,10 @@ impl<'source> Parser<'source> {
                     )?
                 && (header_body.starts_with('|') || header_body.starts_with('>'))
             {
-                for property_line in &lines[nested_index..header_index] {
+                for property_line in lines
+                    .iter_from(nested_index)
+                    .take(header_index - nested_index)
+                {
                     let property_trimmed = property_line.content_without_break.trim();
                     if property_trimmed.is_empty() || property_trimmed.starts_with('#') {
                         continue;
@@ -1496,7 +1501,7 @@ impl<'source> Parser<'source> {
                         header_indent,
                     )?;
                 }
-                let header_start = lines[header_index].content_start + header_indent;
+                let header_start = lines.line(header_index).content_start + header_indent;
                 let (node, scalar_consumed) = self.parse_block_scalar(
                     lines,
                     header_index,
@@ -1541,26 +1546,27 @@ impl<'source> Parser<'source> {
 
     fn parse_block_plain_scalar(
         &mut self,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         parent_indent: usize,
         value_start: usize,
         allow_same_indent_continuation: bool,
     ) -> Result<(NodeId, usize), YamlError> {
         let mut consumed = 1;
-        let mut end = lines[index].content_end;
+        let initial_line = lines.line(index);
+        let mut end = initial_line.content_end;
         let mut pending_blank_lines = 0usize;
         let mut scalar_has_inline_comment = plain_scalar_line_has_inline_comment(
-            &self.source.as_str()[value_start..lines[index].content_end],
+            &self.source.as_str()[value_start..initial_line.content_end],
         );
         let initial_properties = parse_node_properties(
-            &self.source.as_str()[value_start..lines[index].content_end],
-            Span::from_usize(value_start, lines[index].content_end),
+            &self.source.as_str()[value_start..initial_line.content_end],
+            Span::from_usize(value_start, initial_line.content_end),
         )?;
         let scalar_has_node_properties =
             initial_properties.anchor.is_some() || initial_properties.tag.is_some();
 
-        for line in &lines[index + 1..] {
+        for line in lines.iter_from(index + 1) {
             let trimmed = line.content_without_break.trim();
             if trimmed == "---" || trimmed == "..." {
                 break;
@@ -1579,9 +1585,9 @@ impl<'source> Parser<'source> {
                 break;
             }
             if scalar_has_node_properties && trimmed.starts_with('%') {
-                return Err(directive_after_document_content(*line).with_position_from(self.source));
+                return Err(directive_after_document_content(line).with_position_from(self.source));
             }
-            if self.source.as_str()[value_start..lines[index].content_end].starts_with('"')
+            if self.source.as_str()[value_start..initial_line.content_end].starts_with('"')
                 && line.content_without_break.starts_with('\t')
             {
                 return Err(tab_indentation_error(line.content_start));
@@ -1648,7 +1654,7 @@ impl<'source> Parser<'source> {
 
     fn parse_block_scalar(
         &mut self,
-        lines: &[SourceLine<'_>],
+        lines: &LineTable<'_>,
         index: usize,
         header_start: usize,
         parent_indent: usize,
@@ -1660,15 +1666,16 @@ impl<'source> Parser<'source> {
         let mut content_indent = header
             .indent
             .map_or(usize::MAX, |indent| parent_indent + indent);
-        let mut end = lines[index].line_end;
+        let initial_line = lines.line(index);
+        let mut end = initial_line.line_end;
         let inline_header =
-            header_start > lines[index].content_start + parent_indent && !allow_same_indent_content;
+            header_start > initial_line.content_start + parent_indent && !allow_same_indent_content;
         let mut pending_blank_lines = 0usize;
         let mut pending_blank_end = end;
         let mut pending_blank_indent = None::<usize>;
         let mut reached_end = true;
 
-        for line in &lines[index + 1..] {
+        for line in lines.iter_from(index + 1) {
             let trimmed = line.content_without_break.trim();
             if trimmed == "---" || trimmed == "..." {
                 reached_end = false;
@@ -2917,7 +2924,7 @@ fn block_scalar_after_node_properties(
 
 fn property_only_block_collection_indent(
     body: &str,
-    lines: &[SourceLine<'_>],
+    lines: &LineTable<'_>,
     index: usize,
     absolute_start: usize,
 ) -> Result<Option<usize>, YamlError> {
@@ -2940,7 +2947,7 @@ fn property_only_block_collection_indent(
 
 fn property_only_mapping_value_collection_indent(
     body: &str,
-    lines: &[SourceLine<'_>],
+    lines: &LineTable<'_>,
     index: usize,
     absolute_start: usize,
     parent_indent: usize,
@@ -2968,7 +2975,7 @@ fn property_only_mapping_value_collection_indent(
 
 fn reject_invalid_anchor_only_nested_property_mapping(
     body: &str,
-    lines: &[SourceLine<'_>],
+    lines: &LineTable<'_>,
     index: usize,
     absolute_start: usize,
 ) -> Result<(), YamlError> {
@@ -3010,22 +3017,22 @@ fn reject_invalid_anchor_only_nested_property_mapping(
     Ok(())
 }
 
-fn first_non_property_node_after<'line>(
-    lines: &'line [SourceLine<'_>],
+fn first_non_property_node_after<'source>(
+    lines: &LineTable<'source>,
     index: usize,
     absolute_start: usize,
-) -> Result<Option<(usize, &'line str)>, YamlError> {
+) -> Result<Option<(usize, &'source str)>, YamlError> {
     Ok(
         first_non_property_node_after_with_index(lines, index, absolute_start)?
             .map(|(_, indent, body)| (indent, body)),
     )
 }
 
-fn first_non_property_node_after_with_index<'line>(
-    lines: &'line [SourceLine<'_>],
+fn first_non_property_node_after_with_index<'source>(
+    lines: &LineTable<'source>,
     index: usize,
     absolute_start: usize,
-) -> Result<Option<(usize, usize, &'line str)>, YamlError> {
+) -> Result<Option<(usize, usize, &'source str)>, YamlError> {
     let mut scan_index = index;
     while let Some((next_index, indent, nested_body)) =
         next_significant_body_with_index(lines, scan_index)
@@ -3048,7 +3055,7 @@ fn first_non_property_node_after_with_index<'line>(
 
 fn property_only_node_indent(
     body: &str,
-    lines: &[SourceLine<'_>],
+    lines: &LineTable<'_>,
     index: usize,
     absolute_start: usize,
 ) -> Result<Option<usize>, YamlError> {
@@ -3067,11 +3074,12 @@ fn property_only_node_indent(
     Ok(first_non_property_node_after(lines, index, absolute_start)?.map(|(indent, _)| indent))
 }
 
-fn next_significant_body_with_index<'line>(
-    lines: &'line [SourceLine<'_>],
+fn next_significant_body_with_index<'source>(
+    lines: &LineTable<'source>,
     current_index: usize,
-) -> Option<(usize, usize, &'line str)> {
-    for (index, line) in lines.iter().enumerate().skip(current_index + 1) {
+) -> Option<(usize, usize, &'source str)> {
+    for (relative_index, line) in lines.iter_from(current_index + 1).enumerate() {
+        let index = current_index + 1 + relative_index;
         let trimmed = line.content_without_break.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -3489,36 +3497,30 @@ struct SourceLine<'source> {
     content_without_break: &'source str,
 }
 
-struct SourceLines<'source> {
+#[derive(Clone, Copy)]
+struct LineTable<'source> {
     source: &'source Source,
-    index: usize,
 }
 
-impl<'source> SourceLines<'source> {
+impl<'source> LineTable<'source> {
     pub(crate) fn new(source: &'source Source) -> Self {
-        Self { source, index: 0 }
+        Self { source }
     }
-}
 
-impl<'source> Iterator for SourceLines<'source> {
-    type Item = Result<SourceLine<'source>, YamlError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    fn len(self) -> usize {
         let starts = self.source.line_starts();
-        if self.index >= starts.len() {
-            return None;
-        }
+        starts.len()
+            - usize::from(starts.last().copied() == Some(Span::usize_to_u32(self.source.len())))
+    }
 
-        let start = starts[self.index] as usize;
+    fn line(self, index: usize) -> SourceLine<'source> {
+        assert!(index < self.len(), "line index must be in bounds");
+        let starts = self.source.line_starts();
+        let start = starts[index] as usize;
         let next_start = starts
-            .get(self.index + 1)
+            .get(index + 1)
             .map(|start| *start as usize)
             .unwrap_or(self.source.len());
-        self.index += 1;
-
-        if start == self.source.len() && start == next_start {
-            return None;
-        }
 
         let mut content_end = next_start;
         let text = self.source.as_str();
@@ -3531,35 +3533,24 @@ impl<'source> Iterator for SourceLines<'source> {
             content_end -= 1;
         }
 
-        Some(
-            self.source
-                .try_slice(Span::from_usize(start, content_end))
-                .map(|content_without_break| SourceLine {
-                    content_start: start,
-                    content_end,
-                    line_end: next_start,
-                    content_without_break,
-                }),
-        )
+        SourceLine {
+            content_start: start,
+            content_end,
+            line_end: next_start,
+            content_without_break: self.source.slice(Span::from_usize(start, content_end)),
+        }
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let starts = self.source.line_starts();
-        let mut remaining = starts.len().saturating_sub(self.index);
-        if starts.last().copied() == Some(Span::usize_to_u32(self.source.len())) {
-            remaining = remaining.saturating_sub(1);
-        }
-        (remaining, Some(remaining))
+    fn iter_from(self, start: usize) -> impl Iterator<Item = SourceLine<'source>> {
+        (start..self.len()).map(move |index| self.line(index))
     }
 }
 
-impl std::iter::ExactSizeIterator for SourceLines<'_> {}
-
 fn next_significant_indent(
-    lines: &[SourceLine<'_>],
+    lines: &LineTable<'_>,
     current_index: usize,
 ) -> Result<Option<usize>, YamlError> {
-    for line in &lines[current_index + 1..] {
+    for line in lines.iter_from(current_index + 1) {
         let trimmed = line.content_without_break.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;

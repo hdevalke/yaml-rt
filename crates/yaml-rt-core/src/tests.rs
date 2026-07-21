@@ -3068,6 +3068,19 @@ fn parser_handles_utf8_in_offset_sensitive_positions_without_panicking() {
 }
 
 #[test]
+fn parser_indexes_unicode_lines_by_byte_offset() {
+    let input = "clé: un\r\n次:\n  - 値\n";
+    let doc = YamlDoc::parse(input).expect("Unicode keys and mixed line endings parse");
+    let first = doc.get_path(&["clé"]).unwrap().unwrap();
+    let sequence = doc.get_path(&["次"]).unwrap().unwrap();
+    let item = doc.sequence_items(sequence).next().expect("sequence item");
+
+    assert_eq!(doc.scalar_text(first).unwrap(), "un");
+    assert_eq!(doc.scalar_text(item).unwrap(), "値");
+    assert_eq!(doc.to_string(), input);
+}
+
+#[test]
 fn parser_rejects_malformed_compact_utf8_document_content_without_panicking() {
     for input in ["--- ߅foo:", "--- \"߅\":", "!%sҦ"] {
         let error = YamlDoc::parse(input)

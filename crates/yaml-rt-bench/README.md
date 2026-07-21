@@ -3,7 +3,7 @@
 Parse-only benchmarks for RTY against ordinary YAML loader baselines.
 
 RTY preserves lossless round-trip state such as source spans, comments, trivia,
-events, CST nodes, and semantic graph links. `fyaml` and `saphyr` are included as
+CST nodes, and semantic metadata. Tokens and events are lazy. `fyaml` and Saphyr are included as
 useful parser baselines, but they are not feature-equivalent to RTY's
 round-trip model. Treat benchmark results as contextual parse-throughput data,
 not as a complete product comparison.
@@ -21,7 +21,8 @@ cargo bench -p yaml-rt-bench --features baselines --bench parse
 ```
 
 The `parse_scaling` group generates flat mappings containing 100, 1,000, and
-5,000 entries. Use the standalone allocation profiler to measure allocation
+5,000 entries with fixed-width keys and values so bytes per entry stay constant.
+Use the standalone allocation profiler to measure allocation
 count, total allocated bytes, and peak live bytes for the same shape:
 
 ```sh
@@ -49,6 +50,25 @@ data rather than a portable performance guarantee.
 The counting allocator reported 7,061 allocations, 1,467,792 allocated bytes,
 and 1,126,672 peak live bytes per 1,000-entry RTY parse. Atomic counter updates
 make its timing unsuitable for throughput comparison; use Criterion for time.
+
+## Compact-arena result
+
+Final machine-local `--quick` measurements on 2026-07-21:
+
+| fixture | RTY median | Saphyr median | RTY / Saphyr |
+| --- | ---: | ---: | ---: |
+| small config | 5.02 us | 4.41 us | 1.14x |
+| medium nested | 21.26 us | 19.19 us | 1.11x |
+| block scalars | 4.17 us | 3.94 us | 1.06x |
+| multi-document | 7.21 us | 7.55 us | 0.96x |
+| 100 mapping entries | 91.16 us | 99.92 us | 0.91x |
+| 1,000 mapping entries | 0.990 ms | 1.029 ms | 0.96x |
+| 5,000 mapping entries | 5.598 ms | 5.080 ms | 1.10x |
+
+The geometric mean over the four source fixtures is 1.06x Saphyr. The
+5,000/1,000-entry RTY ratio is 5.66x. At 1,000 fixed-width entries, the counting
+allocator reports 23 allocations, 611,868 allocated bytes, and 526,432 peak
+live bytes: reductions of 99.7%, 58.3%, and 53.3% from the reference baseline.
 
 ## RTY-only perf profiling
 

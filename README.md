@@ -15,7 +15,7 @@ loaders discard.
 The workspace is organized around three crates:
 
 ```text
-yaml-rt-core      # no dependencies: parser, CST, semantic graph, editor
+yaml-rt-core      # no dependencies: parser, lossless CST arena, editor
 yaml-rt-derive    # derive macros using syn, quote, and proc-macro2
 yaml-rt           # public facade crate
 ```
@@ -83,8 +83,8 @@ Required guarantees:
 - The CST is the source of truth. The typed struct is only an overlay that reads
   from and writes patches back to the document.
 - Duplicate mapping keys may be preserved by the lossless CST so diagnostics and
-  round-trip inspection remain possible, but the semantic YAML graph and typed
-  loading reject duplicate keys by default.
+  round-trip inspection remain possible, while semantic views and typed loading
+  can reject duplicates by default.
 - Duplicate-key diagnostics should include both the duplicate key span and the
   previous key span.
 - RTY should eventually support deriving typed overlays for arbitrary Rust
@@ -93,39 +93,34 @@ Required guarantees:
 ## Architecture
 
 ```text
-Source
+Owned Source + u32 line index
   ↓
-Lexer
+Parser
   ↓
-Token stream
-  ↓
-Parser events + lossless CST
-  ↓
-CST-linked semantic YAML graph
-  ↓
-Typed derive overlay
-  ↓
-Patch-based emitter
+Lossless CST arena + compact semantic side metadata
+  ├─→ lazy tokenization
+  ├─→ lazy YAML event iterator
+  ├─→ typed derive overlays
+  └─→ patch-based emitter
 ```
 
-The CST remains the source of truth. Semantic nodes, typed Rust structs, and
-schema-resolved values must keep back-pointers or node identifiers into the CST
-instead of replacing it.
+The CST is the source of truth. Semantic metadata is keyed by the same `NodeId`
+used by syntax and stores only information that cannot be recovered cheaply
+from CST topology and source spans. There is no second graph node arena.
 
 ### Core data model
 
 ```rust
 pub struct YamlDoc {
     source: Source,
-    events: Vec<YamlEvent>,
     nodes: Vec<Node>,
-    graph: SemanticGraph,
+    semantics: SemanticStore,
     edits: Vec<Edit>,
 }
 
 pub struct Source {
     text: String,
-    line_starts: Vec<usize>,
+    line_starts: Vec<u32>,
 }
 
 pub struct Span {
@@ -141,17 +136,25 @@ pub struct Token {
 pub struct Node {
     kind: NodeKind,
     span: Span,
+    parent: u32,
+    first_child: u32,
+    last_child: u32,
+    next_sibling: u32,
 }
 ```
 
 The concrete document and node fields are private. Read source and syntax
 through `YamlDoc::source`, `YamlDoc::node`, and the `Node` accessors. Lossless
-tokens are generated only when requested through `YamlDoc::tokens`; ordinary
-document parsing does not retain them. `YamlDoc::parse_owned` accepts a `String`
-without copying its source buffer.
+tokens are generated only when requested through `YamlDoc::tokens`, and events
+are derived through the `YamlEvents` iterator returned by `YamlDoc::events`.
+Ordinary parsing retains neither vector. `YamlDoc::parse_owned` accepts a
+`String` without copying its source buffer.
 
-Nodes store spans instead of `&str` slices. This gives zero-copy reads without
-infecting the public tree with lifetimes.
+Nodes store spans instead of `&str` slices and child topology uses fixed-size
+arena links instead of one `Vec` per node. `documents`, `mapping_entries`,
+`sequence_items`, and `children` expose storage-independent iterators. Plain
+single-line scalar values return a borrowed `Cow<str>`; decoding allocates only
+for quoted, escaped, folded, block, or multiline content.
 
 ### Public traits
 
@@ -177,12 +180,12 @@ pub trait YamlValue: Sized {
 - `yaml-rt-derive` is isolated so `syn`, `quote`, and `proc-macro2` do not leak
   into the parser core.
 - `yaml-rt` re-exports the core API and `YamlRoundTrip` derive macro.
-- `YamlDoc::parse` now validates source characters, lexes losslessly, builds the
-  lossless CST, composes a semantic graph, and preserves byte-identical output
-  for untouched YAML.
+- `YamlDoc::parse` validates source characters, builds one lossless CST arena
+  with compact semantic metadata, and preserves byte-identical output for
+  untouched YAML. Tokens and events are produced on demand.
 - `yaml-rt-core` passes every discovered YAML Test Suite `data-2022-01-17`
   `in.yaml` case for parsing, byte-identical round-trip output, parser event
-  rendering, and semantic graph composition.
+  rendering, and semantic view construction.
 
 ## Milestone plan
 
@@ -289,8 +292,8 @@ Add path APIs:
 - [x] `doc.get_mapping_entry(mapping, "port")`
 - [x] `doc.get_mapping_value(mapping, "port")`
 - [x] `doc.scalar_text(node)`
-- [x] `doc.get_graph_path(&["server", "port"])`
-- [x] `doc.graph_node_cst(graph_node)`
+- [x] `doc.semantic_kind(node)`
+- [x] `doc.mapping_entries(mapping)` and `doc.sequence_items(sequence)`
 
 Typed parsing can now bind fields to MVP YAML nodes without losing the CST as the
 source of truth.
@@ -311,7 +314,7 @@ Implemented for the MVP block-syntax subset:
       line by key and treats missing keys as a no-op.
 - [x] `doc.to_string()` renders the original source plus pending patches.
 - [x] `doc.commit_edits()` reparses the rendered YAML into a fresh CST and
-      semantic graph, then clears pending edits.
+      semantic metadata, then clears pending edits.
 
 Patch application rule: sort edits from highest offset to lowest offset before
 applying them. The writer validates replacement text as YAML-printable text and
@@ -362,12 +365,12 @@ Add support incrementally:
       `String` reads and writes.
 - [x] Folded scalars: `>`, including strip/clip/keep chomping and typed
       `String` reads and writes.
-- [x] Anchors: `&name` on scalars and flow collections are preserved in events
-      and the semantic graph. Anchored scalar and collection values can be
+- [x] Anchors: `&name` on scalars and flow collections are preserved in lazy
+      events and semantic metadata. Anchored scalar and collection values can be
       rewritten while preserving the original anchor spelling and spacing.
 - [x] Aliases: `*name`.
 - [x] Tags: `!tag`, `!!str`, `!<uri>` on scalars and flow collections are
-      preserved in events and the semantic graph. `%TAG` directive resolution is
+      preserved in events and semantic metadata. `%TAG` directive resolution is
       supported, and tagged scalar and collection values can be rewritten while
       preserving the original tag spelling and spacing.
 - [x] Directives: `%YAML` and `%TAG` are parsed before each document. `%TAG`
@@ -375,7 +378,7 @@ Add support incrementally:
       metadata can be inspected, inserted, updated, and removed before document
       content.
 - [x] Multi-document streams: explicit document starts and ends produce
-      per-document events and semantic graph document nodes. Document-selection
+      per-document events and CST document nodes. Document-selection
       APIs can read, look up, and write a selected document by zero-based index,
       and editor APIs can append new explicit stream documents.
 - [x] Explicit keys: `? key`.
@@ -616,8 +619,8 @@ correct.
 - [x] Support focused valid/invalid parse and byte-identical round-trip checks
       through `crates/yaml-rt-core/tests/yaml_test_suite.rs`.
 - [x] Support parser-produced event stream checks for currently accepted cases.
-- [x] Compose a CST-linked semantic graph from parser events for the accepted
-      subset.
+- [x] Build CST-keyed semantic metadata and derive semantic iterators for the
+      accepted subset.
 - [x] Support JSON-compatible value fixture checks with
       `YAML_TEST_SUITE_CHECK_JSON=1`.
 - [ ] Expand round-trip editing conformance with focused fixtures that prove

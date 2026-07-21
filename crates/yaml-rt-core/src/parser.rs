@@ -238,6 +238,17 @@ impl<'source> Parser<'source> {
             return Err(invalid_orphaned_block_content(absolute_start));
         }
         self.document_has_content = true;
+        if let Some(facts) = simple_plain_mapping_facts(body) {
+            return self.parse_simple_plain_mapping_entry(
+                document,
+                lines,
+                index,
+                indent,
+                body,
+                absolute_start,
+                facts,
+            );
+        }
         if let Some(next_indent) = property_only_node_indent(body, lines, index, absolute_start)? {
             self.push_pending_node_properties(body, absolute_start, next_indent)?;
             return Ok(1);
@@ -311,6 +322,53 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(scalar)?;
             Ok(consumed)
         }
+    }
+
+    fn parse_simple_plain_mapping_entry(
+        &mut self,
+        document: NodeId,
+        lines: &LineTable<'_>,
+        index: usize,
+        indent: usize,
+        body: &str,
+        absolute_start: usize,
+        facts: SimpleMappingFacts,
+    ) -> Result<usize, YamlError> {
+        let line = lines.line(index);
+        let mapping = self.ensure_mapping(
+            document,
+            indent,
+            Span::from_usize(line.content_start + indent, line.content_end),
+        );
+        let entry = self.push_node(
+            NodeKind::MappingEntry,
+            Span::from_usize(line.content_start, line.content_end),
+        );
+        self.attach_child_at(mapping.as_usize(), entry);
+        self.extend_node_span(mapping, line.content_end);
+
+        let key = self.push_node(
+            NodeKind::Scalar,
+            Span::from_usize(absolute_start, absolute_start + facts.colon),
+        );
+        self.attach_child_at(entry.as_usize(), key);
+        self.emit_property_free_plain_scalar(key);
+
+        let value_start = absolute_start + facts.value_start;
+        debug_assert_eq!(
+            &body[facts.value_start..],
+            &self.source.as_str()[value_start..line.content_end]
+        );
+        let (value, consumed) =
+            self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
+        self.attach_child_at(entry.as_usize(), value);
+        self.emit_property_free_plain_scalar(value);
+        if consumed > 1 {
+            let end = lines.line(index + consumed - 1).content_end;
+            self.extend_node_span(entry, end);
+            self.extend_node_span(mapping, end);
+        }
+        Ok(consumed)
     }
 
     fn parse_quoted_scalar_lines(
@@ -453,14 +511,19 @@ impl<'source> Parser<'source> {
         let key_start = absolute_start;
         let key_text = body[..colon_byte].trim_end();
         let key_end = key_start + key_text.len();
-        let key_properties = parse_node_properties(key_text, Span::from_usize(key_start, key_end))?;
-        reject_invalid_node_property_placement(key_text, key_start, &key_properties)?;
-        if key_start < key_end && body_starts_flow_value(key_text, key_start)? {
+        if is_simple_plain_atom(key_text) {
+            let key = self.push_node(NodeKind::Scalar, Span::from_usize(key_start, key_end));
+            self.attach_child_at(entry.as_usize(), key);
+            self.emit_property_free_plain_scalar(key);
+        } else if key_start < key_end && body_starts_flow_value(key_text, key_start)? {
             let (key, end) = self.parse_flow_value(key_text, key_start)?;
             reject_trailing_flow_content(key_text, end, key_start)?;
             self.attach_child_at(entry.0 as usize, key);
             self.emit_node_event(key)?;
         } else {
+            let key_properties =
+                parse_node_properties(key_text, Span::from_usize(key_start, key_end))?;
+            reject_invalid_node_property_placement(key_text, key_start, &key_properties)?;
             let key = if key_start < key_end {
                 self.push_node(NodeKind::Scalar, Span::from_usize(key_start, key_end))
             } else {
@@ -1197,6 +1260,13 @@ impl<'source> Parser<'source> {
         } else {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
+            if is_simple_plain_atom(value) && !is_sequence_entry(value) {
+                let (value_node, consumed) =
+                    self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
+                self.attach_child_at(entry.as_usize(), value_node);
+                self.emit_property_free_plain_scalar(value_node);
+                return Ok(consumed);
+            }
             let value_properties = parse_node_properties(
                 value,
                 Span::from_usize(value_start, value_start + value.len()),
@@ -1561,12 +1631,16 @@ impl<'source> Parser<'source> {
         let mut scalar_has_inline_comment = plain_scalar_line_has_inline_comment(
             &self.source.as_str()[value_start..initial_line.content_end],
         );
-        let initial_properties = parse_node_properties(
-            &self.source.as_str()[value_start..initial_line.content_end],
-            Span::from_usize(value_start, initial_line.content_end),
-        )?;
-        let scalar_has_node_properties =
-            initial_properties.anchor.is_some() || initial_properties.tag.is_some();
+        let initial_text = &self.source.as_str()[value_start..initial_line.content_end];
+        let scalar_has_node_properties = if initial_text.starts_with(['!', '&']) {
+            let properties = parse_node_properties(
+                initial_text,
+                Span::from_usize(value_start, initial_line.content_end),
+            )?;
+            properties.anchor.is_some() || properties.tag.is_some()
+        } else {
+            false
+        };
 
         for line in lines.iter_from(index + 1) {
             let trimmed = line.content_without_break.trim();
@@ -2801,6 +2875,21 @@ impl<'source> Parser<'source> {
             semantic_properties,
         );
         Ok(())
+    }
+
+    fn emit_property_free_plain_scalar(&mut self, node: NodeId) {
+        let span = self.nodes[node.as_usize()].span;
+        self.push_node_event_with_properties(
+            YamlEventKind::Scalar {
+                style: YamlScalarStyle::Plain,
+                value: String::new(),
+                tag: None,
+                anchor: None,
+            },
+            span,
+            node,
+            SemanticProperties::NONE,
+        );
     }
 
     fn take_block_scalar_indent(&mut self, node: NodeId) -> Option<usize> {
@@ -4675,6 +4764,44 @@ fn expected_flow_mapping_separator(offset: usize, found: char) -> YamlError {
         )
         .with_expected(", or }"),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SimpleMappingFacts {
+    colon: usize,
+    value_start: usize,
+}
+
+fn simple_plain_mapping_facts(body: &str) -> Option<SimpleMappingFacts> {
+    let bytes = body.as_bytes();
+    let colon = bytes.iter().position(|byte| *byte == b':')?;
+    if !is_simple_plain_atom(&body[..colon]) {
+        return None;
+    }
+
+    let mut value_start = colon + 1;
+    if !matches!(bytes.get(value_start), Some(b' ')) {
+        return None;
+    }
+    while matches!(bytes.get(value_start), Some(b' ')) {
+        value_start += 1;
+    }
+    if value_start == bytes.len()
+        || &body[value_start..] == "-"
+        || !is_simple_plain_atom(&body[value_start..])
+    {
+        return None;
+    }
+
+    Some(SimpleMappingFacts { colon, value_start })
+}
+
+fn is_simple_plain_atom(text: &str) -> bool {
+    !text.is_empty() && text.as_bytes().iter().copied().all(is_simple_plain_byte)
+}
+
+fn is_simple_plain_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/')
 }
 
 pub(crate) fn find_mapping_colon(body: &str) -> Option<usize> {

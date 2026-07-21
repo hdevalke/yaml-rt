@@ -20,6 +20,27 @@ struct PendingNodeProperties {
     properties: NodeProperties,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextFrame {
+    Mapping {
+        indent: usize,
+        node: NodeId,
+    },
+    Sequence {
+        indent: usize,
+        node: NodeId,
+    },
+    EventCollection {
+        indent: usize,
+        collection: OpenEventCollection,
+    },
+    PendingProperties(PendingNodeProperties),
+    BlockScalarIndent {
+        node: NodeId,
+        indent: usize,
+    },
+}
+
 pub(crate) struct Parser<'source> {
     source: &'source Source,
     nodes: Vec<Node>,
@@ -30,11 +51,7 @@ pub(crate) struct Parser<'source> {
     document_was_explicitly_opened: bool,
     document_yaml_directive_seen: bool,
     tag_handles: BTreeMap<String, String>,
-    mappings: Vec<(usize, NodeId)>,
-    sequences: Vec<(usize, NodeId)>,
-    event_collections: Vec<(usize, OpenEventCollection)>,
-    pending_node_properties: Vec<PendingNodeProperties>,
-    block_scalar_content_indents: BTreeMap<NodeId, usize>,
+    contexts: Vec<ContextFrame>,
 }
 
 impl<'source> Parser<'source> {
@@ -52,11 +69,7 @@ impl<'source> Parser<'source> {
             document_was_explicitly_opened: false,
             document_yaml_directive_seen: false,
             tag_handles: BTreeMap::new(),
-            mappings: Vec::with_capacity(8),
-            sequences: Vec::with_capacity(8),
-            event_collections: Vec::with_capacity(8),
-            pending_node_properties: Vec::with_capacity(4),
-            block_scalar_content_indents: BTreeMap::new(),
+            contexts: Vec::with_capacity(16),
         }
     }
 
@@ -185,8 +198,8 @@ impl<'source> Parser<'source> {
         self.validate_indent(indent, line, body)?;
         self.close_collections_deeper_than(indent);
         self.reject_invalid_block_sibling(indent, line, body)?;
-        if self.sequences.iter().any(|(level, _)| *level == indent)
-            && self.mappings.iter().any(|(level, _)| *level == indent)
+        if self.has_sequence_at(indent)
+            && self.has_mapping_at(indent)
             && !is_sequence_entry(body)
             && (is_explicit_mapping_key(body)
                 || is_explicit_mapping_value(body)
@@ -1001,11 +1014,10 @@ impl<'source> Parser<'source> {
             &mut properties,
             Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
-        if let Some(pending) = self
-            .pending_node_properties
-            .iter_mut()
-            .find(|pending| pending.indent == indent)
-        {
+        if let Some(pending) = self.contexts.iter_mut().find_map(|frame| match frame {
+            ContextFrame::PendingProperties(pending) if pending.indent == indent => Some(pending),
+            _ => None,
+        }) {
             pending.span_start = pending.span_start.min(absolute_start);
             if pending.properties.anchor.is_none() {
                 pending.properties.anchor = properties.anchor;
@@ -1014,11 +1026,12 @@ impl<'source> Parser<'source> {
                 pending.properties.tag = properties.tag;
             }
         } else {
-            self.pending_node_properties.push(PendingNodeProperties {
-                indent,
-                span_start: absolute_start,
-                properties,
-            });
+            self.contexts
+                .push(ContextFrame::PendingProperties(PendingNodeProperties {
+                    indent,
+                    span_start: absolute_start,
+                    properties,
+                }));
         }
         Ok(())
     }
@@ -1039,10 +1052,7 @@ impl<'source> Parser<'source> {
         self.document = Some(document);
         self.document_has_content = false;
         self.document_was_explicitly_opened = explicit;
-        self.mappings.clear();
-        self.sequences.clear();
-        self.event_collections.clear();
-        self.pending_node_properties.clear();
+        self.contexts.clear();
         self.push_node_event(YamlEventKind::DocumentStart { explicit }, span, document);
         document
     }
@@ -1064,10 +1074,7 @@ impl<'source> Parser<'source> {
         self.document_was_explicitly_opened = false;
         self.document_yaml_directive_seen = false;
         self.tag_handles.clear();
-        self.mappings.clear();
-        self.sequences.clear();
-        self.event_collections.clear();
-        self.pending_node_properties.clear();
+        self.contexts.clear();
         Ok(())
     }
 
@@ -1519,12 +1526,7 @@ impl<'source> Parser<'source> {
 
             self.close_collections_deeper_than(nested_indent);
             reject_unexpected_line_start(body, line.content_start + nested_indent)?;
-            if self
-                .sequences
-                .iter()
-                .any(|(level, _)| *level == nested_indent)
-                && !is_sequence_entry(body)
-            {
+            if self.has_sequence_at(nested_indent) && !is_sequence_entry(body) {
                 return Err(invalid_nested_block_sequence_sibling(
                     line.content_start + nested_indent,
                 ));
@@ -1746,8 +1748,10 @@ impl<'source> Parser<'source> {
         } else {
             content_indent
         };
-        self.block_scalar_content_indents
-            .insert(scalar, content_indent);
+        self.contexts.push(ContextFrame::BlockScalarIndent {
+            node: scalar,
+            indent: content_indent,
+        });
         Ok((scalar, consumed))
     }
 
@@ -2273,13 +2277,22 @@ impl<'source> Parser<'source> {
     }
 
     fn ensure_mapping(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
-        if let Some((_, node)) = self.mappings.iter().find(|(level, _)| *level == indent) {
-            *node
+        if let Some(node) = self.contexts.iter().find_map(|frame| match frame {
+            ContextFrame::Mapping {
+                indent: level,
+                node,
+            } if *level == indent => Some(*node),
+            _ => None,
+        }) {
+            node
         } else {
             let (span, properties) = self.collection_properties(indent, span);
             let mapping = self.push_node(NodeKind::BlockMapping, span);
             self.attach_child_at(parent.0 as usize, mapping);
-            self.mappings.push((indent, mapping));
+            self.contexts.push(ContextFrame::Mapping {
+                indent,
+                node: mapping,
+            });
             self.open_event_collection(
                 indent,
                 OpenEventCollection::Mapping,
@@ -2306,13 +2319,22 @@ impl<'source> Parser<'source> {
     }
 
     fn ensure_sequence(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
-        if let Some((_, node)) = self.sequences.iter().find(|(level, _)| *level == indent) {
-            *node
+        if let Some(node) = self.contexts.iter().find_map(|frame| match frame {
+            ContextFrame::Sequence {
+                indent: level,
+                node,
+            } if *level == indent => Some(*node),
+            _ => None,
+        }) {
+            node
         } else {
             let (span, properties) = self.collection_properties(indent, span);
             let sequence = self.push_node(NodeKind::BlockSequence, span);
             self.attach_child_at(parent.0 as usize, sequence);
-            self.sequences.push((indent, sequence));
+            self.contexts.push(ContextFrame::Sequence {
+                indent,
+                node: sequence,
+            });
             self.open_event_collection(
                 indent,
                 OpenEventCollection::Sequence,
@@ -2340,11 +2362,16 @@ impl<'source> Parser<'source> {
     }
 
     fn take_pending_node_properties(&mut self, indent: usize) -> Option<PendingNodeProperties> {
-        let index = self
-            .pending_node_properties
-            .iter()
-            .rposition(|pending| pending.indent == indent)?;
-        Some(self.pending_node_properties.remove(index))
+        let index = self.contexts.iter().rposition(|frame| {
+            matches!(
+                frame,
+                ContextFrame::PendingProperties(pending) if pending.indent == indent
+            )
+        })?;
+        match self.contexts.remove(index) {
+            ContextFrame::PendingProperties(pending) => Some(pending),
+            _ => unreachable!("matched pending properties frame"),
+        }
     }
 
     fn source_indent_at(&self, offset: usize) -> usize {
@@ -2383,10 +2410,23 @@ impl<'source> Parser<'source> {
     }
 
     fn has_parent_collection_below(&self, indent: usize) -> bool {
-        self.mappings
-            .iter()
-            .chain(self.sequences.iter())
-            .any(|(level, _)| *level < indent)
+        self.contexts.iter().any(|frame| match frame {
+            ContextFrame::Mapping { indent: level, .. }
+            | ContextFrame::Sequence { indent: level, .. } => *level < indent,
+            _ => false,
+        })
+    }
+
+    fn has_mapping_at(&self, indent: usize) -> bool {
+        self.contexts.iter().any(|frame| {
+            matches!(frame, ContextFrame::Mapping { indent: level, .. } if *level == indent)
+        })
+    }
+
+    fn has_sequence_at(&self, indent: usize) -> bool {
+        self.contexts.iter().any(|frame| {
+            matches!(frame, ContextFrame::Sequence { indent: level, .. } if *level == indent)
+        })
     }
 
     fn reject_invalid_block_sibling(
@@ -2395,8 +2435,8 @@ impl<'source> Parser<'source> {
         line: SourceLine<'_>,
         body: &str,
     ) -> Result<(), YamlError> {
-        if self.sequences.iter().any(|(level, _)| *level == indent) && !is_sequence_entry(body) {
-            let has_mapping_at_indent = self.mappings.iter().any(|(level, _)| *level == indent);
+        if self.has_sequence_at(indent) && !is_sequence_entry(body) {
+            let has_mapping_at_indent = self.has_mapping_at(indent);
             let is_mapping_sibling = is_explicit_mapping_key(body)
                 || is_explicit_mapping_value(body)
                 || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
@@ -2407,19 +2447,13 @@ impl<'source> Parser<'source> {
                 ));
             }
         }
-        if self.mappings.iter().any(|(level, _)| *level == indent)
-            && comment_text_contains_mapping_colon(body)
-        {
+        if self.has_mapping_at(indent) && comment_text_contains_mapping_colon(body) {
             return Err(invalid_orphaned_block_content(
                 line.content_start + indent + separated_comment_offset(body).unwrap_or(0),
             ));
         }
 
-        let has_collection_at_indent = self
-            .mappings
-            .iter()
-            .chain(self.sequences.iter())
-            .any(|(level, _)| *level == indent);
+        let has_collection_at_indent = self.has_mapping_at(indent) || self.has_sequence_at(indent);
         let is_indented_root_collection = indent > 0
             && !self.has_parent_collection_below(indent)
             && (is_sequence_entry(body) || body_starts_flow_value_start(body));
@@ -2438,27 +2472,28 @@ impl<'source> Parser<'source> {
     }
 
     fn close_collections_deeper_than(&mut self, indent: usize) {
-        self.mappings.retain(|(level, _)| *level <= indent);
-        self.sequences.retain(|(level, _)| *level <= indent);
+        self.contexts.retain(|frame| match frame {
+            ContextFrame::Mapping { indent: level, .. }
+            | ContextFrame::Sequence { indent: level, .. } => *level <= indent,
+            _ => true,
+        });
         self.close_event_collections_deeper_than(indent);
     }
 
     fn close_sequence_at_indent(&mut self, indent: usize) {
-        let Some(index) = self
-            .sequences
-            .iter()
-            .rposition(|(level, _)| *level == indent)
+        let Some(index) = self.contexts.iter().rposition(|frame| {
+            matches!(frame, ContextFrame::Sequence { indent: level, .. } if *level == indent)
+        })
         else {
             return;
         };
         if self
-            .event_collections
-            .last()
+            .last_event_collection()
             .is_some_and(|(level, collection)| {
-                *level == indent && *collection == OpenEventCollection::Sequence
+                level == indent && collection == OpenEventCollection::Sequence
             })
         {
-            self.sequences.remove(index);
+            self.contexts.remove(index);
             self.close_last_event_collection();
         }
     }
@@ -2527,29 +2562,36 @@ impl<'source> Parser<'source> {
         cst: NodeId,
         properties: SemanticProperties,
     ) {
-        self.event_collections.push((indent, collection));
+        self.contexts
+            .push(ContextFrame::EventCollection { indent, collection });
         self.push_node_event_with_properties(kind, span, cst, properties);
     }
 
     fn close_event_collections_deeper_than(&mut self, indent: usize) {
         while self
-            .event_collections
-            .last()
-            .is_some_and(|(level, _)| *level > indent)
+            .last_event_collection()
+            .is_some_and(|(level, _)| level > indent)
         {
             self.close_last_event_collection();
         }
     }
 
     fn close_all_event_collections(&mut self) {
-        while !self.event_collections.is_empty() {
+        while self.last_event_collection().is_some() {
             self.close_last_event_collection();
         }
     }
 
     fn close_last_event_collection(&mut self) {
-        let Some((_, collection)) = self.event_collections.pop() else {
+        let Some(index) = self
+            .contexts
+            .iter()
+            .rposition(|frame| matches!(frame, ContextFrame::EventCollection { .. }))
+        else {
             return;
+        };
+        let ContextFrame::EventCollection { collection, .. } = self.contexts.remove(index) else {
+            unreachable!("matched event collection frame");
         };
         let offset = Span::usize_to_u32(self.source.len());
         let kind = match collection {
@@ -2557,6 +2599,13 @@ impl<'source> Parser<'source> {
             OpenEventCollection::Sequence => YamlEventKind::SequenceEnd,
         };
         self.push_event(kind, Span::empty(offset));
+    }
+
+    fn last_event_collection(&self) -> Option<(usize, OpenEventCollection)> {
+        self.contexts.iter().rev().find_map(|frame| match frame {
+            ContextFrame::EventCollection { indent, collection } => Some((*indent, *collection)),
+            _ => None,
+        })
     }
 
     fn emit_node_event(&mut self, node: NodeId) -> Result<(), YamlError> {
@@ -2659,6 +2708,7 @@ impl<'source> Parser<'source> {
 
     fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
         let node_id = node;
+        let block_scalar_content_indent = self.take_block_scalar_indent(node_id);
         let node_kind = self.nodes[node.0 as usize].kind;
         let node_span = self.nodes[node.0 as usize].span;
         let text = self.source.slice(node_span);
@@ -2732,17 +2782,12 @@ impl<'source> Parser<'source> {
             }
         }
         if matches!(node_kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
-            let _ = decode_scalar_value_with_content_indent(
-                value_text,
-                self.block_scalar_content_indents.get(&node_id).copied(),
-            )?;
+            let _ =
+                decode_scalar_value_with_content_indent(value_text, block_scalar_content_indent)?;
         } else if style != YamlScalarStyle::Plain {
             let _ = decode_scalar_value(value_text)?;
         }
-        let content_indent = self
-            .block_scalar_content_indents
-            .get(&node_id)
-            .map(|indent| Span::usize_to_u32(*indent));
+        let content_indent = block_scalar_content_indent.map(Span::usize_to_u32);
         let semantic_properties = semantic_properties(&properties, content_indent);
         self.push_node_event_with_properties(
             YamlEventKind::Scalar {
@@ -2756,6 +2801,16 @@ impl<'source> Parser<'source> {
             semantic_properties,
         );
         Ok(())
+    }
+
+    fn take_block_scalar_indent(&mut self, node: NodeId) -> Option<usize> {
+        let index = self.contexts.iter().rposition(|frame| {
+            matches!(frame, ContextFrame::BlockScalarIndent { node: candidate, .. } if *candidate == node)
+        })?;
+        match self.contexts.remove(index) {
+            ContextFrame::BlockScalarIndent { indent, .. } => Some(indent),
+            _ => unreachable!("matched block scalar indent frame"),
+        }
     }
 
     fn resolve_node_properties(

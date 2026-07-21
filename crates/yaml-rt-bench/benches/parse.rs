@@ -6,7 +6,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use fyaml::Document;
 #[cfg(feature = "saphyr-baseline")]
 use saphyr::{LoadableYamlNode, Yaml};
-use yaml_rt_core::YamlDoc;
+use yaml_rt_core::{Source, YamlDoc, parse_cst};
 
 struct Fixture {
     name: &'static str,
@@ -88,6 +88,25 @@ fn bench_parse(c: &mut Criterion) {
         bench_input(&mut scaling, entries, input);
     }
     scaling.finish();
+
+    let phase_input = flat_mapping(1_000);
+    let mut phases = c.benchmark_group("parse_phases");
+    phases.bench_function("cst/1000", |bencher| {
+        bencher.iter(|| {
+            let source = Source::new(black_box(phase_input.clone()))
+                .expect("generated source should be valid");
+            let nodes = parse_cst(&source).expect("generated mapping should parse as a CST");
+            black_box((source, nodes));
+        });
+    });
+    phases.bench_function("full/1000", |bencher| {
+        bencher.iter(|| {
+            let doc = YamlDoc::parse(black_box(&phase_input))
+                .expect("generated mapping should parse as a full document");
+            black_box(doc);
+        });
+    });
+    phases.finish();
 }
 
 fn bench_input(

@@ -2,10 +2,11 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::fmt::Write;
 use std::hint::black_box;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use yaml_rt_core::YamlDoc;
+use yaml_rt_core::{Node, SemanticKind, Source, YamlDoc, YamlEvent, parse_cst};
 
 struct CountingAllocator;
 
@@ -14,6 +15,43 @@ static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Full,
+    Cst,
+}
+
+impl Mode {
+    fn parse(value: Option<String>) -> Self {
+        match value.as_deref() {
+            None | Some("full") => Self::Full,
+            Some("cst") => Self::Cst,
+            Some(value) => panic!("mode must be `full` or `cst`, got `{value}`"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Cst => "cst",
+        }
+    }
+}
+
+enum Parsed {
+    Full(YamlDoc),
+    Cst { source: Source, nodes: Vec<Node> },
+}
+
+impl Parsed {
+    fn retained_units(&self) -> usize {
+        match self {
+            Self::Full(doc) => doc.source().len(),
+            Self::Cst { source, nodes } => source.len().saturating_add(nodes.len()),
+        }
+    }
+}
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -67,35 +105,72 @@ fn main() {
     let iterations = env::args().nth(2).map_or(100, |value| {
         value.parse().expect("iterations must be numeric")
     });
+    let mode = Mode::parse(env::args().nth(3));
     let input = flat_mapping(entries);
 
     reset_counters();
     ENABLED.store(true, Ordering::Relaxed);
     let started = Instant::now();
     for _ in 0..iterations {
-        let doc = YamlDoc::parse(black_box(&input)).expect("generated mapping should parse");
-        black_box(doc);
+        let parsed = parse_input(mode, black_box(&input));
+        black_box(parsed);
     }
     let elapsed = started.elapsed();
     ENABLED.store(false, Ordering::Relaxed);
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    let repeated_peak_bytes = PEAK_BYTES.load(Ordering::Relaxed);
 
+    reset_counters();
+    ENABLED.store(true, Ordering::Relaxed);
+    let retained = parse_input(mode, black_box(&input));
+    let retained_allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let retained_allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    let retained_peak_bytes = PEAK_BYTES.load(Ordering::Relaxed);
+    let retained_bytes = LIVE_BYTES.load(Ordering::Relaxed);
+    ENABLED.store(false, Ordering::Relaxed);
+    black_box(retained.retained_units());
+
+    println!("mode: {}", mode.name());
     println!("entries: {entries}");
     println!("input bytes: {}", input.len());
     println!("iterations: {iterations}");
+    println!(
+        "type sizes: Node={} SemanticKind={} YamlEvent={}",
+        size_of::<Node>(),
+        size_of::<SemanticKind>(),
+        size_of::<YamlEvent>()
+    );
     println!(
         "time: {:.1} us/op",
         elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64
     );
     println!(
         "allocations: {:.1}/op",
-        ALLOCATIONS.load(Ordering::Relaxed) as f64 / iterations as f64
+        allocations as f64 / iterations as f64
     );
     println!(
         "allocated bytes: {:.1}/op",
-        ALLOCATED_BYTES.load(Ordering::Relaxed) as f64 / iterations as f64
+        allocated_bytes as f64 / iterations as f64
     );
-    println!("peak live bytes: {}", PEAK_BYTES.load(Ordering::Relaxed));
-    println!("final live bytes: {}", LIVE_BYTES.load(Ordering::Relaxed));
+    println!("repeated peak live bytes: {repeated_peak_bytes}");
+    println!("retained allocations: {retained_allocations}");
+    println!("retained allocated bytes: {retained_allocated_bytes}");
+    println!("retained peak live bytes: {retained_peak_bytes}");
+    println!("retained bytes: {retained_bytes}");
+}
+
+fn parse_input(mode: Mode, input: &str) -> Parsed {
+    match mode {
+        Mode::Full => Parsed::Full(
+            YamlDoc::parse(input).expect("generated mapping should parse as a full document"),
+        ),
+        Mode::Cst => {
+            let source = Source::new(input.to_owned()).expect("generated source should be valid");
+            let nodes = parse_cst(&source).expect("generated mapping should parse as a CST");
+            Parsed::Cst { source, nodes }
+        }
+    }
 }
 
 fn reset_counters() {

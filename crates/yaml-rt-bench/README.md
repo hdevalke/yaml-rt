@@ -22,14 +22,33 @@ cargo bench -p yaml-rt-bench --features baselines --bench parse
 
 The `parse_scaling` group generates flat mappings containing 100, 1,000, and
 5,000 entries with fixed-width keys and values so bytes per entry stay constant.
-Use the standalone allocation profiler to measure allocation
-count, total allocated bytes, and peak live bytes for the same shape:
+Use the standalone allocation profiler to measure allocation count, total
+allocated bytes, transient peak live bytes, and retained bytes for the same
+shape:
 
 ```sh
-cargo bench -p yaml-rt-bench --bench profile_alloc -- 1000 100
+cargo bench -p yaml-rt-bench --bench profile_alloc -- 1000 100 full
+cargo bench -p yaml-rt-bench --bench profile_alloc -- 1000 100 cst
 ```
 
-The two positional arguments are mapping entries and parse iterations.
+The positional arguments are mapping entries, parse iterations, and measurement
+mode. `full` (the default) retains a complete `YamlDoc`; `cst` retains only an
+owned `Source` and its CST arena. The `parse_phases` Criterion group provides
+the corresponding 1,000-entry throughput comparison.
+
+For stable comparisons, run Criterion with its default sampling three times and
+compare the median of the three reported medians. Do not use `--quick` for a
+performance gate:
+
+```sh
+cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
+cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
+cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
+```
+
+The current layouts are 28 bytes for `Node`, 56 bytes for `SemanticKind`, and
+104 bytes for the on-demand public `YamlEvent`. The allocation profiler prints
+these sizes so future layout changes are visible in benchmark logs.
 
 ## Reference baseline
 
@@ -69,6 +88,13 @@ The geometric mean over the four source fixtures is 1.06x Saphyr. The
 5,000/1,000-entry RTY ratio is 5.66x. At 1,000 fixed-width entries, the counting
 allocator reports 23 allocations, 611,868 allocated bytes, and 526,432 peak
 live bytes: reductions of 99.7%, 58.3%, and 53.3% from the reference baseline.
+
+With a parsed value kept alive, the full document retains 317,360 bytes. The
+CST-only path uses 18 allocations, allocates 407,296 bytes, peaks at 363,620
+live bytes, and retains 112,948 bytes. The 204,412-byte retained gap isolates
+the current semantic storage, while the full/CST allocation and peak gaps also
+include semantic construction work. These measurements use a 1,000-entry
+fixed-width mapping and the release allocation profiler above.
 
 ## RTY-only perf profiling
 

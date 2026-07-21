@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -9,7 +10,7 @@ use crate::{
     ToYamlFragment, Token, YamlError, YamlEvent, decode_scalar_value_with_content_indent,
     directive_emit_error, double_quoted_scalar_end, edits_conflict, events_to_test_string,
     format_scalar_value, lex, next_line_content_start, parse_node_properties, plain_scalar_end,
-    single_quoted_scalar_end, strip_inline_comment, validate_plain_mapping_fragment,
+    resolve_tag, single_quoted_scalar_end, strip_inline_comment, validate_plain_mapping_fragment,
     validate_tag_directive_parts_for_emit, validate_yaml_chars,
     validate_yaml_directive_version_for_emit,
 };
@@ -214,9 +215,9 @@ impl YamlDoc {
             };
             events.push(YamlEvent {
                 kind: crate::YamlEventKind::DocumentStart {
-                    explicit: metadata.explicit_start,
+                    explicit: metadata.explicit_start(),
                 },
-                span: metadata.span,
+                span: self.semantic_span(*document, metadata),
                 cst: Some(*document),
                 content_indent: None,
             });
@@ -225,9 +226,9 @@ impl YamlDoc {
             }
             events.push(YamlEvent {
                 kind: crate::YamlEventKind::DocumentEnd {
-                    explicit: metadata.explicit_end,
+                    explicit: metadata.explicit_end(),
                 },
-                span: metadata.end_span,
+                span: self.semantic_end_span(*document, metadata),
                 cst: None,
                 content_indent: None,
             });
@@ -245,16 +246,16 @@ impl YamlDoc {
         let Some(metadata) = self.semantics.get(node) else {
             return;
         };
-        match &metadata.kind {
+        match metadata.kind {
             SemanticKind::Document => {}
-            SemanticKind::Mapping { style, tag, anchor } => {
+            SemanticKind::Mapping { style } => {
                 events.push(YamlEvent {
                     kind: crate::YamlEventKind::MappingStart {
-                        style: *style,
-                        tag: tag.clone(),
-                        anchor: anchor.clone(),
+                        style,
+                        tag: self.resolved_tag(node).ok().flatten().map(Cow::into_owned),
+                        anchor: self.anchor(node).map(str::to_owned),
                     },
-                    span: metadata.span,
+                    span: self.semantic_span(node, metadata),
                     cst: Some(node),
                     content_indent: None,
                 });
@@ -264,19 +265,19 @@ impl YamlDoc {
                 }
                 events.push(YamlEvent {
                     kind: crate::YamlEventKind::MappingEnd,
-                    span: metadata.end_span,
+                    span: self.semantic_end_span(node, metadata),
                     cst: None,
                     content_indent: None,
                 });
             }
-            SemanticKind::Sequence { style, tag, anchor } => {
+            SemanticKind::Sequence { style } => {
                 events.push(YamlEvent {
                     kind: crate::YamlEventKind::SequenceStart {
-                        style: *style,
-                        tag: tag.clone(),
-                        anchor: anchor.clone(),
+                        style,
+                        tag: self.resolved_tag(node).ok().flatten().map(Cow::into_owned),
+                        anchor: self.anchor(node).map(str::to_owned),
                     },
-                    span: metadata.span,
+                    span: self.semantic_span(node, metadata),
                     cst: Some(node),
                     content_indent: None,
                 });
@@ -285,31 +286,36 @@ impl YamlDoc {
                 }
                 events.push(YamlEvent {
                     kind: crate::YamlEventKind::SequenceEnd,
-                    span: metadata.end_span,
+                    span: self.semantic_end_span(node, metadata),
                     cst: None,
                     content_indent: None,
                 });
             }
-            SemanticKind::Scalar { style, tag, anchor } => {
+            SemanticKind::Scalar { style } => {
                 let value = self
                     .scalar_value(node)
                     .map(Cow::into_owned)
                     .unwrap_or_default();
                 events.push(YamlEvent {
                     kind: crate::YamlEventKind::Scalar {
-                        style: *style,
+                        style,
                         value,
-                        tag: tag.clone(),
-                        anchor: anchor.clone(),
+                        tag: self.resolved_tag(node).ok().flatten().map(Cow::into_owned),
+                        anchor: self.anchor(node).map(str::to_owned),
                     },
-                    span: metadata.span,
+                    span: self.semantic_span(node, metadata),
                     cst: Some(node),
-                    content_indent: metadata.content_indent,
+                    content_indent: self
+                        .semantics
+                        .properties(node)
+                        .and_then(|properties| properties.content_indent),
                 });
             }
-            SemanticKind::Alias { name } => events.push(YamlEvent {
-                kind: crate::YamlEventKind::Alias { name: name.clone() },
-                span: metadata.span,
+            SemanticKind::Alias => events.push(YamlEvent {
+                kind: crate::YamlEventKind::Alias {
+                    name: self.alias_name(node).unwrap_or_default().to_owned(),
+                },
+                span: self.semantic_span(node, metadata),
                 cst: Some(node),
                 content_indent: None,
             }),
@@ -476,8 +482,104 @@ impl YamlDoc {
 
     /// Returns a node's semantic interpretation.
     #[must_use]
-    pub fn semantic_kind(&self, node: NodeId) -> Option<&SemanticKind> {
-        self.semantics.get(node).map(|node| &node.kind)
+    pub fn semantic_kind(&self, node: NodeId) -> Option<SemanticKind> {
+        self.semantics.get(node).map(|node| node.kind)
+    }
+
+    /// Returns the explicit tag spelling, including its leading `!`.
+    #[must_use]
+    pub fn raw_tag(&self, node: NodeId) -> Option<&str> {
+        let span = self.semantics.properties(node)?.tag?;
+        Some(self.source.slice(span))
+    }
+
+    /// Resolves an explicit tag through the built-in or document-local handle table.
+    pub fn resolved_tag(&self, node: NodeId) -> Result<Option<Cow<'_, str>>, YamlError> {
+        let Some(raw) = self.raw_tag(node) else {
+            return Ok(None);
+        };
+        let document = self.semantics.property_document(node).unwrap_or(node);
+        let handles = self
+            .semantics
+            .tag_directives(document)
+            .map(|(handle, prefix)| {
+                (
+                    self.source.slice(handle).to_owned(),
+                    self.source.slice(prefix).to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let span = self
+            .semantics
+            .properties(node)
+            .and_then(|properties| properties.tag)
+            .unwrap_or_else(|| self.node(node).map_or(Span::empty(0), Node::span));
+        resolve_tag(raw, &handles, span).map(|tag| Some(Cow::Owned(tag)))
+    }
+
+    /// Returns an anchor name without its leading `&`.
+    #[must_use]
+    pub fn anchor(&self, node: NodeId) -> Option<&str> {
+        let span = self.semantics.properties(node)?.anchor?;
+        Some(self.source.slice(span))
+    }
+
+    /// Returns an alias name without its leading `*`.
+    #[must_use]
+    pub fn alias_name(&self, node: NodeId) -> Option<&str> {
+        let span = self.semantics.properties(node)?.alias?;
+        Some(self.source.slice(span))
+    }
+
+    /// Resolves an alias to the most recent matching anchor in its document.
+    #[must_use]
+    pub fn resolve_alias(&self, node: NodeId) -> Option<NodeId> {
+        let name = self.alias_name(node)?;
+        let document = self.semantics.property_document(node)?;
+        let alias_start = self.node(node)?.span.start;
+        self.semantics
+            .anchors()
+            .rev()
+            .find(|(span, target, anchor_document)| {
+                *anchor_document == document
+                    && self
+                        .node(*target)
+                        .is_some_and(|node| node.span.start <= alias_start)
+                    && self.source.slice(*span) == name
+            })
+            .map(|(_, target, _)| target)
+    }
+
+    fn semantic_span(&self, node: NodeId, metadata: &crate::semantic::SemanticNode) -> Span {
+        Span::new(
+            metadata.span_start,
+            self.node(node)
+                .map_or(metadata.end_offset, |node| node.span.end),
+        )
+    }
+
+    fn semantic_end_span(&self, node: NodeId, metadata: &crate::semantic::SemanticNode) -> Span {
+        if metadata.explicit_end()
+            && let Some(marker) = self.children(node).find_map(|child| {
+                let child = self.node(child)?;
+                (child.kind == NodeKind::DocumentMarker
+                    && self.source.slice(child.span).starts_with("..."))
+                .then_some(child.span)
+            })
+        {
+            return marker;
+        }
+        if matches!(
+            metadata.kind,
+            SemanticKind::Mapping {
+                style: CollectionStyle::Flow
+            } | SemanticKind::Sequence {
+                style: CollectionStyle::Flow
+            }
+        ) {
+            return self.semantic_span(node, metadata);
+        }
+        Span::empty(metadata.end_offset)
     }
 
     /// Iterates over semantic document CST nodes in stream order.
@@ -683,7 +785,7 @@ impl YamlDoc {
         let Some(SemanticKind::Mapping { style, .. }) = self.semantic_kind(child) else {
             return Ok(None);
         };
-        if *style != CollectionStyle::Flow || self.mapping_entries(child).next().is_some() {
+        if style != CollectionStyle::Flow || self.mapping_entries(child).next().is_some() {
             return Ok(None);
         }
         Ok(self
@@ -798,8 +900,8 @@ impl YamlDoc {
         decode_scalar_value_with_content_indent(
             value_text,
             self.semantics
-                .get(node)
-                .and_then(|metadata| metadata.content_indent)
+                .properties(node)
+                .and_then(|properties| properties.content_indent)
                 .map(|indent| indent as usize),
         )
         .map(Cow::Owned)

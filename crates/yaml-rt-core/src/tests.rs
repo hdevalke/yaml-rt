@@ -506,11 +506,56 @@ fn semantics_preserve_scalar_anchors_and_tags() {
 
     assert_eq!(
         doc.semantic_kind(value),
-        Some(&SemanticKind::Scalar {
-            style: YamlScalarStyle::Plain,
-            tag: Some("!local".to_owned()),
-            anchor: Some("anchor".to_owned()),
+        Some(SemanticKind::Scalar {
+            style: YamlScalarStyle::Plain
         })
+    );
+    assert_eq!(doc.raw_tag(value), Some("!local"));
+    assert_eq!(
+        doc.resolved_tag(value).expect("tag resolves").as_deref(),
+        Some("!local")
+    );
+    assert_eq!(doc.anchor(value), Some("anchor"));
+}
+
+#[test]
+fn alias_resolution_uses_the_latest_document_local_anchor() {
+    let doc = YamlDoc::parse(
+        "first: &value one\nfirst_alias: *value\nsecond: &value two\nsecond_alias: *value\n",
+    )
+    .expect("valid shadowed anchors");
+    let first = doc.get_path(&["first"]).unwrap().unwrap();
+    let first_alias = doc.get_path(&["first_alias"]).unwrap().unwrap();
+    let second = doc.get_path(&["second"]).unwrap().unwrap();
+    let second_alias = doc.get_path(&["second_alias"]).unwrap().unwrap();
+
+    assert_eq!(doc.alias_name(first_alias), Some("value"));
+    assert_eq!(doc.resolve_alias(first_alias), Some(first));
+    assert_eq!(doc.resolve_alias(second_alias), Some(second));
+}
+
+#[test]
+fn custom_tag_resolution_is_document_local() {
+    let doc = YamlDoc::parse(
+        "%TAG !e! tag:first/\n--- !e!value one\n...\n%TAG !e! tag:second/\n--- !e!value two\n",
+    )
+    .expect("valid per-document tag directives");
+    let tagged = doc
+        .documents()
+        .filter_map(|document| {
+            doc.children(document)
+                .find(|child| doc.semantic_kind(*child).is_some())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(doc.raw_tag(tagged[0]), Some("!e!value"));
+    assert_eq!(
+        doc.resolved_tag(tagged[0]).unwrap().as_deref(),
+        Some("tag:first/value")
+    );
+    assert_eq!(
+        doc.resolved_tag(tagged[1]).unwrap().as_deref(),
+        Some("tag:second/value")
     );
 }
 
@@ -530,12 +575,16 @@ fn parser_builds_anchored_and_tagged_flow_collection_values() {
         .expect("items exists");
     assert_eq!(
         doc.semantic_kind(items),
-        Some(&SemanticKind::Sequence {
-            style: CollectionStyle::Flow,
-            tag: Some("tag:yaml.org,2002:seq".to_owned()),
-            anchor: Some("seq".to_owned()),
+        Some(SemanticKind::Sequence {
+            style: CollectionStyle::Flow
         })
     );
+    assert_eq!(doc.raw_tag(items), Some("!!seq"));
+    assert_eq!(
+        doc.resolved_tag(items).expect("tag resolves").as_deref(),
+        Some("tag:yaml.org,2002:seq")
+    );
+    assert_eq!(doc.anchor(items), Some("seq"));
 }
 
 #[test]
@@ -668,14 +717,11 @@ fn directive_editor_commit_reparses_tag_resolution() {
         .enumerate()
         .find_map(|(index, _)| {
             let node = NodeId::from_usize(index);
-            matches!(
-                doc.semantic_kind(node),
-                Some(SemanticKind::Scalar {
-                    tag: Some(tag),
-                    ..
-                }) if doc.scalar_value(node).is_ok_and(|value| value == "value")
-                    && tag == "tag:new/foo"
-            )
+            (matches!(doc.semantic_kind(node), Some(SemanticKind::Scalar { .. }))
+                && doc.scalar_value(node).is_ok_and(|value| value == "value")
+                && doc
+                    .resolved_tag(node)
+                    .is_ok_and(|tag| tag.as_deref() == Some("tag:new/foo")))
             .then_some(node)
         })
         .expect("tag resolution updates after commit");
@@ -1006,13 +1052,17 @@ fn yaml_value_writes_empty_decorated_mapping_and_preserves_semantic_metadata_aft
         .get_path(&["settings"])
         .expect("path lookup succeeds after commit")
         .expect("settings exists after commit");
-    match doc.semantic_kind(settings).expect("settings is semantic") {
-        SemanticKind::Mapping { tag, anchor, .. } => {
-            assert_eq!(tag.as_deref(), Some("tag:yaml.org,2002:map"));
-            assert_eq!(anchor.as_deref(), Some("settings"));
-        }
-        other => panic!("expected semantic mapping, found {other:?}"),
-    }
+    assert!(matches!(
+        doc.semantic_kind(settings),
+        Some(SemanticKind::Mapping { .. })
+    ));
+    assert_eq!(
+        doc.resolved_tag(settings)
+            .expect("mapping tag resolves")
+            .as_deref(),
+        Some("tag:yaml.org,2002:map")
+    );
+    assert_eq!(doc.anchor(settings), Some("settings"));
 }
 
 #[test]
@@ -1084,10 +1134,8 @@ fn semantic_metadata_is_keyed_by_cst_node() {
     );
     assert_eq!(
         doc.semantic_kind(scalar),
-        Some(&SemanticKind::Scalar {
-            style: YamlScalarStyle::Plain,
-            tag: None,
-            anchor: None,
+        Some(SemanticKind::Scalar {
+            style: YamlScalarStyle::Plain
         })
     );
 }
@@ -1124,10 +1172,8 @@ fn path_lookup_returns_semantic_cst_node() {
 
     assert_eq!(
         doc.semantic_kind(host),
-        Some(&SemanticKind::Scalar {
-            style: YamlScalarStyle::Plain,
-            tag: None,
-            anchor: None,
+        Some(SemanticKind::Scalar {
+            style: YamlScalarStyle::Plain
         })
     );
     assert_eq!(

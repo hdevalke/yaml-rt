@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use crate::syntax::{Children, NO_NODE, node_link};
 use crate::{
     CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, ParsedYaml,
-    SemanticBuilder, Source, Span, YamlError, YamlEvent, YamlEventKind, YamlScalarStyle,
-    validate_yaml_chars,
+    SemanticBuilder, SemanticProperties, Source, Span, YamlError, YamlEvent, YamlEventKind,
+    YamlScalarStyle, validate_yaml_chars,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1121,6 +1121,24 @@ impl<'source> Parser<'source> {
                     ));
                 }
                 validate_tag_handle(handle, line)?;
+                let handle_offset = body
+                    .find(handle)
+                    .expect("parsed TAG handle occurs in directive text");
+                let prefix_offset = handle_offset
+                    + handle.len()
+                    + body[handle_offset + handle.len()..]
+                        .find(prefix)
+                        .expect("parsed TAG prefix occurs after its handle");
+                self.semantics.push_tag_directive(
+                    Span::from_usize(
+                        line.content_start + handle_offset,
+                        line.content_start + handle_offset + handle.len(),
+                    ),
+                    Span::from_usize(
+                        line.content_start + prefix_offset,
+                        line.content_start + prefix_offset + prefix.len(),
+                    ),
+                );
                 self.tag_handles
                     .insert(handle.to_owned(), prefix.to_owned());
                 Ok(())
@@ -2251,7 +2269,7 @@ impl<'source> Parser<'source> {
         if let Some((_, node)) = self.mappings.iter().find(|(level, _)| *level == indent) {
             *node
         } else {
-            let (span, tag, anchor) = self.collection_properties(indent, span);
+            let (span, properties) = self.collection_properties(indent, span);
             let mapping = self.push_node(NodeKind::BlockMapping, span);
             self.attach_child_at(parent.0 as usize, mapping);
             self.mappings.push((indent, mapping));
@@ -2260,11 +2278,12 @@ impl<'source> Parser<'source> {
                 OpenEventCollection::Mapping,
                 YamlEventKind::MappingStart {
                     style: CollectionStyle::Block,
-                    tag,
-                    anchor,
+                    tag: None,
+                    anchor: None,
                 },
                 span,
                 mapping,
+                semantic_properties(&properties, None),
             );
             mapping
         }
@@ -2283,7 +2302,7 @@ impl<'source> Parser<'source> {
         if let Some((_, node)) = self.sequences.iter().find(|(level, _)| *level == indent) {
             *node
         } else {
-            let (span, tag, anchor) = self.collection_properties(indent, span);
+            let (span, properties) = self.collection_properties(indent, span);
             let sequence = self.push_node(NodeKind::BlockSequence, span);
             self.attach_child_at(parent.0 as usize, sequence);
             self.sequences.push((indent, sequence));
@@ -2292,28 +2311,24 @@ impl<'source> Parser<'source> {
                 OpenEventCollection::Sequence,
                 YamlEventKind::SequenceStart {
                     style: CollectionStyle::Block,
-                    tag,
-                    anchor,
+                    tag: None,
+                    anchor: None,
                 },
                 span,
                 sequence,
+                semantic_properties(&properties, None),
             );
             sequence
         }
     }
 
-    fn collection_properties(
-        &mut self,
-        indent: usize,
-        span: Span,
-    ) -> (Span, Option<String>, Option<String>) {
+    fn collection_properties(&mut self, indent: usize, span: Span) -> (Span, NodeProperties) {
         let Some(pending) = self.take_pending_node_properties(indent) else {
-            return (span, None, None);
+            return (span, NodeProperties::default());
         };
         (
             Span::new(Span::usize_to_u32(pending.span_start), span.end),
-            pending.properties.tag,
-            pending.properties.anchor,
+            pending.properties,
         )
     }
 
@@ -2477,21 +2492,23 @@ impl<'source> Parser<'source> {
     }
 
     fn push_event(&mut self, kind: YamlEventKind, span: Span) {
-        self.semantics.push(kind, span, None, None);
+        self.semantics
+            .push(kind, span, None, SemanticProperties::NONE);
     }
 
     fn push_node_event(&mut self, kind: YamlEventKind, span: Span, cst: NodeId) {
-        self.semantics.push(kind, span, Some(cst), None);
+        self.semantics
+            .push(kind, span, Some(cst), SemanticProperties::NONE);
     }
 
-    fn push_node_event_with_content_indent(
+    fn push_node_event_with_properties(
         &mut self,
         kind: YamlEventKind,
         span: Span,
         cst: NodeId,
-        content_indent: Option<u32>,
+        properties: SemanticProperties,
     ) {
-        self.semantics.push(kind, span, Some(cst), content_indent);
+        self.semantics.push(kind, span, Some(cst), properties);
     }
 
     fn open_event_collection(
@@ -2501,9 +2518,10 @@ impl<'source> Parser<'source> {
         kind: YamlEventKind,
         span: Span,
         cst: NodeId,
+        properties: SemanticProperties,
     ) {
         self.event_collections.push((indent, collection));
-        self.push_node_event(kind, span, cst);
+        self.push_node_event_with_properties(kind, span, cst, properties);
     }
 
     fn close_event_collections_deeper_than(&mut self, indent: usize) {
@@ -2550,14 +2568,16 @@ impl<'source> Parser<'source> {
         let mut properties = self.flow_event_properties(sequence_span)?;
         self.resolve_node_properties(&mut properties, sequence_span)?;
         let span = self.apply_pending_event_properties(&mut properties, sequence_span);
-        self.push_node_event(
+        let semantic_properties = semantic_properties(&properties, None);
+        self.push_node_event_with_properties(
             YamlEventKind::SequenceStart {
                 style: CollectionStyle::Flow,
-                tag: properties.tag,
-                anchor: properties.anchor,
+                tag: None,
+                anchor: None,
             },
             span,
             node,
+            semantic_properties,
         );
         let mut entry = node_link(self.nodes[node.as_usize()].first_child);
         while let Some(current_entry) = entry {
@@ -2577,14 +2597,16 @@ impl<'source> Parser<'source> {
         let mut properties = self.flow_event_properties(mapping_span)?;
         self.resolve_node_properties(&mut properties, mapping_span)?;
         let span = self.apply_pending_event_properties(&mut properties, mapping_span);
-        self.push_node_event(
+        let semantic_properties = semantic_properties(&properties, None);
+        self.push_node_event_with_properties(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Flow,
-                tag: properties.tag,
-                anchor: properties.anchor,
+                tag: None,
+                anchor: None,
             },
             span,
             node,
+            semantic_properties,
         );
         let mut entry = node_link(self.nodes[node.as_usize()].first_child);
         while let Some(current_entry) = entry {
@@ -2681,12 +2703,23 @@ impl<'source> Parser<'source> {
                 && !alias.is_empty()
                 && !alias.chars().any(char::is_whitespace)
             {
-                self.push_node_event(
+                let alias_start = node_span.start as usize
+                    + properties.value_start
+                    + value_text
+                        .len()
+                        .saturating_sub(value_text.trim_start().len())
+                    + 1;
+                let semantic_properties = SemanticProperties {
+                    alias: Some(Span::from_usize(alias_start, alias_start + alias.len())),
+                    ..semantic_properties(&properties, None)
+                };
+                self.push_node_event_with_properties(
                     YamlEventKind::Alias {
                         name: alias.to_owned(),
                     },
                     span,
                     node,
+                    semantic_properties,
                 );
                 return Ok(());
             }
@@ -2703,27 +2736,28 @@ impl<'source> Parser<'source> {
             .block_scalar_content_indents
             .get(&node_id)
             .map(|indent| Span::usize_to_u32(*indent));
-        self.push_node_event_with_content_indent(
+        let semantic_properties = semantic_properties(&properties, content_indent);
+        self.push_node_event_with_properties(
             YamlEventKind::Scalar {
                 style,
                 value: String::new(),
-                tag: properties.tag,
-                anchor: properties.anchor,
+                tag: None,
+                anchor: None,
             },
             span,
             node,
-            content_indent,
+            semantic_properties,
         );
         Ok(())
     }
 
     fn resolve_node_properties(
         &self,
-        properties: &mut NodeProperties,
+        properties: &NodeProperties,
         span: Span,
     ) -> Result<(), YamlError> {
-        if let Some(tag) = properties.tag.as_deref() {
-            properties.tag = Some(resolve_tag(tag, &self.tag_handles, span)?);
+        if let Some(tag) = properties.tag {
+            let _ = resolve_tag(self.source.slice(tag), &self.tag_handles, span)?;
         }
         Ok(())
     }
@@ -2747,9 +2781,21 @@ fn unterminated_quoted_scalar_error(quote: char, span: Span) -> YamlError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct NodeProperties {
-    pub(crate) tag: Option<String>,
-    pub(crate) anchor: Option<String>,
+    pub(crate) tag: Option<Span>,
+    pub(crate) anchor: Option<Span>,
     pub(crate) value_start: usize,
+}
+
+fn semantic_properties(
+    properties: &NodeProperties,
+    content_indent: Option<u32>,
+) -> SemanticProperties {
+    SemanticProperties {
+        tag: properties.tag,
+        anchor: properties.anchor,
+        alias: None,
+        content_indent,
+    }
 }
 
 fn reject_invalid_node_property_placement(
@@ -3108,8 +3154,11 @@ pub(crate) fn parse_node_properties(text: &str, span: Span) -> Result<NodeProper
                         position,
                     ));
                 }
-                let (anchor, next) = parse_anchor_property(text, position, span)?;
-                properties.anchor = Some(anchor);
+                let next = parse_anchor_property(text, position, span)?;
+                properties.anchor = Some(Span::new(
+                    Span::offset_from_usize(span.start, position + 1),
+                    Span::offset_from_usize(span.start, next),
+                ));
                 position = next;
             }
             '!' => {
@@ -3120,8 +3169,11 @@ pub(crate) fn parse_node_properties(text: &str, span: Span) -> Result<NodeProper
                         position,
                     ));
                 }
-                let (tag, next) = parse_tag_property(text, position, span)?;
-                properties.tag = Some(tag);
+                let next = parse_tag_property(text, position, span)?;
+                properties.tag = Some(Span::new(
+                    Span::offset_from_usize(span.start, position),
+                    Span::offset_from_usize(span.start, next),
+                ));
                 position = next;
             }
             _ => {
@@ -3157,11 +3209,7 @@ fn next_property_character_is_not_whitespace(text: &str, position: usize) -> boo
     }
 }
 
-fn parse_anchor_property(
-    text: &str,
-    position: usize,
-    span: Span,
-) -> Result<(String, usize), YamlError> {
+fn parse_anchor_property(text: &str, position: usize, span: Span) -> Result<usize, YamlError> {
     let start = position + 1;
     let end = property_token_end(text, start);
     if start == end {
@@ -3172,14 +3220,10 @@ fn parse_anchor_property(
             "an anchor name after `&`",
         ));
     }
-    Ok((text[start..end].to_owned(), end))
+    Ok(end)
 }
 
-fn parse_tag_property(
-    text: &str,
-    position: usize,
-    span: Span,
-) -> Result<(String, usize), YamlError> {
+fn parse_tag_property(text: &str, position: usize, span: Span) -> Result<usize, YamlError> {
     if text[position..].starts_with("!<") {
         let start = position + 2;
         let Some(relative_end) = text[start..].find('>') else {
@@ -3199,14 +3243,14 @@ fn parse_tag_property(
                 "a tag URI inside `!<...>`",
             ));
         }
-        return Ok((format!("!<{}>", &text[start..end]), end + 1));
+        return Ok(end + 1);
     }
 
     let end = property_token_end(text, position);
     if end == position + 1 {
-        return Ok(("!".to_owned(), end));
+        return Ok(end);
     }
-    Ok((text[position..end].to_owned(), end))
+    Ok(end)
 }
 
 fn percent_decode_tag_suffix(suffix: &str, span: Span) -> Result<String, YamlError> {

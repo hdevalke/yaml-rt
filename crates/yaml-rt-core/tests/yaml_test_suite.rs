@@ -472,9 +472,9 @@ fn graph_node_to_json(
                 }
             }
         }
-        SemanticKind::Mapping { anchor, .. } => {
-            if let Some(anchor) = anchor {
-                context.anchors.insert(anchor.clone(), node);
+        SemanticKind::Mapping { .. } => {
+            if let Some(anchor) = doc.anchor(node) {
+                context.anchors.insert(anchor.to_owned(), node);
             }
             let mut object = Vec::new();
             for (key, value) in doc.mapping_entries(node) {
@@ -485,27 +485,27 @@ fn graph_node_to_json(
             }
             Ok(JsonValue::Object(sort_json_object_entries(object)))
         }
-        SemanticKind::Sequence { anchor, .. } => {
-            if let Some(anchor) = anchor {
-                context.anchors.insert(anchor.clone(), node);
+        SemanticKind::Sequence { .. } => {
+            if let Some(anchor) = doc.anchor(node) {
+                context.anchors.insert(anchor.to_owned(), node);
             }
             doc.sequence_items(node)
                 .map(|item| graph_node_to_json(doc, item, context))
                 .collect::<Result<Vec<_>, _>>()
                 .map(JsonValue::Array)
         }
-        SemanticKind::Scalar { style, tag, anchor } => {
-            if let Some(anchor) = anchor {
-                context.anchors.insert(anchor.clone(), node);
+        SemanticKind::Scalar { style } => {
+            if let Some(anchor) = doc.anchor(node) {
+                context.anchors.insert(anchor.to_owned(), node);
             }
             let value = doc.scalar_value(node).map_err(|error| error.to_string())?;
-            scalar_to_json(*style, &value, tag.as_deref())
+            let tag = doc.resolved_tag(node).map_err(|error| error.to_string())?;
+            scalar_to_json(style, &value, tag.as_deref())
         }
-        SemanticKind::Alias { name } => {
-            let target = context
-                .anchors
-                .get(name)
-                .copied()
+        SemanticKind::Alias => {
+            let name = doc.alias_name(node).unwrap_or_default();
+            let target = doc
+                .resolve_alias(node)
                 .ok_or_else(|| format!("alias `{name}` references an unknown anchor"))?;
             graph_node_to_json(doc, target, context)
         }
@@ -521,19 +521,18 @@ fn graph_key_to_json_key(
         .semantic_kind(node)
         .ok_or_else(|| format!("missing semantic key node {}", node.as_usize()))?;
     match semantic {
-        SemanticKind::Scalar { anchor, .. } => {
-            if let Some(anchor) = anchor {
-                context.anchors.insert(anchor.clone(), node);
+        SemanticKind::Scalar { .. } => {
+            if let Some(anchor) = doc.anchor(node) {
+                context.anchors.insert(anchor.to_owned(), node);
             }
             doc.scalar_value(node)
                 .map(|value| value.into_owned())
                 .map_err(|error| error.to_string())
         }
-        SemanticKind::Alias { name } => {
-            let target = context
-                .anchors
-                .get(name)
-                .copied()
+        SemanticKind::Alias => {
+            let name = doc.alias_name(node).unwrap_or_default();
+            let target = doc
+                .resolve_alias(node)
                 .ok_or_else(|| format!("alias key `{name}` references an unknown anchor"))?;
             graph_key_to_json_key(doc, target, context)
         }

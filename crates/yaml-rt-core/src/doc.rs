@@ -1,4 +1,5 @@
 use std::fmt;
+use std::marker::PhantomData;
 
 use crate::syntax::node_link;
 use crate::{
@@ -18,6 +19,20 @@ pub struct Edit {
     pub span: Span,
     /// Replacement text.
     pub replacement: String,
+}
+
+/// On-demand iterator over semantic YAML events.
+pub struct YamlEvents<'doc> {
+    inner: std::vec::IntoIter<YamlEvent>,
+    marker: PhantomData<&'doc YamlDoc>,
+}
+
+impl Iterator for YamlEvents<'_> {
+    type Item = YamlEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
 }
 
 /// Parsed `%YAML` directive metadata.
@@ -75,8 +90,6 @@ pub struct YamlDoc {
     pub(crate) source: Source,
     /// CST and semantic nodes. The CST remains the source of truth.
     pub(crate) nodes: Vec<Node>,
-    /// Semantic YAML event stream produced by the parser.
-    pub(crate) events: Vec<YamlEvent>,
     /// Compact semantic metadata keyed by CST node IDs.
     pub(crate) semantics: SemanticStore,
     /// Optional mapping root used by nested typed overlays.
@@ -110,13 +123,12 @@ impl YamlDoc {
         let parsed = Parser::new(&source)
             .parse()
             .map_err(|error| error.with_position_from(&source))?;
-        let semantics = SemanticStore::from_events(&parsed.nodes, &parsed.events)
+        let semantics = SemanticStore::from_events(&parsed.nodes, parsed.events)
             .map_err(|error| error.with_position_from(&source))?;
 
         Ok(Self {
             source,
             nodes: parsed.nodes,
-            events: parsed.events,
             semantics,
             root_override: None,
             edits: Vec::new(),
@@ -174,16 +186,124 @@ impl YamlDoc {
         (!self.nodes.is_empty()).then_some(NodeId(0))
     }
 
-    /// Returns the semantic event stream produced by the parser.
+    /// Derives the semantic event stream from CST-linked metadata.
     #[must_use]
-    pub fn events(&self) -> &[YamlEvent] {
-        &self.events
+    pub fn events(&self) -> YamlEvents<'_> {
+        YamlEvents {
+            inner: self.collect_events().into_iter(),
+            marker: PhantomData,
+        }
     }
 
     /// Renders semantic events in the YAML Test Suite `test.event` format.
     #[must_use]
     pub fn events_to_test_string(&self) -> String {
-        events_to_test_string(&self.events)
+        events_to_test_string(self.events())
+    }
+
+    fn collect_events(&self) -> Vec<YamlEvent> {
+        let mut events = Vec::with_capacity(self.nodes.len().saturating_add(2));
+        events.push(YamlEvent {
+            kind: crate::YamlEventKind::StreamStart,
+            span: Span::from_usize(0, self.source.len()),
+            cst: None,
+        });
+        for document in &self.semantics.documents {
+            let Some(metadata) = self.semantics.get(*document) else {
+                continue;
+            };
+            events.push(YamlEvent {
+                kind: crate::YamlEventKind::DocumentStart {
+                    explicit: metadata.explicit_start,
+                },
+                span: metadata.span,
+                cst: Some(*document),
+            });
+            for child in self.semantics.children(*document) {
+                self.collect_node_events(child, &mut events);
+            }
+            events.push(YamlEvent {
+                kind: crate::YamlEventKind::DocumentEnd {
+                    explicit: metadata.explicit_end,
+                },
+                span: metadata.end_span,
+                cst: None,
+            });
+        }
+        events.push(YamlEvent {
+            kind: crate::YamlEventKind::StreamEnd,
+            span: Span::empty_from_usize(self.source.len()),
+            cst: None,
+        });
+        events
+    }
+
+    fn collect_node_events(&self, node: NodeId, events: &mut Vec<YamlEvent>) {
+        let Some(metadata) = self.semantics.get(node) else {
+            return;
+        };
+        match &metadata.kind {
+            SemanticKind::Document => {}
+            SemanticKind::Mapping { style, tag, anchor } => {
+                events.push(YamlEvent {
+                    kind: crate::YamlEventKind::MappingStart {
+                        style: *style,
+                        tag: tag.clone(),
+                        anchor: anchor.clone(),
+                    },
+                    span: metadata.span,
+                    cst: Some(node),
+                });
+                for (key, value) in self.mapping_entries(node) {
+                    self.collect_node_events(key, events);
+                    self.collect_node_events(value, events);
+                }
+                events.push(YamlEvent {
+                    kind: crate::YamlEventKind::MappingEnd,
+                    span: metadata.end_span,
+                    cst: None,
+                });
+            }
+            SemanticKind::Sequence { style, tag, anchor } => {
+                events.push(YamlEvent {
+                    kind: crate::YamlEventKind::SequenceStart {
+                        style: *style,
+                        tag: tag.clone(),
+                        anchor: anchor.clone(),
+                    },
+                    span: metadata.span,
+                    cst: Some(node),
+                });
+                for item in self.sequence_items(node) {
+                    self.collect_node_events(item, events);
+                }
+                events.push(YamlEvent {
+                    kind: crate::YamlEventKind::SequenceEnd,
+                    span: metadata.end_span,
+                    cst: None,
+                });
+            }
+            SemanticKind::Scalar {
+                style,
+                value,
+                tag,
+                anchor,
+            } => events.push(YamlEvent {
+                kind: crate::YamlEventKind::Scalar {
+                    style: *style,
+                    value: value.clone(),
+                    tag: tag.clone(),
+                    anchor: anchor.clone(),
+                },
+                span: metadata.span,
+                cst: Some(node),
+            }),
+            SemanticKind::Alias { name } => events.push(YamlEvent {
+                kind: crate::YamlEventKind::Alias { name: name.clone() },
+                span: metadata.span,
+                cst: Some(node),
+            }),
+        }
     }
 
     /// Returns the number of documents in this YAML stream.
@@ -356,11 +476,11 @@ impl YamlDoc {
             self.semantic_kind(mapping),
             Some(SemanticKind::Mapping { .. })
         );
-        self.children(mapping).filter_map(move |entry| {
-            if !is_mapping || self.node(entry)?.kind != NodeKind::MappingEntry {
+        let mut children = self.semantics.children(mapping);
+        std::iter::from_fn(move || {
+            if !is_mapping {
                 return None;
             }
-            let mut children = self.children(entry);
             Some((children.next()?, children.next()?))
         })
     }
@@ -371,16 +491,9 @@ impl YamlDoc {
             self.semantic_kind(sequence),
             Some(SemanticKind::Sequence { .. })
         );
-        self.children(sequence).filter_map(move |child| {
-            if !is_sequence {
-                return None;
-            }
-            if self.node(child)?.kind == NodeKind::SequenceEntry {
-                self.children(child).next()
-            } else {
-                Some(child)
-            }
-        })
+        self.semantics
+            .children(sequence)
+            .filter(move |_| is_sequence)
     }
 
     /// Returns the first root-level block mapping in the document.
@@ -411,7 +524,8 @@ impl YamlDoc {
             .get(index)
             .copied()
             .ok_or_else(|| self.document_index_error(index))?;
-        self.children(document)
+        self.semantics
+            .children(document)
             .find(|child| {
                 self.node(*child)
                     .is_some_and(|node| node.kind == NodeKind::BlockMapping)
@@ -546,10 +660,7 @@ impl YamlDoc {
             .get(index)
             .copied()
             .ok_or_else(|| self.document_index_error(index))?;
-        let Some(child) = self
-            .children(document)
-            .find(|child| self.semantic_kind(*child).is_some())
-        else {
+        let Some(child) = self.semantics.children(document).next() else {
             return Ok(None);
         };
         let Some(SemanticKind::Mapping { style, .. }) = self.semantic_kind(child) else {

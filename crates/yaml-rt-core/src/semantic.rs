@@ -50,6 +50,12 @@ pub enum SemanticKind {
 pub(crate) struct SemanticNode {
     pub(crate) kind: SemanticKind,
     pub(crate) span: Span,
+    pub(crate) end_span: Span,
+    pub(crate) explicit_start: bool,
+    pub(crate) explicit_end: bool,
+    first_child: u32,
+    last_child: u32,
+    next_sibling: u32,
 }
 
 /// Compact semantic side arena indexed through CST `NodeId`s.
@@ -61,45 +67,52 @@ pub(crate) struct SemanticStore {
 }
 
 impl SemanticStore {
-    pub(crate) fn from_events(nodes: &[Node], events: &[YamlEvent]) -> Result<Self, YamlError> {
-        validate_event_structure(events)?;
+    pub(crate) fn from_events(nodes: &[Node], events: Vec<YamlEvent>) -> Result<Self, YamlError> {
+        validate_event_structure(&events)?;
         let mut store = Self {
             slots: vec![NO_SEMANTIC_NODE; nodes.len()],
             nodes: Vec::with_capacity(events.len().saturating_sub(2)),
             documents: Vec::new(),
         };
 
+        let mut open = Vec::with_capacity(8);
         for event in events {
             let Some(cst) = event.cst else {
+                match event.kind {
+                    YamlEventKind::DocumentEnd { explicit } => {
+                        store.close(&mut open, event.span, Some(explicit));
+                    }
+                    YamlEventKind::MappingEnd | YamlEventKind::SequenceEnd => {
+                        store.close(&mut open, event.span, None);
+                    }
+                    _ => {}
+                }
                 continue;
             };
-            let kind = match &event.kind {
-                YamlEventKind::DocumentStart { .. } => {
+            let (kind, explicit_start, is_open) = match event.kind {
+                YamlEventKind::DocumentStart { explicit } => {
                     store.documents.push(cst);
-                    SemanticKind::Document
+                    (SemanticKind::Document, explicit, true)
                 }
-                YamlEventKind::MappingStart { style, tag, anchor } => SemanticKind::Mapping {
-                    style: *style,
-                    tag: tag.clone(),
-                    anchor: anchor.clone(),
-                },
-                YamlEventKind::SequenceStart { style, tag, anchor } => SemanticKind::Sequence {
-                    style: *style,
-                    tag: tag.clone(),
-                    anchor: anchor.clone(),
-                },
+                YamlEventKind::MappingStart { style, tag, anchor } => {
+                    SemanticKind::Mapping { style, tag, anchor }.open()
+                }
+                YamlEventKind::SequenceStart { style, tag, anchor } => {
+                    SemanticKind::Sequence { style, tag, anchor }.open()
+                }
                 YamlEventKind::Scalar {
                     style,
                     value,
                     tag,
                     anchor,
                 } => SemanticKind::Scalar {
-                    style: *style,
-                    value: value.clone(),
-                    tag: tag.clone(),
-                    anchor: anchor.clone(),
-                },
-                YamlEventKind::Alias { name } => SemanticKind::Alias { name: name.clone() },
+                    style,
+                    value,
+                    tag,
+                    anchor,
+                }
+                .closed(),
+                YamlEventKind::Alias { name } => SemanticKind::Alias { name }.closed(),
                 YamlEventKind::StreamStart
                 | YamlEventKind::StreamEnd
                 | YamlEventKind::DocumentEnd { .. }
@@ -111,8 +124,19 @@ impl SemanticStore {
                 SemanticNode {
                     kind,
                     span: event.span,
+                    end_span: event.span,
+                    explicit_start,
+                    explicit_end: false,
+                    first_child: NO_SEMANTIC_NODE,
+                    last_child: NO_SEMANTIC_NODE,
+                    next_sibling: NO_SEMANTIC_NODE,
                 },
             );
+            if is_open {
+                open.push(cst);
+            } else if let Some(parent) = open.last().copied() {
+                store.attach(parent, cst);
+            }
         }
         Ok(store)
     }
@@ -123,9 +147,76 @@ impl SemanticStore {
         self.nodes.push(node);
     }
 
+    fn close(&mut self, open: &mut Vec<NodeId>, span: Span, explicit: Option<bool>) {
+        let Some(cst) = open.pop() else {
+            return;
+        };
+        let index = self.slots[cst.as_usize()] as usize;
+        self.nodes[index].end_span = span;
+        if let Some(explicit) = explicit {
+            self.nodes[index].explicit_end = explicit;
+        } else if let Some(parent) = open.last().copied() {
+            self.attach(parent, cst);
+        }
+    }
+
+    fn attach(&mut self, parent: NodeId, child: NodeId) {
+        let parent_index = self.slots[parent.as_usize()] as usize;
+        let child_index = self.slots[child.as_usize()] as usize;
+        let previous = self.nodes[parent_index].last_child;
+        if previous == NO_SEMANTIC_NODE {
+            self.nodes[parent_index].first_child = child.0;
+        } else {
+            let previous_index = self.slots[previous as usize] as usize;
+            self.nodes[previous_index].next_sibling = child.0;
+        }
+        self.nodes[parent_index].last_child = child.0;
+        debug_assert_eq!(self.nodes[child_index].next_sibling, NO_SEMANTIC_NODE);
+    }
+
     pub(crate) fn get(&self, cst: NodeId) -> Option<&SemanticNode> {
         let index = *self.slots.get(cst.as_usize())?;
         (index != NO_SEMANTIC_NODE).then(|| &self.nodes[index as usize])
+    }
+
+    pub(crate) fn children(&self, parent: NodeId) -> SemanticChildren<'_> {
+        let next = self
+            .get(parent)
+            .map_or(NO_SEMANTIC_NODE, |node| node.first_child);
+        SemanticChildren { store: self, next }
+    }
+}
+
+pub(crate) struct SemanticChildren<'a> {
+    store: &'a SemanticStore,
+    next: u32,
+}
+
+impl Iterator for SemanticChildren<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == NO_SEMANTIC_NODE {
+            return None;
+        }
+        let node = NodeId(self.next);
+        self.next = self.store.get(node)?.next_sibling;
+        Some(node)
+    }
+}
+
+trait SemanticState {
+    fn open(self) -> (SemanticKind, bool, bool);
+    fn closed(self) -> (SemanticKind, bool, bool);
+}
+
+impl SemanticState for SemanticKind {
+    fn open(self) -> (SemanticKind, bool, bool) {
+        (self, false, true)
+    }
+
+    fn closed(self) -> (SemanticKind, bool, bool) {
+        (self, false, false)
     }
 }
 

@@ -479,16 +479,15 @@ fn events_only_classify_plain_scalars_as_aliases() {
     let input = "plain: *alias\nsingle: '*alias'\ndouble: \"*alias\"\nliteral: |\n  *alias\nfolded: >\n  *alias\n";
     let doc = YamlDoc::parse(input).expect("valid scalar styles beginning with an asterisk");
 
-    let aliases = doc
-        .events()
+    let events = doc.events().collect::<Vec<_>>();
+    let aliases = events
         .iter()
         .filter(|event| matches!(event.kind, YamlEventKind::Alias { .. }))
         .count();
-    let scalar_values: Vec<_> = doc
-        .events()
+    let scalar_values: Vec<_> = events
         .iter()
         .filter_map(|event| match &event.kind {
-            YamlEventKind::Scalar { value, .. } if value.starts_with('*') => Some(value.as_str()),
+            YamlEventKind::Scalar { value, .. } if value.starts_with('*') => Some(value.clone()),
             _ => None,
         })
         .collect();
@@ -1040,16 +1039,18 @@ fn parser_events_carry_source_spans() {
     let doc = YamlDoc::parse("host: localhost\n").expect("valid mapping");
     let scalar_events: Vec<_> = doc
         .events()
-        .iter()
-        .filter_map(|event| match &event.kind {
-            YamlEventKind::Scalar { value, .. } => Some((value.as_str(), event.span)),
+        .filter_map(|event| match event.kind {
+            YamlEventKind::Scalar { value, .. } => Some((value, event.span)),
             _ => None,
         })
         .collect();
 
     assert_eq!(
         scalar_events,
-        [("host", Span::new(0, 4)), ("localhost", Span::new(6, 15))]
+        [
+            ("host".to_owned(), Span::new(0, 4)),
+            ("localhost".to_owned(), Span::new(6, 15))
+        ]
     );
 }
 

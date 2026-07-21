@@ -5265,9 +5265,14 @@ fn ends_with_line_break(value: &str) -> bool {
 
 /// Renders YAML events in the YAML Test Suite `test.event` format.
 #[must_use]
-pub fn events_to_test_string(events: &[YamlEvent]) -> String {
+pub fn events_to_test_string<I, E>(events: I) -> String
+where
+    I: IntoIterator<Item = E>,
+    E: std::borrow::Borrow<YamlEvent>,
+{
     let mut output = String::new();
     for event in events {
+        let event = event.borrow();
         match &event.kind {
             YamlEventKind::StreamStart => output.push_str("+STR\n"),
             YamlEventKind::StreamEnd => output.push_str("-STR\n"),

@@ -15,7 +15,9 @@ mod syntax;
 mod typed;
 
 pub use diagnostic::{Diagnostic, DiagnosticKind, ParseError, YamlError};
-pub use doc::{Edit, MappingEntryStyle, ReservedDirective, TagDirective, YamlDirective, YamlDoc};
+pub use doc::{
+    Edit, MappingEntryStyle, ReservedDirective, TagDirective, YamlDirective, YamlDoc, YamlEvents,
+};
 pub use lexer::{Token, TokenKind, lex, tokens_to_string};
 pub use parser::events_to_test_string;
 pub use semantic::SemanticKind;

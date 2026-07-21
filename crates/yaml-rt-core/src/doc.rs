@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::marker::PhantomData;
 
 use crate::syntax::node_link;
 use crate::{
@@ -26,15 +25,271 @@ pub struct Edit {
 
 /// On-demand iterator over semantic YAML events.
 pub struct YamlEvents<'doc> {
-    inner: std::vec::IntoIter<YamlEvent>,
-    marker: PhantomData<&'doc YamlDoc>,
+    doc: &'doc YamlDoc,
+    tasks: Vec<EventTask>,
 }
 
 impl Iterator for YamlEvents<'_> {
     type Item = YamlEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        while let Some(task) = self.tasks.pop() {
+            match task {
+                EventTask::StreamStart => {
+                    return Some(YamlEvent {
+                        kind: crate::YamlEventKind::StreamStart,
+                        span: Span::from_usize(0, self.doc.source.len()),
+                        cst: None,
+                        content_indent: None,
+                    });
+                }
+                EventTask::Documents(index) => self.schedule_document(index),
+                EventTask::DocumentStart(document) => {
+                    let Some(metadata) = self.doc.semantics.get(document) else {
+                        continue;
+                    };
+                    return Some(YamlEvent {
+                        kind: crate::YamlEventKind::DocumentStart {
+                            explicit: metadata.explicit_start(),
+                        },
+                        span: self.doc.semantic_span(document, metadata),
+                        cst: Some(document),
+                        content_indent: None,
+                    });
+                }
+                EventTask::DocumentChildren(next) => self.schedule_document_child(next),
+                EventTask::DocumentEnd(document) => {
+                    let Some(metadata) = self.doc.semantics.get(document) else {
+                        continue;
+                    };
+                    return Some(YamlEvent {
+                        kind: crate::YamlEventKind::DocumentEnd {
+                            explicit: metadata.explicit_end(),
+                        },
+                        span: self.doc.semantic_end_span(document, metadata),
+                        cst: None,
+                        content_indent: None,
+                    });
+                }
+                EventTask::Node(node) => {
+                    if let Some(event) = self.schedule_node(node) {
+                        return Some(event);
+                    }
+                }
+                EventTask::MappingEntries(next) => self.schedule_mapping_entry(next),
+                EventTask::SequenceEntries(next) => self.schedule_sequence_entry(next),
+                EventTask::CollectionEnd { node, mapping } => {
+                    let Some(metadata) = self.doc.semantics.get(node) else {
+                        continue;
+                    };
+                    return Some(YamlEvent {
+                        kind: if mapping {
+                            crate::YamlEventKind::MappingEnd
+                        } else {
+                            crate::YamlEventKind::SequenceEnd
+                        },
+                        span: self.doc.semantic_end_span(node, metadata),
+                        cst: None,
+                        content_indent: None,
+                    });
+                }
+                EventTask::StreamEnd => {
+                    return Some(YamlEvent {
+                        kind: crate::YamlEventKind::StreamEnd,
+                        span: Span::empty_from_usize(self.doc.source.len()),
+                        cst: None,
+                        content_indent: None,
+                    });
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventTask {
+    StreamStart,
+    Documents(usize),
+    DocumentStart(NodeId),
+    DocumentChildren(u32),
+    DocumentEnd(NodeId),
+    Node(NodeId),
+    MappingEntries(u32),
+    SequenceEntries(u32),
+    CollectionEnd { node: NodeId, mapping: bool },
+    StreamEnd,
+}
+
+impl YamlEvents<'_> {
+    fn schedule_document(&mut self, index: usize) {
+        let Some(&document) = self.doc.semantics.documents.get(index) else {
+            return;
+        };
+        let Some(node) = self.doc.node(document) else {
+            self.tasks.push(EventTask::Documents(index + 1));
+            return;
+        };
+        self.tasks.push(EventTask::Documents(index + 1));
+        self.tasks.push(EventTask::DocumentEnd(document));
+        self.tasks
+            .push(EventTask::DocumentChildren(node.first_child));
+        self.tasks.push(EventTask::DocumentStart(document));
+    }
+
+    fn schedule_document_child(&mut self, next: u32) {
+        let Some(child) = node_link(next) else {
+            return;
+        };
+        self.tasks.push(EventTask::DocumentChildren(
+            self.doc.nodes[child.as_usize()].next_sibling,
+        ));
+        if self.doc.semantics.get(child).is_some() {
+            self.tasks.push(EventTask::Node(child));
+        }
+    }
+
+    fn schedule_node(&mut self, node: NodeId) -> Option<YamlEvent> {
+        let metadata = self.doc.semantics.get(node)?;
+        let span = self.doc.semantic_span(node, metadata);
+        match metadata.kind {
+            SemanticKind::Document => None,
+            SemanticKind::Mapping { style } => {
+                self.tasks.push(EventTask::CollectionEnd {
+                    node,
+                    mapping: true,
+                });
+                self.tasks.push(EventTask::MappingEntries(
+                    self.doc.nodes[node.as_usize()].first_child,
+                ));
+                Some(YamlEvent {
+                    kind: crate::YamlEventKind::MappingStart {
+                        style,
+                        tag: self
+                            .doc
+                            .resolved_tag(node)
+                            .ok()
+                            .flatten()
+                            .map(Cow::into_owned),
+                        anchor: self.doc.anchor(node).map(str::to_owned),
+                    },
+                    span,
+                    cst: Some(node),
+                    content_indent: None,
+                })
+            }
+            SemanticKind::Sequence { style } => {
+                self.tasks.push(EventTask::CollectionEnd {
+                    node,
+                    mapping: false,
+                });
+                self.tasks.push(EventTask::SequenceEntries(
+                    self.doc.nodes[node.as_usize()].first_child,
+                ));
+                Some(YamlEvent {
+                    kind: crate::YamlEventKind::SequenceStart {
+                        style,
+                        tag: self
+                            .doc
+                            .resolved_tag(node)
+                            .ok()
+                            .flatten()
+                            .map(Cow::into_owned),
+                        anchor: self.doc.anchor(node).map(str::to_owned),
+                    },
+                    span,
+                    cst: Some(node),
+                    content_indent: None,
+                })
+            }
+            SemanticKind::Scalar { style } => Some(YamlEvent {
+                kind: crate::YamlEventKind::Scalar {
+                    style,
+                    value: self
+                        .doc
+                        .scalar_value(node)
+                        .map(Cow::into_owned)
+                        .unwrap_or_default(),
+                    tag: self
+                        .doc
+                        .resolved_tag(node)
+                        .ok()
+                        .flatten()
+                        .map(Cow::into_owned),
+                    anchor: self.doc.anchor(node).map(str::to_owned),
+                },
+                span,
+                cst: Some(node),
+                content_indent: self
+                    .doc
+                    .semantics
+                    .properties(node)
+                    .and_then(|properties| properties.content_indent),
+            }),
+            SemanticKind::Alias => Some(YamlEvent {
+                kind: crate::YamlEventKind::Alias {
+                    name: self.doc.alias_name(node).unwrap_or_default().to_owned(),
+                },
+                span,
+                cst: Some(node),
+                content_indent: None,
+            }),
+        }
+    }
+
+    fn schedule_mapping_entry(&mut self, next: u32) {
+        let Some(entry) = node_link(next) else {
+            return;
+        };
+        self.tasks.push(EventTask::MappingEntries(
+            self.doc.nodes[entry.as_usize()].next_sibling,
+        ));
+        if self.doc.nodes[entry.as_usize()].kind != NodeKind::MappingEntry {
+            return;
+        }
+        let Some(key) = self.first_semantic_child(entry) else {
+            return;
+        };
+        let Some(value) = self.next_semantic_sibling(key) else {
+            return;
+        };
+        self.tasks.push(EventTask::Node(value));
+        self.tasks.push(EventTask::Node(key));
+    }
+
+    fn schedule_sequence_entry(&mut self, next: u32) {
+        let Some(entry) = node_link(next) else {
+            return;
+        };
+        self.tasks.push(EventTask::SequenceEntries(
+            self.doc.nodes[entry.as_usize()].next_sibling,
+        ));
+        if self.doc.nodes[entry.as_usize()].kind != NodeKind::SequenceEntry {
+            return;
+        }
+        if let Some(item) = self.first_semantic_child(entry) {
+            self.tasks.push(EventTask::Node(item));
+        }
+    }
+
+    fn first_semantic_child(&self, parent: NodeId) -> Option<NodeId> {
+        let next = self.doc.nodes[parent.as_usize()].first_child;
+        self.next_semantic(next)
+    }
+
+    fn next_semantic_sibling(&self, node: NodeId) -> Option<NodeId> {
+        let next = self.doc.nodes[node.as_usize()].next_sibling;
+        self.next_semantic(next)
+    }
+
+    fn next_semantic(&self, mut next: u32) -> Option<NodeId> {
+        while let Some(node) = node_link(next) {
+            if self.doc.semantics.get(node).is_some() {
+                return Some(node);
+            }
+            next = self.doc.nodes[node.as_usize()].next_sibling;
+        }
+        None
     }
 }
 
@@ -189,137 +444,17 @@ impl YamlDoc {
     /// Derives the semantic event stream from CST-linked metadata.
     #[must_use]
     pub fn events(&self) -> YamlEvents<'_> {
-        YamlEvents {
-            inner: self.collect_events().into_iter(),
-            marker: PhantomData,
-        }
+        let mut tasks = Vec::with_capacity(8);
+        tasks.push(EventTask::StreamEnd);
+        tasks.push(EventTask::Documents(0));
+        tasks.push(EventTask::StreamStart);
+        YamlEvents { doc: self, tasks }
     }
 
     /// Renders semantic events in the YAML Test Suite `test.event` format.
     #[must_use]
     pub fn events_to_test_string(&self) -> String {
         events_to_test_string(self.events())
-    }
-
-    fn collect_events(&self) -> Vec<YamlEvent> {
-        let mut events = Vec::with_capacity(self.nodes.len().saturating_add(2));
-        events.push(YamlEvent {
-            kind: crate::YamlEventKind::StreamStart,
-            span: Span::from_usize(0, self.source.len()),
-            cst: None,
-            content_indent: None,
-        });
-        for document in &self.semantics.documents {
-            let Some(metadata) = self.semantics.get(*document) else {
-                continue;
-            };
-            events.push(YamlEvent {
-                kind: crate::YamlEventKind::DocumentStart {
-                    explicit: metadata.explicit_start(),
-                },
-                span: self.semantic_span(*document, metadata),
-                cst: Some(*document),
-                content_indent: None,
-            });
-            for child in self.semantic_children(*document) {
-                self.collect_node_events(child, &mut events);
-            }
-            events.push(YamlEvent {
-                kind: crate::YamlEventKind::DocumentEnd {
-                    explicit: metadata.explicit_end(),
-                },
-                span: self.semantic_end_span(*document, metadata),
-                cst: None,
-                content_indent: None,
-            });
-        }
-        events.push(YamlEvent {
-            kind: crate::YamlEventKind::StreamEnd,
-            span: Span::empty_from_usize(self.source.len()),
-            cst: None,
-            content_indent: None,
-        });
-        events
-    }
-
-    fn collect_node_events(&self, node: NodeId, events: &mut Vec<YamlEvent>) {
-        let Some(metadata) = self.semantics.get(node) else {
-            return;
-        };
-        match metadata.kind {
-            SemanticKind::Document => {}
-            SemanticKind::Mapping { style } => {
-                events.push(YamlEvent {
-                    kind: crate::YamlEventKind::MappingStart {
-                        style,
-                        tag: self.resolved_tag(node).ok().flatten().map(Cow::into_owned),
-                        anchor: self.anchor(node).map(str::to_owned),
-                    },
-                    span: self.semantic_span(node, metadata),
-                    cst: Some(node),
-                    content_indent: None,
-                });
-                for (key, value) in self.mapping_entries(node) {
-                    self.collect_node_events(key, events);
-                    self.collect_node_events(value, events);
-                }
-                events.push(YamlEvent {
-                    kind: crate::YamlEventKind::MappingEnd,
-                    span: self.semantic_end_span(node, metadata),
-                    cst: None,
-                    content_indent: None,
-                });
-            }
-            SemanticKind::Sequence { style } => {
-                events.push(YamlEvent {
-                    kind: crate::YamlEventKind::SequenceStart {
-                        style,
-                        tag: self.resolved_tag(node).ok().flatten().map(Cow::into_owned),
-                        anchor: self.anchor(node).map(str::to_owned),
-                    },
-                    span: self.semantic_span(node, metadata),
-                    cst: Some(node),
-                    content_indent: None,
-                });
-                for item in self.sequence_items(node) {
-                    self.collect_node_events(item, events);
-                }
-                events.push(YamlEvent {
-                    kind: crate::YamlEventKind::SequenceEnd,
-                    span: self.semantic_end_span(node, metadata),
-                    cst: None,
-                    content_indent: None,
-                });
-            }
-            SemanticKind::Scalar { style } => {
-                let value = self
-                    .scalar_value(node)
-                    .map(Cow::into_owned)
-                    .unwrap_or_default();
-                events.push(YamlEvent {
-                    kind: crate::YamlEventKind::Scalar {
-                        style,
-                        value,
-                        tag: self.resolved_tag(node).ok().flatten().map(Cow::into_owned),
-                        anchor: self.anchor(node).map(str::to_owned),
-                    },
-                    span: self.semantic_span(node, metadata),
-                    cst: Some(node),
-                    content_indent: self
-                        .semantics
-                        .properties(node)
-                        .and_then(|properties| properties.content_indent),
-                });
-            }
-            SemanticKind::Alias => events.push(YamlEvent {
-                kind: crate::YamlEventKind::Alias {
-                    name: self.alias_name(node).unwrap_or_default().to_owned(),
-                },
-                span: self.semantic_span(node, metadata),
-                cst: Some(node),
-                content_indent: None,
-            }),
-        }
     }
 
     /// Returns the number of documents in this YAML stream.

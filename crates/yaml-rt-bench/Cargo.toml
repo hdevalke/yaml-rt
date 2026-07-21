@@ -10,9 +10,19 @@ publish = false
 [[bench]]
 name = "parse"
 harness = false
+required-features = ["baselines"]
+
+[[bench]]
+name = "profile_parse"
+harness = false
 
 [dev-dependencies]
 criterion = "0.5"
-fyaml = "0.5.0"
-saphyr = "0.0.6"
 yaml-rt-core.workspace = true
+
+[dependencies]
+fyaml = { version = "0.5.0", optional = true }
+saphyr = { version = "0.0.6", optional = true }
+
+[features]
+baselines = ["dep:fyaml", "dep:saphyr"]

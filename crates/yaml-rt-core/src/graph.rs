@@ -104,7 +104,8 @@ pub(crate) fn compose_graph(
 
 struct GraphComposer<'events> {
     events: &'events [YamlEvent],
-    cst_nodes: &'events [Node],
+    exact_cst_nodes: Vec<((NodeKind, Span), NodeId)>,
+    start_cst_nodes: Vec<((NodeKind, u32), NodeId)>,
     graph_nodes: Vec<GraphNode>,
     stack: Vec<OpenGraphNode>,
     root: Option<GraphNodeId>,
@@ -126,13 +127,15 @@ enum OpenGraphKind {
 
 impl<'events> GraphComposer<'events> {
     fn new(events: &'events [YamlEvent], cst_nodes: &'events [Node]) -> Self {
+        let (exact_cst_nodes, start_cst_nodes) = cst_node_indexes(cst_nodes);
         Self {
             events,
-            cst_nodes,
-            graph_nodes: Vec::new(),
-            stack: Vec::new(),
+            exact_cst_nodes,
+            start_cst_nodes,
+            graph_nodes: Vec::with_capacity(events.len()),
+            stack: Vec::with_capacity(8),
             root: None,
-            documents: Vec::new(),
+            documents: Vec::with_capacity(document_event_count(events)),
         }
     }
 
@@ -206,7 +209,7 @@ impl<'events> GraphComposer<'events> {
     fn open_document(&mut self, span: Span) {
         let id = self.push_node(GraphNode {
             kind: GraphKind::Document {
-                children: Vec::new(),
+                children: Vec::with_capacity(1),
             },
             span,
             cst: self.find_cst_node(NodeKind::Document, span),
@@ -233,7 +236,7 @@ impl<'events> GraphComposer<'events> {
                 style,
                 tag,
                 anchor,
-                entries: Vec::new(),
+                entries: Vec::with_capacity(2),
             },
             span,
             cst: self.find_cst_node(mapping_node_kind(style), span),
@@ -256,7 +259,7 @@ impl<'events> GraphComposer<'events> {
                 style,
                 tag,
                 anchor,
-                items: Vec::new(),
+                items: Vec::with_capacity(2),
             },
             span,
             cst: self.find_cst_node(sequence_node_kind(style), span),
@@ -351,18 +354,45 @@ impl<'events> GraphComposer<'events> {
     }
 
     fn find_cst_node(&self, kind: NodeKind, span: Span) -> Option<NodeId> {
-        self.cst_nodes
-            .iter()
-            .enumerate()
-            .find(|(_, node)| node.kind == kind && node.span == span)
+        self.exact_cst_nodes
+            .binary_search_by_key(&(kind, span), |(key, _)| *key)
+            .ok()
+            .map(|index| self.exact_cst_nodes[index].1)
             .or_else(|| {
-                self.cst_nodes
-                    .iter()
-                    .enumerate()
-                    .find(|(_, node)| node.kind == kind && node.span.start == span.start)
+                self.start_cst_nodes
+                    .binary_search_by_key(&(kind, span.start), |(key, _)| *key)
+                    .ok()
+                    .map(|index| self.start_cst_nodes[index].1)
             })
-            .map(|(index, _)| NodeId::from_usize(index))
     }
+}
+
+fn cst_node_indexes(
+    nodes: &[Node],
+) -> (
+    Vec<((NodeKind, Span), NodeId)>,
+    Vec<((NodeKind, u32), NodeId)>,
+) {
+    let mut exact = Vec::with_capacity(nodes.len());
+    let mut start = Vec::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        let id = NodeId::from_usize(index);
+        exact.push(((node.kind, node.span), id));
+        start.push(((node.kind, node.span.start), id));
+    }
+    exact.sort_by_key(|(key, _)| *key);
+    exact.dedup_by_key(|(key, _)| *key);
+    start.sort_by_key(|(key, _)| *key);
+    start.dedup_by_key(|(key, _)| *key);
+    (exact, start)
+}
+
+fn document_event_count(events: &[YamlEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event.kind, YamlEventKind::DocumentStart { .. }))
+        .count()
+        .max(1)
 }
 
 fn graph_error(message: impl Into<String>, span: Span) -> YamlError {

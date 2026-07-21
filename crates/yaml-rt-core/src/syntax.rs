@@ -12,7 +12,7 @@ pub struct Node {
 }
 
 /// Node kinds emitted by the CST parser MVP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NodeKind {
     /// Complete YAML stream.
     Stream,

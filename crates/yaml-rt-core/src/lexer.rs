@@ -81,7 +81,7 @@ impl<'source> Lexer<'source> {
             source,
             text: source.as_str(),
             position: 0,
-            tokens: Vec::new(),
+            tokens: Vec::with_capacity(source.len() / 4 + 1),
         }
     }
 

@@ -129,11 +129,26 @@ impl Source {
     /// Returns an error when `text` contains characters that are not valid in a
     /// YAML 1.2.2 stream.
     pub fn new(text: String) -> Result<Self, YamlError> {
-        validate_yaml_chars(&text)?;
-
-        let mut line_starts = vec![0];
-        for (offset, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
+        let mut line_starts = Vec::with_capacity(text.len() / 32 + 1);
+        line_starts.push(0);
+        for (offset, character) in text.char_indices() {
+            if !is_yaml_printable(character) {
+                let span = Span::from_usize(offset, offset + character.len_utf8());
+                return Err(YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Source,
+                        format!(
+                            "invalid YAML 1.2.2 character U+{:04X}",
+                            character as u32
+                        ),
+                        span,
+                    )
+                    .with_note(
+                        "YAML streams may contain tab, line feeds, carriage returns, printable Unicode characters, and non-breaking spaces",
+                    ),
+                ));
+            }
+            if character == '\n' {
                 line_starts.push(offset + 1);
             }
         }

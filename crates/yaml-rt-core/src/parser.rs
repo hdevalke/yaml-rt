@@ -36,21 +36,23 @@ pub(crate) struct Parser<'source> {
 }
 
 impl<'source> Parser<'source> {
-    pub(crate) fn new(source: &'source Source, _tokens: &'source [Token]) -> Self {
+    pub(crate) fn new(source: &'source Source, tokens: &'source [Token]) -> Self {
+        let estimated_nodes = tokens.len().saturating_div(2).saturating_add(4);
+        let estimated_events = estimated_nodes.saturating_mul(2).saturating_add(2);
         Self {
             source,
-            nodes: Vec::new(),
-            events: Vec::new(),
+            nodes: Vec::with_capacity(estimated_nodes),
+            events: Vec::with_capacity(estimated_events),
             stream: None,
             document: None,
             document_has_content: false,
             document_was_explicitly_opened: false,
             document_yaml_directive_seen: false,
             tag_handles: default_tag_handles(),
-            mappings: Vec::new(),
-            sequences: Vec::new(),
-            event_collections: Vec::new(),
-            pending_node_properties: Vec::new(),
+            mappings: Vec::with_capacity(8),
+            sequences: Vec::with_capacity(8),
+            event_collections: Vec::with_capacity(8),
+            pending_node_properties: Vec::with_capacity(4),
             block_scalar_content_indents: BTreeMap::new(),
         }
     }
@@ -2430,7 +2432,7 @@ impl<'source> Parser<'source> {
         self.nodes.push(Node {
             kind,
             span,
-            children: Vec::new(),
+            children: Vec::with_capacity(2),
         });
         id
     }
@@ -2572,12 +2574,13 @@ impl<'source> Parser<'source> {
 
     fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
         let node_id = node;
-        let node = self.nodes[node.0 as usize].clone();
-        let text = self.source.slice(node.span);
-        let mut properties = parse_node_properties(text, node.span)?;
-        self.resolve_node_properties(&mut properties, node.span)?;
+        let node_kind = self.nodes[node.0 as usize].kind;
+        let node_span = self.nodes[node.0 as usize].span;
+        let text = self.source.slice(node_span);
+        let mut properties = parse_node_properties(text, node_span)?;
+        self.resolve_node_properties(&mut properties, node_span)?;
         let span = if let Some(pending) =
-            self.take_pending_node_properties(self.source_indent_at(node.span.start as usize))
+            self.take_pending_node_properties(self.source_indent_at(node_span.start as usize))
         {
             if properties.anchor.is_none() {
                 properties.anchor = pending.properties.anchor;
@@ -2585,9 +2588,9 @@ impl<'source> Parser<'source> {
             if properties.tag.is_none() {
                 properties.tag = pending.properties.tag;
             }
-            Span::new(Span::usize_to_u32(pending.span_start), node.span.end)
+            Span::new(Span::usize_to_u32(pending.span_start), node_span.end)
         } else {
-            node.span
+            node_span
         };
         let value_text = &text[properties.value_start..];
         let trimmed = strip_inline_comment(value_text).trim();
@@ -2604,7 +2607,7 @@ impl<'source> Parser<'source> {
             return Ok(());
         }
 
-        let style = match node.kind {
+        let style = match node_kind {
             NodeKind::LiteralScalar => YamlScalarStyle::Literal,
             NodeKind::FoldedScalar => YamlScalarStyle::Folded,
             NodeKind::Scalar if value_text.starts_with('"') => YamlScalarStyle::DoubleQuoted,
@@ -2612,7 +2615,7 @@ impl<'source> Parser<'source> {
             NodeKind::Scalar => YamlScalarStyle::Plain,
             _ => unreachable!("emit_scalar_event only receives scalar nodes"),
         };
-        let value = if matches!(node.kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
+        let value = if matches!(node_kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
             decode_scalar_value_with_content_indent(
                 value_text,
                 self.block_scalar_content_indents.get(&node_id).copied(),
@@ -3028,11 +3031,7 @@ pub(crate) fn parse_node_properties(text: &str, span: Span) -> Result<NodeProper
             }
         }
 
-        if text[position..]
-            .chars()
-            .next()
-            .is_some_and(|next| !next.is_whitespace())
-        {
+        if next_property_character_is_not_whitespace(text, position) {
             properties.value_start = position;
             return Ok(properties);
         }
@@ -3040,14 +3039,23 @@ pub(crate) fn parse_node_properties(text: &str, span: Span) -> Result<NodeProper
 }
 
 fn skip_property_whitespace(text: &str, mut position: usize) -> usize {
-    while let Some(character) = text[position..].chars().next() {
-        if character == ' ' || character == '\t' {
-            position += character.len_utf8();
-        } else {
-            break;
-        }
+    let bytes = text.as_bytes();
+    while matches!(bytes.get(position), Some(b' ' | b'\t')) {
+        position += 1;
     }
     position
+}
+
+fn next_property_character_is_not_whitespace(text: &str, position: usize) -> bool {
+    match text.as_bytes().get(position) {
+        Some(b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) => false,
+        Some(byte) if byte.is_ascii() => true,
+        Some(_) => text[position..]
+            .chars()
+            .next()
+            .is_some_and(|next| !next.is_whitespace()),
+        None => false,
+    }
 }
 
 fn parse_anchor_property(
@@ -3140,6 +3148,20 @@ fn percent_decode_tag_suffix(suffix: &str, span: Span) -> Result<String, YamlErr
 }
 
 fn property_token_end(text: &str, mut position: usize) -> usize {
+    if text.is_ascii() {
+        let bytes = text.as_bytes();
+        while let Some(byte) = bytes.get(position) {
+            if matches!(
+                *byte,
+                b' ' | b'\t' | b'\r' | b'\n' | b'[' | b']' | b'{' | b'}' | b','
+            ) {
+                break;
+            }
+            position += 1;
+        }
+        return position;
+    }
+
     while let Some(character) = text[position..].chars().next() {
         if character.is_whitespace() || matches!(character, '[' | ']' | '{' | '}' | ',') {
             break;
@@ -3183,6 +3205,10 @@ pub(crate) fn document_marker_rest<'text>(body: &'text str, marker: &str) -> Opt
 }
 
 pub(crate) fn strip_inline_comment(text: &str) -> &str {
+    if text.is_ascii() {
+        return strip_inline_comment_ascii(text);
+    }
+
     let mut quoted = None;
     let mut previous_was_space = true;
     for (offset, character) in text.char_indices() {
@@ -3194,6 +3220,22 @@ pub(crate) fn strip_inline_comment(text: &str) -> &str {
             Some(_) | None => {}
         }
         previous_was_space = character.is_whitespace();
+    }
+    text
+}
+
+fn strip_inline_comment_ascii(text: &str) -> &str {
+    let mut quoted = None;
+    let mut previous_was_space = true;
+    for (offset, byte) in text.bytes().enumerate() {
+        match quoted {
+            Some(b'"') if byte == b'"' => quoted = None,
+            Some(b'\'') if byte == b'\'' => quoted = None,
+            None if byte == b'"' || byte == b'\'' => quoted = Some(byte),
+            None if byte == b'#' && previous_was_space => return &text[..offset],
+            Some(_) | None => {}
+        }
+        previous_was_space = matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C);
     }
     text
 }

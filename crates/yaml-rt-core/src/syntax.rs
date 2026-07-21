@@ -7,9 +7,13 @@ pub struct Node {
     pub(crate) kind: NodeKind,
     /// Original source span for this node.
     pub(crate) span: Span,
-    /// Child node identifiers in source order.
-    pub(crate) children: Vec<NodeId>,
+    pub(crate) parent: u32,
+    pub(crate) first_child: u32,
+    pub(crate) last_child: u32,
+    pub(crate) next_sibling: u32,
 }
+
+pub(crate) const NO_NODE: u32 = u32::MAX;
 
 impl Node {
     /// Returns this node's syntax classification.
@@ -24,10 +28,44 @@ impl Node {
         self.span
     }
 
-    /// Returns this node's children in source order.
+    /// Returns this node's parent, when it is not the stream root.
     #[must_use]
-    pub fn children(&self) -> &[NodeId] {
-        &self.children
+    pub const fn parent(&self) -> Option<NodeId> {
+        node_link(self.parent)
+    }
+}
+
+/// Iterator over a node's children in source order.
+#[derive(Debug, Clone)]
+pub struct Children<'doc> {
+    nodes: &'doc [Node],
+    next: u32,
+}
+
+impl<'doc> Children<'doc> {
+    pub(crate) fn new(nodes: &'doc [Node], parent: NodeId) -> Self {
+        let next = nodes
+            .get(parent.as_usize())
+            .map_or(NO_NODE, |node| node.first_child);
+        Self { nodes, next }
+    }
+}
+
+impl Iterator for Children<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let id = node_link(self.next)?;
+        self.next = self.nodes[id.as_usize()].next_sibling;
+        Some(id)
+    }
+}
+
+pub(crate) const fn node_link(link: u32) -> Option<NodeId> {
+    if link == NO_NODE {
+        None
+    } else {
+        Some(NodeId(link))
     }
 }
 

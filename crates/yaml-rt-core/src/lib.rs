@@ -22,7 +22,7 @@ pub use parser::events_to_test_string;
 pub use source::{LineCol, NodeId, Source, Span, TARGET_YAML_VERSION};
 pub(crate) use syntax::ParsedYaml;
 pub use syntax::{
-    CollectionStyle, Node, NodeKind, YamlEvent, YamlEventKind, YamlScalarStyle, parse_cst,
+    Children, CollectionStyle, Node, NodeKind, YamlEvent, YamlEventKind, YamlScalarStyle, parse_cst,
 };
 pub use typed::{FromYamlDoc, ToYamlDoc, ToYamlFragment, YamlValue};
 

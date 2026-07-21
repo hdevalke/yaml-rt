@@ -1,9 +1,10 @@
 use std::fmt;
 
+use crate::syntax::node_link;
 use crate::{
-    CollectionStyle, CollectionTarget, Diagnostic, DiagnosticKind, FromYamlDoc, GraphKind,
-    GraphNode, GraphNodeId, Node, NodeId, NodeKind, Parser, ScalarStyle, SemanticGraph, Source,
-    Span, ToYamlDoc, ToYamlFragment, Token, YamlError, YamlEvent, compose_graph,
+    Children, CollectionStyle, CollectionTarget, Diagnostic, DiagnosticKind, FromYamlDoc,
+    GraphKind, GraphNode, GraphNodeId, Node, NodeId, NodeKind, Parser, ScalarStyle, SemanticGraph,
+    Source, Span, ToYamlDoc, ToYamlFragment, Token, YamlError, YamlEvent, compose_graph,
     decode_scalar_value, directive_emit_error, double_quoted_scalar_end, edits_conflict,
     events_to_test_string, format_scalar_value, lex, next_line_content_start,
     parse_node_properties, plain_scalar_end, single_quoted_scalar_end, strip_inline_comment,
@@ -345,6 +346,12 @@ impl YamlDoc {
     #[must_use]
     pub fn node(&self, node: NodeId) -> Option<&Node> {
         self.nodes.get(node.0 as usize)
+    }
+
+    /// Iterates over a node's children in source order.
+    #[must_use]
+    pub fn children(&self, node: NodeId) -> Children<'_> {
+        Children::new(&self.nodes, node)
     }
 
     /// Returns the root mapping graph node.
@@ -1102,21 +1109,21 @@ impl YamlDoc {
         mapping: NodeId,
         allowed_keys: &[&str],
     ) -> Result<(), YamlError> {
-        let mapping_node = self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
+        self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
         let mut removals = Vec::new();
 
-        for entry in &mapping_node.children {
-            let entry_node = self.expect_node(*entry)?;
+        for entry in self.children(mapping) {
+            let entry_node = self.expect_node(entry)?;
             if entry_node.kind != NodeKind::MappingEntry {
                 continue;
             }
 
-            let Some(key_node) = entry_node.children.first().copied() else {
+            let Some(key_node) = self.children(entry).next() else {
                 continue;
             };
             let key = self.scalar_text(key_node)?;
             if !allowed_keys.contains(&key) {
-                removals.push(*entry);
+                removals.push(entry);
             }
         }
 
@@ -1230,9 +1237,8 @@ impl YamlDoc {
 
     fn directive_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.root()
-            .and_then(|root| self.node(root))
             .into_iter()
-            .flat_map(|stream| stream.children.iter().copied())
+            .flat_map(|root| self.children(root))
             .filter(|node| {
                 self.node(*node)
                     .is_some_and(|node| node.kind == NodeKind::Directive)
@@ -1304,8 +1310,7 @@ impl YamlDoc {
         }
 
         self.root()
-            .and_then(|root| self.node(root))
-            .and_then(|stream| stream.children.first().copied())
+            .and_then(|root| self.children(root).next())
             .and_then(|node| self.node(node))
             .map_or(0, |node| {
                 self.line_start_for_offset(node.span.start as usize)
@@ -1344,11 +1349,10 @@ impl YamlDoc {
     }
 
     pub(crate) fn containing_entry(&self, value: NodeId) -> Option<NodeId> {
-        self.nodes.iter().enumerate().find_map(|(index, node)| {
-            matches!(node.kind, NodeKind::MappingEntry | NodeKind::SequenceEntry)
-                .then_some(())
-                .filter(|()| node.children.contains(&value))
-                .map(|()| NodeId::from_usize(index))
+        self.node(value).and_then(Node::parent).filter(|parent| {
+            self.node(*parent).is_some_and(|node| {
+                matches!(node.kind, NodeKind::MappingEntry | NodeKind::SequenceEntry)
+            })
         })
     }
 
@@ -1549,20 +1553,16 @@ impl YamlDoc {
     }
 
     fn mapping_insertion_offset(&self, mapping: &Node) -> usize {
-        mapping
-            .children
-            .last()
-            .and_then(|child| self.node(*child))
+        node_link(mapping.last_child)
+            .and_then(|child| self.node(child))
             .map_or(mapping.span.end as usize, |last_child| {
                 self.line_span_including_break(last_child.span).end as usize
             })
     }
 
     pub(crate) fn sequence_insertion_offset(&self, sequence: &Node) -> usize {
-        sequence
-            .children
-            .last()
-            .and_then(|child| self.node(*child))
+        node_link(sequence.last_child)
+            .and_then(|child| self.node(child))
             .map_or(sequence.span.end as usize, |last_child| {
                 self.line_span_including_break(last_child.span).end as usize
             })

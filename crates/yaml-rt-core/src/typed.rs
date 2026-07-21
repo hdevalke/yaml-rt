@@ -648,17 +648,17 @@ where
 
         match sequence.kind {
             NodeKind::BlockSequence => {
-                for entry in &sequence.children {
-                    let entry_node = doc.expect_node(*entry)?;
-                    let Some(value_node) = entry_node.children.first().copied() else {
+                for entry in doc.children(node) {
+                    let entry_node = doc.expect_node(entry)?;
+                    let Some(value_node) = doc.children(entry).next() else {
                         return Err(missing_collection_item_error(doc, entry_node, "sequence"));
                     };
                     values.push(T::read_yaml(doc, value_node)?);
                 }
             }
             NodeKind::FlowSequence => {
-                for value_node in &sequence.children {
-                    values.push(T::read_yaml(doc, *value_node)?);
+                for value_node in doc.children(node) {
+                    values.push(T::read_yaml(doc, value_node)?);
                 }
             }
             _ => {
@@ -686,14 +686,14 @@ where
             doc.queue_edit(target.span, replacement)?;
             return Ok(node);
         }
-        let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?.clone();
-        let children = sequence.children.clone();
-        let tail_indent = doc.node_indent(&sequence);
-        let insertion_offset = doc.sequence_insertion_offset(&sequence);
+        let sequence = doc.expect_node_kind(node, NodeKind::BlockSequence)?;
+        let tail_indent = doc.node_indent(sequence);
+        let insertion_offset = doc.sequence_insertion_offset(sequence);
+        let children = doc.children(node).collect::<Vec<_>>();
         let common_len = children.len().min(self.len());
         for (entry, value) in children.iter().copied().take(common_len).zip(self) {
             let entry_node = doc.expect_node(entry)?;
-            let Some(value_node) = entry_node.children.first().copied() else {
+            let Some(value_node) = doc.children(entry).next() else {
                 return Err(missing_collection_item_error(doc, entry_node, "sequence"));
             };
             value.write_yaml(doc, Some(value_node))?;
@@ -734,13 +734,14 @@ where
         match mapping.kind {
             NodeKind::BlockMapping => {
                 let mapping_indent = doc.node_indent(mapping);
-                for entry in &mapping.children {
-                    let entry_node = doc.expect_node(*entry)?;
-                    let Some(key_node) = entry_node.children.first().copied() else {
+                for entry in doc.children(node) {
+                    let entry_node = doc.expect_node(entry)?;
+                    let mut children = doc.children(entry);
+                    let Some(key_node) = children.next() else {
                         continue;
                     };
                     let key = doc.scalar_text(key_node)?.to_owned();
-                    let value_node = if let Some(value_node) = entry_node.children.get(1).copied() {
+                    let value_node = if let Some(value_node) = children.next() {
                         value_node
                     } else {
                         doc.find_nested_collection_after(entry_node, mapping_indent)
@@ -752,16 +753,16 @@ where
                 }
             }
             NodeKind::FlowMapping => {
-                for entry in &mapping.children {
-                    let entry_node = doc.expect_node(*entry)?;
-                    let Some(key_node) = entry_node.children.first().copied() else {
+                for entry in doc.children(node) {
+                    let entry_node = doc.expect_node(entry)?;
+                    let mut children = doc.children(entry);
+                    let Some(key_node) = children.next() else {
                         continue;
                     };
                     let key = doc.scalar_text(key_node)?.to_owned();
-                    let value_node =
-                        entry_node.children.get(1).copied().ok_or_else(|| {
-                            missing_collection_item_error(doc, entry_node, "mapping")
-                        })?;
+                    let value_node = children
+                        .next()
+                        .ok_or_else(|| missing_collection_item_error(doc, entry_node, "mapping"))?;
                     values.insert(key, T::read_yaml(doc, value_node)?);
                 }
             }
@@ -790,7 +791,7 @@ where
             doc.queue_edit(target.span, replacement)?;
             return Ok(node);
         }
-        let mapping = doc.expect_node_kind(node, NodeKind::BlockMapping)?.clone();
+        doc.expect_node_kind(node, NodeKind::BlockMapping)?;
         for (key, value) in self {
             if let Some(value_node) = doc.get_mapping_value(node, key)? {
                 value.write_yaml(doc, Some(value_node))?;
@@ -804,7 +805,7 @@ where
                 )?;
             }
         }
-        if mapping.children.is_empty() && self.is_empty() {
+        if doc.children(node).next().is_none() && self.is_empty() {
             let target = doc.collection_replacement_target(node)?;
             let replacement = format_block_mapping_replacement(doc, target.indent, self)?;
             if !replacement.is_empty() {

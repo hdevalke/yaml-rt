@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::syntax::{Children, NO_NODE, node_link};
 use crate::{
     CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, ParsedYaml, Source, Span,
     YamlError, YamlEvent, YamlEventKind, YamlScalarStyle, validate_yaml_chars,
@@ -79,11 +80,9 @@ impl<'source> Parser<'source> {
         }
         if self.document.is_some() {
             self.close_document(false, Span::empty_from_usize(self.source.len()))?;
-        } else if self.nodes[stream.0 as usize].children.is_empty() {
-        } else if !self.nodes[stream.0 as usize]
-            .children
-            .iter()
-            .any(|child| self.nodes[child.0 as usize].kind == NodeKind::Document)
+        } else if self.nodes[stream.0 as usize].first_child == NO_NODE {
+        } else if !Children::new(&self.nodes, stream)
+            .any(|child| self.nodes[child.as_usize()].kind == NodeKind::Document)
         {
             return Err(YamlError::new(
                 Diagnostic::new(
@@ -146,7 +145,7 @@ impl<'source> Parser<'source> {
                 NodeKind::DocumentMarker,
                 Span::from_usize(line.content_start, line.content_start + 3),
             );
-            self.nodes[document.0 as usize].children.push(marker);
+            self.attach_child_at(document.0 as usize, marker);
             let rest = rest.trim_start();
             if rest.is_empty() || rest.starts_with('#') {
                 return Ok(1);
@@ -161,10 +160,8 @@ impl<'source> Parser<'source> {
                 return Err(invalid_document_marker(line));
             }
             let has_prior_document = self.stream.is_some_and(|stream| {
-                self.nodes[stream.0 as usize]
-                    .children
-                    .iter()
-                    .any(|child| self.nodes[child.0 as usize].kind == NodeKind::Document)
+                Children::new(&self.nodes, stream)
+                    .any(|child| self.nodes[child.as_usize()].kind == NodeKind::Document)
             });
             if self.document.is_none() && has_prior_document {
                 return Ok(1);
@@ -184,7 +181,7 @@ impl<'source> Parser<'source> {
                 NodeKind::DocumentMarker,
                 Span::from_usize(line.content_start, line.content_start + 3),
             );
-            self.nodes[document.0 as usize].children.push(marker);
+            self.attach_child_at(document.0 as usize, marker);
             self.close_document(true, Span::from_usize(line.content_start, line.content_end))?;
             return Ok(1);
         }
@@ -244,7 +241,7 @@ impl<'source> Parser<'source> {
         } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, absolute_start, indent, body, true)?;
-            self.nodes[document.0 as usize].children.push(node);
+            self.attach_child_at(document.0 as usize, node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if let Some(colon_byte) = flow_collection_mapping_key_colon(body, absolute_start)? {
@@ -261,7 +258,7 @@ impl<'source> Parser<'source> {
             let (flow_text, consumed) = self.flow_value_text(lines, index, absolute_start, body)?;
             let (node, end) = self.parse_flow_value(flow_text, absolute_start)?;
             reject_trailing_flow_content(flow_text, end, absolute_start)?;
-            self.nodes[document.0 as usize].children.push(node);
+            self.attach_child_at(document.0 as usize, node);
             self.emit_node_event(node)?;
             Ok(consumed)
         } else if body.starts_with('"') {
@@ -278,7 +275,7 @@ impl<'source> Parser<'source> {
             } else {
                 let (node, consumed) =
                     self.parse_quoted_scalar_lines(lines, index, absolute_start, '"')?;
-                self.nodes[document.0 as usize].children.push(node);
+                self.attach_child_at(document.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 Ok(consumed)
             }
@@ -301,7 +298,7 @@ impl<'source> Parser<'source> {
                 absolute_start,
                 allow_same_indent_continuation,
             )?;
-            self.nodes[document.0 as usize].children.push(scalar);
+            self.attach_child_at(document.0 as usize, scalar);
             self.emit_scalar_event(scalar)?;
             Ok(consumed)
         }
@@ -439,7 +436,7 @@ impl<'source> Parser<'source> {
             NodeKind::MappingEntry,
             Span::from_usize(line.content_start, line.content_end),
         );
-        self.nodes[mapping.0 as usize].children.push(entry);
+        self.attach_child_at(mapping.0 as usize, entry);
         self.extend_node_span(mapping, line.content_end);
 
         let key_start = absolute_start;
@@ -450,7 +447,7 @@ impl<'source> Parser<'source> {
         if key_start < key_end && body_starts_flow_value(key_text, key_start)? {
             let (key, end) = self.parse_flow_value(key_text, key_start)?;
             reject_trailing_flow_content(key_text, end, key_start)?;
-            self.nodes[entry.0 as usize].children.push(key);
+            self.attach_child_at(entry.0 as usize, key);
             self.emit_node_event(key)?;
         } else {
             let key = if key_start < key_end {
@@ -458,7 +455,7 @@ impl<'source> Parser<'source> {
             } else {
                 self.push_empty_scalar(key_start)
             };
-            self.nodes[entry.0 as usize].children.push(key);
+            self.attach_child_at(entry.0 as usize, key);
             self.emit_scalar_event(key)?;
         }
 
@@ -490,7 +487,7 @@ impl<'source> Parser<'source> {
                     value_trimmed,
                     false,
                 )?;
-                self.nodes[entry.0 as usize].children.push(node);
+                self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
             } else if let Some(header_offset) =
@@ -509,7 +506,7 @@ impl<'source> Parser<'source> {
                     &value_trimmed[header_offset..],
                     false,
                 )?;
-                self.nodes[entry.0 as usize].children.push(node);
+                self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
             } else if let Some(next_indent) = property_only_mapping_value_collection_indent(
@@ -531,7 +528,7 @@ impl<'source> Parser<'source> {
                     self.flow_value_text(lines, index, value_start, raw_value_trimmed)?;
                 let (node, end) = self.parse_flow_value(flow_text, value_start)?;
                 reject_trailing_flow_content(flow_text, end, value_start)?;
-                self.nodes[entry.0 as usize].children.push(node);
+                self.attach_child_at(entry.0 as usize, node);
                 self.emit_node_event(node)?;
                 return Ok(consumed);
             }
@@ -539,7 +536,7 @@ impl<'source> Parser<'source> {
             reject_nested_plain_mapping_colon(value_trimmed, value_start)?;
             let (node, consumed) =
                 self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
-            self.nodes[entry.0 as usize].children.push(node);
+            self.attach_child_at(entry.0 as usize, node);
             self.emit_scalar_event(node)?;
             return Ok(consumed);
         }
@@ -556,7 +553,7 @@ impl<'source> Parser<'source> {
         let next_significant_indent = next_significant.map(|(_, next_indent, _)| next_indent);
         if next_significant_indent.is_none_or(|next| next <= indent) {
             let empty = self.push_empty_scalar(line.content_end);
-            self.nodes[entry.0 as usize].children.push(empty);
+            self.attach_child_at(entry.0 as usize, empty);
             self.emit_scalar_event(empty)?;
             return Ok(1);
         }
@@ -589,7 +586,7 @@ impl<'source> Parser<'source> {
             NodeKind::MappingEntry,
             Span::from_usize(line.content_start, line.content_end),
         );
-        self.nodes[mapping.0 as usize].children.push(entry);
+        self.attach_child_at(mapping.0 as usize, entry);
         self.extend_node_span(mapping, line.content_end);
 
         let after_question = if body == "?" { "" } else { &body[1..] };
@@ -604,7 +601,7 @@ impl<'source> Parser<'source> {
                 self.parse_following_explicit_key_block(entry, lines, index, indent)?
             } else {
                 let key = self.push_empty_scalar(line.content_start + indent + 1);
-                self.nodes[entry.0 as usize].children.push(key);
+                self.attach_child_at(entry.0 as usize, key);
                 self.emit_scalar_event(key)?;
                 1
             }
@@ -625,7 +622,7 @@ impl<'source> Parser<'source> {
             self.close_sequence_at_indent(indent);
             self.close_collections_deeper_than(indent);
             let empty = self.push_empty_scalar(line.content_end);
-            self.nodes[entry.0 as usize].children.push(empty);
+            self.attach_child_at(entry.0 as usize, empty);
             self.emit_scalar_event(empty)?;
             return Ok(key_consumed);
         };
@@ -634,7 +631,7 @@ impl<'source> Parser<'source> {
             self.close_sequence_at_indent(indent);
             self.close_collections_deeper_than(indent);
             let empty = self.push_empty_scalar(line.content_end);
-            self.nodes[entry.0 as usize].children.push(empty);
+            self.attach_child_at(entry.0 as usize, empty);
             self.emit_scalar_event(empty)?;
             return Ok(key_consumed);
         }
@@ -706,7 +703,7 @@ impl<'source> Parser<'source> {
         if key_text.starts_with('|') || key_text.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, key_start, parent_indent, key_text, false)?;
-            self.nodes[entry.0 as usize].children.push(node);
+            self.attach_child_at(entry.0 as usize, node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if is_sequence_entry(key_text) {
@@ -745,7 +742,7 @@ impl<'source> Parser<'source> {
             let (flow_text, consumed) = self.flow_value_text(lines, index, key_start, key_text)?;
             let (key, end) = self.parse_flow_value(flow_text, key_start)?;
             reject_trailing_flow_content(flow_text, end, key_start)?;
-            self.nodes[entry.0 as usize].children.push(key);
+            self.attach_child_at(entry.0 as usize, key);
             self.emit_node_event(key)?;
             Ok(consumed)
         } else if let Some(colon_byte) = find_mapping_colon(key_text) {
@@ -755,7 +752,7 @@ impl<'source> Parser<'source> {
             reject_nested_plain_mapping_colon(key_text, key_start)?;
             let (key, consumed) =
                 self.parse_block_plain_scalar(lines, index, parent_indent, key_start, false)?;
-            self.nodes[entry.0 as usize].children.push(key);
+            self.attach_child_at(entry.0 as usize, key);
             self.emit_scalar_event(key)?;
             Ok(consumed)
         }
@@ -787,7 +784,7 @@ impl<'source> Parser<'source> {
                 return self.parse_following_explicit_value_block(entry, lines, index, indent);
             }
             let empty = self.push_empty_scalar(line.content_end);
-            self.nodes[entry.0 as usize].children.push(empty);
+            self.attach_child_at(entry.0 as usize, empty);
             self.emit_scalar_event(empty)?;
             return Ok(1);
         }
@@ -807,7 +804,7 @@ impl<'source> Parser<'source> {
         if value_trimmed.starts_with('|') || value_trimmed.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, value_start, indent, value_trimmed, false)?;
-            self.nodes[entry.0 as usize].children.push(node);
+            self.attach_child_at(entry.0 as usize, node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if let Some(header_offset) =
@@ -826,7 +823,7 @@ impl<'source> Parser<'source> {
                 &value_trimmed[header_offset..],
                 false,
             )?;
-            self.nodes[entry.0 as usize].children.push(node);
+            self.attach_child_at(entry.0 as usize, node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if let Some(next_indent) = property_only_mapping_value_collection_indent(
@@ -854,7 +851,7 @@ impl<'source> Parser<'source> {
                 self.flow_value_text(lines, index, value_start, raw_value_trimmed)?;
             let (value_node, end) = self.parse_flow_value(flow_text, value_start)?;
             reject_trailing_flow_content(flow_text, end, value_start)?;
-            self.nodes[entry.0 as usize].children.push(value_node);
+            self.attach_child_at(entry.0 as usize, value_node);
             self.emit_node_event(value_node)?;
             Ok(consumed)
         } else {
@@ -862,7 +859,7 @@ impl<'source> Parser<'source> {
             reject_nested_plain_mapping_colon(value_trimmed, value_start)?;
             let (node, consumed) =
                 self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
-            self.nodes[entry.0 as usize].children.push(node);
+            self.attach_child_at(entry.0 as usize, node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
         }
@@ -983,7 +980,7 @@ impl<'source> Parser<'source> {
                 line.content_start + nested_indent,
                 false,
             )?;
-            self.nodes[entry.0 as usize].children.push(scalar);
+            self.attach_child_at(entry.0 as usize, scalar);
             self.emit_scalar_event(scalar)?;
             return Ok(nested_index - index + consumed);
         }
@@ -1040,7 +1037,7 @@ impl<'source> Parser<'source> {
     fn open_document(&mut self, explicit: bool, span: Span) -> NodeId {
         let stream = self.stream.expect("stream node exists before documents");
         let document = self.push_node(NodeKind::Document, span);
-        self.nodes[stream.0 as usize].children.push(document);
+        self.attach_child_at(stream.0 as usize, document);
         self.document = Some(document);
         self.document_has_content = false;
         self.document_was_explicitly_opened = explicit;
@@ -1060,7 +1057,7 @@ impl<'source> Parser<'source> {
         self.close_all_event_collections();
         if !self.document_has_content && self.document_was_explicitly_opened {
             let empty = self.push_empty_scalar(span.start as usize);
-            self.nodes[document.0 as usize].children.push(empty);
+            self.attach_child_at(document.0 as usize, empty);
             self.emit_scalar_event(empty)?;
         }
         self.push_event(YamlEventKind::DocumentEnd { explicit }, span);
@@ -1086,7 +1083,7 @@ impl<'source> Parser<'source> {
             NodeKind::Directive,
             Span::from_usize(line.content_start, line.content_end),
         );
-        self.nodes[stream.0 as usize].children.push(directive);
+        self.attach_child_at(stream.0 as usize, directive);
 
         let body = strip_inline_comment(line.content_without_break).trim();
         let mut parts = body.split_whitespace();
@@ -1154,7 +1151,7 @@ impl<'source> Parser<'source> {
             NodeKind::SequenceEntry,
             Span::from_usize(line.content_start, line.content_end),
         );
-        self.nodes[sequence.0 as usize].children.push(entry);
+        self.attach_child_at(sequence.0 as usize, entry);
         self.extend_node_span(sequence, line.content_end);
 
         let after_dash = if body == "-" { "" } else { &body[1..] };
@@ -1172,7 +1169,7 @@ impl<'source> Parser<'source> {
                 return Ok(consumed);
             }
             let empty = self.push_empty_scalar(line.content_start + indent + 1);
-            self.nodes[entry.0 as usize].children.push(empty);
+            self.attach_child_at(entry.0 as usize, empty);
             self.emit_scalar_event(empty)?;
         } else {
             let leading = after_dash.len() - value.len();
@@ -1186,7 +1183,7 @@ impl<'source> Parser<'source> {
             if value.starts_with('|') || value.starts_with('>') {
                 let (node, consumed) =
                     self.parse_block_scalar(lines, index, value_start, indent, value, false)?;
-                self.nodes[entry.0 as usize].children.push(node);
+                self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
             } else if let Some(header_offset) =
@@ -1205,7 +1202,7 @@ impl<'source> Parser<'source> {
                     &value[header_offset..],
                     false,
                 )?;
-                self.nodes[entry.0 as usize].children.push(node);
+                self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
             } else if let Some(next_indent) =
@@ -1232,7 +1229,7 @@ impl<'source> Parser<'source> {
                     self.flow_value_text(lines, index, value_start, value)?;
                 let (value_node, end) = self.parse_flow_value(flow_text, value_start)?;
                 reject_trailing_flow_content(flow_text, end, value_start)?;
-                self.nodes[entry.0 as usize].children.push(value_node);
+                self.attach_child_at(entry.0 as usize, value_node);
                 self.emit_node_event(value_node)?;
                 return Ok(consumed);
             } else if is_explicit_mapping_key(value) {
@@ -1267,7 +1264,7 @@ impl<'source> Parser<'source> {
             reject_nested_plain_mapping_colon(value, value_start)?;
             let (value_node, consumed) =
                 self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
-            self.nodes[entry.0 as usize].children.push(value_node);
+            self.attach_child_at(entry.0 as usize, value_node);
             self.emit_scalar_event(value_node)?;
             return Ok(consumed);
         }
@@ -1292,15 +1289,13 @@ impl<'source> Parser<'source> {
             NodeKind::MappingEntry,
             Span::from_usize(absolute_start, line.content_end),
         );
-        self.nodes[mapping.0 as usize].children.push(outer_entry);
+        self.attach_child_at(mapping.0 as usize, outer_entry);
 
         let inner_mapping = self.push_node(
             NodeKind::BlockMapping,
             Span::from_usize(absolute_start, line.content_end),
         );
-        self.nodes[outer_entry.0 as usize]
-            .children
-            .push(inner_mapping);
+        self.attach_child_at(outer_entry.0 as usize, inner_mapping);
         self.push_node_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Block,
@@ -1315,16 +1310,14 @@ impl<'source> Parser<'source> {
             NodeKind::MappingEntry,
             Span::from_usize(absolute_start, line.content_end),
         );
-        self.nodes[inner_mapping.0 as usize]
-            .children
-            .push(inner_entry);
+        self.attach_child_at(inner_mapping.0 as usize, inner_entry);
 
         let colon_offset = body
             .find(':')
             .expect("compact explicit empty key mapping contains colon");
         let colon_start = absolute_start + colon_offset;
         let key = self.push_empty_scalar(colon_start);
-        self.nodes[inner_entry.0 as usize].children.push(key);
+        self.attach_child_at(inner_entry.0 as usize, key);
         self.emit_scalar_event(key)?;
 
         let raw_value = &body[colon_offset + 1..];
@@ -1341,7 +1334,7 @@ impl<'source> Parser<'source> {
                 ),
             )
         };
-        self.nodes[inner_entry.0 as usize].children.push(value);
+        self.attach_child_at(inner_entry.0 as usize, value);
         self.emit_scalar_event(value)?;
         self.push_event(
             YamlEventKind::MappingEnd,
@@ -1349,9 +1342,7 @@ impl<'source> Parser<'source> {
         );
 
         let outer_value = self.push_empty_scalar(line.content_end);
-        self.nodes[outer_entry.0 as usize]
-            .children
-            .push(outer_value);
+        self.attach_child_at(outer_entry.0 as usize, outer_value);
         self.emit_scalar_event(outer_value)?;
         Ok(())
     }
@@ -1367,7 +1358,7 @@ impl<'source> Parser<'source> {
             NodeKind::BlockMapping,
             Span::from_usize(absolute_start, absolute_start + body.len()),
         );
-        self.nodes[parent.0 as usize].children.push(mapping);
+        self.attach_child_at(parent.0 as usize, mapping);
         self.push_node_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Block,
@@ -1382,7 +1373,7 @@ impl<'source> Parser<'source> {
             NodeKind::MappingEntry,
             Span::from_usize(absolute_start, absolute_start + body.len()),
         );
-        self.nodes[mapping.0 as usize].children.push(entry);
+        self.attach_child_at(mapping.0 as usize, entry);
 
         let key_text = body[..colon_byte].trim_end();
         let key = if key_text.is_empty() {
@@ -1395,7 +1386,7 @@ impl<'source> Parser<'source> {
             let key_end = absolute_start + key_text.len();
             self.push_node(NodeKind::Scalar, Span::from_usize(absolute_start, key_end))
         };
-        self.nodes[entry.0 as usize].children.push(key);
+        self.attach_child_at(entry.0 as usize, key);
         self.emit_node_event(key)?;
 
         let raw_value = &body[colon_byte + 1..];
@@ -1412,7 +1403,7 @@ impl<'source> Parser<'source> {
                 ),
             )
         };
-        self.nodes[entry.0 as usize].children.push(value);
+        self.attach_child_at(entry.0 as usize, value);
         self.emit_scalar_event(value)?;
 
         self.push_event(
@@ -1494,7 +1485,7 @@ impl<'source> Parser<'source> {
                     header_body,
                     true,
                 )?;
-                self.nodes[parent.0 as usize].children.push(node);
+                self.attach_child_at(parent.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 consumed += header_index - nested_index + scalar_consumed;
                 nested_index = header_index + scalar_consumed;
@@ -1770,7 +1761,7 @@ impl<'source> Parser<'source> {
                 '?' if is_flow_explicit_key_indicator(text, position) => {
                     let (mapping, consumed) =
                         self.parse_explicit_flow_mapping_item(text, position, absolute_start, ']')?;
-                    self.nodes[sequence.0 as usize].children.push(mapping);
+                    self.attach_child_at(sequence.0 as usize, mapping);
                     position = consumed;
                 }
                 '[' | '{' => {
@@ -1783,13 +1774,13 @@ impl<'source> Parser<'source> {
                             colon,
                             absolute_start,
                         )?;
-                        self.nodes[sequence.0 as usize].children.push(mapping);
+                        self.attach_child_at(sequence.0 as usize, mapping);
                         position = consumed;
                     } else {
                         let child_start = absolute_start + position;
                         let (child, consumed) =
                             self.parse_flow_value(&text[position..], child_start)?;
-                        self.nodes[sequence.0 as usize].children.push(child);
+                        self.attach_child_at(sequence.0 as usize, child);
                         position += consumed;
                     }
                 }
@@ -1804,13 +1795,13 @@ impl<'source> Parser<'source> {
                             colon,
                             absolute_start,
                         )?;
-                        self.nodes[sequence.0 as usize].children.push(mapping);
+                        self.attach_child_at(sequence.0 as usize, mapping);
                         position = consumed;
                     } else if body_starts_flow_value(&text[position..], absolute_start + position)?
                     {
                         let (value, consumed) =
                             self.parse_flow_value(&text[position..], absolute_start + position)?;
-                        self.nodes[sequence.0 as usize].children.push(value);
+                        self.attach_child_at(sequence.0 as usize, value);
                         position += consumed;
                     } else {
                         let value_end =
@@ -1829,7 +1820,7 @@ impl<'source> Parser<'source> {
                                 absolute_start + scalar_end,
                             ),
                         );
-                        self.nodes[sequence.0 as usize].children.push(scalar);
+                        self.attach_child_at(sequence.0 as usize, scalar);
                         position = value_end;
                     }
                 }
@@ -1876,13 +1867,13 @@ impl<'source> Parser<'source> {
         );
         let key = self.parse_flow_node_segment(text, entry_start, colon, absolute_start)?;
         reject_split_implicit_flow_mapping_key(text, entry_start, colon, absolute_start)?;
-        self.nodes[entry.0 as usize].children.push(key);
+        self.attach_child_at(entry.0 as usize, key);
 
         let mut value_position = skip_flow_whitespace(text, colon + 1);
         match text[value_position..].chars().next() {
             Some(',' | ']') => {
                 let value = self.push_empty_scalar(absolute_start + value_position);
-                self.nodes[entry.0 as usize].children.push(value);
+                self.attach_child_at(entry.0 as usize, value);
             }
             Some(_) => {
                 value_position = self.parse_flow_mapping_value_with_close(
@@ -1899,7 +1890,7 @@ impl<'source> Parser<'source> {
         self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + value_position);
         self.nodes[mapping.as_usize()].span.end =
             Span::usize_to_u32(absolute_start + value_position);
-        self.nodes[mapping.0 as usize].children.push(entry);
+        self.attach_child_at(mapping.0 as usize, entry);
         Ok((mapping, value_position))
     }
 
@@ -1941,7 +1932,7 @@ impl<'source> Parser<'source> {
             if character == '?' && is_flow_explicit_key_indicator(text, position) {
                 let (entry, consumed) =
                     self.parse_explicit_flow_mapping_entry(text, position, absolute_start, '}')?;
-                self.nodes[mapping.0 as usize].children.push(entry);
+                self.attach_child_at(mapping.0 as usize, entry);
                 self.nodes[entry.as_usize()].span.end =
                     Span::usize_to_u32(absolute_start + consumed);
                 self.nodes[mapping.as_usize()].span.end =
@@ -1977,7 +1968,7 @@ impl<'source> Parser<'source> {
             let (key, key_end) =
                 self.parse_flow_mapping_key(text, position, absolute_start, character)?;
             position = key_end;
-            self.nodes[entry.0 as usize].children.push(key);
+            self.attach_child_at(entry.0 as usize, key);
 
             let separator_position = skip_flow_whitespace(text, position);
             position = separator_position;
@@ -1986,10 +1977,10 @@ impl<'source> Parser<'source> {
             };
             if separator == ',' {
                 let value = self.push_empty_scalar(absolute_start + position);
-                self.nodes[entry.0 as usize].children.push(value);
+                self.attach_child_at(entry.0 as usize, value);
                 self.nodes[entry.as_usize()].span.end =
                     Span::usize_to_u32(absolute_start + position);
-                self.nodes[mapping.0 as usize].children.push(entry);
+                self.attach_child_at(mapping.0 as usize, entry);
                 saw_pair = true;
                 position += 1;
                 expecting_pair = true;
@@ -2014,7 +2005,7 @@ impl<'source> Parser<'source> {
             position = self.parse_flow_mapping_value(text, position, absolute_start, entry)?;
 
             self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + position);
-            self.nodes[mapping.0 as usize].children.push(entry);
+            self.attach_child_at(mapping.0 as usize, entry);
             saw_pair = true;
             position = skip_flow_whitespace(text, position);
             let Some(separator) = text[position..].chars().next() else {
@@ -2098,7 +2089,7 @@ impl<'source> Parser<'source> {
         );
         let (entry, consumed) =
             self.parse_explicit_flow_mapping_entry(text, position, absolute_start, close)?;
-        self.nodes[mapping.0 as usize].children.push(entry);
+        self.attach_child_at(mapping.0 as usize, entry);
         self.nodes[mapping.as_usize()].span.end = Span::usize_to_u32(absolute_start + consumed);
         Ok((mapping, consumed))
     }
@@ -2123,8 +2114,8 @@ impl<'source> Parser<'source> {
         {
             let key = self.push_empty_scalar(absolute_start + key_position);
             let value = self.push_empty_scalar(absolute_start + key_position);
-            self.nodes[entry.0 as usize].children.push(key);
-            self.nodes[entry.0 as usize].children.push(value);
+            self.attach_child_at(entry.0 as usize, key);
+            self.attach_child_at(entry.0 as usize, value);
             return Ok((entry, key_position));
         }
 
@@ -2139,7 +2130,7 @@ impl<'source> Parser<'source> {
             )
         };
         let key = self.parse_flow_node_segment(text, key_position, key_end, absolute_start)?;
-        self.nodes[entry.0 as usize].children.push(key);
+        self.attach_child_at(entry.0 as usize, key);
 
         let consumed = if has_value {
             let value_position = skip_flow_whitespace(text, key_end + ':'.len_utf8());
@@ -2152,7 +2143,7 @@ impl<'source> Parser<'source> {
             )?
         } else {
             let value = self.push_empty_scalar(absolute_start + key_end);
-            self.nodes[entry.0 as usize].children.push(value);
+            self.attach_child_at(entry.0 as usize, value);
             key_end
         };
         Ok((entry, consumed))
@@ -2204,7 +2195,7 @@ impl<'source> Parser<'source> {
         if body_starts_flow_value(&text[position..], absolute_start + position)? {
             let (value, consumed) =
                 self.parse_flow_value(&text[position..], absolute_start + position)?;
-            self.nodes[entry.0 as usize].children.push(value);
+            self.attach_child_at(entry.0 as usize, value);
             return Ok(position + consumed);
         }
 
@@ -2212,11 +2203,11 @@ impl<'source> Parser<'source> {
             None => return Err(missing_flow_mapping_end(absolute_start, text.len())),
             Some(',') => {
                 let value = self.push_empty_scalar(absolute_start + position);
-                self.nodes[entry.0 as usize].children.push(value);
+                self.attach_child_at(entry.0 as usize, value);
             }
             Some(character) if character == close => {
                 let value = self.push_empty_scalar(absolute_start + position);
-                self.nodes[entry.0 as usize].children.push(value);
+                self.attach_child_at(entry.0 as usize, value);
             }
             Some(_) => {
                 let terminators = [',', close];
@@ -2238,7 +2229,7 @@ impl<'source> Parser<'source> {
                             absolute_start + value_trimmed_end,
                         ),
                     );
-                    self.nodes[entry.0 as usize].children.push(value);
+                    self.attach_child_at(entry.0 as usize, value);
                 }
                 position = value_end;
             }
@@ -2252,7 +2243,7 @@ impl<'source> Parser<'source> {
         } else {
             let (span, tag, anchor) = self.collection_properties(indent, span);
             let mapping = self.push_node(NodeKind::BlockMapping, span);
-            self.nodes[parent.0 as usize].children.push(mapping);
+            self.attach_child_at(parent.0 as usize, mapping);
             self.mappings.push((indent, mapping));
             self.open_event_collection(
                 indent,
@@ -2270,15 +2261,12 @@ impl<'source> Parser<'source> {
     }
 
     fn document_has_root_flow_collection(&self, document: NodeId) -> bool {
-        self.nodes[document.as_usize()]
-            .children
-            .iter()
-            .any(|child| {
-                matches!(
-                    self.nodes[child.as_usize()].kind,
-                    NodeKind::FlowSequence | NodeKind::FlowMapping
-                )
-            })
+        Children::new(&self.nodes, document).any(|child| {
+            matches!(
+                self.nodes[child.as_usize()].kind,
+                NodeKind::FlowSequence | NodeKind::FlowMapping
+            )
+        })
     }
 
     fn ensure_sequence(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
@@ -2287,7 +2275,7 @@ impl<'source> Parser<'source> {
         } else {
             let (span, tag, anchor) = self.collection_properties(indent, span);
             let sequence = self.push_node(NodeKind::BlockSequence, span);
-            self.nodes[parent.0 as usize].children.push(sequence);
+            self.attach_child_at(parent.0 as usize, sequence);
             self.sequences.push((indent, sequence));
             self.open_event_collection(
                 indent,
@@ -2448,9 +2436,25 @@ impl<'source> Parser<'source> {
         self.nodes.push(Node {
             kind,
             span,
-            children: Vec::with_capacity(2),
+            parent: NO_NODE,
+            first_child: NO_NODE,
+            last_child: NO_NODE,
+            next_sibling: NO_NODE,
         });
         id
+    }
+
+    fn attach_child_at(&mut self, parent_index: usize, child: NodeId) {
+        debug_assert_eq!(self.nodes[child.as_usize()].parent, NO_NODE);
+        let parent = NodeId::from_usize(parent_index);
+        let previous = node_link(self.nodes[parent_index].last_child);
+        self.nodes[child.as_usize()].parent = parent.0;
+        if let Some(previous) = previous {
+            self.nodes[previous.as_usize()].next_sibling = child.0;
+        } else {
+            self.nodes[parent_index].first_child = child.0;
+        }
+        self.nodes[parent_index].last_child = child.0;
     }
 
     fn push_empty_scalar(&mut self, offset: usize) -> NodeId {
@@ -2530,10 +2534,10 @@ impl<'source> Parser<'source> {
     }
 
     fn emit_flow_sequence_events(&mut self, node: NodeId) -> Result<(), YamlError> {
-        let sequence = self.nodes[node.0 as usize].clone();
-        let mut properties = self.flow_event_properties(sequence.span)?;
-        self.resolve_node_properties(&mut properties, sequence.span)?;
-        let span = self.apply_pending_event_properties(&mut properties, sequence.span);
+        let sequence_span = self.nodes[node.0 as usize].span;
+        let mut properties = self.flow_event_properties(sequence_span)?;
+        self.resolve_node_properties(&mut properties, sequence_span)?;
+        let span = self.apply_pending_event_properties(&mut properties, sequence_span);
         self.push_node_event(
             YamlEventKind::SequenceStart {
                 style: CollectionStyle::Flow,
@@ -2543,18 +2547,20 @@ impl<'source> Parser<'source> {
             span,
             node,
         );
-        for child in sequence.children {
-            self.emit_node_event(child)?;
+        let mut child = node_link(self.nodes[node.as_usize()].first_child);
+        while let Some(current) = child {
+            child = node_link(self.nodes[current.as_usize()].next_sibling);
+            self.emit_node_event(current)?;
         }
         self.push_event(YamlEventKind::SequenceEnd, span);
         Ok(())
     }
 
     fn emit_flow_mapping_events(&mut self, node: NodeId) -> Result<(), YamlError> {
-        let mapping = self.nodes[node.0 as usize].clone();
-        let mut properties = self.flow_event_properties(mapping.span)?;
-        self.resolve_node_properties(&mut properties, mapping.span)?;
-        let span = self.apply_pending_event_properties(&mut properties, mapping.span);
+        let mapping_span = self.nodes[node.0 as usize].span;
+        let mut properties = self.flow_event_properties(mapping_span)?;
+        self.resolve_node_properties(&mut properties, mapping_span)?;
+        let span = self.apply_pending_event_properties(&mut properties, mapping_span);
         self.push_node_event(
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Flow,
@@ -2564,10 +2570,13 @@ impl<'source> Parser<'source> {
             span,
             node,
         );
-        for entry in mapping.children {
-            let entry = self.nodes[entry.0 as usize].clone();
-            for child in entry.children {
-                self.emit_node_event(child)?;
+        let mut entry = node_link(self.nodes[node.as_usize()].first_child);
+        while let Some(current_entry) = entry {
+            entry = node_link(self.nodes[current_entry.as_usize()].next_sibling);
+            let mut child = node_link(self.nodes[current_entry.as_usize()].first_child);
+            while let Some(current_child) = child {
+                child = node_link(self.nodes[current_child.as_usize()].next_sibling);
+                self.emit_node_event(current_child)?;
             }
         }
         self.push_event(YamlEventKind::MappingEnd, span);

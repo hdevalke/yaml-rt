@@ -2185,7 +2185,7 @@ fn parser_builds_flow_mapping_mapping_value_cst() {
 
     assert_eq!(doc.to_string(), input);
     assert_eq!(mapping.kind, NodeKind::FlowMapping);
-    assert_eq!(mapping.children.len(), 2);
+    assert_eq!(doc.children(settings).count(), 2);
     assert_eq!(
         flow_mapping_scalar_pairs(&doc, settings),
         [("a", "b"), ("c", "d")]
@@ -3691,12 +3691,11 @@ fn patch_writer_rejects_overlapping_edits() {
 
 fn mapping_entry_by_key(doc: &YamlDoc, key: &str) -> Option<NodeId> {
     let root = doc.root_mapping().ok()?;
-    let mapping = doc.node(root)?;
-    mapping.children.iter().copied().find(|entry| {
-        let Some(entry_node) = doc.node(*entry) else {
+    doc.children(root).find(|entry| {
+        let Some(_) = doc.node(*entry) else {
             return false;
         };
-        let Some(key_node) = entry_node.children.first().copied() else {
+        let Some(key_node) = doc.children(*entry).next() else {
             return false;
         };
         doc.scalar_text(key_node) == Ok(key)
@@ -3732,26 +3731,20 @@ fn folded_scalar(doc: &YamlDoc) -> Option<NodeId> {
 }
 
 fn flow_sequence_scalar_texts(doc: &YamlDoc, sequence: NodeId) -> Vec<&str> {
-    doc.node(sequence)
-        .expect("sequence exists")
-        .children
-        .iter()
+    doc.children(sequence)
         .filter_map(|child| {
-            let child = doc.node(*child)?;
+            let child = doc.node(child)?;
             (child.kind == NodeKind::Scalar).then(|| doc.source.slice(child.span))
         })
         .collect()
 }
 
 fn flow_mapping_scalar_pairs(doc: &YamlDoc, mapping: NodeId) -> Vec<(&str, &str)> {
-    doc.node(mapping)
-        .expect("mapping exists")
-        .children
-        .iter()
+    doc.children(mapping)
         .filter_map(|entry| {
-            let entry = doc.node(*entry)?;
-            let key = entry.children.first().copied()?;
-            let value = entry.children.get(1).copied()?;
+            let mut children = doc.children(entry);
+            let key = children.next()?;
+            let value = children.next()?;
             Some((doc.scalar_text(key).ok()?, doc.scalar_text(value).ok()?))
         })
         .collect()

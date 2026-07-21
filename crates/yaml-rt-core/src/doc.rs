@@ -72,17 +72,17 @@ pub enum MappingEntryStyle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YamlDoc {
     /// Original source buffer.
-    pub source: Source,
+    pub(crate) source: Source,
     /// Lossless token stream in source order.
-    pub tokens: Vec<Token>,
+    pub(crate) tokens: Vec<Token>,
     /// CST and semantic nodes. The CST remains the source of truth.
-    pub nodes: Vec<Node>,
+    pub(crate) nodes: Vec<Node>,
     /// Semantic YAML event stream produced by the parser.
-    pub events: Vec<YamlEvent>,
+    pub(crate) events: Vec<YamlEvent>,
     /// CST-linked semantic graph composed from parser events.
-    pub graph: SemanticGraph,
+    pub(crate) graph: SemanticGraph,
     /// Pending patch edits applied from highest offset to lowest offset.
-    pub edits: Vec<Edit>,
+    pub(crate) edits: Vec<Edit>,
 }
 
 impl YamlDoc {
@@ -139,6 +139,24 @@ impl YamlDoc {
     #[must_use]
     pub fn as_source(&self) -> &str {
         self.source.as_str()
+    }
+
+    /// Returns the original source buffer and its line index.
+    #[must_use]
+    pub const fn source(&self) -> &Source {
+        &self.source
+    }
+
+    /// Returns a freshly owned copy of the lossless token stream.
+    ///
+    /// The owned return type keeps this API stable when tokenization becomes
+    /// on demand rather than retained by every document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lexer diagnostic if the source cannot be tokenized.
+    pub fn tokens(&self) -> Result<Vec<Token>, YamlError> {
+        Ok(self.tokens.clone())
     }
 
     /// Returns the root node identifier when present.

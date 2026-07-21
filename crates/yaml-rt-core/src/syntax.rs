@@ -4,11 +4,31 @@ use crate::{NodeId, Parser, Source, Span, Token, YamlError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     /// Node classification.
-    pub kind: NodeKind,
+    pub(crate) kind: NodeKind,
     /// Original source span for this node.
-    pub span: Span,
+    pub(crate) span: Span,
     /// Child node identifiers in source order.
-    pub children: Vec<NodeId>,
+    pub(crate) children: Vec<NodeId>,
+}
+
+impl Node {
+    /// Returns this node's syntax classification.
+    #[must_use]
+    pub const fn kind(&self) -> NodeKind {
+        self.kind
+    }
+
+    /// Returns this node's original source span.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        self.span
+    }
+
+    /// Returns this node's children in source order.
+    #[must_use]
+    pub fn children(&self) -> &[NodeId] {
+        &self.children
+    }
 }
 
 /// Node kinds emitted by the CST parser MVP.

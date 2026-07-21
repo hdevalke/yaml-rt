@@ -1,4 +1,4 @@
-use crate::{NodeId, Parser, Source, Span, Token, YamlError};
+use crate::{NodeId, Parser, Source, Span, YamlError};
 
 /// Lossless syntax node produced by the CST parser MVP.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,16 +154,14 @@ pub enum YamlEventKind {
     },
 }
 
-/// Parses the MVP token/source pair into a lossless CST node arena.
+/// Parses a source buffer into a lossless CST node arena.
 ///
 /// # Errors
 ///
-/// Returns an error when the token stream contains YAML syntax the parser
-/// cannot accept or when parser events cannot be produced from the CST.
-pub fn parse_cst(source: &Source, tokens: &[Token]) -> Result<Vec<Node>, YamlError> {
-    Parser::new(source, tokens)
-        .parse()
-        .map(|parsed| parsed.nodes)
+/// Returns an error when the source contains YAML syntax the parser cannot
+/// accept or when parser events cannot be produced from the CST.
+pub fn parse_cst(source: &Source) -> Result<Vec<Node>, YamlError> {
+    Parser::new(source).parse().map(|parsed| parsed.nodes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

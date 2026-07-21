@@ -117,7 +117,6 @@ instead of replacing it.
 ```rust
 pub struct YamlDoc {
     source: Source,
-    tokens: Vec<Token>,
     events: Vec<YamlEvent>,
     nodes: Vec<Node>,
     graph: SemanticGraph,
@@ -146,9 +145,10 @@ pub struct Node {
 ```
 
 The concrete document and node fields are private. Read source and syntax
-through `YamlDoc::source`, `YamlDoc::node`, and the `Node` accessors; request an
-owned token stream with `YamlDoc::tokens`. Keeping storage behind accessors lets
-the parser change its arena layout without changing document consumers.
+through `YamlDoc::source`, `YamlDoc::node`, and the `Node` accessors. Lossless
+tokens are generated only when requested through `YamlDoc::tokens`; ordinary
+document parsing does not retain them. `YamlDoc::parse_owned` accepts a `String`
+without copying its source buffer.
 
 Nodes store spans instead of `&str` slices. This gives zero-copy reads without
 infecting the public tree with lifetimes.

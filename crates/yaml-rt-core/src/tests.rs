@@ -60,29 +60,30 @@ single: 'hello'
 ";
     let doc = YamlDoc::parse(input).expect("lexer MVP should accept fixture");
 
-    assert_eq!(tokens_to_string(&doc.tokens, &doc.source), input);
+    let tokens = doc.tokens().expect("document tokenization succeeds");
+    assert_eq!(tokens_to_string(&tokens, &doc.source), input);
     assert_eq!(doc.to_string(), input);
     assert_eq!(
-        doc.tokens.first().map(|token| token.kind),
+        tokens.first().map(|token| token.kind),
         Some(TokenKind::Comment)
     );
     assert!(
-        doc.tokens
+        tokens
             .iter()
             .any(|token| token.kind == TokenKind::DocumentStart)
     );
     assert!(
-        doc.tokens
+        tokens
             .iter()
             .any(|token| token.kind == TokenKind::DocumentEnd)
     );
     assert!(
-        doc.tokens
+        tokens
             .iter()
             .any(|token| token.kind == TokenKind::DoubleQuotedScalar)
     );
     assert!(
-        doc.tokens
+        tokens
             .iter()
             .any(|token| token.kind == TokenKind::SingleQuotedScalar)
     );
@@ -425,8 +426,7 @@ fn events_render_explicit_folded_scalar_key_with_empty_value() {
 #[test]
 fn parser_events_render_explicit_following_sequence_key() {
     let source = Source::new("---\n?\n- a\n- b\n:\n- c\n- d\n".to_owned()).expect("valid source");
-    let tokens = lex(&source).expect("valid tokens");
-    let parsed = Parser::new(&source, &tokens).parse().expect("valid parser");
+    let parsed = Parser::new(&source).parse().expect("valid parser");
 
     assert_eq!(
         events_to_test_string(&parsed.events),

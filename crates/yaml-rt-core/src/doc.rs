@@ -73,8 +73,6 @@ pub enum MappingEntryStyle {
 pub struct YamlDoc {
     /// Original source buffer.
     pub(crate) source: Source,
-    /// Lossless token stream in source order.
-    pub(crate) tokens: Vec<Token>,
     /// CST and semantic nodes. The CST remains the source of truth.
     pub(crate) nodes: Vec<Node>,
     /// Semantic YAML event stream produced by the parser.
@@ -93,12 +91,21 @@ impl YamlDoc {
     ///
     /// # Errors
     ///
-    /// Returns an error when source validation, lexing, CST parsing, or semantic
-    /// graph composition fails.
+    /// Returns an error when source validation, CST parsing, or semantic graph
+    /// composition fails.
     pub fn parse(input: &str) -> Result<Self, YamlError> {
-        let source = Source::new(input.to_owned())?;
-        let tokens = lex(&source).map_err(|error| error.with_position_from(&source))?;
-        let parsed = Parser::new(&source, &tokens)
+        Self::parse_owned(input.to_owned())
+    }
+
+    /// Parses an owned YAML stream without copying its source buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when source validation, CST parsing, or semantic graph
+    /// composition fails.
+    pub fn parse_owned(input: String) -> Result<Self, YamlError> {
+        let source = Source::new(input)?;
+        let parsed = Parser::new(&source)
             .parse()
             .map_err(|error| error.with_position_from(&source))?;
         let graph =
@@ -106,7 +113,6 @@ impl YamlDoc {
 
         Ok(Self {
             source,
-            tokens,
             nodes: parsed.nodes,
             events: parsed.events,
             graph,
@@ -156,7 +162,7 @@ impl YamlDoc {
     ///
     /// Returns a lexer diagnostic if the source cannot be tokenized.
     pub fn tokens(&self) -> Result<Vec<Token>, YamlError> {
-        Ok(self.tokens.clone())
+        lex(&self.source).map_err(|error| error.with_position_from(&self.source))
     }
 
     /// Returns the root node identifier when present.

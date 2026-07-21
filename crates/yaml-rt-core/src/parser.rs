@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, ParsedYaml, Source, Span,
-    Token, YamlError, YamlEvent, YamlEventKind, YamlScalarStyle, validate_yaml_chars,
+    YamlError, YamlEvent, YamlEventKind, YamlScalarStyle, validate_yaml_chars,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,9 +36,16 @@ pub(crate) struct Parser<'source> {
 }
 
 impl<'source> Parser<'source> {
-    pub(crate) fn new(source: &'source Source, tokens: &'source [Token]) -> Self {
-        let estimated_nodes = tokens.len().saturating_div(2).saturating_add(4);
-        let estimated_events = estimated_nodes.saturating_mul(2).saturating_add(2);
+    pub(crate) fn new(source: &'source Source) -> Self {
+        let line_estimate = source.line_starts().len();
+        let estimated_nodes = line_estimate
+            .saturating_mul(3)
+            .max(source.len().saturating_div(4))
+            .saturating_add(4);
+        let estimated_events = line_estimate
+            .saturating_mul(2)
+            .max(source.len().saturating_div(6))
+            .saturating_add(8);
         Self {
             source,
             nodes: Vec::with_capacity(estimated_nodes),
@@ -314,13 +321,18 @@ impl<'source> Parser<'source> {
             _ => None,
         }
         .ok_or_else(|| {
+            let scalar_name = if quote == '"' {
+                "double-quoted scalar"
+            } else {
+                "single-quoted scalar"
+            };
             YamlError::new(
                 Diagnostic::new(
-                    DiagnosticKind::Typed,
-                    "could not decode quoted scalar",
-                    Span::empty_from_usize(absolute_start),
+                    DiagnosticKind::Lexer,
+                    format!("unterminated {scalar_name}"),
+                    Span::from_usize(absolute_start, self.source.len()),
                 )
-                .with_expected("a closed quoted scalar"),
+                .with_expected(format!("closing {quote}")),
             )
         })?;
         let absolute_end = absolute_start + end;
@@ -2620,6 +2632,24 @@ impl<'source> Parser<'source> {
             NodeKind::Scalar => YamlScalarStyle::Plain,
             _ => unreachable!("emit_scalar_event only receives scalar nodes"),
         };
+        if (style == YamlScalarStyle::DoubleQuoted
+            && double_quoted_scalar_end(value_text).is_none())
+            || (style == YamlScalarStyle::SingleQuoted
+                && single_quoted_scalar_end(value_text).is_none())
+        {
+            let quote = if style == YamlScalarStyle::DoubleQuoted {
+                '"'
+            } else {
+                '\''
+            };
+            return Err(unterminated_quoted_scalar_error(
+                quote,
+                Span::from_usize(
+                    node_span.start as usize + properties.value_start,
+                    node_span.end as usize,
+                ),
+            ));
+        }
         if style == YamlScalarStyle::Plain {
             let trimmed = strip_inline_comment(value_text).trim();
             if let Some(alias) = trimmed.strip_prefix('*')
@@ -2667,6 +2697,22 @@ impl<'source> Parser<'source> {
         }
         Ok(())
     }
+}
+
+fn unterminated_quoted_scalar_error(quote: char, span: Span) -> YamlError {
+    let scalar_name = if quote == '"' {
+        "double-quoted scalar"
+    } else {
+        "single-quoted scalar"
+    };
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Lexer,
+            format!("unterminated {scalar_name}"),
+            span,
+        )
+        .with_expected(format!("closing {quote}")),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

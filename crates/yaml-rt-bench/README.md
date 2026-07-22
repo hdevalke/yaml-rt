@@ -1,14 +1,14 @@
 # yaml-rt-bench
 
-Parse-only benchmarks for RTY against ordinary YAML loader baselines.
+Parse-only benchmarks for yaml-rt against ordinary YAML loader baselines.
 
-RTY preserves lossless round-trip state such as source spans, comments, trivia,
+yaml-rt preserves lossless round-trip state such as source spans, comments, trivia,
 CST nodes, and semantic metadata. Tokens and events are lazy. `fyaml` and Saphyr are included as
-useful parser baselines, but they are not feature-equivalent to RTY's
+useful parser baselines, but they are not feature-equivalent to yaml-rt's
 round-trip model. Treat benchmark results as contextual parse-throughput data,
 not as a complete product comparison.
 
-Run RTY against Saphyr without requiring the native fyaml build:
+Run yaml-rt against Saphyr without requiring the native fyaml build:
 
 ```sh
 cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
@@ -56,7 +56,7 @@ The compact-arena refactor started from this machine-local reference on
 2026-07-21. Criterion was run with `--quick`, so these numbers are orientation
 data rather than a portable performance guarantee.
 
-| fixture | RTY median | Saphyr median | RTY / Saphyr |
+| fixture | yaml-rt median | Saphyr median | yaml-rt / Saphyr |
 | --- | ---: | ---: | ---: |
 | small config | 7.56 us | 3.86 us | 1.96x |
 | medium nested | 37.87 us | 18.26 us | 2.07x |
@@ -67,14 +67,14 @@ data rather than a portable performance guarantee.
 | 5,000 mapping entries | 12.73 ms | 5.72 ms | 2.23x |
 
 The counting allocator reported 7,061 allocations, 1,467,792 allocated bytes,
-and 1,126,672 peak live bytes per 1,000-entry RTY parse. Atomic counter updates
+and 1,126,672 peak live bytes per 1,000-entry yaml-rt parse. Atomic counter updates
 make its timing unsuitable for throughput comparison; use Criterion for time.
 
 ## Compact-arena result
 
 Final machine-local `--quick` measurements on 2026-07-21:
 
-| fixture | RTY median | Saphyr median | RTY / Saphyr |
+| fixture | yaml-rt median | Saphyr median | yaml-rt / Saphyr |
 | --- | ---: | ---: | ---: |
 | small config | 5.02 us | 4.41 us | 1.14x |
 | medium nested | 21.26 us | 19.19 us | 1.11x |
@@ -85,7 +85,7 @@ Final machine-local `--quick` measurements on 2026-07-21:
 | 5,000 mapping entries | 5.598 ms | 5.080 ms | 1.10x |
 
 The geometric mean over the four source fixtures is 1.06x Saphyr. The
-5,000/1,000-entry RTY ratio is 5.66x. At 1,000 fixed-width entries, the counting
+5,000/1,000-entry yaml-rt ratio is 5.66x. At 1,000 fixed-width entries, the counting
 allocator reports 23 allocations, 611,868 allocated bytes, and 526,432 peak
 live bytes: reductions of 99.7%, 58.3%, and 53.3% from the reference baseline.
 
@@ -102,7 +102,7 @@ Final machine-local results on 2026-07-21 use the median of the three medians
 reported by three complete, default-sampling Criterion runs. Lower ratios are
 better.
 
-| fixture | RTY median | Saphyr median | RTY / Saphyr |
+| fixture | yaml-rt median | Saphyr median | yaml-rt / Saphyr |
 | --- | ---: | ---: | ---: |
 | small config | 2.185 us | 3.713 us | 0.59x |
 | medium nested | 14.865 us | 17.990 us | 0.83x |
@@ -112,7 +112,7 @@ better.
 | 1,000 mapping entries | 0.31088 ms | 0.98680 ms | 0.32x |
 | 5,000 mapping entries | 1.5119 ms | 5.1792 ms | 0.29x |
 
-The geometric mean across the four source fixtures is **0.737x Saphyr**. RTY
+The geometric mean across the four source fixtures is **0.737x Saphyr**. yaml-rt
 is faster on every fixture and generated size. Its 5,000/1,000-entry scaling is
 **4.86x**, below the 5.5x gate.
 
@@ -134,10 +134,10 @@ index, keeps decorated-node properties sparse and span-backed, and specializes
 ordinary property-free plain nodes. Tokens are lexed on request and events are
 streamed from CST topology without a retained or transient event arena.
 
-## RTY-only perf profiling
+## yaml-rt-only perf profiling
 
 The `profile_parse` bench avoids third-party parser dependencies and is intended
-for Linux `perf` runs against RTY parser hot paths. It discovers all non-error
+for Linux `perf` runs against yaml-rt parser hot paths. It discovers all non-error
 YAML Test Suite `in.yaml` fixtures and parses each fixture as a separate
 document by default. A synthesized stream mode is available, but it can expose
 cross-fixture directive and tag-scope interactions.

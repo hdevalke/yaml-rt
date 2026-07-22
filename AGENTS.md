@@ -1,6 +1,6 @@
-# Agent instructions for RTY
+# Agent instructions for yaml-rt
 
-RTY is a Rust 2024 workspace for a minimal-dependency YAML 1.2.2 round-trip
+yaml-rt is a Rust 2024 workspace for a minimal-dependency YAML 1.2.2 round-trip
 parser. Keep every change aligned with the roadmap in `README.md`.
 
 ## Project goals

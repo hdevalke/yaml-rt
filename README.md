@@ -1,6 +1,6 @@
-# RTY: a YAML 1.2.2 round-trip parser
+# yaml-rt: a YAML 1.2.2 round-trip parser
 
-RTY is an early-stage Rust workspace for a minimal-dependency YAML round-trip
+yaml-rt is an early-stage Rust workspace for a minimal-dependency YAML round-trip
 parser. The target language is YAML 1.2.2, and the parser core should test
 against the YAML Test Suite at tag `v2022-01-17`.
 
@@ -131,7 +131,7 @@ Required guarantees:
   can reject duplicates by default.
 - Duplicate-key diagnostics should include both the duplicate key span and the
   previous key span.
-- RTY should eventually support deriving typed overlays for arbitrary Rust
+- yaml-rt should eventually support deriving typed overlays for arbitrary Rust
   structs through `YamlRoundTrip` or related macros.
 
 ## Architecture
@@ -462,7 +462,7 @@ At this point the parser becomes serious YAML 1.2.2, not only config YAML.
 Current editing limits: semantic alias propagation is not attempted for rewritten
 anchors, and inserting new documents at arbitrary stream positions is future
 work. Canonical semantic re-emission is not a primary conformance target because
-it discards the presentation details RTY is designed to preserve.
+it discards the presentation details yaml-rt is designed to preserve.
 
 Compatibility note: `root_mapping`, `get_path`, `FromYamlDoc::from_yaml_doc`,
 and `ToYamlDoc::apply_to_yaml_doc` continue to target the first document.
@@ -699,7 +699,7 @@ The fastest path to value is not “complete YAML first.” It is:
 lossless subset → editable subset → typed overlay → full YAML completion
 ```
 
-That gives RTY a usable library early while keeping the final architecture
+That gives yaml-rt a usable library early while keeping the final architecture
 correct.
 
 ## YAML Test Suite strategy

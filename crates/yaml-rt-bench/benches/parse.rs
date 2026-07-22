@@ -114,12 +114,16 @@ fn bench_input(
     name: impl std::fmt::Display,
     input: &str,
 ) {
-    group.bench_with_input(BenchmarkId::new("rty", &name), input, |bencher, input| {
-        bencher.iter(|| {
-            let doc = YamlDoc::parse(black_box(input)).expect("RTY fixture should parse");
-            black_box(doc);
-        });
-    });
+    group.bench_with_input(
+        BenchmarkId::new("yaml-rt", &name),
+        input,
+        |bencher, input| {
+            bencher.iter(|| {
+                let doc = YamlDoc::parse(black_box(input)).expect("yaml-rt fixture should parse");
+                black_box(doc);
+            });
+        },
+    );
 
     #[cfg(feature = "fyaml-baseline")]
     group.bench_with_input(BenchmarkId::new("fyaml", &name), input, |bencher, input| {

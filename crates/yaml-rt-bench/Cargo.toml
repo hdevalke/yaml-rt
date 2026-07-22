@@ -1,6 +1,6 @@
 [package]
 name = "yaml-rt-bench"
-description = "Parse benchmarks for RTY and YAML parser baselines"
+description = "Parse benchmarks for yaml-rt and YAML parser baselines"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

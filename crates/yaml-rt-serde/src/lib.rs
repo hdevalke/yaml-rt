@@ -1,4 +1,4 @@
-//! Serde serialization and deserialization for RTY's YAML 1.2.2 model.
+//! Serde serialization and deserialization for yaml-rt's YAML 1.2.2 model.
 //!
 //! This crate converts typed values. It intentionally does not preserve YAML
 //! presentation details; use `yaml-rt`'s `YamlRoundTrip` overlay for lossless

@@ -46,6 +46,20 @@ cfg.apply_to_yaml_doc(&mut doc)?;
 let output = doc.to_string();
 ```
 
+`yaml-rt` enables its `derive` feature by default, which re-exports
+`YamlRoundTrip`. To use only the core facade without proc-macro dependencies,
+disable default features:
+
+```toml
+yaml-rt = { version = "...", default-features = false }
+```
+
+Enable `derive` explicitly when defaults are disabled:
+
+```toml
+yaml-rt = { version = "...", default-features = false, features = ["derive"] }
+```
+
 ## Examples
 
 Run examples from the workspace root with `cargo run -p yaml-rt --example NAME`,
@@ -202,7 +216,9 @@ pub trait YamlValue: Sized {
 - `yaml-rt-core` has no dependencies.
 - `yaml-rt-derive` is isolated so `syn`, `quote`, and `proc-macro2` do not leak
   into the parser core.
-- `yaml-rt` re-exports the core API and `YamlRoundTrip` derive macro.
+- `yaml-rt` re-exports the core API; its default `derive` feature re-exports
+  the `YamlRoundTrip` derive macro and can be disabled for a proc-macro-free
+  facade.
 - `YamlDoc::parse` validates source characters, builds one lossless CST arena
   with direct, sparse semantic metadata, and preserves byte-identical output
   for untouched YAML. Tokens and events are produced on demand and are never

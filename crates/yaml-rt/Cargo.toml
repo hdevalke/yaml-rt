@@ -10,6 +10,34 @@ repository.workspace = true
 name = "yaml_rt"
 path = "src/lib.rs"
 
+[features]
+default = ["derive"]
+derive = ["dep:yaml-rt-derive"]
+
 [dependencies]
 yaml-rt-core.workspace = true
-yaml-rt-derive.workspace = true
+yaml-rt-derive = { workspace = true, optional = true }
+
+[[example]]
+name = "typed_config"
+required-features = ["derive"]
+
+[[example]]
+name = "nested_edit"
+required-features = ["derive"]
+
+[[example]]
+name = "multi_document"
+required-features = ["derive"]
+
+[[test]]
+name = "derive_mvp"
+required-features = ["derive"]
+
+[[test]]
+name = "derive_attributes"
+required-features = ["derive"]
+
+[[test]]
+name = "usefulness_target"
+required-features = ["derive"]

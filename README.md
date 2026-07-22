@@ -12,11 +12,12 @@ loaders discard.
 
 ## End goal
 
-The workspace is organized around three crates:
+The workspace is organized around four public crates:
 
 ```text
 yaml-rt-core      # no dependencies: parser, lossless CST arena, editor
 yaml-rt-derive    # derive macros using syn, quote, and proc-macro2
+yaml-rt-serde     # typed Serde loading and dumping
 yaml-rt           # public facade crate
 ```
 
@@ -59,6 +60,35 @@ Enable `derive` explicitly when defaults are disabled:
 ```toml
 yaml-rt = { version = "...", default-features = false, features = ["derive"] }
 ```
+
+Serde integration uses Serde's normal `Serialize` and `Deserialize` derives. It
+is available through the facade's off-by-default `serde` feature:
+
+```toml
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+yaml-rt = { version = "...", features = ["serde"] }
+```
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Config {
+    host: String,
+    port: u16,
+}
+
+let input = "host: localhost\nport: 8080\n";
+let config: Config = yaml_rt::from_str(input)?;
+let output = yaml_rt::to_string(&config)?;
+# Ok::<(), yaml_rt::Error>(())
+```
+
+Serde conversion round-trips typed values, not YAML presentation. Comments,
+whitespace, scalar style, source spelling, and anchor identity are not present in
+Serde's data model. Use `YamlRoundTrip` and retain the `YamlDoc` when those details
+must survive an edit.
 
 ## Examples
 
@@ -218,7 +248,11 @@ pub trait YamlValue: Sized {
   into the parser core.
 - `yaml-rt` re-exports the core API; its default `derive` feature re-exports
   the `YamlRoundTrip` derive macro and can be disabled for a proc-macro-free
-  facade.
+  facade. Its off-by-default `serde` feature re-exports the typed Serde adapter.
+- `yaml-rt-serde` provides `from_str`, `from_slice`, `from_reader`,
+  `to_string`, and `to_writer` APIs plus multi-document deserialization and
+  serialization. It can be used directly or through `yaml-rt`'s `serde` feature
+  and does not add dependencies to the core.
 - `YamlDoc::parse` validates source characters, builds one lossless CST arena
   with direct, sparse semantic metadata, and preserves byte-identical output
   for untouched YAML. Tokens and events are produced on demand and are never
@@ -626,6 +660,23 @@ extra: keep-me
 # Enable debug logging.
 debug: true
 ```
+
+### 15. Serde typed conversion
+
+`yaml-rt-serde` is the conventional typed loading and dumping path for types
+implementing `serde::Serialize` and `serde::Deserialize`.
+
+- It supports primitives, options, sequences, tuples, mappings, structs,
+  newtypes, and YAML-tagged enum variants.
+- Plain scalars use the YAML 1.2 core schema. Plain borrowed strings can be read
+  directly from string and byte-slice inputs.
+- Deserialization follows anchors and aliases with recursion and repetition
+  limits. Serialization does not invent anchors because Serde does not expose
+  shared object identity.
+- A `Deserializer` iterator and reusable `Serializer` support YAML streams with
+  multiple documents.
+- Dynamic `Value` APIs, merge-key expansion, UTF-16/UTF-32 input, and applying
+  arbitrary Serde values as lossless document patches remain future work.
 
 ## Implementation order
 

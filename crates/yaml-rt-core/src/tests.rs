@@ -3171,6 +3171,44 @@ fn document_selection_counts_stream_documents() {
 }
 
 #[test]
+fn document_root_returns_arbitrary_and_empty_roots() {
+    let doc = YamlDoc::parse("---\nscalar\n---\n[one, two]\n---\n").expect("valid stream");
+
+    let scalar = doc.document_root(0).expect("first document").unwrap();
+    assert!(matches!(
+        doc.semantic_kind(scalar),
+        Some(SemanticKind::Scalar { .. })
+    ));
+    let sequence = doc.document_root(1).expect("second document").unwrap();
+    assert!(matches!(
+        doc.semantic_kind(sequence),
+        Some(SemanticKind::Sequence { .. })
+    ));
+    assert_eq!(doc.document_root(2).expect("empty document"), None);
+    assert!(doc.document_root(3).is_err());
+}
+
+#[test]
+fn borrowable_scalar_span_excludes_properties_and_decoded_styles() {
+    let doc = YamlDoc::parse(
+        "plain: &name value # keep\nquoted: \"value\"\nmultiline: first\n  second\n",
+    )
+    .expect("valid YAML");
+
+    let plain = doc.get_path(&["plain"]).unwrap().unwrap();
+    let span = doc
+        .borrowable_scalar_span(plain)
+        .expect("plain scalar span")
+        .unwrap();
+    assert_eq!(doc.source().slice(span), "value");
+
+    let quoted = doc.get_path(&["quoted"]).unwrap().unwrap();
+    assert_eq!(doc.borrowable_scalar_span(quoted).unwrap(), None);
+    let multiline = doc.get_path(&["multiline"]).unwrap().unwrap();
+    assert_eq!(doc.borrowable_scalar_span(multiline).unwrap(), None);
+}
+
+#[test]
 fn document_selection_reads_second_document_mapping() {
     let doc = YamlDoc::parse("---\nname: first\n---\nname: second\n")
         .expect("valid multi-document stream");

@@ -1,0 +1,18 @@
+[package]
+name = "yaml-rt-serde"
+description = "Serde integration for the yaml-rt YAML 1.2.2 parser"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "yaml_rt_serde"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+yaml-rt-core.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }

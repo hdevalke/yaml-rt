@@ -13,10 +13,15 @@ path = "src/lib.rs"
 [features]
 default = ["derive"]
 derive = ["dep:yaml-rt-derive"]
+serde = ["dep:yaml-rt-serde"]
 
 [dependencies]
 yaml-rt-core.workspace = true
 yaml-rt-derive = { workspace = true, optional = true }
+yaml-rt-serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
 
 [[example]]
 name = "typed_config"
@@ -41,3 +46,7 @@ required-features = ["derive"]
 [[test]]
 name = "usefulness_target"
 required-features = ["derive"]
+
+[[test]]
+name = "serde_facade"
+required-features = ["serde"]

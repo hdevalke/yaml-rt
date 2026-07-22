@@ -722,6 +722,34 @@ impl YamlDoc {
         self.semantics.documents.iter().copied()
     }
 
+    /// Returns the semantic root value of a selected document.
+    ///
+    /// Empty documents have no root value and return `Ok(None)`. Unlike
+    /// [`YamlDoc::document_root_mapping`], this method accepts scalar, sequence,
+    /// mapping, and alias roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `index` is outside the YAML stream.
+    pub fn document_root(&self, index: usize) -> Result<Option<NodeId>, YamlError> {
+        if let Some(root) = self.root_override {
+            return (index == 0)
+                .then_some(Some(root))
+                .ok_or_else(|| self.document_index_error(index));
+        }
+        let document = self
+            .semantics
+            .documents
+            .get(index)
+            .copied()
+            .ok_or_else(|| self.document_index_error(index))?;
+        let root = self.semantic_children(document).next();
+        Ok(root.filter(|root| {
+            !matches!(self.semantic_kind(*root), Some(SemanticKind::Scalar { .. }))
+                || self.node(*root).is_some_and(|node| !node.span.is_empty())
+        }))
+    }
+
     /// Iterates over mapping key/value CST node pairs in source order.
     pub fn mapping_entries(&self, mapping: NodeId) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
         let is_mapping = matches!(
@@ -1040,6 +1068,56 @@ impl YamlDoc {
                 .map(|indent| indent as usize),
         )
         .map(Cow::Owned)
+    }
+
+    /// Returns the source span of a scalar whose decoded value can be borrowed
+    /// byte-for-byte from the original input.
+    ///
+    /// This currently returns a span only for single-line plain scalars. Quoted,
+    /// escaped, folded, literal, and multiline scalars require decoding and
+    /// return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node` is unknown, is not a scalar, or has malformed
+    /// node properties.
+    pub fn borrowable_scalar_span(&self, node: NodeId) -> Result<Option<Span>, YamlError> {
+        let node_ref = self.expect_node(node)?;
+        if !matches!(
+            self.semantic_kind(node),
+            Some(SemanticKind::Scalar {
+                style: crate::YamlScalarStyle::Plain,
+            })
+        ) {
+            if matches!(
+                node_ref.kind,
+                NodeKind::Scalar | NodeKind::LiteralScalar | NodeKind::FoldedScalar
+            ) {
+                return Ok(None);
+            }
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    format!("expected scalar value, found {:?}", node_ref.kind),
+                    node_ref.span,
+                )
+                .with_expected("Scalar, LiteralScalar, or FoldedScalar"),
+            )
+            .with_position_from(&self.source));
+        }
+
+        let text = self.source.slice(node_ref.span);
+        if text.contains(['\n', '\r']) {
+            return Ok(None);
+        }
+        let properties = parse_node_properties(text, node_ref.span)?;
+        let value_text = &text[properties.value_start..];
+        let value_len = plain_scalar_end(value_text);
+        let start = Span::offset_from_usize(node_ref.span.start, properties.value_start);
+        Ok(Some(Span::new(
+            start,
+            Span::offset_from_usize(start, value_len),
+        )))
     }
 
     /// Queues a scalar value replacement at `path` while preserving the existing

@@ -4,6 +4,7 @@ members = [
     "crates/yaml-rt-derive",
     "crates/yaml-rt-serde",
     "crates/yaml-rt",
+    "crates/yaml-rt-cli",
     "crates/yaml-rt-bench",
 ]
 resolver = "3"
@@ -15,6 +16,7 @@ license = "MIT OR Apache-2.0"
 repository = ""
 
 [workspace.dependencies]
+clap = "4.6.1"
 yaml-rt-core = { path = "crates/yaml-rt-core" }
 yaml-rt-derive = { path = "crates/yaml-rt-derive" }
 yaml-rt-serde = { path = "crates/yaml-rt-serde" }

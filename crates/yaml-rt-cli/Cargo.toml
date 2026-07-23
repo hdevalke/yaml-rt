@@ -1,0 +1,16 @@
+[package]
+name = "yaml-rt-cli"
+description = "Presentation-preserving command-line YAML editor"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "yaml-rt"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+yaml-rt-core.workspace = true

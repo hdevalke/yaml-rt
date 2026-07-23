@@ -12,13 +12,15 @@ loaders discard.
 
 ## End goal
 
-The workspace is organized around four public crates:
+The workspace is organized around four public library crates and one
+command-line application crate:
 
 ```text
 yaml-rt-core      # no dependencies: parser, lossless CST arena, editor
 yaml-rt-derive    # derive macros using syn, quote, and proc-macro2
 yaml-rt-serde     # typed Serde loading and dumping
 yaml-rt           # public facade crate
+yaml-rt-cli       # private package producing the yaml-rt executable
 ```
 
 Target usage:
@@ -107,6 +109,75 @@ cargo run -p yaml-rt --example multi_document
   preserving comments, scalar style, unknown fields, and inline comments.
 - `multi_document` reads and writes a selected document in a YAML stream without
   changing the other document.
+
+## Command-line editor
+
+The `yaml-rt-cli` package builds an executable named `yaml-rt`. Install it from
+the workspace or run it directly:
+
+```sh
+cargo install --path crates/yaml-rt-cli
+cargo run -p yaml-rt-cli -- get /server/host config.yaml
+```
+
+It exposes RFC 6902-style operations as subcommands:
+
+```text
+yaml-rt get     [OPTIONS] <PATH> [FILE]
+yaml-rt add     [OPTIONS] <PATH> (--value <YAML> | --value-file <FILE>) [FILE]
+yaml-rt remove  [OPTIONS] <PATH> [FILE]
+yaml-rt replace [OPTIONS] <PATH> (--value <YAML> | --value-file <FILE>) [FILE]
+yaml-rt move    [OPTIONS] <FROM> <PATH> [FILE]
+yaml-rt copy    [OPTIONS] <FROM> <PATH> [FILE]
+yaml-rt test    [OPTIONS] <PATH> (--value <YAML> | --value-file <FILE>) [FILE]
+```
+
+Paths use plain RFC 6901 JSON Pointer syntax such as `/server/host`, not URI
+fragment syntax such as `#/server/host`. `~1` represents `/`, `~0` represents
+`~`, and the empty pointer selects the document root. Evaluation follows the
+RFC 9512 YAML representation graph: aliases are traversed when a later pointer
+token requires it, while a pointer ending on an alias selects the alias
+occurrence itself. Duplicate matching keys and mappings with non-string keys are
+rejected.
+
+Examples:
+
+```sh
+yaml-rt get /server/host config.yaml
+yaml-rt add /server/tls --value '{enabled: true, port: 443}' config.yaml
+yaml-rt replace /server/port --value 9090 config.yaml
+yaml-rt replace /server/tls --value-file tls.yaml config.yaml
+yaml-rt remove /server/legacy config.yaml
+yaml-rt move /old/path /new/path config.yaml
+yaml-rt copy /defaults /services/foo config.yaml
+yaml-rt test /server/port --value 9090 config.yaml
+```
+
+`--value` is always parsed as a complete YAML node. It is never interpreted as
+a filename, even if a file with the same spelling exists. `--value-file` reads
+the node explicitly and accepts `-` for stdin when the target document comes
+from a real file. Both forms require exactly one non-empty YAML document.
+
+Input defaults to stdin. Mutations write the complete stream to stdout unless
+`--output FILE` or `--in-place` is used. `get --output FILE` writes only the
+selected node; `test` produces no output. In-place edits use a temporary sibling
+with the source permissions and rename it over the source only after parsing and
+editing succeed. Symlink inputs are rejected for in-place replacement.
+
+Streams with more than one document require `--doc INDEX`; unselected documents
+remain byte-identical. Semantic `test` compares the JSON-compatible YAML data
+model, ignores presentation and mapping order, preserves sequence order, and
+treats `1`, `1.0`, and `1e0` as equal. Custom-tagged values, non-string mapping
+keys, duplicate keys, cycles, infinities, and NaN are not JSON-compatible and
+produce errors rather than falling back to source-text equality.
+
+Unrelated target syntax remains source-owned and is emitted byte-for-byte.
+Inserted fragments are normalized only when their original block/flow form is
+invalid in the destination context. Copying a subtree containing an anchor is
+rejected in the initial implementation. Moving an anchored subtree is also
+rejected when an alias outside that subtree depends on it.
+
+Clap is used only by `yaml-rt-cli`; `yaml-rt-core` remains dependency-free.
 
 Required guarantees:
 
@@ -253,6 +324,9 @@ pub trait YamlValue: Sized {
   `to_string`, and `to_writer` APIs plus multi-document deserialization and
   serialization. It can be used directly or through `yaml-rt`'s `serde` feature
   and does not add dependencies to the core.
+- `yaml-rt-cli` provides RFC 6901 pointer lookup, RFC 6902-style direct
+  operations, RFC 9512 alias traversal, semantic `test`, stdin/stdout operation,
+  and atomic in-place file replacement.
 - `YamlDoc::parse` validates source characters, builds one lossless CST arena
   with direct, sparse semantic metadata, and preserves byte-identical output
   for untouched YAML. Tokens and events are produced on demand and are never
@@ -677,6 +751,21 @@ implementing `serde::Serialize` and `serde::Deserialize`.
   multiple documents.
 - Dynamic `Value` APIs, merge-key expansion, UTF-16/UTF-32 input, and applying
   arbitrary Serde values as lossless document patches remain future work.
+
+### 16. JSON Pointer command-line editor
+
+- [x] Parse plain RFC 6901 JSON Pointers with strict escape and sequence-index
+      validation.
+- [x] Resolve pointers through RFC 9512 aliases while preserving terminal alias
+      identity.
+- [x] Parse, extract, re-indent, and contextually render standalone YAML
+      fragments.
+- [x] Apply transactional `add`, `remove`, `replace`, `move`, and `copy`
+      operations through the patch emitter.
+- [x] Compare JSON-compatible YAML values semantically with exact finite-number
+      equality.
+- [x] Provide the `yaml-rt` executable with explicit value sources,
+      multi-document selection, output files, and atomic in-place writes.
 
 ## Implementation order
 

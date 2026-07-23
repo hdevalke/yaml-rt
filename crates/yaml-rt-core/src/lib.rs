@@ -9,6 +9,7 @@ mod diagnostic;
 mod doc;
 mod lexer;
 mod parser;
+mod pointer;
 mod semantic;
 mod source;
 mod syntax;
@@ -21,6 +22,7 @@ pub use doc::{
 };
 pub use lexer::{Token, TokenKind, lex, tokens_to_string};
 pub use parser::events_to_test_string;
+pub use pointer::{JsonPointer, PointerError, PointerErrorKind, ReferenceToken};
 pub use semantic::SemanticKind;
 pub use source::{LineCol, NodeId, Source, Span, TARGET_YAML_VERSION};
 pub(crate) use syntax::ParsedYaml;

@@ -82,6 +82,18 @@ impl JsonPointer {
     pub fn is_proper_prefix_of(&self, other: &Self) -> bool {
         self.tokens.len() < other.tokens.len() && other.tokens.starts_with(&self.tokens)
     }
+
+    pub(crate) fn parent(&self) -> Option<(Self, &ReferenceToken)> {
+        let (last, parent) = self.tokens.split_last()?;
+        let original = encode_tokens(parent);
+        Some((
+            Self {
+                original,
+                tokens: parent.to_vec(),
+            },
+            last,
+        ))
+    }
 }
 
 impl std::str::FromStr for JsonPointer {
@@ -108,6 +120,15 @@ fn decode_token(token: &str) -> Result<String, String> {
         }
     }
     Ok(output)
+}
+
+fn encode_tokens(tokens: &[ReferenceToken]) -> String {
+    let mut pointer = String::new();
+    for token in tokens {
+        pointer.push('/');
+        pointer.push_str(&token.as_str().replace('~', "~0").replace('/', "~1"));
+    }
+    pointer
 }
 
 /// Classification of a JSON Pointer parse or resolution failure.

@@ -1,0 +1,722 @@
+use std::fmt;
+
+use crate::fragment::indent_text;
+use crate::pointer::parse_sequence_index;
+use crate::{
+    CollectionStyle, FragmentError, JsonPointer, NodeId, PointerError, ResolvedScalar,
+    SemanticKind, SemanticValueError, Span, YamlDoc, YamlError, YamlFragment, YamlScalarStyle,
+    resolve_scalar, semantically_equal,
+};
+
+/// Failure while applying a pointer-addressed YAML edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YamlEditError {
+    message: String,
+}
+
+impl YamlEditError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for YamlEditError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for YamlEditError {}
+
+impl From<PointerError> for YamlEditError {
+    fn from(error: PointerError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<FragmentError> for YamlEditError {
+    fn from(error: FragmentError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<YamlError> for YamlEditError {
+    fn from(error: YamlError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<SemanticValueError> for YamlEditError {
+    fn from(error: SemanticValueError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+enum AddLocation {
+    Root(NodeId),
+    Mapping {
+        mapping: NodeId,
+        existing: Option<NodeId>,
+        key: String,
+    },
+    Sequence {
+        sequence: NodeId,
+        index: usize,
+    },
+}
+
+impl YamlDoc {
+    /// Applies RFC 6902 `add` semantics at a JSON Pointer destination.
+    pub fn add_at(
+        &mut self,
+        document: usize,
+        pointer: &JsonPointer,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        self.transaction(|work| {
+            let location = work.resolve_add_location(document, pointer)?;
+            work.queue_add(location, value)
+        })
+    }
+
+    /// Removes an existing value. Removing a document root is unsupported.
+    pub fn remove_at(
+        &mut self,
+        document: usize,
+        pointer: &JsonPointer,
+    ) -> Result<(), YamlEditError> {
+        if pointer.is_root() {
+            return Err(YamlEditError::new(
+                "removing a YAML document root is not supported",
+            ));
+        }
+        self.transaction(|work| {
+            let target = work.resolve_pointer(document, pointer)?;
+            work.queue_value_removal(target)
+        })
+    }
+
+    /// Replaces an existing value while preserving its surrounding syntax.
+    pub fn replace_at(
+        &mut self,
+        document: usize,
+        pointer: &JsonPointer,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        self.transaction(|work| {
+            let target = work.resolve_pointer(document, pointer)?;
+            work.queue_fragment_replacement(target, value)
+        })
+    }
+
+    /// Moves a value using RFC 6902 remove-then-add semantics.
+    pub fn move_at(
+        &mut self,
+        document: usize,
+        from: &JsonPointer,
+        path: &JsonPointer,
+    ) -> Result<(), YamlEditError> {
+        if from == path {
+            return Ok(());
+        }
+        if from.is_proper_prefix_of(path) {
+            return Err(YamlEditError::new(
+                "move source must not be a proper prefix of its destination",
+            ));
+        }
+        let mut work = self.clone();
+        let source = work.resolve_pointer(document, from)?;
+        if work.anchor_has_external_alias(source) {
+            return Err(YamlEditError::new(
+                "cannot move anchored subtree because an alias outside it depends on that anchor",
+            ));
+        }
+        let fragment = YamlFragment::from_document_node(&work, source)?;
+        if from.is_root() {
+            return Err(YamlEditError::new(
+                "a document root cannot be moved into another location",
+            ));
+        }
+        work.queue_value_removal(source)?;
+        work.commit_edits()?;
+        let location = work.resolve_add_location(document, path)?;
+        work.queue_add(location, &fragment)?;
+        work.commit_edits()?;
+        *self = work;
+        Ok(())
+    }
+
+    /// Deep-copies a value using RFC 6902 `copy` semantics.
+    pub fn copy_at(
+        &mut self,
+        document: usize,
+        from: &JsonPointer,
+        path: &JsonPointer,
+    ) -> Result<(), YamlEditError> {
+        let source = self.resolve_pointer(document, from)?;
+        let fragment = YamlFragment::from_document_node(self, source)?;
+        if fragment.contains_anchor() {
+            return Err(YamlEditError::new(format!(
+                "cannot copy {:?}: subtree contains an anchor",
+                from.as_str()
+            )));
+        }
+        self.add_at(document, path, &fragment)
+    }
+
+    /// Compares a pointer-selected target with a YAML value.
+    pub fn test_at(
+        &self,
+        document: usize,
+        pointer: &JsonPointer,
+        value: &YamlFragment,
+    ) -> Result<bool, YamlEditError> {
+        let target = self.resolve_pointer(document, pointer)?;
+        semantically_equal(self, target, value.document(), value.root()).map_err(Into::into)
+    }
+
+    fn transaction(
+        &mut self,
+        operation: impl FnOnce(&mut YamlDoc) -> Result<(), YamlEditError>,
+    ) -> Result<(), YamlEditError> {
+        let mut work = self.clone();
+        operation(&mut work)?;
+        work.commit_edits()?;
+        *self = work;
+        Ok(())
+    }
+
+    fn resolve_add_location(
+        &self,
+        document: usize,
+        pointer: &JsonPointer,
+    ) -> Result<AddLocation, YamlEditError> {
+        let Some((parent_pointer, token)) = pointer.parent() else {
+            let root = self
+                .document_root(document)?
+                .ok_or_else(|| YamlEditError::new("selected document has no root node"))?;
+            return Ok(AddLocation::Root(root));
+        };
+        let mut parent = self.resolve_pointer(document, &parent_pointer)?;
+        parent = self.resolve_aliases_for_pointer(
+            parent,
+            pointer,
+            pointer.tokens().len().saturating_sub(1),
+        )?;
+        match self.semantic_kind(parent) {
+            Some(SemanticKind::Mapping { .. }) => {
+                let existing = self
+                    .mapping_match(
+                        parent,
+                        token,
+                        pointer,
+                        pointer.tokens().len().saturating_sub(1),
+                    )?
+                    .map(|entry| entry.value);
+                Ok(AddLocation::Mapping {
+                    mapping: parent,
+                    existing,
+                    key: token.as_str().to_owned(),
+                })
+            }
+            Some(SemanticKind::Sequence { .. }) => {
+                let length = self.sequence_items(parent).count();
+                let parsed = parse_sequence_index(
+                    token,
+                    pointer,
+                    pointer.tokens().len().saturating_sub(1),
+                    true,
+                )?;
+                let index = if parsed == usize::MAX { length } else { parsed };
+                if index > length {
+                    return Err(YamlEditError::new(format!(
+                        "sequence index {index} is out of bounds for insertion into length {length}"
+                    )));
+                }
+                Ok(AddLocation::Sequence {
+                    sequence: parent,
+                    index,
+                })
+            }
+            _ => Err(YamlEditError::new(format!(
+                "add parent {:?} is not a mapping or sequence",
+                parent_pointer.as_str()
+            ))),
+        }
+    }
+
+    fn queue_add(
+        &mut self,
+        location: AddLocation,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        match location {
+            AddLocation::Root(root) => self.queue_fragment_replacement(root, value),
+            AddLocation::Mapping {
+                existing: Some(existing),
+                ..
+            } => self.queue_fragment_replacement(existing, value),
+            AddLocation::Mapping {
+                mapping,
+                existing: None,
+                key,
+            } => self.queue_mapping_insert(mapping, &key, value),
+            AddLocation::Sequence { sequence, index } => {
+                self.queue_sequence_insert(sequence, index, value)
+            }
+        }
+    }
+
+    fn queue_fragment_replacement(
+        &mut self,
+        target: NodeId,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        if self
+            .node(target)
+            .is_some_and(|node| node.kind() == crate::NodeKind::Scalar)
+            && matches!(
+                value.document().semantic_kind(value.root()),
+                Some(SemanticKind::Scalar { .. })
+            )
+            && value.document().raw_tag(value.root()).is_none()
+            && value.document().anchor(value.root()).is_none()
+        {
+            let mut replacement = value.to_yaml()?;
+            if !replacement.contains(['\n', '\r']) {
+                let (span, target_style) = self.scalar_replacement_target(target)?;
+                if scalar_is_string(self, target)?
+                    && scalar_is_string(value.document(), value.root())?
+                {
+                    let decoded = value.document().scalar_value(value.root())?;
+                    if let Ok(styled) = crate::format_scalar_value(&decoded, target_style) {
+                        replacement = styled;
+                    }
+                }
+                self.queue_edit(span, replacement)?;
+                return Ok(());
+            }
+        }
+        let replacement = if self.is_flow_context(target) {
+            value.render_flow(self)?
+        } else {
+            let yaml = value.prepared(self)?.to_yaml()?;
+            indent_continuation_lines(&yaml, self.node_indent(self.expect_node(target)?))
+        };
+        self.replace_node_text(target, replacement)?;
+        Ok(())
+    }
+
+    fn queue_value_removal(&mut self, target: NodeId) -> Result<(), YamlEditError> {
+        let Some(entry) = self.containing_entry(target) else {
+            self.remove_node(target)?;
+            return Ok(());
+        };
+        let Some(collection) = self.node(entry).and_then(|node| node.parent()) else {
+            self.remove_node(entry)?;
+            return Ok(());
+        };
+        let flow = matches!(
+            self.semantic_kind(collection),
+            Some(
+                SemanticKind::Mapping {
+                    style: CollectionStyle::Flow
+                } | SemanticKind::Sequence {
+                    style: CollectionStyle::Flow
+                }
+            )
+        );
+        if !flow {
+            self.remove_node(entry)?;
+            return Ok(());
+        }
+
+        let entries = self
+            .children(collection)
+            .filter(|node| self.containing_entry_child(*node))
+            .collect::<Vec<_>>();
+        let index = entries
+            .iter()
+            .position(|candidate| *candidate == entry)
+            .ok_or_else(|| YamlEditError::new("flow collection entry is missing"))?;
+        let entry_span = self.expect_node(entry)?.span;
+        let span = if let Some(next) = entries.get(index + 1).copied() {
+            Span::new(entry_span.start, self.expect_node(next)?.span.start)
+        } else if index > 0 {
+            let previous = self.expect_node(entries[index - 1])?.span;
+            Span::new(previous.end, entry_span.end)
+        } else {
+            entry_span
+        };
+        self.queue_edit(span, String::new())?;
+        Ok(())
+    }
+
+    fn containing_entry_child(&self, node: NodeId) -> bool {
+        self.node(node).is_some_and(|node| {
+            matches!(
+                node.kind(),
+                crate::NodeKind::MappingEntry | crate::NodeKind::SequenceEntry
+            )
+        })
+    }
+
+    fn queue_mapping_insert(
+        &mut self,
+        mapping: NodeId,
+        key: &str,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        let Some(SemanticKind::Mapping { style }) = self.semantic_kind(mapping) else {
+            return Err(YamlEditError::new(
+                "mapping insertion target is not a mapping",
+            ));
+        };
+        let key = emit_string_key(key);
+        match style {
+            CollectionStyle::Flow => {
+                let mapping_node = self.expect_node(mapping)?;
+                let close = closing_delimiter_offset(self, mapping_node.span, '}')?;
+                let prefix = if self.mapping_entries(mapping).next().is_some() {
+                    ", "
+                } else {
+                    ""
+                };
+                let value = value.render_flow(self)?;
+                self.queue_edit(
+                    Span::empty_from_usize(close),
+                    format!("{prefix}{key}: {value}"),
+                )?;
+            }
+            CollectionStyle::Block => {
+                let mapping_node = self.expect_node(mapping)?;
+                let indent = self.node_indent(mapping_node);
+                let offset = self.mapping_insertion_offset(mapping_node);
+                let mut insertion = insertion_prefix(self, offset);
+                let value = value.prepared(self)?.to_yaml()?;
+                insertion.push_str(&format_block_mapping_entry(
+                    &key,
+                    &value,
+                    indent,
+                    self.preferred_line_ending(),
+                ));
+                self.queue_edit(Span::empty_from_usize(offset), insertion)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_sequence_insert(
+        &mut self,
+        sequence: NodeId,
+        index: usize,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        let Some(SemanticKind::Sequence { style }) = self.semantic_kind(sequence) else {
+            return Err(YamlEditError::new(
+                "sequence insertion target is not a sequence",
+            ));
+        };
+        let items = self.sequence_items(sequence).collect::<Vec<_>>();
+        match style {
+            CollectionStyle::Flow => {
+                let sequence_node = self.expect_node(sequence)?;
+                let offset = if let Some(item) = items.get(index).copied() {
+                    self.expect_node(item)?.span.start as usize
+                } else {
+                    closing_delimiter_offset(self, sequence_node.span, ']')?
+                };
+                let value = value.render_flow(self)?;
+                let insertion = if items.is_empty() {
+                    value
+                } else if index < items.len() {
+                    format!("{value}, ")
+                } else {
+                    format!(", {value}")
+                };
+                self.queue_edit(Span::empty_from_usize(offset), insertion)?;
+            }
+            CollectionStyle::Block => {
+                let sequence_node = self.expect_node(sequence)?;
+                let indent = self.node_indent(sequence_node);
+                let offset = if let Some(item) = items.get(index).copied() {
+                    let entry = self.containing_entry(item).unwrap_or(item);
+                    self.line_start_offset(self.expect_node(entry)?.span.start as usize)
+                } else {
+                    self.sequence_insertion_offset(sequence_node)
+                };
+                let mut insertion = insertion_prefix(self, offset);
+                let value = value.prepared(self)?.to_yaml()?;
+                insertion.push_str(&format_block_sequence_entry(
+                    &value,
+                    indent,
+                    self.preferred_line_ending(),
+                ));
+                self.queue_edit(Span::empty_from_usize(offset), insertion)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_flow_context(&self, mut node: NodeId) -> bool {
+        while let Some(parent) = self.node(node).and_then(|node| node.parent()) {
+            if matches!(
+                self.semantic_kind(parent),
+                Some(
+                    SemanticKind::Mapping {
+                        style: CollectionStyle::Flow
+                    } | SemanticKind::Sequence {
+                        style: CollectionStyle::Flow
+                    }
+                )
+            ) {
+                return true;
+            }
+            node = parent;
+        }
+        false
+    }
+
+    fn anchor_has_external_alias(&self, root: NodeId) -> bool {
+        let Some(root_span) = self.node(root).map(|node| node.span()) else {
+            return false;
+        };
+        let anchored = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, _)| NodeId::from_usize(index))
+            .filter(|node| {
+                self.anchor(*node).is_some()
+                    && self.node(*node).is_some_and(|node| {
+                        node.span().start >= root_span.start && node.span().end <= root_span.end
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(index, _)| NodeId::from_usize(index))
+            .filter(|node| matches!(self.semantic_kind(*node), Some(SemanticKind::Alias)))
+            .any(|alias| {
+                let outside = self.node(alias).is_some_and(|node| {
+                    node.span().start < root_span.start || node.span().end > root_span.end
+                });
+                outside
+                    && self
+                        .resolve_alias(alias)
+                        .is_some_and(|target| anchored.contains(&target))
+            })
+    }
+
+    pub(crate) fn line_start_offset(&self, offset: usize) -> usize {
+        let offset = u32::try_from(offset).unwrap_or(u32::MAX);
+        match self.source.line_starts().binary_search(&offset) {
+            Ok(index) => self.source.line_starts()[index] as usize,
+            Err(index) => self.source.line_starts()[index.saturating_sub(1)] as usize,
+        }
+    }
+}
+
+fn closing_delimiter_offset(
+    doc: &YamlDoc,
+    span: Span,
+    delimiter: char,
+) -> Result<usize, YamlEditError> {
+    let source = doc.source.slice(span);
+    let relative = source
+        .rfind(delimiter)
+        .ok_or_else(|| YamlEditError::new(format!("missing `{delimiter}` delimiter")))?;
+    Ok(span.start as usize + relative)
+}
+
+fn insertion_prefix(doc: &YamlDoc, offset: usize) -> String {
+    if offset == doc.source.len()
+        && !doc
+            .source
+            .as_str()
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        doc.preferred_line_ending().to_owned()
+    } else {
+        String::new()
+    }
+}
+
+fn format_block_mapping_entry(key: &str, value: &str, indent: usize, ending: &str) -> String {
+    let prefix = " ".repeat(indent);
+    if !value.contains(['\n', '\r']) {
+        return format!("{prefix}{key}: {value}{ending}");
+    }
+    let value = indent_text(value, indent + 2);
+    let mut output = format!("{prefix}{key}:{ending}{value}");
+    if !output.ends_with(['\n', '\r']) {
+        output.push_str(ending);
+    }
+    output
+}
+
+fn format_block_sequence_entry(value: &str, indent: usize, ending: &str) -> String {
+    let prefix = " ".repeat(indent);
+    if !value.contains(['\n', '\r']) {
+        return format!("{prefix}- {value}{ending}");
+    }
+    let value = indent_text(value, indent + 2);
+    let mut output = format!("{prefix}-{ending}{value}");
+    if !output.ends_with(['\n', '\r']) {
+        output.push_str(ending);
+    }
+    output
+}
+
+fn indent_continuation_lines(value: &str, indent: usize) -> String {
+    if indent == 0 {
+        return value.to_owned();
+    }
+    let prefix = " ".repeat(indent);
+    let mut output = String::with_capacity(value.len());
+    let mut after_break = false;
+    for character in value.chars() {
+        if after_break && !matches!(character, '\r' | '\n') {
+            output.push_str(&prefix);
+            after_break = false;
+        }
+        output.push(character);
+        if character == '\n' {
+            after_break = true;
+        } else if character != '\r' {
+            after_break = false;
+        }
+    }
+    output
+}
+
+fn emit_string_key(value: &str) -> String {
+    if safe_plain_string(value) {
+        value.to_owned()
+    } else {
+        crate::fragment::quote_string(value)
+    }
+}
+
+fn safe_plain_string(value: &str) -> bool {
+    if value.is_empty()
+        || value.trim() != value
+        || value.contains(['\n', '\r', '\t', ':', '#', '[', ']', '{', '}', ','])
+        || value.starts_with(['-', '?', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`'])
+    {
+        return false;
+    }
+    matches!(
+        resolve_scalar(value, YamlScalarStyle::Plain, None),
+        Ok(ResolvedScalar::String)
+    )
+}
+
+fn scalar_is_string(doc: &YamlDoc, node: NodeId) -> Result<bool, YamlEditError> {
+    let Some(SemanticKind::Scalar { style }) = doc.semantic_kind(node) else {
+        return Ok(false);
+    };
+    let value = doc.scalar_value(node)?;
+    let tag = doc.resolved_tag(node)?;
+    Ok(matches!(
+        resolve_scalar(&value, style, tag.as_deref()),
+        Ok(ResolvedScalar::String)
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pointer(value: &str) -> JsonPointer {
+        JsonPointer::parse(value).unwrap()
+    }
+
+    fn fragment(value: &str) -> YamlFragment {
+        YamlFragment::parse(value).unwrap()
+    }
+
+    #[test]
+    fn adds_replaces_and_removes_block_mapping_values() {
+        let mut doc = YamlDoc::parse("server:\n  host: localhost # keep\n").unwrap();
+        doc.add_at(0, &pointer("/server/port"), &fragment("8080"))
+            .unwrap();
+        assert_eq!(
+            doc.as_source(),
+            "server:\n  host: localhost # keep\n  port: 8080\n"
+        );
+        doc.replace_at(0, &pointer("/server/host"), &fragment("example.com"))
+            .unwrap();
+        assert_eq!(
+            doc.as_source(),
+            "server:\n  host: example.com # keep\n  port: 8080\n"
+        );
+        doc.remove_at(0, &pointer("/server/port")).unwrap();
+        assert_eq!(doc.as_source(), "server:\n  host: example.com # keep\n");
+    }
+
+    #[test]
+    fn adds_string_keys_without_changing_their_schema_type() {
+        let mut doc = YamlDoc::parse("{}\n").unwrap();
+        doc.add_at(0, &pointer("/true"), &fragment("value"))
+            .unwrap();
+        assert_eq!(doc.as_source(), "{\"true\": value}\n");
+        assert!(
+            doc.resolve_pointer(0, &pointer("/true")).is_ok(),
+            "{}",
+            doc.as_source()
+        );
+    }
+
+    #[test]
+    fn inserts_block_and_flow_sequence_items() {
+        let mut block = YamlDoc::parse("items:\n  - a\n  - c\n").unwrap();
+        block
+            .add_at(0, &pointer("/items/1"), &fragment("b"))
+            .unwrap();
+        block
+            .add_at(0, &pointer("/items/-"), &fragment("d"))
+            .unwrap();
+        assert_eq!(block.as_source(), "items:\n  - a\n  - b\n  - c\n  - d\n");
+
+        let mut flow = YamlDoc::parse("items: [a, c]\n").unwrap();
+        flow.add_at(0, &pointer("/items/1"), &fragment("b"))
+            .unwrap();
+        assert_eq!(flow.as_source(), "items: [a, b, c]\n");
+    }
+
+    #[test]
+    fn mutations_are_transactional() {
+        let input = "items: [a]\n";
+        let mut doc = YamlDoc::parse(input).unwrap();
+        assert!(doc.add_at(0, &pointer("/items/4"), &fragment("x")).is_err());
+        assert_eq!(doc.as_source(), input);
+    }
+
+    #[test]
+    fn move_uses_remove_then_add_sequence_indices() {
+        let mut doc = YamlDoc::parse("[a, b, c]\n").unwrap();
+        doc.move_at(0, &pointer("/0"), &pointer("/2")).unwrap();
+        assert_eq!(doc.as_source(), "[b, c, a]\n");
+    }
+
+    #[test]
+    fn copy_rejects_anchors_and_test_is_semantic() {
+        let mut doc = YamlDoc::parse("one: &one {value: 1}\ntwo: null\n").unwrap();
+        assert!(
+            doc.copy_at(0, &pointer("/one"), &pointer("/two"))
+                .unwrap_err()
+                .to_string()
+                .contains("anchor")
+        );
+        assert!(
+            doc.test_at(0, &pointer("/one/value"), &fragment("1.0"))
+                .unwrap()
+        );
+    }
+}

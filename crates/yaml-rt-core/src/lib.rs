@@ -7,6 +7,8 @@
 
 mod diagnostic;
 mod doc;
+mod edit;
+mod fragment;
 mod lexer;
 mod parser;
 mod pointer;
@@ -20,6 +22,8 @@ pub use diagnostic::{Diagnostic, DiagnosticKind, ParseError, YamlError};
 pub use doc::{
     Edit, MappingEntryStyle, ReservedDirective, TagDirective, YamlDirective, YamlDoc, YamlEvents,
 };
+pub use edit::YamlEditError;
+pub use fragment::{FragmentError, YamlFragment};
 pub use lexer::{Token, TokenKind, lex, tokens_to_string};
 pub use parser::events_to_test_string;
 pub use pointer::{JsonPointer, PointerError, PointerErrorKind, ReferenceToken};

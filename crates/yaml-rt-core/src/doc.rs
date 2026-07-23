@@ -1874,7 +1874,7 @@ impl YamlDoc {
         Ok(())
     }
 
-    fn mapping_insertion_offset(&self, mapping: &Node) -> usize {
+    pub(crate) fn mapping_insertion_offset(&self, mapping: &Node) -> usize {
         node_link(mapping.last_child)
             .and_then(|child| self.node(child))
             .map_or(mapping.span.end as usize, |last_child| {

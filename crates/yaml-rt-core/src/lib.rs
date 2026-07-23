@@ -13,6 +13,7 @@ mod semantic;
 mod source;
 mod syntax;
 mod typed;
+mod value;
 
 pub use diagnostic::{Diagnostic, DiagnosticKind, ParseError, YamlError};
 pub use doc::{
@@ -27,6 +28,10 @@ pub use syntax::{
     Children, CollectionStyle, Node, NodeKind, YamlEvent, YamlEventKind, YamlScalarStyle, parse_cst,
 };
 pub use typed::{FromYamlDoc, ToYamlDoc, ToYamlFragment, YamlValue};
+pub use value::{
+    NonFiniteFloat, ResolvedScalar, ScalarResolveError, SemanticValueError, YamlNumber,
+    resolve_scalar, semantically_equal,
+};
 
 pub(crate) use parser::{
     BlockChomp, CollectionTarget, Parser, ScalarStyle, decode_scalar_value_with_content_indent,

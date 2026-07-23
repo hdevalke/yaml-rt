@@ -5,7 +5,10 @@ use serde::de::{
     self, DeserializeOwned, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess,
     Visitor,
 };
-use yaml_rt_core::{NodeId, SemanticKind, Span, YamlDoc, YamlScalarStyle};
+use yaml_rt_core::{
+    NodeId, NonFiniteFloat, ResolvedScalar, SemanticKind, Span, YamlDoc, YamlScalarStyle,
+    resolve_scalar,
+};
 
 use crate::{Error, Result};
 
@@ -359,7 +362,9 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
             .resolved_tag(node)
             .map_err(Error::from)?
             .map(Cow::into_owned);
-        self.annotate(classify_scalar(&value, style, tag.as_deref()))
+        let resolved = resolve_scalar(&value, style, tag.as_deref())
+            .map_err(|error| Error::message(error.to_string()))?;
+        self.annotate(scalar_kind_from_resolved(resolved))
     }
 
     fn borrowed_scalar(&self, node: NodeId) -> Option<&'de str> {
@@ -393,95 +398,35 @@ enum ScalarKind {
     String,
 }
 
-fn classify_scalar(value: &str, style: YamlScalarStyle, tag: Option<&str>) -> Result<ScalarKind> {
-    const NULL: &str = "tag:yaml.org,2002:null";
-    const BOOL: &str = "tag:yaml.org,2002:bool";
-    const INT: &str = "tag:yaml.org,2002:int";
-    const FLOAT: &str = "tag:yaml.org,2002:float";
-    const STR: &str = "tag:yaml.org,2002:str";
-
-    if tag == Some(STR) {
-        return Ok(ScalarKind::String);
-    }
-    if style != YamlScalarStyle::Plain && tag.is_none() {
-        return Ok(ScalarKind::String);
-    }
-    if tag == Some(NULL) || tag.is_none() && matches!(value, "" | "~" | "null" | "Null" | "NULL") {
-        return Ok(ScalarKind::Null);
-    }
-    if tag == Some(BOOL) || tag.is_none() {
-        match value {
-            "true" | "True" | "TRUE" => return Ok(ScalarKind::Bool(true)),
-            "false" | "False" | "FALSE" => return Ok(ScalarKind::Bool(false)),
-            _ if tag == Some(BOOL) => return Err(Error::message("invalid boolean scalar")),
-            _ => {}
-        }
-    }
-    if tag == Some(INT) || tag.is_none() {
-        if let Some(integer) = parse_integer(value) {
-            return Ok(integer);
-        }
-        if tag == Some(INT) {
-            return Err(Error::message("invalid integer scalar"));
-        }
-    }
-    if tag == Some(FLOAT) || tag.is_none() && looks_like_float(value) {
-        if let Some(float) = parse_float(value) {
-            return Ok(ScalarKind::Float(float));
-        }
-        if tag == Some(FLOAT) {
-            return Err(Error::message("invalid float scalar"));
-        }
-    }
-    Ok(ScalarKind::String)
-}
-
-fn parse_integer(value: &str) -> Option<ScalarKind> {
-    let normalized = value.replace('_', "");
-    let (negative, unsigned) = if let Some(rest) = normalized.strip_prefix('-') {
-        (true, rest)
-    } else {
-        (false, normalized.strip_prefix('+').unwrap_or(&normalized))
-    };
-    let (radix, digits) = if let Some(rest) = unsigned.strip_prefix("0x") {
-        (16, rest)
-    } else if let Some(rest) = unsigned.strip_prefix("0o") {
-        (8, rest)
-    } else if let Some(rest) = unsigned.strip_prefix("0b") {
-        (2, rest)
-    } else {
-        (10, unsigned)
-    };
-    if digits.is_empty() || radix == 10 && digits.len() > 1 && digits.starts_with('0') {
-        return None;
-    }
-    let magnitude = u128::from_str_radix(digits, radix).ok()?;
-    if negative {
-        let limit = (i128::MAX as u128) + 1;
-        if magnitude > limit {
-            return None;
-        }
-        let value = if magnitude == limit {
-            i128::MIN
-        } else {
-            -(magnitude as i128)
-        };
-        Some(ScalarKind::Signed(value))
-    } else {
-        Some(ScalarKind::Unsigned(magnitude))
-    }
-}
-
-fn looks_like_float(value: &str) -> bool {
-    value.contains(['.', 'e', 'E'])
-}
-
-fn parse_float(value: &str) -> Option<f64> {
+fn scalar_kind_from_resolved(value: ResolvedScalar) -> Result<ScalarKind> {
     match value {
-        ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" => Some(f64::INFINITY),
-        "-.inf" | "-.Inf" | "-.INF" => Some(f64::NEG_INFINITY),
-        ".nan" | ".NaN" | ".NAN" => Some(f64::NAN),
-        _ => value.replace('_', "").parse().ok(),
+        ResolvedScalar::Null => Ok(ScalarKind::Null),
+        ResolvedScalar::Bool(value) => Ok(ScalarKind::Bool(value)),
+        ResolvedScalar::Number(number) if number.has_integer_syntax() => {
+            if let Some(value) = number.as_i128()
+                && value < 0
+            {
+                Ok(ScalarKind::Signed(value))
+            } else if let Some(value) = number.as_u128() {
+                Ok(ScalarKind::Unsigned(value))
+            } else if let Some(value) = number.as_i128() {
+                Ok(ScalarKind::Signed(value))
+            } else {
+                Err(Error::message("integer is outside the supported range"))
+            }
+        }
+        ResolvedScalar::Number(number) => number
+            .as_f64()
+            .map(ScalarKind::Float)
+            .ok_or_else(|| Error::message("float is outside the supported range")),
+        ResolvedScalar::NonFinite(NonFiniteFloat::PositiveInfinity) => {
+            Ok(ScalarKind::Float(f64::INFINITY))
+        }
+        ResolvedScalar::NonFinite(NonFiniteFloat::NegativeInfinity) => {
+            Ok(ScalarKind::Float(f64::NEG_INFINITY))
+        }
+        ResolvedScalar::NonFinite(NonFiniteFloat::NaN) => Ok(ScalarKind::Float(f64::NAN)),
+        ResolvedScalar::String => Ok(ScalarKind::String),
     }
 }
 

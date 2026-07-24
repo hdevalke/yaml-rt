@@ -38,6 +38,10 @@ jobs:
   verify:
     name: Verify release readiness
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -112,10 +116,10 @@ jobs:
           cargo package --locked -p yaml-rt-derive
       - name: Compile default benchmarks
         run: cargo check -p yaml-rt-bench --benches --no-default-features --locked
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.1 --locked
       - name: Audit dependencies
-        run: cargo audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Convco
         uses: convco/convco-action@v0.3.0
         with:

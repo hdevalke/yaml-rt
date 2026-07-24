@@ -234,9 +234,7 @@ impl SemanticBuilder {
                 self.open.push(OpenNode::Sequence { cst });
                 Ok(())
             }
-            YamlEventKind::Scalar {
-                style, value: _, ..
-            } => {
+            YamlEventKind::Scalar { style, .. } => {
                 let cst = required_cst(cst, span)?;
                 let property = self.insert_properties(cst, properties);
                 self.store.insert(

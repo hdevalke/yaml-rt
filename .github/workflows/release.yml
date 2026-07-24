@@ -44,12 +44,15 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           submodules: recursive
-      - name: Install nightly rustfmt
-        run: rustup toolchain install --profile minimal nightly --component rustfmt
-      - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
       - name: Install stable toolchain
-        run: rustup toolchain install --profile minimal stable --component clippy
+        run: >-
+          rustup toolchain install
+          --profile minimal
+          stable
+          --component clippy
+          --component rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Test facade without default features
@@ -114,7 +117,9 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
       - name: Install Convco
-        run: cargo install convco --version 0.6.4 --locked
+        uses: convco/convco-action@v0.3.0
+        with:
+          convco_version: 0.7.0
       - name: Validate commit history
         run: convco check
 
@@ -140,7 +145,9 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install --profile minimal stable
       - name: Install Convco
-        run: cargo install convco --version 0.6.4 --locked
+        uses: convco/convco-action@v0.3.0
+        with:
+          convco_version: 0.7.0
       - name: Install cargo-release
         run: cargo install cargo-release --version 1.1.2 --locked
       - name: Calculate release version
@@ -440,7 +447,9 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install --profile minimal stable
       - name: Install Convco
-        run: cargo install convco --version 0.6.4 --locked
+        uses: convco/convco-action@v0.3.0
+        with:
+          convco_version: 0.7.0
       - name: Generate release notes
         run: convco changelog --no-links --max-versions 1 -o release-notes.md
       - name: Download release artifacts

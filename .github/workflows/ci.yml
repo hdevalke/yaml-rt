@@ -23,15 +23,15 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           submodules: recursive
-      - name: Install stable toolchain
-        run: rustup toolchain install --profile minimal stable
       - name: Install Convco
-        run: cargo install convco --version 0.6.4 --locked
+        uses: convco/convco-action@v0.3.0
+        with:
+          convco_version: 0.7.0
       - name: Validate commit history
         run: convco check
 
   rustfmt:
-    name: Nightly rustfmt
+    name: Stable rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -39,10 +39,10 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           submodules: recursive
-      - name: Install nightly rustfmt
-        run: rustup toolchain install --profile minimal nightly --component rustfmt
+      - name: Install stable rustfmt
+        run: rustup toolchain install --profile minimal stable --component rustfmt
       - name: Check formatting
-        run: cargo +nightly fmt --all -- --check
+        run: cargo fmt --all -- --check
 
   workspace-tests:
     name: Stable tests (${{ matrix.os }})
@@ -181,10 +181,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --no-deps --locked --format-version 1 > metadata.json
-          for package in yaml-rt-core yaml-rt-derive yaml-rt-serde; do
-            test "$(grep -c "version = \"0.1.0\", path = \"crates/${package}\"" Cargo.toml)" -eq 1
-          done
+          metadata="${RUNNER_TEMP}/yaml-rt-metadata.json"
+          cargo metadata --no-deps --locked --format-version 1 > "${metadata}"
+          workspace_version="$(
+            jq -r '.packages[] | select(.name == "yaml-rt-core") | .version' "${metadata}"
+          )"
+          jq -e --arg version "${workspace_version}" --arg requirement "^${workspace_version}" '
+            [
+              .packages[]
+              | select(
+                  .name == "yaml-rt-core"
+                  or .name == "yaml-rt-derive"
+                  or .name == "yaml-rt-serde"
+                  or .name == "yaml-rt-cli"
+                  or .name == "yaml-rt"
+                )
+              | .version
+            ] as $versions
+            | [
+                .packages[]
+                | select(
+                    .name == "yaml-rt-serde"
+                    or .name == "yaml-rt-cli"
+                    or .name == "yaml-rt"
+                  )
+                | .dependencies[]
+                | select(
+                    .path != null
+                    and (.name | startswith("yaml-rt"))
+                  )
+              ] as $dependencies
+            | ($versions | length == 5)
+              and all($versions[]; . == $version)
+              and ($dependencies | length == 5)
+              and all($dependencies[]; .req == $requirement)
+          ' "${metadata}"
 
   security-and-benchmarks:
     name: Security and benchmarks

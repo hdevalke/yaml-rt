@@ -12,5 +12,5 @@ dependent-version = "upgrade"
 allow-branch = ["main"]
 
 [rate-limit]
-new-packages = 2
-existing-packages = 15
+new-packages = 5
+existing-packages = 5

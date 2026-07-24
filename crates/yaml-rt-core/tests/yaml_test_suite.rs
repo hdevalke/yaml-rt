@@ -96,8 +96,6 @@ impl std::fmt::Display for ClassifiedFailure {
 
 #[test]
 fn yaml_test_suite_data_harness() {
-    let root = suite_root();
-
     let selected = selected_cases();
     let run_all = env::var_os(RUN_ALL_ENV).is_some_and(|value| value == "1");
     if selected.is_empty() && !run_all {
@@ -107,6 +105,7 @@ fn yaml_test_suite_data_harness() {
         return;
     }
 
+    let root = suite_root();
     let cases = discover_cases(&root).unwrap_or_else(|error| {
         panic!(
             "failed to discover YAML Test Suite cases below {}: {error}",

@@ -1153,7 +1153,7 @@ impl YamlDoc {
     /// Queues a patch that replaces the exact source span covered by `node`.
     ///
     /// The CST remains unchanged until the edited text is parsed again; callers
-    /// can inspect the pending minimal-diff output through [`YamlDoc::to_string`].
+    /// can inspect the pending minimal-diff output through `doc.to_string()`.
     ///
     /// # Errors
     ///

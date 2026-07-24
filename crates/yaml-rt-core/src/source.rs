@@ -3,7 +3,7 @@ use crate::{Diagnostic, DiagnosticKind, YamlError};
 /// YAML version targeted by this workspace.
 pub const TARGET_YAML_VERSION: &str = "1.2.2";
 
-/// Identifier for a node stored inside a [`YamlDoc`].
+/// Identifier for a node stored inside a [`crate::YamlDoc`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 

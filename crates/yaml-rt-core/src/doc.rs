@@ -331,7 +331,7 @@ enum ParsedDirective {
     Reserved(ReservedDirective),
 }
 
-/// Formatting controls for inserting an MVP block mapping entry.
+/// Formatting controls for inserting a block mapping entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MappingEntryStyle {
     /// Reuse the target mapping indentation and the document line ending.
@@ -1021,11 +1021,11 @@ impl YamlDoc {
         Ok(self.source.slice(node.span))
     }
 
-    /// Returns the decoded value text for a scalar node in the MVP scalar subset.
+    /// Returns the decoded value text for a scalar node.
     ///
     /// Plain scalars have trailing inline comments stripped, single-quoted
     /// scalars unescape doubled apostrophes, and double-quoted scalars unescape
-    /// the common JSON/YAML escapes currently used by the typed overlay MVP.
+    /// the common JSON/YAML escapes used by typed overlays.
     ///
     /// # Errors
     ///
@@ -1121,7 +1121,7 @@ impl YamlDoc {
     }
 
     /// Queues a scalar value replacement at `path` while preserving the existing
-    /// scalar style where the MVP writer can do so safely.
+    /// scalar style where the editor can do so safely.
     ///
     /// Plain scalars remain plain, single-quoted scalars remain single-quoted,
     /// and double-quoted scalars remain double-quoted. Inline comments and
@@ -1170,8 +1170,8 @@ impl YamlDoc {
 
     /// Queues insertion of a plain `key: value` entry into a block mapping.
     ///
-    /// This MVP writer intentionally accepts raw plain scalar text. Later scalar
-    /// writers will own quoting and schema-aware formatting.
+    /// This low-level writer accepts raw plain scalar text. Use typed values or
+    /// node fragments when quoting or schema-aware formatting is required.
     ///
     /// # Errors
     ///
@@ -1366,7 +1366,7 @@ impl YamlDoc {
     ///
     /// If a later key from `ordered_keys` already exists in `mapping`, the new
     /// entry is inserted before that entry. Otherwise this falls back to append
-    /// insertion. This is the MVP primitive behind `insert_order = "struct"`.
+    /// insertion. This is the primitive behind `insert_order = "struct"`.
     ///
     /// # Errors
     ///

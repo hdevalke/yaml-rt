@@ -3,6 +3,10 @@
 //! This crate converts typed values. It intentionally does not preserve YAML
 //! presentation details; use `yaml-rt`'s `YamlRoundTrip` overlay for lossless
 //! document editing.
+//!
+//! [`from_str`] and [`from_slice`] deserialize one YAML document. [`from_reader`]
+//! accepts any byte reader. [`to_string`] and [`to_writer`] emit deterministic
+//! block-style YAML.
 
 mod de;
 mod error;

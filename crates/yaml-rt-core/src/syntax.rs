@@ -1,7 +1,7 @@
 use crate::semantic::SemanticStore;
 use crate::{NodeId, Parser, Source, Span, YamlError};
 
-/// Lossless syntax node produced by the CST parser MVP.
+/// Lossless syntax node produced by the CST parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     /// Node classification.
@@ -70,7 +70,7 @@ pub(crate) const fn node_link(link: u32) -> Option<NodeId> {
     }
 }
 
-/// Node kinds emitted by the CST parser MVP.
+/// Node kinds emitted by the CST parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NodeKind {
     /// Complete YAML stream.

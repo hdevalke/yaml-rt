@@ -1,9 +1,10 @@
 //! Core types for a YAML 1.2.2 round-trip parser.
 //!
-//! This crate is intentionally dependency-free. The first implementation keeps
-//! the source text intact while the source model, lexer, CST parser, semantic
-//! graph, editor, and patch emitter are built out according to the workspace
-//! roadmap.
+//! This crate is intentionally dependency-free. It owns source storage, the
+//! lossless lexer and CST, semantic metadata, diagnostics, JSON Pointer
+//! operations, typed-overlay traits, editor APIs, and patch-based emission.
+//! The original source and CST remain authoritative so untouched YAML is
+//! emitted byte-for-byte.
 
 mod diagnostic;
 mod doc;

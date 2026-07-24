@@ -1,3 +1,9 @@
+//! Command-line editing operations for the `yaml-rt` binary.
+//!
+//! The binary applies JSON Pointer operations to YAML documents while retaining
+//! unrelated presentation. [`run`] is public so integrations can supply their
+//! own argument and I/O streams.
+
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};

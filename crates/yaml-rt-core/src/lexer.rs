@@ -9,7 +9,7 @@ pub struct Token {
     pub span: Span,
 }
 
-/// Token kinds emitted by the lossless lexer MVP.
+/// Token kinds emitted by the lossless lexer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     /// UTF-8 byte-order mark at the start of a stream.
@@ -48,7 +48,7 @@ pub enum TokenKind {
     PlainScalar,
 }
 
-/// Lexes YAML source into lossless tokens for the MVP subset.
+/// Lexes YAML source into lossless tokens.
 ///
 /// # Errors
 ///

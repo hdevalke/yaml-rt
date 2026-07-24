@@ -5021,7 +5021,7 @@ fn format_single_quoted_scalar_value(value: &str) -> Result<String, YamlError> {
         return Err(YamlError::new(
             Diagnostic::new(
                 DiagnosticKind::Emitter,
-                "single-quoted scalar replacement cannot contain line breaks in the MVP writer",
+                "single-quoted scalar replacement cannot contain line breaks",
                 Span::empty(0),
             )
             .with_expected("single-line scalar text"),

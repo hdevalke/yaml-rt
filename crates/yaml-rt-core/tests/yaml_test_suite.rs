@@ -9,15 +9,14 @@ use yaml_rt_core::{DiagnosticKind, NodeId, SemanticKind, YamlDoc, YamlError, Yam
 const SUITE_DIR_ENV: &str = "YAML_TEST_SUITE_DIR";
 /// Optional comma-separated list of case ids to run, such as `MJS9` or `VJP3:00`.
 const CASES_ENV: &str = "YAML_TEST_SUITE_CASES";
-/// Set to `1` to run every discovered case. This is intentionally opt-in while
-/// the parser is still an MVP subset.
+/// Set to `1` to run every discovered case. This is intentionally opt-in so
+/// ordinary package tests do not require the external fixture checkout.
 const RUN_ALL_ENV: &str = "YAML_TEST_SUITE_RUN_ALL";
 /// Set to `1` to compare optional YAML Test Suite `in.json` fixtures against
-/// the semantic graph. This is opt-in while schema-compatible value rendering
-/// is being expanded.
+/// the semantic graph. This remains opt-in because it is part of the complete
+/// conformance run rather than ordinary package testing.
 const CHECK_JSON_ENV: &str = "YAML_TEST_SUITE_CHECK_JSON";
-/// Valid YAML Test Suite cases accepted as known failures while the parser,
-/// composer, and schema layers are incomplete.
+/// Valid YAML Test Suite cases accepted as known failures.
 const EXPECTED_FAILURES: &[&str] = &[];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

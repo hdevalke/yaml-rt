@@ -1,6 +1,6 @@
 //! Derive macro entry point for typed YAML round-trip overlays.
 //!
-//! The MVP derive supports named-field structs and generates `FromYamlDoc` and
+//! The derive supports named-field structs and generates `FromYamlDoc` and
 //! `ToYamlDoc` implementations that bind Rust fields to YAML mapping keys.
 
 use proc_macro::TokenStream;
@@ -10,7 +10,7 @@ use syn::{Attribute, Data, DeriveInput, Fields, LitStr, Meta, Path, parse_macro_
 
 /// Derives typed YAML round-trip overlay implementations.
 ///
-/// Supported field attributes in this milestone:
+/// Supported field attributes:
 ///
 /// - `#[yaml(rename = "yaml-key")]`
 /// - `#[yaml(default)]`
@@ -25,7 +25,7 @@ use syn::{Attribute, Data, DeriveInput, Fields, LitStr, Meta, Path, parse_macro_
 /// - Rust doc comments as insertion comments when `yaml(comment = ...)` is not
 ///   present
 ///
-/// Supported struct attributes in this milestone:
+/// Supported struct attributes:
 ///
 /// - `#[yaml(preserve_unknown_fields)]` keeps unknown mapping entries, which is
 ///   the default behavior
@@ -142,7 +142,7 @@ fn named_struct_fields(
             Fields::Named(fields) => Ok(fields.named),
             _ => Err(syn::Error::new_spanned(
                 name,
-                "YamlRoundTrip MVP supports only structs with named fields",
+                "YamlRoundTrip supports only structs with named fields",
             )),
         },
         _ => Err(syn::Error::new_spanned(
@@ -166,7 +166,7 @@ fn expand_fields(
         let Some(field_name) = field.ident else {
             return Err(syn::Error::new_spanned(
                 field,
-                "YamlRoundTrip MVP supports only named fields",
+                "YamlRoundTrip supports only named fields",
             ));
         };
         let field_type = field.ty;
@@ -222,7 +222,7 @@ fn push_flatten_field(
     {
         return Err(syn::Error::new_spanned(
             field_name,
-            "yaml(flatten) cannot be combined with rename, alias, default, comment, or skip_serializing_if in this milestone",
+            "yaml(flatten) cannot be combined with rename, alias, default, comment, or skip_serializing_if",
         ));
     }
 
@@ -402,14 +402,14 @@ fn validate_struct_options(
     if struct_options.insert_order == InsertOrder::Struct && has_flatten {
         return Err(syn::Error::new_spanned(
             name.clone(),
-            "yaml(insert_order = \"struct\") cannot be combined with yaml(flatten) in this milestone",
+            "yaml(insert_order = \"struct\") cannot be combined with yaml(flatten)",
         ));
     }
 
     if struct_options.unknown_field_policy == UnknownFieldPolicy::Prune && has_flatten {
         return Err(syn::Error::new_spanned(
             name.clone(),
-            "yaml(prune_unknown_fields) cannot be combined with yaml(flatten) in this milestone",
+            "yaml(prune_unknown_fields) cannot be combined with yaml(flatten)",
         ));
     }
 
@@ -448,7 +448,7 @@ fn parse_struct_yaml_attr(attr: &Attribute, options: &mut StructOptions) -> syn:
             }
             Ok(())
         } else {
-            Err(meta.error("unsupported yaml struct attribute for this derive milestone"))
+            Err(meta.error("unsupported yaml struct attribute"))
         }
     })
 }
@@ -526,7 +526,7 @@ fn parse_yaml_attr(attr: &Attribute, options: &mut FieldOptions) -> syn::Result<
             options.flatten = true;
             Ok(())
         } else {
-            Err(meta.error("unsupported yaml attribute for this derive milestone"))
+            Err(meta.error("unsupported yaml attribute"))
         }
     })
 }

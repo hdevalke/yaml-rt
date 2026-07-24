@@ -3,8 +3,8 @@ members = [
     "crates/yaml-rt-core",
     "crates/yaml-rt-derive",
     "crates/yaml-rt-serde",
-    "crates/yaml-rt",
     "crates/yaml-rt-cli",
+    "crates/yaml-rt",
     "crates/yaml-rt-bench",
 ]
 resolver = "3"

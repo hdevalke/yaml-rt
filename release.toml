@@ -1,0 +1,16 @@
+pre-release-hook = [
+  "bash",
+  "-c",
+  "convco changelog -C \"${WORKSPACE_ROOT}\" --no-links --unreleased \"${NEW_VERSION}\" -o \"${WORKSPACE_ROOT}/CHANGELOG.md\"",
+]
+pre-release-commit-message = "chore: release v{{version}}"
+tag-message = "yaml-rt v{{version}}"
+tag-name = "v{{version}}"
+consolidate-commits = true
+shared-version = true
+dependent-version = "upgrade"
+allow-branch = ["main"]
+
+[rate-limit]
+new-packages = 2
+existing-packages = 15

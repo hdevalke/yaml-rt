@@ -1,0 +1,259 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  commits:
+    name: Conventional commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install stable toolchain
+        run: rustup toolchain install --profile minimal stable
+      - name: Install Convco
+        run: cargo install convco --version 0.6.4 --locked
+      - name: Validate commit history
+        run: convco check
+
+  rustfmt:
+    name: Nightly rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install nightly rustfmt
+        run: rustup toolchain install --profile minimal nightly --component rustfmt
+      - name: Check formatting
+        run: cargo +nightly fmt --all -- --check
+
+  workspace-tests:
+    name: Stable tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install stable toolchain
+        run: rustup toolchain install --profile minimal stable
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  facade-features:
+    name: Facade (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            command: cargo test -p yaml-rt --no-default-features --locked
+          - name: derive
+            command: cargo test -p yaml-rt --no-default-features --features derive --locked
+          - name: serde
+            command: cargo test -p yaml-rt --no-default-features --features serde --locked
+          - name: all-features
+            command: cargo test -p yaml-rt --all-features --locked
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install stable toolchain
+        run: rustup toolchain install --profile minimal stable
+      - name: Test facade feature set
+        env:
+          TEST_COMMAND: ${{ matrix.command }}
+        run: bash -lc "${TEST_COMMAND}"
+
+  quality:
+    name: Clippy and rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install stable toolchain
+        run: rustup toolchain install --profile minimal stable --component clippy
+      - name: Run Clippy
+        run: >-
+          cargo clippy
+          -p yaml-rt-core
+          -p yaml-rt-derive
+          -p yaml-rt-serde
+          -p yaml-rt
+          -p yaml-rt-cli
+          --all-targets
+          --all-features
+          --locked
+          --
+          -D warnings
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: >-
+          cargo doc
+          -p yaml-rt-core
+          -p yaml-rt-derive
+          -p yaml-rt-serde
+          -p yaml-rt
+          -p yaml-rt-cli
+          --all-features
+          --no-deps
+          --locked
+
+  conformance:
+    name: YAML Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install stable toolchain
+        run: rustup toolchain install --profile minimal stable
+      - name: Run all 402 cases with semantic JSON checks
+        env:
+          YAML_TEST_SUITE_RUN_ALL: "1"
+          YAML_TEST_SUITE_CHECK_JSON: "1"
+        run: cargo test -p yaml-rt-core --test yaml_test_suite --locked
+
+  packages:
+    name: Package contents
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install stable toolchain
+        run: rustup toolchain install --profile minimal stable
+      - name: Inspect publishable archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(
+            yaml-rt-core
+            yaml-rt-derive
+            yaml-rt-serde
+            yaml-rt
+            yaml-rt-cli
+          )
+          for package in "${packages[@]}"; do
+            cargo package --list --locked -p "${package}"
+          done
+      - name: Build independently packageable crates
+        run: |
+          cargo package --locked -p yaml-rt-core
+          cargo package --locked -p yaml-rt-derive
+      - name: Verify normalized dependency versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --locked --format-version 1 > metadata.json
+          for package in yaml-rt-core yaml-rt-derive yaml-rt-serde; do
+            test "$(grep -c "version = \"0.1.0\", path = \"crates/${package}\"" Cargo.toml)" -eq 1
+          done
+
+  security-and-benchmarks:
+    name: Security and benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install stable toolchain
+        run: rustup toolchain install --profile minimal stable
+      - name: Compile default benchmarks
+        run: cargo check -p yaml-rt-bench --benches --no-default-features --locked
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+      - name: Audit dependencies
+        run: cargo audit
+
+  fuzz:
+    name: Parser fuzz regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install nightly toolchain
+        run: rustup toolchain install --profile minimal nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Replay known artifacts
+        working-directory: fuzz
+        env:
+          LSAN_OPTIONS: detect_leaks=0
+          RUST_BACKTRACE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          for artifact in regressions/parse_yaml/*; do
+            cargo +nightly fuzz run parse_yaml "${artifact}"
+          done
+      - name: Seed parser corpus
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: fuzz/scripts/seed_parse_yaml_corpus.sh
+      - name: Run bounded parser fuzzing
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        working-directory: fuzz
+        env:
+          LSAN_OPTIONS: detect_leaks=0
+        run: >-
+          cargo +nightly fuzz run parse_yaml corpus/parse_yaml --
+          -dict=parse_yaml.dict
+          -max_len=8192
+          -max_total_time=60
+
+  workflows:
+    name: Workflow syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          echo "$(go env GOPATH)/bin" >> "${GITHUB_PATH}"
+      - name: Validate workflows
+        run: actionlint

@@ -331,10 +331,10 @@ fn run_case(case: &SuiteCase) -> Result<(), ClassifiedFailure> {
         ));
     }
 
-    if env::var_os(CHECK_JSON_ENV).is_some_and(|value| value == "1") {
-        if let Some(json) = &case.json {
-            assert_json_fixture_matches(&doc, json)?;
-        }
+    if env::var_os(CHECK_JSON_ENV).is_some_and(|value| value == "1")
+        && let Some(json) = &case.json
+    {
+        assert_json_fixture_matches(&doc, json)?;
     }
 
     Ok(())

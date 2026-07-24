@@ -324,6 +324,9 @@ impl<'source> Parser<'source> {
         }
     }
 
+    // These inputs describe one already-analyzed source line. Keeping them
+    // explicit avoids duplicating or obscuring the parser's offset bookkeeping.
+    #[allow(clippy::too_many_arguments)]
     fn parse_simple_plain_mapping_entry(
         &mut self,
         document: NodeId,
@@ -485,6 +488,9 @@ impl<'source> Parser<'source> {
         ))
     }
 
+    // Mapping parsing needs both the source-line view and its absolute offsets;
+    // bundling them would only move this context into a single-use wrapper.
+    #[allow(clippy::too_many_arguments)]
     fn parse_mapping_entry(
         &mut self,
         document: NodeId,
@@ -1068,13 +1074,13 @@ impl<'source> Parser<'source> {
         absolute_start: usize,
         indent: usize,
     ) -> Result<(), YamlError> {
-        let mut properties = parse_node_properties(
+        let properties = parse_node_properties(
             text,
             Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
         reject_invalid_node_property_placement(text, absolute_start, &properties)?;
         self.resolve_node_properties(
-            &mut properties,
+            &properties,
             Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
         if let Some(pending) = self.contexts.iter_mut().find_map(|frame| match frame {
@@ -2696,7 +2702,7 @@ impl<'source> Parser<'source> {
     fn emit_flow_sequence_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let sequence_span = self.nodes[node.0 as usize].span;
         let mut properties = self.flow_event_properties(sequence_span)?;
-        self.resolve_node_properties(&mut properties, sequence_span)?;
+        self.resolve_node_properties(&properties, sequence_span)?;
         let span = self.apply_pending_event_properties(&mut properties, sequence_span);
         let semantic_properties = semantic_properties(&properties, None);
         self.push_node_event_with_properties(
@@ -2725,7 +2731,7 @@ impl<'source> Parser<'source> {
     fn emit_flow_mapping_events(&mut self, node: NodeId) -> Result<(), YamlError> {
         let mapping_span = self.nodes[node.0 as usize].span;
         let mut properties = self.flow_event_properties(mapping_span)?;
-        self.resolve_node_properties(&mut properties, mapping_span)?;
+        self.resolve_node_properties(&properties, mapping_span)?;
         let span = self.apply_pending_event_properties(&mut properties, mapping_span);
         let semantic_properties = semantic_properties(&properties, None);
         self.push_node_event_with_properties(
@@ -2787,7 +2793,7 @@ impl<'source> Parser<'source> {
         let node_span = self.nodes[node.0 as usize].span;
         let text = self.source.slice(node_span);
         let mut properties = parse_node_properties(text, node_span)?;
-        self.resolve_node_properties(&mut properties, node_span)?;
+        self.resolve_node_properties(&properties, node_span)?;
         let span = if let Some(pending) =
             self.take_pending_node_properties(self.source_indent_at(node_span.start as usize))
         {
@@ -3245,14 +3251,11 @@ pub(crate) fn resolve_tag(
     }
 
     let (handle, suffix) = tag_handle_and_suffix(tag);
-    let prefix = handles
-        .get(handle)
-        .map(String::as_str)
-        .or_else(|| match handle {
-            "!" => Some("!"),
-            "!!" => Some("tag:yaml.org,2002:"),
-            _ => None,
-        });
+    let prefix = handles.get(handle).map(String::as_str).or(match handle {
+        "!" => Some("!"),
+        "!!" => Some("tag:yaml.org,2002:"),
+        _ => None,
+    });
     let Some(prefix) = prefix else {
         return Err(YamlError::new(
             Diagnostic::new(

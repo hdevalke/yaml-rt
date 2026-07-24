@@ -13,13 +13,16 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-repository = ""
+authors = ["Hannes De Valkeneer <hannes@de-valkeneer.be>"]
+readme = "README.md"
+repository = "https://github.com/hdevalke/yaml-rt"
+rust-version = "1.96"
 
 [workspace.dependencies]
 clap = "4.6.1"
-yaml-rt-core = { path = "crates/yaml-rt-core" }
-yaml-rt-derive = { path = "crates/yaml-rt-derive" }
-yaml-rt-serde = { path = "crates/yaml-rt-serde" }
+yaml-rt-core = { version = "0.1.0", path = "crates/yaml-rt-core" }
+yaml-rt-derive = { version = "0.1.0", path = "crates/yaml-rt-derive" }
+yaml-rt-serde = { version = "0.1.0", path = "crates/yaml-rt-serde" }
 proc-macro2 = "1"
 quote = "1"
 serde = "1"

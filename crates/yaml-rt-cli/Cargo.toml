@@ -4,7 +4,13 @@ description = "Presentation-preserving command-line YAML editor"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+authors.workspace = true
+readme.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+documentation = "https://docs.rs/yaml-rt-cli"
+keywords = ["yaml", "cli", "editor", "json-pointer", "configuration"]
+categories = ["command-line-utilities", "config"]
 publish = false
 
 [[bin]]

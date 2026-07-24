@@ -4,7 +4,13 @@ description = "Facade crate for YAML 1.2.2 round-trip parsing and typed overlays
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+authors.workspace = true
+readme.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+documentation = "https://docs.rs/yaml-rt"
+keywords = ["yaml", "parser", "round-trip", "serde", "configuration"]
+categories = ["config", "parser-implementations"]
 
 [lib]
 name = "yaml_rt"
@@ -50,3 +56,6 @@ required-features = ["derive"]
 [[test]]
 name = "serde_facade"
 required-features = ["serde"]
+
+[package.metadata.docs.rs]
+all-features = true

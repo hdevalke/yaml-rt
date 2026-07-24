@@ -4,7 +4,13 @@ description = "Derive macros for yaml-rt typed round-trip overlays"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+authors.workspace = true
+readme.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+documentation = "https://docs.rs/yaml-rt-derive"
+keywords = ["yaml", "derive", "proc-macro", "round-trip", "configuration"]
+categories = ["config", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

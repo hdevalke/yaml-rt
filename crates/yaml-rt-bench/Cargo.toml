@@ -4,7 +4,9 @@ description = "Parse benchmarks for yaml-rt and YAML parser baselines"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+authors.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [[bench]]

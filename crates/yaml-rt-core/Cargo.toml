@@ -1,10 +1,16 @@
 [package]
 name = "yaml-rt-core"
-description = "No-dependency YAML 1.2.2 round-trip parser core under construction"
+description = "Dependency-free YAML 1.2.2 lossless parser and editor core"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+authors.workspace = true
+readme.workspace = true
 repository.workspace = true
+rust-version.workspace = true
+documentation = "https://docs.rs/yaml-rt-core"
+keywords = ["yaml", "parser", "round-trip", "cst", "lossless"]
+categories = ["config", "parser-implementations"]
 
 [lib]
 name = "yaml_rt_core"

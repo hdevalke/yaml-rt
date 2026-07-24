@@ -52,6 +52,7 @@ where
 
 fn command() -> Command {
     Command::new("yaml-rt")
+        .version(env!("CARGO_PKG_VERSION"))
         .about("Edit YAML through JSON Pointers while preserving presentation")
         .subcommand_required(true)
         .arg_required_else_help(true)

@@ -11,11 +11,11 @@ rust-version.workspace = true
 documentation = "https://docs.rs/yaml-rt-cli"
 keywords = ["yaml", "cli", "editor", "json-pointer", "configuration"]
 categories = ["command-line-utilities", "config"]
-publish = false
 
 [[bin]]
 name = "yaml-rt"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 clap.workspace = true

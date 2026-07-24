@@ -15,6 +15,28 @@ fn temp_dir() -> PathBuf {
 }
 
 #[test]
+fn help_and_version_report_distribution_metadata() {
+    let version = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success(), "{:?}", version.stderr);
+    assert_eq!(
+        version.stdout,
+        format!("yaml-rt {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+    );
+    assert!(version.stderr.is_empty());
+
+    let help = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(help.status.success(), "{:?}", help.stderr);
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: yaml-rt"));
+    assert!(help.stderr.is_empty());
+}
+
+#[test]
 fn value_is_never_autodetected_as_a_filename() {
     let directory = temp_dir();
     let input = directory.join("document.yaml");

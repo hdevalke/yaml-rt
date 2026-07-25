@@ -4222,7 +4222,7 @@ fn yaml_value_patches_same_length_nested_block_sequences_in_place() {
 }
 
 #[test]
-fn yaml_value_patches_nested_block_mapping_sequence_items_in_place() {
+fn yaml_value_patches_nested_block_mapping_sequence_items_exactly() {
     let mut doc = YamlDoc::parse(
         "items:\n  -\n    name: \"old\" # keep name comment\n    extra: keep\n  -\n    name: 'older'\n    extra: keep-too\n",
     )
@@ -4242,7 +4242,7 @@ fn yaml_value_patches_nested_block_mapping_sequence_items_in_place() {
 
     assert_eq!(
         doc.to_string(),
-        "items:\n  -\n    name: \"new\" # keep name comment\n    extra: keep\n  -\n    name: 'newer'\n    extra: keep-too\n"
+        "items:\n  -\n    name: \"new\" # keep name comment\n  -\n    name: 'newer'\n"
     );
 }
 
@@ -4269,7 +4269,7 @@ fn yaml_value_grows_nested_block_mapping_sequence_items_by_appending_tail() {
 
     assert_eq!(
         doc.to_string(),
-        "items:\n  -\n    name: \"new\" # keep name comment\n    extra: keep\n  -\n    name: newer\n    port: 9090\n"
+        "items:\n  -\n    name: \"new\" # keep name comment\n  -\n    name: newer\n    port: 9090\n"
     );
 }
 
@@ -4377,7 +4377,7 @@ fn yaml_value_reads_and_writes_btree_map_values() {
 }
 
 #[test]
-fn yaml_value_updates_block_mapping_keys_and_preserves_unknown_entries() {
+fn yaml_value_updates_block_mapping_keys_and_removes_absent_entries() {
     let mut doc = YamlDoc::parse(
         "limits:
   low: 1 # keep low
@@ -4396,14 +4396,7 @@ fn yaml_value_updates_block_mapping_keys_and_preserves_unknown_entries() {
         .write_yaml(&mut doc, Some(limits))
         .expect("map patches and inserts");
 
-    assert_eq!(
-        doc.to_string(),
-        "limits:
-  low: 2 # keep low
-  extra: keep
-  high: 7
-"
-    );
+    assert_eq!(doc.to_string(), "limits:\n  low: 2 # keep low\n  high: 7\n");
 }
 
 #[test]
@@ -4430,12 +4423,7 @@ fn yaml_value_updates_block_mapping_keys_preserving_order_and_comments() {
 
     assert_eq!(
         doc.to_string(),
-        "limits:
-  # low limit
-  low: 2
-  mid: keep
-  high: 7 # upper
-"
+        "limits:\n  # low limit\n  low: 2\n  high: 7 # upper\n"
     );
 }
 

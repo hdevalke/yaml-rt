@@ -4953,31 +4953,11 @@ pub(crate) fn plain_scalar_end(text: &str) -> usize {
     text[..end].trim_end_matches([' ', '\t']).len()
 }
 
-pub(crate) fn next_line_content_start(text: &str, mut position: usize) -> usize {
-    if text[position..].starts_with("\r\n") {
-        position += 2;
-    } else if text[position..].starts_with(['\r', '\n']) {
-        position += 1;
-    }
-
-    while text[position..].starts_with([' ', '\t']) {
-        position += 1;
-    }
-
-    position
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScalarStyle {
     Plain,
     SingleQuoted,
     DoubleQuoted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CollectionTarget {
-    pub(crate) span: Span,
-    pub(crate) indent: usize,
 }
 
 pub(crate) fn format_scalar_value(value: &str, style: ScalarStyle) -> Result<String, YamlError> {

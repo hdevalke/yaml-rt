@@ -171,7 +171,7 @@ fn derive_writes_appended_empty_mapping_document() {
     assert_eq!(read, config);
     assert_eq!(
         doc.to_string(),
-        "host: first\nport: 1000\n---\nhost: second\nport: 2000\n"
+        "host: first\nport: 1000\n---\n{host: second, port: 2000}\n"
     );
 }
 

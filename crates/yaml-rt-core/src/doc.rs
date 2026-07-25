@@ -4,13 +4,13 @@ use std::fmt;
 
 use crate::syntax::node_link;
 use crate::{
-    Children, CollectionStyle, CollectionTarget, Diagnostic, DiagnosticKind, FromYamlDoc, Node,
-    NodeId, NodeKind, Parser, ScalarStyle, SemanticKind, SemanticStore, Source, Span, ToYamlDoc,
-    ToYamlFragment, Token, YamlError, YamlEvent, decode_scalar_value_with_content_indent,
-    directive_emit_error, double_quoted_scalar_end, edits_conflict, events_to_test_string,
-    format_scalar_value, lex, next_line_content_start, parse_node_properties, plain_scalar_end,
-    resolve_tag, single_quoted_scalar_end, strip_inline_comment, validate_plain_mapping_fragment,
-    validate_tag_directive_parts_for_emit, validate_yaml_chars,
+    Children, CollectionStyle, Diagnostic, DiagnosticKind, FromYamlDoc, Node, NodeId, NodeKind,
+    Parser, ScalarStyle, SemanticKind, SemanticStore, Source, Span, ToYamlDoc, ToYamlFragment,
+    Token, YamlEditError, YamlError, YamlEvent, YamlFragment,
+    decode_scalar_value_with_content_indent, directive_emit_error, double_quoted_scalar_end,
+    edits_conflict, events_to_test_string, format_scalar_value, lex, parse_node_properties,
+    plain_scalar_end, resolve_tag, single_quoted_scalar_end, strip_inline_comment,
+    validate_plain_mapping_fragment, validate_tag_directive_parts_for_emit, validate_yaml_chars,
     validate_yaml_directive_version_for_emit,
 };
 
@@ -779,21 +779,21 @@ impl YamlDoc {
         })
     }
 
-    /// Returns the first root-level block mapping in the document.
+    /// Returns the root-level mapping in the document.
     ///
     /// # Errors
     ///
-    /// Returns an error when no root block mapping exists or when the semantic
+    /// Returns an error when no root mapping exists or when the semantic
     /// root mapping is not linked back to a CST node.
     pub fn root_mapping(&self) -> Result<NodeId, YamlError> {
         self.document_root_mapping(0)
     }
 
-    /// Returns the root-level block mapping in a selected document.
+    /// Returns the root-level mapping in a selected document.
     ///
     /// # Errors
     ///
-    /// Returns an error when the selected document does not exist, has no block
+    /// Returns an error when the selected document does not exist, has no
     /// mapping root, or the root mapping is not linked back to the CST.
     pub fn document_root_mapping(&self, index: usize) -> Result<NodeId, YamlError> {
         if let Some(root) = self.root_override {
@@ -809,12 +809,12 @@ impl YamlDoc {
             .ok_or_else(|| self.document_index_error(index))?;
         self.semantic_children(document)
             .find(|child| {
-                self.node(*child)
-                    .is_some_and(|node| node.kind == NodeKind::BlockMapping)
-                    && matches!(
-                        self.semantic_kind(*child),
-                        Some(SemanticKind::Mapping { .. })
-                    )
+                self.node(*child).is_some_and(|node| {
+                    matches!(node.kind, NodeKind::BlockMapping | NodeKind::FlowMapping)
+                }) && matches!(
+                    self.semantic_kind(*child),
+                    Some(SemanticKind::Mapping { .. })
+                )
             })
             .ok_or_else(|| {
                 YamlError::new(
@@ -823,7 +823,7 @@ impl YamlDoc {
                         "document does not contain a root mapping",
                         self.node(document).map_or(Span::empty(0), |node| node.span),
                     )
-                    .with_expected("a block mapping node"),
+                    .with_expected("a block or flow mapping node"),
                 )
             })
     }
@@ -982,7 +982,21 @@ impl YamlDoc {
     }
 
     pub(crate) fn rerooted_at_mapping(&self, mapping: NodeId) -> Result<Self, YamlError> {
-        self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
+        let mapping_node = self.expect_node(mapping)?;
+        if !matches!(
+            mapping_node.kind,
+            NodeKind::BlockMapping | NodeKind::FlowMapping
+        ) {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    format!("expected mapping, found {:?}", mapping_node.kind),
+                    mapping_node.span,
+                )
+                .with_expected("BlockMapping or FlowMapping"),
+            )
+            .with_position_from(&self.source));
+        }
         if !matches!(
             self.semantic_kind(mapping),
             Some(SemanticKind::Mapping { .. })
@@ -1248,6 +1262,17 @@ impl YamlDoc {
     where
         T: ToYamlFragment,
     {
+        if matches!(
+            self.semantic_kind(mapping),
+            Some(SemanticKind::Mapping {
+                style: CollectionStyle::Flow
+            })
+        ) {
+            let fragment = self.typed_value_fragment(value)?;
+            return self
+                .queue_mapping_insert(mapping, key, &fragment)
+                .map_err(YamlEditError::into_yaml_error);
+        }
         let mapping_node = self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
         let indent = match style {
             MappingEntryStyle::Inherit => self.node_indent(mapping_node),
@@ -1269,6 +1294,23 @@ impl YamlDoc {
         )?;
 
         self.queue_edit(Span::empty_from_usize(insertion_offset), replacement)
+    }
+
+    fn typed_value_fragment<T>(&self, value: &T) -> Result<YamlFragment, YamlError>
+    where
+        T: ToYamlFragment,
+    {
+        let yaml = value.to_yaml_fragment(0, self.preferred_line_ending())?;
+        YamlFragment::parse(&yaml).map_err(|error| {
+            YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Emitter,
+                    format!("typed YAML fragment is invalid: {error}"),
+                    Span::empty(0),
+                )
+                .with_expected("one valid YAML value"),
+            )
+        })
     }
 
     /// Queues insertion of a typed YAML value according to declaration order.
@@ -1351,6 +1393,27 @@ impl YamlDoc {
         T: ToYamlFragment,
     {
         let before_node = self.expect_node_kind(before_entry, NodeKind::MappingEntry)?;
+        let mapping = before_node.parent().ok_or_else(|| {
+            YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    "mapping entry has no parent mapping",
+                    before_node.span,
+                )
+                .with_expected("a mapping parent"),
+            )
+        })?;
+        if matches!(
+            self.semantic_kind(mapping),
+            Some(SemanticKind::Mapping {
+                style: CollectionStyle::Flow
+            })
+        ) {
+            let fragment = self.typed_value_fragment(value)?;
+            return self
+                .queue_mapping_insert_before(mapping, before_entry, key, &fragment)
+                .map_err(YamlEditError::into_yaml_error);
+        }
         let indent = match style {
             MappingEntryStyle::Inherit => self.node_indent(before_node),
             MappingEntryStyle::Indent(indent) => indent,
@@ -1412,7 +1475,7 @@ impl YamlDoc {
         let Some(entry) = self.get_mapping_entry(mapping, key)? else {
             return Ok(());
         };
-        self.remove_node(entry)
+        self.remove_collection_entries(mapping, &[entry])
     }
 
     /// Queues line-wise removal edits for mapping entries whose keys are not allowed.
@@ -1430,7 +1493,20 @@ impl YamlDoc {
         mapping: NodeId,
         allowed_keys: &[&str],
     ) -> Result<(), YamlError> {
-        self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
+        let mapping_node = self.expect_node(mapping)?;
+        if !matches!(
+            mapping_node.kind,
+            NodeKind::BlockMapping | NodeKind::FlowMapping
+        ) {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    format!("expected mapping, found {:?}", mapping_node.kind),
+                    mapping_node.span,
+                )
+                .with_expected("BlockMapping or FlowMapping"),
+            ));
+        }
         let mut removals = Vec::new();
 
         for entry in self.children(mapping) {
@@ -1448,10 +1524,86 @@ impl YamlDoc {
             }
         }
 
-        for entry in removals {
-            self.remove_node(entry)?;
+        self.remove_collection_entries(mapping, &removals)
+    }
+
+    pub(crate) fn remove_collection_entries(
+        &mut self,
+        collection: NodeId,
+        removals: &[NodeId],
+    ) -> Result<(), YamlError> {
+        if removals.is_empty() {
+            return Ok(());
+        }
+        let Some(style) = (match self.semantic_kind(collection) {
+            Some(SemanticKind::Mapping { style } | SemanticKind::Sequence { style }) => Some(style),
+            _ => None,
+        }) else {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    "collection entry removal target is not a mapping or sequence",
+                    self.expect_node(collection)?.span,
+                )
+                .with_expected("a mapping or sequence"),
+            ));
+        };
+        if style == CollectionStyle::Block {
+            for entry in removals {
+                self.remove_node(*entry)?;
+            }
+            return Ok(());
         }
 
+        let entries = self
+            .children(collection)
+            .filter(|node| {
+                self.node(*node).is_some_and(|node| {
+                    matches!(node.kind, NodeKind::MappingEntry | NodeKind::SequenceEntry)
+                })
+            })
+            .collect::<Vec<_>>();
+        if removals.len() == entries.len() {
+            let collection_node = self.expect_node(collection)?;
+            let delimiter = match collection_node.kind {
+                NodeKind::FlowMapping => '}',
+                NodeKind::FlowSequence => ']',
+                _ => unreachable!("flow semantic collection must have a flow CST node"),
+            };
+            if let Some(relative) = self.source.slice(collection_node.span).rfind(delimiter) {
+                let close = Span::offset_from_usize(collection_node.span.start, relative);
+                if let Some(edit) = self
+                    .edits
+                    .iter_mut()
+                    .find(|edit| edit.span == Span::empty(close))
+                    && let Some(replacement) = edit.replacement.strip_prefix(", ")
+                {
+                    edit.replacement = replacement.to_owned();
+                }
+            }
+        }
+        let mut index = 0;
+        while index < entries.len() {
+            if !removals.contains(&entries[index]) {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < entries.len() && removals.contains(&entries[index]) {
+                index += 1;
+            }
+            let end = index;
+            let first = self.expect_node(entries[start])?.span;
+            let last = self.expect_node(entries[end - 1])?.span;
+            let span = if let Some(next) = entries.get(end).copied() {
+                Span::new(first.start, self.expect_node(next)?.span.start)
+            } else if start > 0 {
+                Span::new(self.expect_node(entries[start - 1])?.span.end, last.end)
+            } else {
+                Span::new(first.start, last.end)
+            };
+            self.queue_edit(span, String::new())?;
+        }
         Ok(())
     }
 
@@ -1534,26 +1686,6 @@ impl YamlDoc {
             Span::new(value_start, Span::offset_from_usize(value_start, end)),
             ScalarStyle::Plain,
         ))
-    }
-
-    pub(crate) fn collection_replacement_target(
-        &self,
-        node: NodeId,
-    ) -> Result<CollectionTarget, YamlError> {
-        let node = self.expect_node(node)?;
-        let text = self.source.slice(node.span);
-        let properties = parse_node_properties(text, node.span)?;
-        let mut body_start = properties.value_start;
-
-        if text[body_start..].starts_with(['\r', '\n']) {
-            body_start = next_line_content_start(text, body_start);
-        }
-
-        let start = Span::offset_from_usize(node.span.start, body_start);
-        Ok(CollectionTarget {
-            span: Span::new(start, node.span.end),
-            indent: self.line_indent_for_offset(start as usize),
-        })
     }
 
     fn directive_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -1783,14 +1915,6 @@ impl YamlDoc {
     pub(crate) fn node_indent(&self, node: &Node) -> usize {
         let line_start = self.line_start_for_offset(node.span.start as usize);
         self.source.as_str()[line_start..node.span.start as usize]
-            .bytes()
-            .filter(|byte| *byte == b' ')
-            .count()
-    }
-
-    fn line_indent_for_offset(&self, offset: usize) -> usize {
-        let line_start = self.line_start_for_offset(offset);
-        self.source.as_str()[line_start..offset]
             .bytes()
             .filter(|byte| *byte == b' ')
             .count()

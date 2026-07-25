@@ -3,9 +3,9 @@ use std::fmt;
 use crate::fragment::indent_text;
 use crate::pointer::parse_sequence_index;
 use crate::{
-    CollectionStyle, FragmentError, JsonPointer, NodeId, PointerError, ResolvedScalar,
-    SemanticKind, SemanticValueError, Span, YamlDoc, YamlError, YamlFragment, YamlScalarStyle,
-    resolve_scalar, semantically_equal,
+    CollectionStyle, Diagnostic, DiagnosticKind, FragmentError, JsonPointer, NodeId, PointerError,
+    ResolvedScalar, SemanticKind, SemanticValueError, Span, YamlDoc, YamlError, YamlFragment,
+    YamlScalarStyle, resolve_scalar, semantically_equal,
 };
 
 /// Failure while applying a pointer-addressed YAML edit.
@@ -19,6 +19,13 @@ impl YamlEditError {
         Self {
             message: message.into(),
         }
+    }
+
+    pub(crate) fn into_yaml_error(self) -> YamlError {
+        YamlError::new(
+            Diagnostic::new(DiagnosticKind::Emitter, self.message, Span::empty(0))
+                .with_expected("a source-preserving YAML edit"),
+        )
     }
 }
 
@@ -309,7 +316,7 @@ impl YamlDoc {
         Ok(())
     }
 
-    fn queue_value_removal(&mut self, target: NodeId) -> Result<(), YamlEditError> {
+    pub(crate) fn queue_value_removal(&mut self, target: NodeId) -> Result<(), YamlEditError> {
         let Some(entry) = self.containing_entry(target) else {
             self.remove_node(target)?;
             return Ok(());
@@ -363,7 +370,7 @@ impl YamlDoc {
         })
     }
 
-    fn queue_mapping_insert(
+    pub(crate) fn queue_mapping_insert(
         &mut self,
         mapping: NodeId,
         key: &str,
@@ -379,7 +386,11 @@ impl YamlDoc {
             CollectionStyle::Flow => {
                 let mapping_node = self.expect_node(mapping)?;
                 let close = closing_delimiter_offset(self, mapping_node.span, '}')?;
-                let prefix = if self.mapping_entries(mapping).next().is_some() {
+                let has_pending_entry = self.edits.iter().any(|edit| {
+                    edit.span == Span::empty_from_usize(close) && !edit.replacement.is_empty()
+                });
+                let prefix = if self.mapping_entries(mapping).next().is_some() || has_pending_entry
+                {
                     ", "
                 } else {
                     ""
@@ -408,7 +419,31 @@ impl YamlDoc {
         Ok(())
     }
 
-    fn queue_sequence_insert(
+    pub(crate) fn queue_mapping_insert_before(
+        &mut self,
+        mapping: NodeId,
+        before_entry: NodeId,
+        key: &str,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        let Some(SemanticKind::Mapping { style }) = self.semantic_kind(mapping) else {
+            return Err(YamlEditError::new(
+                "mapping insertion target is not a mapping",
+            ));
+        };
+        if style != CollectionStyle::Flow {
+            return Err(YamlEditError::new(
+                "ordered flow insertion requires a flow mapping",
+            ));
+        }
+        let entry = self.expect_node(before_entry)?;
+        let key = emit_string_key(key);
+        let value = value.render_flow(self)?;
+        self.queue_edit(Span::empty(entry.span.start), format!("{key}: {value}, "))?;
+        Ok(())
+    }
+
+    pub(crate) fn queue_sequence_insert(
         &mut self,
         sequence: NodeId,
         index: usize,
@@ -460,7 +495,7 @@ impl YamlDoc {
         Ok(())
     }
 
-    fn is_flow_context(&self, mut node: NodeId) -> bool {
+    pub(crate) fn is_flow_context(&self, mut node: NodeId) -> bool {
         while let Some(parent) = self.node(node).and_then(|node| node.parent()) {
             if matches!(
                 self.semantic_kind(parent),
@@ -520,7 +555,7 @@ impl YamlDoc {
     }
 }
 
-fn closing_delimiter_offset(
+pub(crate) fn closing_delimiter_offset(
     doc: &YamlDoc,
     span: Span,
     delimiter: char,
@@ -595,7 +630,7 @@ fn indent_continuation_lines(value: &str, indent: usize) -> String {
     output
 }
 
-fn emit_string_key(value: &str) -> String {
+pub(crate) fn emit_string_key(value: &str) -> String {
     if safe_plain_string(value) {
         value.to_owned()
     } else {

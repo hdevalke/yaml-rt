@@ -282,6 +282,44 @@ struct NestedCollectionsConfig {
     groups: BTreeMap<String, ServerFields>,
 }
 
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct FlowNestedConfig {
+    servers: Vec<ServerFields>,
+}
+
+#[test]
+fn nested_struct_sequence_patches_flow_mappings_in_place() {
+    let mut doc = YamlDoc::parse("{servers: [{host: \"one\", extra: keep}], tail: yes}\n")
+        .expect("valid flow YAML");
+    let mut config = FlowNestedConfig::from_yaml_doc(&doc).expect("derive reads flow mappings");
+
+    config.servers[0].host = "updated".to_owned();
+    config.servers.push(ServerFields {
+        host: "two".to_owned(),
+        port: 9090,
+    });
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive patches flow mappings");
+
+    assert_eq!(
+        doc.to_string(),
+        "{servers: [{host: \"updated\", extra: keep, port: 8080}, {host: two, port: 9090}], tail: yes}\n"
+    );
+
+    doc.commit_edits().expect("flow update commits");
+    let mut config = FlowNestedConfig::from_yaml_doc(&doc).expect("derive rereads flow mappings");
+    config.servers.truncate(1);
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive shrinks flow sequence");
+
+    assert_eq!(
+        doc.to_string(),
+        "{servers: [{host: \"updated\", extra: keep, port: 8080}], tail: yes}\n"
+    );
+}
+
 #[test]
 fn nested_structs_work_inside_sequences_and_mappings() {
     let mut doc = YamlDoc::parse(

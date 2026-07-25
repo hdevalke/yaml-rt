@@ -41,11 +41,11 @@ pub use value::{
 };
 
 pub(crate) use parser::{
-    BlockChomp, CollectionTarget, Parser, ScalarStyle, decode_scalar_value_with_content_indent,
-    directive_emit_error, double_quoted_scalar_end, edits_conflict, format_scalar_value,
-    next_line_content_start, parse_block_scalar_header, parse_node_properties, plain_scalar_end,
-    resolve_tag, single_quoted_scalar_end, strip_inline_comment, validate_plain_mapping_fragment,
-    validate_tag_directive_parts_for_emit, validate_yaml_directive_version_for_emit,
+    BlockChomp, Parser, ScalarStyle, decode_scalar_value_with_content_indent, directive_emit_error,
+    double_quoted_scalar_end, edits_conflict, format_scalar_value, parse_block_scalar_header,
+    parse_node_properties, plain_scalar_end, resolve_tag, single_quoted_scalar_end,
+    strip_inline_comment, validate_plain_mapping_fragment, validate_tag_directive_parts_for_emit,
+    validate_yaml_directive_version_for_emit,
 };
 pub(crate) use semantic::{SemanticBuilder, SemanticProperties, SemanticStore};
 pub(crate) use source::validate_yaml_chars;

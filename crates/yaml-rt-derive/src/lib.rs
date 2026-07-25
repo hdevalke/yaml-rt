@@ -105,10 +105,51 @@ struct FieldExpansion {
 }
 
 fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
-    let struct_options = parse_struct_options(&input.attrs)?;
-    let name = input.ident;
-    let generics = input.generics;
-    let fields = named_struct_fields(input.data, &name)?;
+    let DeriveInput {
+        attrs,
+        ident: name,
+        generics,
+        data,
+        ..
+    } = input;
+    match data {
+        Data::Struct(struct_data) => match struct_data.fields {
+            Fields::Named(fields) => expand_named_struct(attrs, name, generics, fields.named),
+            Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                let field = fields
+                    .unnamed
+                    .into_iter()
+                    .next()
+                    .expect("one unnamed field was checked");
+                expand_newtype_struct(attrs, name, generics, field)
+            }
+            Fields::Unnamed(fields) => Err(syn::Error::new_spanned(
+                fields,
+                "YamlRoundTrip supports tuple structs only when they contain exactly one field",
+            )),
+            Fields::Unit => Err(syn::Error::new_spanned(
+                name,
+                "YamlRoundTrip does not support unit structs",
+            )),
+        },
+        Data::Enum(data) => Err(syn::Error::new_spanned(
+            data.enum_token,
+            "YamlRoundTrip enum support is not available yet",
+        )),
+        Data::Union(data) => Err(syn::Error::new_spanned(
+            data.union_token,
+            "YamlRoundTrip cannot be derived for unions",
+        )),
+    }
+}
+
+fn expand_named_struct(
+    attrs: Vec<Attribute>,
+    name: syn::Ident,
+    generics: syn::Generics,
+    fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+) -> syn::Result<TokenStream2> {
+    let struct_options = parse_struct_options(&attrs)?;
     let fields = expand_fields(fields, struct_options.insert_order)?;
     validate_struct_options(&name, &struct_options, fields.has_flatten)?;
 
@@ -208,23 +249,155 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-fn named_struct_fields(
-    data: Data,
-    name: &syn::Ident,
-) -> syn::Result<syn::punctuated::Punctuated<syn::Field, syn::token::Comma>> {
-    match data {
-        Data::Struct(struct_data) => match struct_data.fields {
-            Fields::Named(fields) => Ok(fields.named),
-            _ => Err(syn::Error::new_spanned(
-                name,
-                "YamlRoundTrip supports only structs with named fields",
-            )),
-        },
-        _ => Err(syn::Error::new_spanned(
-            name,
-            "YamlRoundTrip can only be derived for structs",
-        )),
+fn expand_newtype_struct(
+    attrs: Vec<Attribute>,
+    name: syn::Ident,
+    generics: syn::Generics,
+    field: syn::Field,
+) -> syn::Result<TokenStream2> {
+    if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident("yaml")) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "transparent newtype structs do not support container-level yaml attributes",
+        ));
     }
+    let options = parse_field_options(&field.attrs)?;
+    if options.rename.is_some()
+        || !options.aliases.is_empty()
+        || options.default.is_some()
+        || options.comment.is_some()
+        || options.skip
+        || options.skip_serializing_if.is_some()
+        || options.flatten
+    {
+        return Err(syn::Error::new_spanned(
+            field,
+            "transparent newtype fields support only yaml(with)",
+        ));
+    }
+    let field_type = field.ty;
+    let (read_value, read_document_value, write_value, fragment_value, read_bound, write_bound) =
+        if let Some(with) = options.with {
+            (
+                quote! {
+                    {
+                        let __yaml_rt_repr =
+                            <#with::Repr as ::yaml_rt::YamlValue>::read_yaml(doc, node)?;
+                        #with::from_yaml(__yaml_rt_repr)?
+                    }
+                },
+                quote! {
+                    {
+                        let __yaml_rt_repr =
+                            ::yaml_rt::__read_yaml_document::<#with::Repr>(doc)?;
+                        #with::from_yaml(__yaml_rt_repr)?
+                    }
+                },
+                quote! {
+                    let __yaml_rt_repr = #with::to_yaml(&self.0)?;
+                    <#with::Repr as ::yaml_rt::YamlValue>::write_yaml(
+                        &__yaml_rt_repr,
+                        doc,
+                        node,
+                    )
+                },
+                quote! {
+                    let __yaml_rt_repr = #with::to_yaml(&self.0)?;
+                    <#with::Repr as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                        &__yaml_rt_repr,
+                        indent,
+                        line_ending,
+                    )
+                },
+                syn::parse_quote! {
+                    #with::Repr: ::yaml_rt::YamlValue
+                },
+                syn::parse_quote! {
+                    #with::Repr: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
+                },
+            )
+        } else {
+            (
+                quote! {
+                    <#field_type as ::yaml_rt::YamlValue>::read_yaml(doc, node)?
+                },
+                quote! {
+                    ::yaml_rt::__read_yaml_document::<#field_type>(doc)?
+                },
+                quote! {
+                    <#field_type as ::yaml_rt::YamlValue>::write_yaml(&self.0, doc, node)
+                },
+                quote! {
+                    <#field_type as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                        &self.0,
+                        indent,
+                        line_ending,
+                    )
+                },
+                syn::parse_quote! {
+                    #field_type: ::yaml_rt::YamlValue
+                },
+                syn::parse_quote! {
+                    #field_type: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
+                },
+            )
+        };
+
+    let mut read_generics = generics.clone();
+    read_generics
+        .make_where_clause()
+        .predicates
+        .push(read_bound);
+    let mut write_generics = generics;
+    write_generics
+        .make_where_clause()
+        .predicates
+        .push(write_bound);
+    let (read_impl_generics, read_type_generics, read_where_clause) =
+        read_generics.split_for_impl();
+    let (write_impl_generics, write_type_generics, write_where_clause) =
+        write_generics.split_for_impl();
+
+    Ok(quote! {
+        impl #read_impl_generics ::yaml_rt::FromYamlDoc for #name #read_type_generics #read_where_clause {
+            fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
+                Ok(Self(#read_document_value))
+            }
+        }
+
+        impl #write_impl_generics ::yaml_rt::ToYamlDoc for #name #write_type_generics #write_where_clause {
+            fn apply_to_yaml_doc(&self, doc: &mut ::yaml_rt::YamlDoc) -> Result<(), ::yaml_rt::YamlError> {
+                ::yaml_rt::__write_yaml_document(self, doc)
+            }
+        }
+
+        impl #write_impl_generics ::yaml_rt::YamlValue for #name #write_type_generics #write_where_clause {
+            fn read_yaml(
+                doc: &::yaml_rt::YamlDoc,
+                node: ::yaml_rt::NodeId,
+            ) -> Result<Self, ::yaml_rt::YamlError> {
+                Ok(Self(#read_value))
+            }
+
+            fn write_yaml(
+                &self,
+                doc: &mut ::yaml_rt::YamlDoc,
+                node: Option<::yaml_rt::NodeId>,
+            ) -> Result<::yaml_rt::NodeId, ::yaml_rt::YamlError> {
+                #write_value
+            }
+        }
+
+        impl #write_impl_generics ::yaml_rt::ToYamlFragment for #name #write_type_generics #write_where_clause {
+            fn to_yaml_fragment(
+                &self,
+                indent: usize,
+                line_ending: &str,
+            ) -> Result<String, ::yaml_rt::YamlError> {
+                #fragment_value
+            }
+        }
+    })
 }
 
 fn expand_fields(

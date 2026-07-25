@@ -491,6 +491,7 @@ struct FlowNestedConfig {
 struct StandardShapeConfig {
     primary: Box<ServerFields>,
     fixed: [ServerFields; 2],
+    maybe: Option<ServerFields>,
     by_name: HashMap<String, ServerFields>,
 }
 
@@ -521,14 +522,18 @@ struct GenericFlatten<T> {
 #[test]
 fn derived_structs_work_inside_box_arrays_and_hash_maps() {
     let doc = YamlDoc::parse(
-        "primary:\n  host: one\n  port: 1\nfixed:\n  -\n    host: two\n    port: 2\n  -\n    host: three\n    port: 3\nby_name:\n  z:\n    host: last\n    port: 4\n",
+        "primary:\n  host: one\n  port: 1\nfixed:\n  -\n    host: two\n    port: 2\n  -\n    host: three\n    port: 3\nmaybe:\n  host: optional\n  port: 4\nby_name:\n  z:\n    host: last\n    port: 5\n",
     )
     .expect("valid standard shape YAML");
     let config = StandardShapeConfig::from_yaml_doc(&doc).expect("derive reads standard shapes");
 
     assert_eq!(config.primary.host, "one");
     assert_eq!(config.fixed[1].host, "three");
-    assert_eq!(config.by_name.get("z").map(|server| server.port), Some(4));
+    assert_eq!(
+        config.maybe.as_ref().map(|server| server.host.as_str()),
+        Some("optional")
+    );
+    assert_eq!(config.by_name.get("z").map(|server| server.port), Some(5));
 }
 
 #[test]
@@ -601,6 +606,41 @@ fn nested_struct_sequence_patches_flow_mappings_in_place() {
     assert_eq!(
         doc.to_string(),
         "{servers: [{host: \"updated\", extra: keep, port: 8080}], tail: yes}\n"
+    );
+}
+
+#[test]
+fn nested_struct_sequence_preserves_and_resizes_block_yaml_incrementally() {
+    let input = "servers:\n  -\n    host: \"one\" # keep\n    port: 8080\n    extra: keep\n  -\n    host: two\n    port: 9090\ntail: yes\n";
+    let mut doc = YamlDoc::parse(input).expect("valid block YAML");
+    let mut config = FlowNestedConfig::from_yaml_doc(&doc).expect("derive reads block mappings");
+
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("unchanged derive apply succeeds");
+    assert_eq!(doc.to_string(), input);
+
+    config.servers[0].host = "updated".to_owned();
+    config.servers.truncate(1);
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive patches and shrinks block sequence");
+    assert_eq!(
+        doc.to_string(),
+        "servers:\n  -\n    host: \"updated\" # keep\n    port: 8080\n    extra: keep\ntail: yes\n"
+    );
+
+    doc.commit_edits().expect("block shrink commits");
+    config.servers.push(ServerFields {
+        host: "new".to_owned(),
+        port: 9443,
+    });
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive grows block sequence");
+    assert_eq!(
+        doc.to_string(),
+        "servers:\n  -\n    host: \"updated\" # keep\n    port: 8080\n    extra: keep\n  -\n    host: new\n    port: 9443\ntail: yes\n"
     );
 }
 

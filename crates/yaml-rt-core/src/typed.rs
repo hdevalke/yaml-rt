@@ -210,7 +210,7 @@ where
         }
         let indent_text = " ".repeat(indent);
         let mut entries = self.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_unstable_by_key(|(key, _)| *key);
         let mut output = String::new();
         for (index, (key, value)) in entries.into_iter().enumerate() {
             validate_yaml_chars(key)?;
@@ -1107,7 +1107,7 @@ where
             .with_position_from(&doc.source));
         }
         let mut entries = self.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_unstable_by_key(|(key, _)| *key);
         for (key, value) in entries {
             if let Some(value_node) = doc.get_mapping_value(node, key)? {
                 value.write_yaml(doc, Some(value_node))?;

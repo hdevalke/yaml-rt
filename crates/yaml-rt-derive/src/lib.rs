@@ -29,6 +29,19 @@ use syn::{
 /// - Rust doc comments as insertion comments when `yaml(comment = ...)` is not
 ///   present
 ///
+/// Adapter modules use this contract:
+///
+/// ```text
+/// type Repr;
+///
+/// fn from_yaml(value: Repr) -> Result<FieldType, yaml_rt::YamlError>;
+/// fn to_yaml(value: &FieldType) -> Result<Repr, yaml_rt::YamlError>;
+/// ```
+///
+/// `Repr` must implement `YamlValue` and `ToYamlFragment`. The usual field
+/// attributes are applied outside the conversion. `with` cannot be combined
+/// with `skip` or `flatten`.
+///
 /// Supported struct attributes:
 ///
 /// - `#[yaml(preserve_unknown_fields)]` keeps unknown mapping entries, which is
@@ -81,6 +94,7 @@ struct FieldOptions {
     with: Option<Path>,
 }
 
+#[derive(Default)]
 struct FieldExpansion {
     reads: Vec<TokenStream2>,
     writes: Vec<TokenStream2>,
@@ -217,12 +231,7 @@ fn expand_fields(
     fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
     insert_order: InsertOrder,
 ) -> syn::Result<FieldExpansion> {
-    let mut field_reads = Vec::new();
-    let mut field_writes = Vec::new();
-    let mut known_keys = Vec::new();
-    let mut has_flatten = false;
-    let mut read_bounds = Vec::new();
-    let mut write_bounds = Vec::new();
+    let mut expansion = FieldExpansion::default();
 
     for field in fields {
         let options = parse_field_options(&field.attrs)?;
@@ -234,50 +243,28 @@ fn expand_fields(
         };
         let field_type = field.ty;
         if options.flatten {
-            has_flatten = true;
-            push_flatten_field(
-                &mut field_reads,
-                &mut field_writes,
-                &field_name,
-                &field_type,
-                &options,
-                &mut read_bounds,
-                &mut write_bounds,
-            )?;
+            expansion.has_flatten = true;
+            push_flatten_field(&mut expansion, &field_name, &field_type, &options)?;
             continue;
         }
 
         push_regular_field(
-            &mut field_reads,
-            &mut field_writes,
-            &mut known_keys,
+            &mut expansion,
             &field_name,
             &field_type,
             &options,
             insert_order,
-            &mut read_bounds,
-            &mut write_bounds,
         )?;
     }
 
-    Ok(FieldExpansion {
-        reads: field_reads,
-        writes: field_writes,
-        known_keys,
-        has_flatten,
-        read_bounds,
-        write_bounds,
-    })
+    Ok(expansion)
 }
 
 fn push_flatten_field(
-    field_reads: &mut Vec<TokenStream2>,
-    field_writes: &mut Vec<TokenStream2>,
+    expansion: &mut FieldExpansion,
     field_name: &syn::Ident,
     field_type: &syn::Type,
     options: &FieldOptions,
-    read_bounds: &mut Vec<WherePredicate>,
-    write_bounds: &mut Vec<WherePredicate>,
 ) -> syn::Result<()> {
     if options.skip {
         return Err(syn::Error::new_spanned(
@@ -303,39 +290,35 @@ fn push_flatten_field(
         ));
     }
 
-    read_bounds.push(syn::parse_quote! {
+    expansion.read_bounds.push(syn::parse_quote! {
         #field_type: ::yaml_rt::FromYamlDoc
     });
-    write_bounds.push(syn::parse_quote! {
+    expansion.write_bounds.push(syn::parse_quote! {
         #field_type: ::yaml_rt::ToYamlDoc
     });
-    field_reads.push(quote! {
+    expansion.reads.push(quote! {
         #field_name: <#field_type as ::yaml_rt::FromYamlDoc>::from_yaml_doc(doc)?
     });
-    field_writes.push(quote! {
+    expansion.writes.push(quote! {
         ::yaml_rt::ToYamlDoc::apply_to_yaml_doc(&self.#field_name, doc)?;
     });
     Ok(())
 }
 
 fn push_regular_field(
-    field_reads: &mut Vec<TokenStream2>,
-    field_writes: &mut Vec<TokenStream2>,
-    known_keys: &mut Vec<String>,
+    expansion: &mut FieldExpansion,
     field_name: &syn::Ident,
     field_type: &syn::Type,
     options: &FieldOptions,
     insert_order: InsertOrder,
-    read_bounds: &mut Vec<WherePredicate>,
-    write_bounds: &mut Vec<WherePredicate>,
 ) -> syn::Result<()> {
     let yaml_key = options
         .rename
         .clone()
         .unwrap_or_else(|| field_name.to_string());
-    known_keys.push(yaml_key.clone());
+    expansion.known_keys.push(yaml_key.clone());
     let aliases = options.aliases.clone();
-    known_keys.extend(aliases.iter().cloned());
+    expansion.known_keys.extend(aliases.iter().cloned());
     let insert_comment = if let Some(comment) = options
         .comment
         .clone()
@@ -354,10 +337,10 @@ fn push_regular_field(
                 "yaml(with) cannot be combined with yaml(skip)",
             ));
         }
-        read_bounds.push(syn::parse_quote! {
+        expansion.read_bounds.push(syn::parse_quote! {
             #field_type: ::core::default::Default
         });
-        field_reads.push(quote! {
+        expansion.reads.push(quote! {
             #field_name: ::core::default::Default::default()
         });
         return Ok(());
@@ -365,10 +348,10 @@ fn push_regular_field(
 
     let (read_present_value, read_required_field, write_type, write_value_binding, write_value_ref) =
         if let Some(with) = &options.with {
-            read_bounds.push(syn::parse_quote! {
+            expansion.read_bounds.push(syn::parse_quote! {
                 #with::Repr: ::yaml_rt::YamlValue
             });
-            write_bounds.push(syn::parse_quote! {
+            expansion.write_bounds.push(syn::parse_quote! {
                 #with::Repr: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
             });
             (
@@ -397,10 +380,10 @@ fn push_regular_field(
                 quote! { &__yaml_rt_repr },
             )
         } else {
-            read_bounds.push(syn::parse_quote! {
+            expansion.read_bounds.push(syn::parse_quote! {
                 #field_type: ::yaml_rt::YamlValue
             });
-            write_bounds.push(syn::parse_quote! {
+            expansion.write_bounds.push(syn::parse_quote! {
                 #field_type: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
             });
             (
@@ -429,7 +412,7 @@ fn push_regular_field(
     } else {
         read_required_field
     };
-    field_reads.push(quote! {
+    expansion.reads.push(quote! {
         #field_name: {
             let mut node = doc.get_path(&[#yaml_key])?;
             #(
@@ -454,7 +437,7 @@ fn push_regular_field(
         #write_field
     };
     push_field_write(
-        field_writes,
+        &mut expansion.writes,
         field_name,
         &yaml_key,
         &aliases,

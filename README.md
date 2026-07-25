@@ -141,11 +141,74 @@ Supported field attributes are:
 - `skip`
 - `skip_serializing_if = "path::to::predicate"`
 - `flatten`
+- `with = "module::path"`
 
 Rust doc comments become comments for newly inserted entries when no explicit
 `comment` attribute is present. Struct-level policies control unknown fields
 with `preserve_unknown_fields` or `prune_unknown_fields`, and insertion order
 with `insert_order = "append"` or `insert_order = "struct"`.
+
+Common configuration shapes are supported directly:
+
+| Shape | Coverage |
+| --- | --- |
+| Scalars | `String`, `bool`, `char`, all signed and unsigned integer widths including 128-bit values, `f32`, and `f64` |
+| Wrappers | `Option<T>`, `Box<T>`, and fixed arrays `[T; N]` |
+| Collections | `Vec<T>`, `BTreeMap<String, T>`, and `HashMap<String, T>` |
+| Nested models | Named `YamlRoundTrip` structs, including structs nested inside the wrappers and collections above |
+| Generics | Type, lifetime, and const generics with inferred field bounds and retained user `where` clauses |
+| Presentation | Existing block and flow collections are patched in their original style |
+
+Sequence elements are matched positionally. Existing elements retain comments,
+unknown nested keys, anchors, tags, spelling, and style; appended elements use
+deterministic formatting. Typed maps synchronize modeled keys exactly while a
+derived struct still preserves unknown fields by default. A semantically
+unchanged scalar is not rewritten, so spellings such as `TRUE` and `0x10`
+survive. Missing and explicit-null `Option<T>` fields both read as `None`;
+writing `None` emits `null` unless `skip_serializing_if` omits the field.
+
+Use `with` when a field has a configuration representation different from its
+Rust type. The adapter module declares a supported YAML representation and two
+conversions:
+
+```rust
+use std::time::Duration;
+use yaml_rt::YamlError;
+
+mod duration_seconds {
+    use super::{Duration, YamlError};
+
+    pub type Repr = u64;
+
+    pub fn from_yaml(value: Repr) -> Result<Duration, YamlError> {
+        Ok(Duration::from_secs(value))
+    }
+
+    pub fn to_yaml(value: &Duration) -> Result<Repr, YamlError> {
+        Ok(value.as_secs())
+    }
+}
+
+# use yaml_rt::YamlRoundTrip;
+#[derive(YamlRoundTrip)]
+struct Service {
+    #[yaml(with = "duration_seconds", rename = "timeout-seconds")]
+    timeout: Duration,
+}
+```
+
+`Repr` must implement `YamlValue + ToYamlFragment` and can be a scalar or a
+collection. `rename`, `alias`, `default`, `comment`, and
+`skip_serializing_if` continue to apply around the adapter. See the
+[`config_models` example](crates/yaml-rt/examples/config_models.rs) for nested
+struct sequences, a flow-style update, optional/null fields, generics, and the
+duration adapter together.
+
+`YamlRoundTrip` is a lossless overlay, not a general-purpose Serde data-model
+implementation: it reads from an existing `YamlDoc` and applies localized
+patches back to that same source. Serde conversion creates ordinary Rust
+values and deterministic YAML when retaining the original presentation is not
+required.
 
 ## Serde conversion
 
@@ -274,6 +337,12 @@ cargo test -p yaml-rt-core --test yaml_test_suite
   or presentation metadata.
 - Typed-overlay `flatten` has intentionally conservative combinations with
   field and struct policies; unsupported combinations produce derive errors.
+- Typed overlays currently target named mapping structs with string mapping
+  keys. Enums, tuple/newtype/unit structs, borrowed overlay fields, catch-all
+  map flattening, and full Serde attribute compatibility remain future work.
+- Collection identity is positional for sequences. Mapping insertion accepts
+  string keys only; newly inserted `HashMap` keys are sorted for deterministic
+  output while existing source order is retained.
 
 These constraints are checked rather than silently producing lossy or
 surprising output.

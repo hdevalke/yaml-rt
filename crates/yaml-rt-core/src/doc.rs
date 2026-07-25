@@ -350,7 +350,7 @@ pub struct YamlDoc {
     pub(crate) nodes: Vec<Node>,
     /// Compact semantic metadata keyed by CST node IDs.
     pub(crate) semantics: SemanticStore,
-    /// Optional mapping root used by nested typed overlays.
+    /// Optional scalar, sequence, or mapping root used by nested typed overlays.
     pub(crate) root_override: Option<NodeId>,
     /// Pending patch edits applied from highest offset to lowest offset.
     pub(crate) edits: Vec<Edit>,

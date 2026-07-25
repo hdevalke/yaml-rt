@@ -1,7 +1,9 @@
 //! Derive macro entry point for typed YAML round-trip overlays.
 //!
-//! The derive supports named-field structs and generates `FromYamlDoc` and
-//! `ToYamlDoc` implementations that bind Rust fields to YAML mapping keys.
+//! The derive supports named mapping structs, transparent single-field tuple
+//! structs, and every enum variant shape. It generates document- and
+//! node-level overlay implementations that retain the lossless YAML document
+//! as the source of truth.
 
 use std::collections::BTreeMap;
 
@@ -13,6 +15,25 @@ use syn::{
 };
 
 /// Derives typed YAML round-trip overlay implementations.
+///
+/// Named structs overlay YAML mappings. A tuple struct with exactly one field
+/// is transparent and delegates directly to that field. Unit and multi-field
+/// tuple structs are rejected.
+///
+/// Enum unit variants are represented as scalar strings. Newtype, tuple, and
+/// struct variants use local YAML tags:
+///
+/// ```text
+/// Unit
+/// !Newtype 42
+/// !Tuple [1, true]
+/// !Struct {host: api}
+/// ```
+///
+/// Enum-level `rename_all` accepts `lowercase`, `snake_case`, `kebab-case`,
+/// `SCREAMING_SNAKE_CASE`, `camelCase`, and `PascalCase`. Variants accept
+/// `rename` and repeated `alias` attributes. Unnamed newtype and tuple payload
+/// fields accept `with`.
 ///
 /// Supported field attributes:
 ///
@@ -54,6 +75,12 @@ use syn::{
 ///   default behavior
 /// - `#[yaml(insert_order = "struct")]` inserts missing fields before the next
 ///   existing field in declaration order when possible
+///
+/// Same-variant enum writes patch payloads incrementally. Variant switches
+/// replace the enum node while retaining its anchor and surrounding entry
+/// comment. Enum data variants intentionally support only the local-tag
+/// representation; internally tagged, adjacently tagged, externally mapped,
+/// and untagged representations are outside this derive's current contract.
 #[proc_macro_derive(YamlRoundTrip, attributes(yaml))]
 pub fn derive_yaml_round_trip(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);

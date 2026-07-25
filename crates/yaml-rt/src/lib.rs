@@ -15,10 +15,10 @@
 //! # }
 //! ```
 //!
-//! The default `derive` feature re-exports [`YamlRoundTrip`] for typed
-//! round-trip overlays. The optional `serde` feature re-exports serialization
-//! and deserialization APIs for conversions where presentation preservation is
-//! not required.
+//! The default `derive` feature re-exports [`YamlRoundTrip`] for named mapping
+//! structs, transparent newtypes, and locally tagged enums. The optional
+//! `serde` feature re-exports serialization and deserialization APIs for
+//! conversions where presentation preservation is not required.
 
 pub use yaml_rt_core::*;
 

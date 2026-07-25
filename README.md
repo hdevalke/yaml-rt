@@ -88,9 +88,9 @@ patch-oriented editing primitives.
 
 ## Typed round-trip overlays
 
-`YamlRoundTrip` maps a Rust struct onto a YAML mapping without turning the Rust
-value into the source of truth. Reading does not discard syntax, and writing
-patches only known fields unless configured otherwise.
+`YamlRoundTrip` maps Rust configuration models onto YAML without turning the
+Rust value into the source of truth. Reading does not discard syntax, and
+writing patches only modeled values unless configured otherwise.
 
 ```rust
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRoundTrip};
@@ -148,6 +148,37 @@ Rust doc comments become comments for newly inserted entries when no explicit
 with `preserve_unknown_fields` or `prune_unknown_fields`, and insertion order
 with `insert_order = "append"` or `insert_order = "struct"`.
 
+Single-field tuple structs are transparent automatically. Their inner value is
+represented directly, so `struct Port(u16)` reads and writes `8080`, not a
+mapping or tag. The unnamed field may use `yaml(with = "module")`.
+
+Enums use the same YAML representation as `yaml-rt-serde`: unit variants are
+strings, and variants with data use local tags.
+
+```rust
+# use yaml_rt::YamlRoundTrip;
+#[derive(YamlRoundTrip)]
+#[yaml(rename_all = "lowercase")]
+enum Mode {
+    A,                          // a
+    Value(u16),                 // !value 42
+    Pair(u8, bool),             // !pair [1, true]
+    Server { host: String },    // !server {host: api}
+}
+```
+
+Enum variants support `rename` and repeated `alias`. Enum-level `rename_all`
+accepts `lowercase`, `snake_case`, `kebab-case`, `SCREAMING_SNAKE_CASE`,
+`camelCase`, and `PascalCase`, following Serde's variant transformations.
+Aliases are accepted when reading; new values emit the canonical name. An
+existing alias spelling is retained while the variant stays the same.
+
+Same-variant writes patch newtype payloads, tuple elements, and struct fields
+incrementally. That retains scalar spelling, collection style, comments,
+anchors, and unknown struct-variant fields. Switching variants replaces the
+enum node deterministically, retains its anchor and surrounding entry comment,
+and removes comments owned by the old payload.
+
 Common configuration shapes are supported directly:
 
 | Shape | Coverage |
@@ -155,8 +186,11 @@ Common configuration shapes are supported directly:
 | Scalars | `String`, `bool`, `char`, all signed and unsigned integer widths including 128-bit values, `f32`, and `f64` |
 | Wrappers | `Option<T>`, `Box<T>`, and fixed arrays `[T; N]` |
 | Collections | `Vec<T>`, `BTreeMap<String, T>`, and `HashMap<String, T>` |
-| Nested models | Named `YamlRoundTrip` structs, including structs nested inside the wrappers and collections above |
+| Structs | Named mapping structs and transparent single-field tuple structs |
+| Enums | Unit, newtype, tuple, and named-field variants; data variants use local YAML tags |
+| Nested models | Derived structs, newtypes, and enums inside the wrappers and collections above |
 | Generics | Type, lifetime, and const generics with inferred field bounds and retained user `where` clauses |
+| Document roots | Typed scalar, sequence, mapping, newtype, and enum roots |
 | Presentation | Existing block and flow collections are patched in their original style |
 
 Sequence elements are matched positionally. Existing elements retain comments,
@@ -199,10 +233,13 @@ struct Service {
 
 `Repr` must implement `YamlValue + ToYamlFragment` and can be a scalar or a
 collection. `rename`, `alias`, `default`, `comment`, and
-`skip_serializing_if` continue to apply around the adapter. See the
+`skip_serializing_if` continue to apply around a named-field adapter. Adapters
+also work on transparent newtype fields and unnamed enum payload fields. See the
 [`config_models` example](crates/yaml-rt/examples/config_models.rs) for nested
 struct sequences, a flow-style update, optional/null fields, generics, and the
-duration adapter together.
+duration adapter together, and the
+[`enum_overlays` example](crates/yaml-rt/examples/enum_overlays.rs) for
+transparent newtypes and tagged enums.
 
 `YamlRoundTrip` is a lossless overlay, not a general-purpose Serde data-model
 implementation: it reads from an existing `YamlDoc` and applies localized
@@ -337,9 +374,11 @@ cargo test -p yaml-rt-core --test yaml_test_suite
   or presentation metadata.
 - Typed-overlay `flatten` has intentionally conservative combinations with
   field and struct policies; unsupported combinations produce derive errors.
-- Typed overlays currently target named mapping structs with string mapping
-  keys. Enums, tuple/newtype/unit structs, borrowed overlay fields, catch-all
-  map flattening, and full Serde attribute compatibility remain future work.
+- Typed mappings use string keys. Borrowed overlay fields, catch-all map
+  flattening, standalone unit structs, standalone multi-field tuple structs,
+  and full Serde attribute compatibility remain future work.
+- Enum data variants use local tags only. Internally tagged, adjacently tagged,
+  externally mapped, and untagged enum representations are not implemented.
 - Collection identity is positional for sequences. Mapping insertion accepts
   string keys only; newly inserted `HashMap` keys are sorted for deterministic
   output while existing source order is retained.

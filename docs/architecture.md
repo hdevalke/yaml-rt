@@ -72,8 +72,10 @@ the API reports an error rather than performing a lossy rewrite.
 `FromYamlDoc` reads fields from the semantic view while leaving the document
 owned by the caller. `ToYamlDoc` compares and writes field values through the
 editor API. The derive crate adds field aliases, defaults, comments, flattening,
-unknown-field policy, and insertion-order policy. Unknown source entries remain
-untouched by default.
+unknown-field policy, insertion-order policy, transparent newtypes, and locally
+tagged enums. Same-variant enum payloads use the existing scalar, sequence, and
+mapping editors; variant changes replace only the selected node. Unknown source
+entries remain untouched by default.
 
 Serde conversion is intentionally separate. It represents typed YAML data but
 does not promise round-trip presentation preservation.

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    marker::PhantomData,
+};
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
@@ -331,6 +334,30 @@ struct StandardShapeConfig {
     by_name: HashMap<String, ServerFields>,
 }
 
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct GenericLeaf<T> {
+    value: T,
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct GenericConfig<'a, T, const N: usize>
+where
+    T: Copy,
+{
+    current: T,
+    history: Vec<T>,
+    fixed: [T; N],
+    nested: Vec<GenericLeaf<T>>,
+    #[yaml(skip)]
+    marker: PhantomData<&'a T>,
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct GenericFlatten<T> {
+    #[yaml(flatten)]
+    values: T,
+}
+
 #[test]
 fn derived_structs_work_inside_box_arrays_and_hash_maps() {
     let doc = YamlDoc::parse(
@@ -342,6 +369,46 @@ fn derived_structs_work_inside_box_arrays_and_hash_maps() {
     assert_eq!(config.primary.host, "one");
     assert_eq!(config.fixed[1].host, "three");
     assert_eq!(config.by_name.get("z").map(|server| server.port), Some(4));
+}
+
+#[test]
+fn derive_preserves_generics_const_generics_and_where_clauses() {
+    let mut doc =
+        YamlDoc::parse("current: 1\nhistory: [2, 3]\nfixed: [4, 5]\nnested:\n  - value: 6\n")
+            .expect("valid generic config YAML");
+    let mut config =
+        GenericConfig::<'static, u16, 2>::from_yaml_doc(&doc).expect("generic derive reads");
+
+    assert_eq!(config.current, 1);
+    assert_eq!(config.history, vec![2, 3]);
+    assert_eq!(config.fixed, [4, 5]);
+    assert_eq!(config.nested[0].value, 6);
+
+    config.current = 7;
+    config.fixed[1] = 8;
+    config.nested[0].value = 9;
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("generic derive writes");
+
+    assert_eq!(
+        doc.to_string(),
+        "current: 7\nhistory: [2, 3]\nfixed: [4, 8]\nnested:\n  - value: 9\n"
+    );
+}
+
+#[test]
+fn derive_infers_flatten_bounds_for_generic_fields() {
+    let mut doc = YamlDoc::parse("host: one\nport: 1\n").expect("valid flattened generic YAML");
+    let mut config =
+        GenericFlatten::<ServerFields>::from_yaml_doc(&doc).expect("generic flatten derive reads");
+
+    config.values.port = 2;
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("generic flatten derive writes");
+
+    assert_eq!(doc.to_string(), "host: one\nport: 2\n");
 }
 
 #[test]

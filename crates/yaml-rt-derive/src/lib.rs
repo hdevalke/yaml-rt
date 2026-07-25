@@ -6,7 +6,9 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Attribute, Data, DeriveInput, Fields, LitStr, Meta, Path, parse_macro_input};
+use syn::{
+    Attribute, Data, DeriveInput, Fields, LitStr, Meta, Path, WherePredicate, parse_macro_input,
+};
 
 /// Derives typed YAML round-trip overlay implementations.
 ///
@@ -81,11 +83,14 @@ struct FieldExpansion {
     writes: Vec<TokenStream2>,
     known_keys: Vec<String>,
     has_flatten: bool,
+    read_bounds: Vec<WherePredicate>,
+    write_bounds: Vec<WherePredicate>,
 }
 
 fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
     let struct_options = parse_struct_options(&input.attrs)?;
     let name = input.ident;
+    let generics = input.generics;
     let fields = named_struct_fields(input.data, &name)?;
     let fields = expand_fields(fields, struct_options.insert_order)?;
     validate_struct_options(&name, &struct_options, fields.has_flatten)?;
@@ -112,8 +117,34 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let field_reads = fields.reads;
     let field_writes = fields.writes;
+    let mut read_generics = generics.clone();
+    read_generics
+        .make_where_clause()
+        .predicates
+        .extend(fields.read_bounds.iter().cloned());
+    let mut write_generics = generics.clone();
+    write_generics
+        .make_where_clause()
+        .predicates
+        .extend(fields.write_bounds.iter().cloned());
+    let mut combined_generics = generics;
+    combined_generics
+        .make_where_clause()
+        .predicates
+        .extend(fields.read_bounds);
+    combined_generics
+        .make_where_clause()
+        .predicates
+        .extend(fields.write_bounds);
+    let (read_impl_generics, read_type_generics, read_where_clause) =
+        read_generics.split_for_impl();
+    let (write_impl_generics, write_type_generics, write_where_clause) =
+        write_generics.split_for_impl();
+    let (combined_impl_generics, combined_type_generics, combined_where_clause) =
+        combined_generics.split_for_impl();
+
     Ok(quote! {
-        impl ::yaml_rt::FromYamlDoc for #name {
+        impl #read_impl_generics ::yaml_rt::FromYamlDoc for #name #read_type_generics #read_where_clause {
             fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
                 Ok(Self {
                     #(#field_reads,)*
@@ -121,7 +152,7 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
 
-        impl ::yaml_rt::ToYamlDoc for #name {
+        impl #write_impl_generics ::yaml_rt::ToYamlDoc for #name #write_type_generics #write_where_clause {
             fn apply_to_yaml_doc(&self, doc: &mut ::yaml_rt::YamlDoc) -> Result<(), ::yaml_rt::YamlError> {
                 let root = doc.root_mapping()?;
                 #ordered_keys_binding
@@ -131,7 +162,7 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
 
-        impl ::yaml_rt::YamlValue for #name {
+        impl #combined_impl_generics ::yaml_rt::YamlValue for #name #combined_type_generics #combined_where_clause {
             fn read_yaml(
                 doc: &::yaml_rt::YamlDoc,
                 node: ::yaml_rt::NodeId,
@@ -148,7 +179,7 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
 
-        impl ::yaml_rt::ToYamlFragment for #name {
+        impl #write_impl_generics ::yaml_rt::ToYamlFragment for #name #write_type_generics #write_where_clause {
             fn to_yaml_fragment(
                 &self,
                 indent: usize,
@@ -187,6 +218,8 @@ fn expand_fields(
     let mut field_writes = Vec::new();
     let mut known_keys = Vec::new();
     let mut has_flatten = false;
+    let mut read_bounds = Vec::new();
+    let mut write_bounds = Vec::new();
 
     for field in fields {
         let options = parse_field_options(&field.attrs)?;
@@ -205,6 +238,8 @@ fn expand_fields(
                 &field_name,
                 &field_type,
                 &options,
+                &mut read_bounds,
+                &mut write_bounds,
             )?;
             continue;
         }
@@ -217,6 +252,8 @@ fn expand_fields(
             &field_type,
             &options,
             insert_order,
+            &mut read_bounds,
+            &mut write_bounds,
         );
     }
 
@@ -225,6 +262,8 @@ fn expand_fields(
         writes: field_writes,
         known_keys,
         has_flatten,
+        read_bounds,
+        write_bounds,
     })
 }
 
@@ -234,6 +273,8 @@ fn push_flatten_field(
     field_name: &syn::Ident,
     field_type: &syn::Type,
     options: &FieldOptions,
+    read_bounds: &mut Vec<WherePredicate>,
+    write_bounds: &mut Vec<WherePredicate>,
 ) -> syn::Result<()> {
     if options.skip {
         return Err(syn::Error::new_spanned(
@@ -253,6 +294,12 @@ fn push_flatten_field(
         ));
     }
 
+    read_bounds.push(syn::parse_quote! {
+        #field_type: ::yaml_rt::FromYamlDoc
+    });
+    write_bounds.push(syn::parse_quote! {
+        #field_type: ::yaml_rt::ToYamlDoc
+    });
     field_reads.push(quote! {
         #field_name: <#field_type as ::yaml_rt::FromYamlDoc>::from_yaml_doc(doc)?
     });
@@ -270,6 +317,8 @@ fn push_regular_field(
     field_type: &syn::Type,
     options: &FieldOptions,
     insert_order: InsertOrder,
+    read_bounds: &mut Vec<WherePredicate>,
+    write_bounds: &mut Vec<WherePredicate>,
 ) {
     let yaml_key = options
         .rename
@@ -290,12 +339,21 @@ fn push_regular_field(
     let skip_serializing_if = options.skip_serializing_if.clone();
 
     if options.skip {
+        read_bounds.push(syn::parse_quote! {
+            #field_type: ::core::default::Default
+        });
         field_reads.push(quote! {
             #field_name: ::core::default::Default::default()
         });
         return;
     }
 
+    read_bounds.push(syn::parse_quote! {
+        #field_type: ::yaml_rt::YamlValue
+    });
+    write_bounds.push(syn::parse_quote! {
+        #field_type: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
+    });
     let read_value = if let Some(default) = options.default.clone() {
         quote! {
             match node {

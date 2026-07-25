@@ -746,6 +746,29 @@ fn expand_tagged_enum(
         .iter()
         .map(enum_variant_fragment_arm)
         .collect::<Vec<_>>();
+    let untagged_scalar_read = if unit_read_arms.is_empty() {
+        quote! {
+            Err(::yaml_rt::__typed_node_error(
+                doc,
+                node,
+                "enum data variant requires a local YAML tag",
+                &[#(#expected_tags),*],
+            ))
+        }
+    } else {
+        quote! {
+            let value = <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)?;
+            match value.as_str() {
+                #(#unit_read_arms,)*
+                _ => Err(::yaml_rt::__typed_node_error(
+                    doc,
+                    node,
+                    format!("unknown YAML enum variant `{value}`"),
+                    &[#(#expected_units),*],
+                )),
+            }
+        }
+    };
 
     let read_body = quote! {
         let __yaml_rt_raw_tag = doc.raw_tag(node);
@@ -782,16 +805,7 @@ fn expand_tagged_enum(
             doc.semantic_kind(node),
             Some(::yaml_rt::SemanticKind::Scalar { .. })
         ) {
-            let value = <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)?;
-            match value.as_str() {
-                #(#unit_read_arms,)*
-                _ => Err(::yaml_rt::__typed_node_error(
-                    doc,
-                    node,
-                    format!("unknown YAML enum variant `{value}`"),
-                    &[#(#expected_units),*],
-                )),
-            }
+            #untagged_scalar_read
         } else {
             Err(::yaml_rt::__typed_node_error(
                 doc,
@@ -1334,7 +1348,7 @@ fn variant_snake_case(name: &str) -> String {
         if index > 0 && character.is_uppercase() {
             output.push('_');
         }
-        output.extend(character.to_lowercase());
+        output.push(character.to_ascii_lowercase());
     }
     output
 }
@@ -1878,6 +1892,88 @@ mod tests {
             error
                 .to_string()
                 .contains("yaml(with) cannot be combined with yaml(flatten)")
+        );
+    }
+
+    #[test]
+    fn duplicate_variant_names_report_both_variants() {
+        let input: DeriveInput = syn::parse_quote! {
+            enum Invalid {
+                First,
+                #[yaml(rename = "First")]
+                Second,
+            }
+        };
+
+        let error = expand_yaml_round_trip(input).expect_err("duplicate names must fail");
+        let message = error.to_string();
+
+        assert!(message.contains("yaml enum variant name `First`"));
+        assert!(message.contains("both `First` and `Second`"));
+    }
+
+    #[test]
+    fn data_variant_tags_reject_invalid_local_tag_characters() {
+        let input: DeriveInput = syn::parse_quote! {
+            enum Invalid {
+                #[yaml(rename = "not/a/tag")]
+                Value(u16),
+            }
+        };
+
+        let error = expand_yaml_round_trip(input).expect_err("invalid tag must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not a valid local YAML tag name")
+        );
+    }
+
+    #[test]
+    fn unsupported_rename_rule_is_targeted() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[yaml(rename_all = "UPPERCASE")]
+            enum Invalid {
+                Value,
+            }
+        };
+
+        let error = expand_yaml_round_trip(input).expect_err("unsupported rename rule must fail");
+
+        assert!(error.to_string().contains(
+            "rename_all must be lowercase, snake_case, kebab-case, SCREAMING_SNAKE_CASE, camelCase, or PascalCase"
+        ));
+    }
+
+    #[test]
+    fn invalid_variant_and_unnamed_payload_attributes_are_targeted() {
+        let variant_input: DeriveInput = syn::parse_quote! {
+            enum Invalid {
+                #[yaml(default)]
+                Value(u16),
+            }
+        };
+        let payload_input: DeriveInput = syn::parse_quote! {
+            enum Invalid {
+                Value(#[yaml(rename = "value")] u16),
+            }
+        };
+
+        let variant_error =
+            expand_yaml_round_trip(variant_input).expect_err("invalid variant attr must fail");
+        let payload_error =
+            expand_yaml_round_trip(payload_input).expect_err("invalid payload attr must fail");
+
+        assert!(
+            variant_error
+                .to_string()
+                .contains("enum variants support only yaml(rename) and yaml(alias)")
+        );
+        assert!(
+            payload_error
+                .to_string()
+                .contains("unnamed enum fields support only yaml(with)")
         );
     }
 }

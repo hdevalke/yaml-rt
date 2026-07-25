@@ -4135,6 +4135,25 @@ keep: yes
 }
 
 #[test]
+fn yaml_option_none_removes_a_non_null_explicit_tag_whole() {
+    let mut doc = YamlDoc::parse("maybe: !present 1 # keep\n").expect("valid tagged scalar");
+    let maybe = doc.get_path(&["maybe"]).unwrap().unwrap();
+
+    Option::<u16>::None
+        .write_yaml(&mut doc, Some(maybe))
+        .expect("none replaces tagged value");
+
+    assert_eq!(doc.to_string(), "maybe: null # keep\n");
+    doc.commit_edits().expect("tag removal reparses");
+    let maybe = doc.get_path(&["maybe"]).unwrap().unwrap();
+    assert_eq!(doc.raw_tag(maybe), None);
+    assert_eq!(
+        Option::<u16>::read_yaml(&doc, maybe).expect("rewritten null reads"),
+        None
+    );
+}
+
+#[test]
 fn yaml_value_reads_and_writes_vec_values() {
     let mut doc = YamlDoc::parse(
         "ports:

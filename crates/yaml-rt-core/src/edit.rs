@@ -306,6 +306,14 @@ impl YamlDoc {
                 return Ok(());
             }
         }
+        self.queue_fragment_replacement_whole(target, value)
+    }
+
+    pub(crate) fn queue_fragment_replacement_whole(
+        &mut self,
+        target: NodeId,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
         let target_is_flow = matches!(
             self.semantic_kind(target),
             Some(

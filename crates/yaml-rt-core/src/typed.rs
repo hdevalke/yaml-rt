@@ -466,7 +466,15 @@ pub fn __replace_yaml_value<T>(
 where
     T: ToYamlFragment,
 {
-    let mut yaml = value.to_yaml_fragment(0, doc.preferred_line_ending())?;
+    let yaml = value.to_yaml_fragment(0, doc.preferred_line_ending())?;
+    replace_typed_yaml(doc, node, yaml)
+}
+
+fn replace_typed_yaml(
+    doc: &mut YamlDoc,
+    node: NodeId,
+    mut yaml: String,
+) -> Result<NodeId, YamlError> {
     if let Some(anchor) = doc.anchor(node).map(str::to_owned) {
         preserve_fragment_root_anchor(&mut yaml, &anchor)?;
     }
@@ -475,8 +483,13 @@ where
         yaml.push_str(&comment);
     }
     let fragment = parse_typed_fragment(&yaml)?;
-    doc.queue_fragment_replacement(node, &fragment)
-        .map_err(YamlEditError::into_yaml_error)?;
+    let replacement =
+        if doc.raw_tag(node).is_some() && fragment.document().raw_tag(fragment.root()).is_none() {
+            doc.queue_fragment_replacement_whole(node, &fragment)
+        } else {
+            doc.queue_fragment_replacement(node, &fragment)
+        };
+    replacement.map_err(YamlEditError::into_yaml_error)?;
     Ok(node)
 }
 
@@ -1029,6 +1042,9 @@ where
             let node = node.ok_or_else(missing_write_node_error)?;
             if matches!(resolved_scalar_at(doc, node), Ok(ResolvedScalar::Null)) {
                 return Ok(node);
+            }
+            if doc.raw_tag(node).is_some() {
+                return replace_typed_yaml(doc, node, "null".to_owned());
             }
             let null = YamlFragment::parse("null").expect("static null fragment is valid");
             doc.queue_fragment_replacement(node, &null)

@@ -24,6 +24,8 @@ use syn::{
 ///   the field when the predicate returns `true`
 /// - `#[yaml(flatten)]` to overlay a nested round-trip struct on the same root
 ///   mapping
+/// - `#[yaml(with = "module::path")]` to convert through the module's `Repr`
+///   type and `from_yaml`/`to_yaml` functions
 /// - Rust doc comments as insertion comments when `yaml(comment = ...)` is not
 ///   present
 ///
@@ -76,6 +78,7 @@ struct FieldOptions {
     skip: bool,
     skip_serializing_if: Option<Path>,
     flatten: bool,
+    with: Option<Path>,
 }
 
 struct FieldExpansion {
@@ -254,7 +257,7 @@ fn expand_fields(
             insert_order,
             &mut read_bounds,
             &mut write_bounds,
-        );
+        )?;
     }
 
     Ok(FieldExpansion {
@@ -280,6 +283,12 @@ fn push_flatten_field(
         return Err(syn::Error::new_spanned(
             field_name,
             "yaml(flatten) cannot be combined with yaml(skip)",
+        ));
+    }
+    if options.with.is_some() {
+        return Err(syn::Error::new_spanned(
+            field_name,
+            "yaml(with) cannot be combined with yaml(flatten)",
         ));
     }
     if options.rename.is_some()
@@ -319,7 +328,7 @@ fn push_regular_field(
     insert_order: InsertOrder,
     read_bounds: &mut Vec<WherePredicate>,
     write_bounds: &mut Vec<WherePredicate>,
-) {
+) -> syn::Result<()> {
     let yaml_key = options
         .rename
         .clone()
@@ -339,32 +348,86 @@ fn push_regular_field(
     let skip_serializing_if = options.skip_serializing_if.clone();
 
     if options.skip {
+        if options.with.is_some() {
+            return Err(syn::Error::new_spanned(
+                field_name,
+                "yaml(with) cannot be combined with yaml(skip)",
+            ));
+        }
         read_bounds.push(syn::parse_quote! {
             #field_type: ::core::default::Default
         });
         field_reads.push(quote! {
             #field_name: ::core::default::Default::default()
         });
-        return;
+        return Ok(());
     }
 
-    read_bounds.push(syn::parse_quote! {
-        #field_type: ::yaml_rt::YamlValue
-    });
-    write_bounds.push(syn::parse_quote! {
-        #field_type: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
-    });
+    let (read_present_value, read_required_field, write_type, write_value_binding, write_value_ref) =
+        if let Some(with) = &options.with {
+            read_bounds.push(syn::parse_quote! {
+                #with::Repr: ::yaml_rt::YamlValue
+            });
+            write_bounds.push(syn::parse_quote! {
+                #with::Repr: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
+            });
+            (
+                quote! {
+                    {
+                        let __yaml_rt_repr =
+                            <#with::Repr as ::yaml_rt::YamlValue>::read_yaml(doc, node)?;
+                        #with::from_yaml(__yaml_rt_repr)?
+                    }
+                },
+                quote! {
+                    {
+                        let __yaml_rt_repr =
+                            <#with::Repr as ::yaml_rt::YamlValue>::read_yaml_field(
+                                doc,
+                                node,
+                                #yaml_key,
+                            )?;
+                        #with::from_yaml(__yaml_rt_repr)?
+                    }
+                },
+                quote! { #with::Repr },
+                quote! {
+                    let __yaml_rt_repr = #with::to_yaml(&self.#field_name)?;
+                },
+                quote! { &__yaml_rt_repr },
+            )
+        } else {
+            read_bounds.push(syn::parse_quote! {
+                #field_type: ::yaml_rt::YamlValue
+            });
+            write_bounds.push(syn::parse_quote! {
+                #field_type: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
+            });
+            (
+                quote! {
+                    <#field_type as ::yaml_rt::YamlValue>::read_yaml(doc, node)?
+                },
+                quote! {
+                    <#field_type as ::yaml_rt::YamlValue>::read_yaml_field(
+                        doc,
+                        node,
+                        #yaml_key,
+                    )?
+                },
+                quote! { #field_type },
+                quote! {},
+                quote! { &self.#field_name },
+            )
+        };
     let read_value = if let Some(default) = options.default.clone() {
         quote! {
             match node {
-                Some(node) => <#field_type as ::yaml_rt::YamlValue>::read_yaml(doc, node)?,
+                Some(node) => #read_present_value,
                 None => { #default }
             }
         }
     } else {
-        quote! {
-            <#field_type as ::yaml_rt::YamlValue>::read_yaml_field(doc, node, #yaml_key)?
-        }
+        read_required_field
     };
     field_reads.push(quote! {
         #field_name: {
@@ -379,13 +442,17 @@ fn push_regular_field(
     });
 
     let write_field = write_field_tokens(
-        field_name,
-        field_type,
+        &write_type,
+        &write_value_ref,
         &yaml_key,
         &aliases,
         insert_order,
         &insert_comment,
     );
+    let write_field = quote! {
+        #write_value_binding
+        #write_field
+    };
     push_field_write(
         field_writes,
         field_name,
@@ -394,11 +461,12 @@ fn push_regular_field(
         skip_serializing_if,
         write_field,
     );
+    Ok(())
 }
 
 fn write_field_tokens(
-    field_name: &syn::Ident,
-    field_type: &syn::Type,
+    field_type: &TokenStream2,
+    field_value: &TokenStream2,
     yaml_key: &str,
     aliases: &[String],
     insert_order: InsertOrder,
@@ -409,7 +477,7 @@ fn write_field_tokens(
             doc.insert_mapping_value_with_comment(
                 root,
                 #yaml_key,
-                &self.#field_name,
+                #field_value,
                 ::yaml_rt::MappingEntryStyle::default(),
                 #insert_comment,
             )?;
@@ -418,7 +486,7 @@ fn write_field_tokens(
             doc.insert_mapping_value_ordered_with_comment(
                 root,
                 #yaml_key,
-                &self.#field_name,
+                #field_value,
                 ::yaml_rt::MappingEntryStyle::default(),
                 #insert_comment,
                 __yaml_rt_ordered_keys,
@@ -434,7 +502,7 @@ fn write_field_tokens(
             }
         )*
         if let Some(node) = node {
-            <#field_type as ::yaml_rt::YamlValue>::write_yaml(&self.#field_name, doc, Some(node))?;
+            <#field_type as ::yaml_rt::YamlValue>::write_yaml(#field_value, doc, Some(node))?;
         } else {
             #insert_missing_field
         }
@@ -601,8 +669,53 @@ fn parse_yaml_attr(attr: &Attribute, options: &mut FieldOptions) -> syn::Result<
         } else if meta.path.is_ident("flatten") {
             options.flatten = true;
             Ok(())
+        } else if meta.path.is_ident("with") {
+            let value = meta.value()?;
+            options.with = Some(value.parse::<LitStr>()?.parse::<Path>()?);
+            Ok(())
         } else {
             Err(meta.error("unsupported yaml attribute"))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_and_skip_report_a_targeted_error() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct Invalid {
+                #[yaml(with = "adapter", skip)]
+                value: String,
+            }
+        };
+
+        let error = expand_yaml_round_trip(input).expect_err("with plus skip must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("yaml(with) cannot be combined with yaml(skip)")
+        );
+    }
+
+    #[test]
+    fn with_and_flatten_report_a_targeted_error() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct Invalid {
+                #[yaml(with = "adapter", flatten)]
+                value: String,
+            }
+        };
+
+        let error = expand_yaml_round_trip(input).expect_err("with plus flatten must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("yaml(with) cannot be combined with yaml(flatten)")
+        );
+    }
 }

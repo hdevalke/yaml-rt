@@ -1,8 +1,168 @@
 use std::{
     collections::{BTreeMap, HashMap},
     marker::PhantomData,
+    time::Duration,
 };
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
+
+mod duration_seconds {
+    use std::time::Duration;
+    use yaml_rt::YamlError;
+
+    pub type Repr = u64;
+
+    pub fn from_yaml(value: Repr) -> Result<Duration, YamlError> {
+        Ok(Duration::from_secs(value))
+    }
+
+    pub fn to_yaml(value: &Duration) -> Result<Repr, YamlError> {
+        Ok(value.as_secs())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PortSet(Vec<u16>);
+
+mod port_list {
+    use super::PortSet;
+    use yaml_rt::YamlError;
+
+    pub type Repr = Vec<u16>;
+
+    pub fn from_yaml(value: Repr) -> Result<PortSet, YamlError> {
+        Ok(PortSet(value))
+    }
+
+    pub fn to_yaml(value: &PortSet) -> Result<Repr, YamlError> {
+        Ok(value.0.clone())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PositivePort(u16);
+
+mod positive_port {
+    use super::PositivePort;
+    use yaml_rt::{Diagnostic, DiagnosticKind, Span, YamlError};
+
+    pub type Repr = u16;
+
+    pub fn from_yaml(value: Repr) -> Result<PositivePort, YamlError> {
+        if value == 0 {
+            return Err(YamlError::new(Diagnostic::new(
+                DiagnosticKind::Semantic,
+                "port must be positive",
+                Span::empty(0),
+            )));
+        }
+        Ok(PositivePort(value))
+    }
+
+    pub fn to_yaml(value: &PositivePort) -> Result<Repr, YamlError> {
+        if value.0 == 0 {
+            return Err(YamlError::new(Diagnostic::new(
+                DiagnosticKind::Emitter,
+                "port must be positive",
+                Span::empty(0),
+            )));
+        }
+        Ok(value.0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct AdapterConfig {
+    #[yaml(
+        with = "duration_seconds",
+        rename = "timeout-seconds",
+        alias = "timeout",
+        default = Duration::from_secs(30),
+        comment = "Request timeout in seconds."
+    )]
+    timeout: Duration,
+    #[yaml(with = "port_list")]
+    ports: PortSet,
+    #[yaml(with = "positive_port")]
+    admin_port: PositivePort,
+    #[yaml(
+        with = "duration_seconds",
+        default = Duration::from_secs(0),
+        skip_serializing_if = "Duration::is_zero"
+    )]
+    cooldown: Duration,
+}
+
+#[test]
+fn with_adapters_patch_scalar_and_collection_representations_in_flow_yaml() {
+    let mut doc = YamlDoc::parse("{timeout: 5, ports: [80, 443], admin_port: 9000, tail: keep}\n")
+        .expect("valid adapter YAML");
+    let mut config = AdapterConfig::from_yaml_doc(&doc).expect("adapters read representations");
+
+    assert_eq!(config.timeout, Duration::from_secs(5));
+    assert_eq!(config.ports, PortSet(vec![80, 443]));
+    assert_eq!(config.cooldown, Duration::from_secs(0));
+
+    config.timeout = Duration::from_secs(6);
+    config.ports.0[0] = 81;
+    config.ports.0.push(8080);
+    config.admin_port = PositivePort(9001);
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("adapters write representations");
+
+    assert_eq!(
+        doc.to_string(),
+        "{timeout: 6, ports: [81, 443, 8080], admin_port: 9001, tail: keep}\n"
+    );
+}
+
+#[test]
+fn with_adapters_apply_defaults_comments_and_omission_normally() {
+    let mut doc =
+        YamlDoc::parse("ports: [80]\nadmin_port: 9000\n").expect("valid adapter defaults YAML");
+    let config = AdapterConfig::from_yaml_doc(&doc).expect("adapter default is applied");
+
+    assert_eq!(config.timeout, Duration::from_secs(30));
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("adapter default is emitted");
+
+    assert_eq!(
+        doc.to_string(),
+        "ports: [80]\nadmin_port: 9000\n# Request timeout in seconds.\ntimeout-seconds: 30\n"
+    );
+
+    let mut doc =
+        YamlDoc::parse("timeout-seconds: 30\nports: [80]\nadmin_port: 9000\ncooldown: 2\n")
+            .expect("valid adapter omission YAML");
+    let mut config = AdapterConfig::from_yaml_doc(&doc).expect("adapter reads omitted field");
+    config.cooldown = Duration::from_secs(0);
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("adapter omission removes field");
+
+    assert_eq!(
+        doc.to_string(),
+        "timeout-seconds: 30\nports: [80]\nadmin_port: 9000\n"
+    );
+}
+
+#[test]
+fn with_adapters_propagate_read_and_write_conversion_errors() {
+    let doc = YamlDoc::parse("timeout: 5\nports: [80]\nadmin_port: 0\n")
+        .expect("valid representation YAML");
+    let error = AdapterConfig::from_yaml_doc(&doc).expect_err("zero port conversion must fail");
+    assert_eq!(error.diagnostic.message, "port must be positive");
+
+    let mut doc =
+        YamlDoc::parse("timeout: 5\nports: [80]\nadmin_port: 1\n").expect("valid adapter YAML");
+    let mut config = AdapterConfig::from_yaml_doc(&doc).expect("valid port conversion");
+    config.admin_port = PositivePort(0);
+    let error = config
+        .apply_to_yaml_doc(&mut doc)
+        .expect_err("invalid typed port must fail conversion");
+    assert_eq!(error.diagnostic.message, "port must be positive");
+}
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
 struct Config {

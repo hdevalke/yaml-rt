@@ -34,6 +34,14 @@ name = "typed_config"
 required-features = ["derive"]
 
 [[example]]
+name = "config_models"
+required-features = ["derive"]
+
+[[example]]
+name = "enum_overlays"
+required-features = ["derive"]
+
+[[example]]
 name = "nested_edit"
 required-features = ["derive"]
 
@@ -47,6 +55,14 @@ required-features = ["derive"]
 
 [[test]]
 name = "derive_attributes"
+required-features = ["derive"]
+
+[[test]]
+name = "derive_enums"
+required-features = ["derive"]
+
+[[test]]
+name = "derive_newtypes"
 required-features = ["derive"]
 
 [[test]]

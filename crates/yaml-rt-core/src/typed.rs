@@ -343,6 +343,21 @@ where
     Ok(node)
 }
 
+#[doc(hidden)]
+pub fn __typed_node_error(
+    doc: &YamlDoc,
+    node: NodeId,
+    message: impl Into<String>,
+    expected: &[&str],
+) -> YamlError {
+    let span = doc.node(node).map_or(Span::empty(0), Node::span);
+    let mut diagnostic = Diagnostic::new(DiagnosticKind::Typed, message, span);
+    diagnostic
+        .expected
+        .extend(expected.iter().map(|value| (*value).to_owned()));
+    YamlError::new(diagnostic).with_position_from(&doc.source)
+}
+
 fn preserve_fragment_root_anchor(yaml: &mut String, anchor: &str) -> Result<(), YamlError> {
     let properties = parse_node_properties(yaml, Span::from_usize(0, yaml.len()))?;
     if let Some(existing) = properties.anchor {

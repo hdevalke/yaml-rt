@@ -3,6 +3,8 @@
 //! The derive supports named-field structs and generates `FromYamlDoc` and
 //! `ToYamlDoc` implementations that bind Rust fields to YAML mapping keys.
 
+use std::collections::BTreeMap;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
@@ -81,6 +83,27 @@ struct StructOptions {
     insert_order: InsertOrder,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RenameRule {
+    Lowercase,
+    SnakeCase,
+    KebabCase,
+    ScreamingSnakeCase,
+    CamelCase,
+    PascalCase,
+}
+
+#[derive(Default)]
+struct EnumOptions {
+    rename_all: Option<RenameRule>,
+}
+
+#[derive(Default)]
+struct VariantOptions {
+    rename: Option<String>,
+    aliases: Vec<String>,
+}
+
 #[derive(Default)]
 struct FieldOptions {
     rename: Option<String>,
@@ -132,10 +155,7 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
                 "YamlRoundTrip does not support unit structs",
             )),
         },
-        Data::Enum(data) => Err(syn::Error::new_spanned(
-            data.enum_token,
-            "YamlRoundTrip enum support is not available yet",
-        )),
+        Data::Enum(data) => expand_unit_enum(attrs, name, generics, data.variants),
         Data::Union(data) => Err(syn::Error::new_spanned(
             data.union_token,
             "YamlRoundTrip cannot be derived for unions",
@@ -398,6 +418,202 @@ fn expand_newtype_struct(
             }
         }
     })
+}
+
+struct UnitVariant {
+    ident: syn::Ident,
+    canonical: String,
+    aliases: Vec<String>,
+}
+
+fn expand_unit_enum(
+    attrs: Vec<Attribute>,
+    name: syn::Ident,
+    generics: syn::Generics,
+    variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
+) -> syn::Result<TokenStream2> {
+    let options = parse_enum_options(&attrs)?;
+    let mut expanded = Vec::new();
+    let mut names = BTreeMap::<String, String>::new();
+    for variant in variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                variant,
+                "tagged enum payload variants are not available yet",
+            ));
+        }
+        let variant_options = parse_variant_options(&variant.attrs)?;
+        let rust_name = variant.ident.to_string();
+        let canonical = variant_options
+            .rename
+            .unwrap_or_else(|| apply_rename_rule(&rust_name, options.rename_all));
+        for accepted in std::iter::once(&canonical).chain(variant_options.aliases.iter()) {
+            if let Some(previous) = names.insert(accepted.clone(), rust_name.clone()) {
+                return Err(syn::Error::new_spanned(
+                    &variant.ident,
+                    format!(
+                        "yaml enum variant name `{accepted}` is used by both `{previous}` and `{rust_name}`"
+                    ),
+                ));
+            }
+        }
+        expanded.push(UnitVariant {
+            ident: variant.ident,
+            canonical,
+            aliases: variant_options.aliases,
+        });
+    }
+
+    let expected = expanded
+        .iter()
+        .map(|variant| variant.canonical.as_str())
+        .collect::<Vec<_>>();
+    let read_arms = expanded.iter().map(|variant| {
+        let ident = &variant.ident;
+        let names = std::iter::once(&variant.canonical)
+            .chain(variant.aliases.iter())
+            .collect::<Vec<_>>();
+        quote! {
+            #(#names)|* => Ok(Self::#ident)
+        }
+    });
+    let write_arms = expanded.iter().map(|variant| {
+        let ident = &variant.ident;
+        let canonical = &variant.canonical;
+        let names = std::iter::once(&variant.canonical)
+            .chain(variant.aliases.iter())
+            .collect::<Vec<_>>();
+        quote! {
+            Self::#ident => {
+                let __yaml_rt_has_local_tag = doc.raw_tag(node).is_some_and(|tag| {
+                    tag.starts_with('!') && !tag.starts_with("!!")
+                });
+                if !__yaml_rt_has_local_tag
+                    && <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)
+                        .is_ok_and(|value| matches!(value.as_str(), #(#names)|*))
+                {
+                    return Ok(node);
+                }
+                <String as ::yaml_rt::YamlValue>::write_yaml(
+                    &#canonical.to_owned(),
+                    doc,
+                    Some(node),
+                )
+            }
+        }
+    });
+    let fragment_arms = expanded.iter().map(|variant| {
+        let ident = &variant.ident;
+        let canonical = &variant.canonical;
+        quote! {
+            Self::#ident => <String as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                &#canonical.to_owned(),
+                indent,
+                line_ending,
+            )
+        }
+    });
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+
+    Ok(quote! {
+        impl #impl_generics ::yaml_rt::FromYamlDoc for #name #type_generics #where_clause {
+            fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
+                ::yaml_rt::__read_yaml_document(doc)
+            }
+        }
+
+        impl #impl_generics ::yaml_rt::ToYamlDoc for #name #type_generics #where_clause {
+            fn apply_to_yaml_doc(&self, doc: &mut ::yaml_rt::YamlDoc) -> Result<(), ::yaml_rt::YamlError> {
+                ::yaml_rt::__write_yaml_document(self, doc)
+            }
+        }
+
+        impl #impl_generics ::yaml_rt::YamlValue for #name #type_generics #where_clause {
+            fn read_yaml(
+                doc: &::yaml_rt::YamlDoc,
+                node: ::yaml_rt::NodeId,
+            ) -> Result<Self, ::yaml_rt::YamlError> {
+                if let Some(tag) = doc.raw_tag(node).filter(|tag| {
+                    tag.starts_with('!') && !tag.starts_with("!!")
+                }) {
+                    return Err(::yaml_rt::__typed_node_error(
+                        doc,
+                        node,
+                        format!("unknown YAML enum tag `{tag}`"),
+                        &[#(#expected),*],
+                    ));
+                }
+                let value = <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)?;
+                match value.as_str() {
+                    #(#read_arms,)*
+                    _ => Err(::yaml_rt::__typed_node_error(
+                        doc,
+                        node,
+                        format!("unknown YAML enum variant `{value}`"),
+                        &[#(#expected),*],
+                    )),
+                }
+            }
+
+            fn write_yaml(
+                &self,
+                doc: &mut ::yaml_rt::YamlDoc,
+                node: Option<::yaml_rt::NodeId>,
+            ) -> Result<::yaml_rt::NodeId, ::yaml_rt::YamlError> {
+                let node = node.ok_or_else(|| {
+                    ::yaml_rt::YamlError::new(::yaml_rt::Diagnostic::new(
+                        ::yaml_rt::DiagnosticKind::Typed,
+                        "cannot insert a standalone YAML enum without collection context",
+                        ::yaml_rt::Span::empty(0),
+                    ))
+                })?;
+                match self {
+                    #(#write_arms,)*
+                }
+            }
+        }
+
+        impl #impl_generics ::yaml_rt::ToYamlFragment for #name #type_generics #where_clause {
+            fn to_yaml_fragment(
+                &self,
+                indent: usize,
+                line_ending: &str,
+            ) -> Result<String, ::yaml_rt::YamlError> {
+                match self {
+                    #(#fragment_arms,)*
+                }
+            }
+        }
+    })
+}
+
+fn apply_rename_rule(name: &str, rule: Option<RenameRule>) -> String {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    match rule {
+        None | Some(RenameRule::PascalCase) => name.to_owned(),
+        Some(RenameRule::Lowercase) => name.to_ascii_lowercase(),
+        Some(RenameRule::SnakeCase) => variant_snake_case(name),
+        Some(RenameRule::KebabCase) => variant_snake_case(name).replace('_', "-"),
+        Some(RenameRule::ScreamingSnakeCase) => variant_snake_case(name).to_ascii_uppercase(),
+        Some(RenameRule::CamelCase) => {
+            let mut value = name.to_owned();
+            if let Some(first) = value.get_mut(0..1) {
+                first.make_ascii_lowercase();
+            }
+            value
+        }
+    }
+}
+
+fn variant_snake_case(name: &str) -> String {
+    let mut output = String::with_capacity(name.len());
+    for (index, character) in name.char_indices() {
+        if index > 0 && character.is_uppercase() {
+            output.push('_');
+        }
+        output.extend(character.to_lowercase());
+    }
+    output
 }
 
 fn expand_fields(
@@ -725,6 +941,60 @@ fn parse_struct_options(attrs: &[Attribute]) -> syn::Result<StructOptions> {
         }
     }
 
+    Ok(options)
+}
+
+fn parse_enum_options(attrs: &[Attribute]) -> syn::Result<EnumOptions> {
+    let mut options = EnumOptions::default();
+    for attr in attrs {
+        if !attr.path().is_ident("yaml") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if !meta.path.is_ident("rename_all") {
+                return Err(meta.error("unsupported yaml enum attribute"));
+            }
+            let value = meta.value()?.parse::<LitStr>()?;
+            options.rename_all = Some(match value.value().as_str() {
+                "lowercase" => RenameRule::Lowercase,
+                "snake_case" => RenameRule::SnakeCase,
+                "kebab-case" => RenameRule::KebabCase,
+                "SCREAMING_SNAKE_CASE" => RenameRule::ScreamingSnakeCase,
+                "camelCase" => RenameRule::CamelCase,
+                "PascalCase" => RenameRule::PascalCase,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "rename_all must be lowercase, snake_case, kebab-case, SCREAMING_SNAKE_CASE, camelCase, or PascalCase",
+                    ));
+                }
+            });
+            Ok(())
+        })?;
+    }
+    Ok(options)
+}
+
+fn parse_variant_options(attrs: &[Attribute]) -> syn::Result<VariantOptions> {
+    let mut options = VariantOptions::default();
+    for attr in attrs {
+        if !attr.path().is_ident("yaml") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                options.rename = Some(meta.value()?.parse::<LitStr>()?.value());
+                Ok(())
+            } else if meta.path.is_ident("alias") {
+                options
+                    .aliases
+                    .push(meta.value()?.parse::<LitStr>()?.value());
+                Ok(())
+            } else {
+                Err(meta.error("enum variants support only yaml(rename) and yaml(alias)"))
+            }
+        })?;
+    }
     Ok(options)
 }
 

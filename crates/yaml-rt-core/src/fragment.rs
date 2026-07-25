@@ -68,7 +68,26 @@ impl YamlFragment {
     }
 
     pub(crate) fn prepared(&self, target: &YamlDoc) -> Result<Self, FragmentError> {
+        self.prepared_with_anchor_exemption(target, None)
+    }
+
+    pub(crate) fn prepared_for_replacement(
+        &self,
+        target: &YamlDoc,
+        replaced: NodeId,
+    ) -> Result<Self, FragmentError> {
+        self.prepared_with_anchor_exemption(target, target.anchor(replaced))
+    }
+
+    fn prepared_with_anchor_exemption(
+        &self,
+        target: &YamlDoc,
+        exempt_anchor: Option<&str>,
+    ) -> Result<Self, FragmentError> {
         let mut used = target.anchor_names();
+        if let Some(anchor) = exempt_anchor {
+            used.remove(anchor);
+        }
         let mut renamed = BTreeMap::new();
         for node in self.subtree_nodes() {
             let Some(name) = self.doc.anchor(node) else {
@@ -122,6 +141,15 @@ impl YamlFragment {
 
     pub(crate) fn render_flow(&self, target: &YamlDoc) -> Result<String, FragmentError> {
         let prepared = self.prepared(target)?;
+        prepared.render_node_flow(prepared.root, 0)
+    }
+
+    pub(crate) fn render_flow_for_replacement(
+        &self,
+        target: &YamlDoc,
+        replaced: NodeId,
+    ) -> Result<String, FragmentError> {
+        let prepared = self.prepared_for_replacement(target, replaced)?;
         prepared.render_node_flow(prepared.root, 0)
     }
 

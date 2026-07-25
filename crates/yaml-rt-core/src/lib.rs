@@ -36,7 +36,8 @@ pub use syntax::{
 };
 #[doc(hidden)]
 pub use typed::{
-    __mapping_overlay_to_yaml_fragment, __read_mapping_overlay, __write_mapping_overlay,
+    __mapping_overlay_to_yaml_fragment, __read_mapping_overlay, __read_yaml_document,
+    __replace_yaml_value, __write_mapping_overlay, __write_yaml_document,
 };
 pub use typed::{FromYamlDoc, ToYamlDoc, ToYamlFragment, YamlValue};
 pub use value::{

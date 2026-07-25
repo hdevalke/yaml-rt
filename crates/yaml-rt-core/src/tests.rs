@@ -3964,6 +3964,61 @@ impl ToYamlFragment for Config {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ScalarDocument(u16);
+
+impl FromYamlDoc for ScalarDocument {
+    fn from_yaml_doc(doc: &YamlDoc) -> Result<Self, YamlError> {
+        __read_yaml_document(doc).map(Self)
+    }
+}
+
+impl ToYamlDoc for ScalarDocument {
+    fn apply_to_yaml_doc(&self, doc: &mut YamlDoc) -> Result<(), YamlError> {
+        __write_yaml_document(&self.0, doc)
+    }
+}
+
+struct TaggedSequence;
+
+impl ToYamlFragment for TaggedSequence {
+    fn to_yaml_fragment(&self, _indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        Ok(format!("!New{line_ending}- 3{line_ending}- 4"))
+    }
+}
+
+#[test]
+fn selected_typed_documents_accept_arbitrary_root_values() {
+    let mut doc =
+        YamlDoc::parse("name: mapping\n---\n0x10\n---\n[1, 2]\n").expect("valid mixed-root stream");
+
+    let value: ScalarDocument = doc.read_document(1).expect("scalar document reads");
+    assert_eq!(value, ScalarDocument(16));
+
+    doc.write_document(1, &ScalarDocument(17))
+        .expect("scalar document writes");
+    assert_eq!(doc.to_string(), "name: mapping\n---\n17\n---\n[1, 2]\n");
+}
+
+#[test]
+fn typed_replacement_preserves_anchor_flow_style_comments_and_crlf() {
+    let mut doc =
+        YamlDoc::parse("mode: &mode !Old [1, 2] # keep\r\nref: *mode\r\n").expect("valid YAML");
+    let mode = doc.get_path(&["mode"]).unwrap().unwrap();
+
+    __replace_yaml_value(&TaggedSequence, &mut doc, mode).expect("tagged replacement succeeds");
+
+    assert_eq!(
+        doc.to_string(),
+        "mode: !New &mode [3, 4] # keep\r\nref: *mode\r\n"
+    );
+    doc.commit_edits().expect("replacement reparses");
+    let alias = doc.get_path(&["ref"]).unwrap().unwrap();
+    let target = doc.resolve_alias(alias).expect("preserved anchor resolves");
+    assert_eq!(doc.anchor(target), Some("mode"));
+    assert_eq!(doc.raw_tag(target), Some("!New"));
+}
+
 #[test]
 fn yaml_value_reads_and_writes_scalar_values() {
     let mut doc =

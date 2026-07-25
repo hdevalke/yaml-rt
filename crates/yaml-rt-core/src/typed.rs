@@ -301,6 +301,73 @@ where
     Ok(node)
 }
 
+#[doc(hidden)]
+pub fn __read_yaml_document<T>(doc: &YamlDoc) -> Result<T, YamlError>
+where
+    T: YamlValue,
+{
+    let node = doc
+        .document_root(0)?
+        .ok_or_else(|| missing_document_value_error(doc))?;
+    T::read_yaml(doc, node)
+}
+
+#[doc(hidden)]
+pub fn __write_yaml_document<T>(value: &T, doc: &mut YamlDoc) -> Result<(), YamlError>
+where
+    T: YamlValue,
+{
+    let node = doc
+        .document_root(0)?
+        .ok_or_else(|| missing_document_value_error(doc))?;
+    value.write_yaml(doc, Some(node))?;
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn __replace_yaml_value<T>(
+    value: &T,
+    doc: &mut YamlDoc,
+    node: NodeId,
+) -> Result<NodeId, YamlError>
+where
+    T: ToYamlFragment,
+{
+    let mut yaml = value.to_yaml_fragment(0, doc.preferred_line_ending())?;
+    if let Some(anchor) = doc.anchor(node).map(str::to_owned) {
+        preserve_fragment_root_anchor(&mut yaml, &anchor)?;
+    }
+    let fragment = parse_typed_fragment(&yaml)?;
+    doc.queue_fragment_replacement(node, &fragment)
+        .map_err(YamlEditError::into_yaml_error)?;
+    Ok(node)
+}
+
+fn preserve_fragment_root_anchor(yaml: &mut String, anchor: &str) -> Result<(), YamlError> {
+    let properties = parse_node_properties(yaml, Span::from_usize(0, yaml.len()))?;
+    if let Some(existing) = properties.anchor {
+        yaml.replace_range(existing.start as usize..existing.end as usize, anchor);
+    } else if let Some(tag) = properties.tag {
+        yaml.insert_str(tag.end as usize, &format!(" &{anchor}"));
+    } else {
+        yaml.insert_str(0, &format!("&{anchor} "));
+    }
+    Ok(())
+}
+
+fn parse_typed_fragment(yaml: &str) -> Result<YamlFragment, YamlError> {
+    YamlFragment::parse(yaml).map_err(|error| {
+        YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Emitter,
+                format!("typed YAML fragment is invalid: {error}"),
+                Span::empty(0),
+            )
+            .with_expected("one valid YAML value"),
+        )
+    })
+}
+
 fn missing_write_node_error() -> YamlError {
     YamlError::new(
         Diagnostic::new(
@@ -309,6 +376,17 @@ fn missing_write_node_error() -> YamlError {
             Span::empty(0),
         )
         .with_expected("an existing YAML node"),
+    )
+}
+
+fn missing_document_value_error(doc: &YamlDoc) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Typed,
+            "document does not contain a YAML value",
+            Span::empty_from_usize(doc.as_source().len()),
+        )
+        .with_expected("a scalar, sequence, or mapping document root"),
     )
 }
 
@@ -515,16 +593,7 @@ where
     T: ToYamlFragment,
 {
     let fragment = value.to_yaml_fragment(0, doc.preferred_line_ending())?;
-    let fragment = YamlFragment::parse(&fragment).map_err(|error| {
-        YamlError::new(
-            Diagnostic::new(
-                DiagnosticKind::Emitter,
-                format!("typed YAML fragment is invalid: {error}"),
-                Span::empty(0),
-            )
-            .with_expected("one valid YAML value"),
-        )
-    })?;
+    let fragment = parse_typed_fragment(&fragment)?;
     fragment.render_flow(doc).map_err(|error| {
         YamlError::new(
             Diagnostic::new(

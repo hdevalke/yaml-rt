@@ -832,14 +832,16 @@ impl YamlDoc {
     ///
     /// # Errors
     ///
-    /// Returns an error when the selected document is missing, does not contain
-    /// a root block mapping, or the typed overlay cannot be read.
+    /// Returns an error when the selected document is missing or empty, or the
+    /// typed overlay cannot be read.
     pub fn read_document<T>(&self, index: usize) -> Result<T, YamlError>
     where
         T: FromYamlDoc,
     {
-        let root = self.document_root_mapping(index)?;
-        let nested = self.rerooted_at_mapping(root)?;
+        let root = self
+            .document_root(index)?
+            .ok_or_else(|| self.empty_document_error(index))?;
+        let nested = self.rerooted_at(root)?;
         T::from_yaml_doc(&nested)
     }
 
@@ -847,14 +849,16 @@ impl YamlDoc {
     ///
     /// # Errors
     ///
-    /// Returns an error when the selected document is missing, does not contain
-    /// a root block mapping, or the typed overlay cannot be written.
+    /// Returns an error when the selected document is missing or empty, or the
+    /// typed overlay cannot be written.
     pub fn write_document<T>(&mut self, index: usize, value: &T) -> Result<(), YamlError>
     where
         T: ToYamlDoc,
     {
-        let root = self.document_root_mapping(index)?;
-        let mut nested = self.rerooted_at_mapping(root)?;
+        let root = self
+            .document_root(index)?
+            .ok_or_else(|| self.empty_document_error(index))?;
+        let mut nested = self.rerooted_at(root)?;
         value.apply_to_yaml_doc(&mut nested)?;
         self.queue_edits_from(&nested)
     }
@@ -937,6 +941,17 @@ impl YamlDoc {
         )
     }
 
+    fn empty_document_error(&self, index: usize) -> YamlError {
+        YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Typed,
+                format!("document {index} does not contain a YAML value"),
+                Span::empty_from_usize(self.source.len()),
+            )
+            .with_expected("a scalar, sequence, or mapping document root"),
+        )
+    }
+
     fn find_mapping_pair(
         &self,
         mapping: NodeId,
@@ -948,6 +963,25 @@ impl YamlDoc {
             }
         }
         Ok(None)
+    }
+
+    pub(crate) fn rerooted_at(&self, root: NodeId) -> Result<Self, YamlError> {
+        let root_node = self.expect_node(root)?;
+        if self.semantic_kind(root).is_none() {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Semantic,
+                    "typed overlay root does not have semantic metadata",
+                    root_node.span,
+                )
+                .with_expected("a semantic YAML value"),
+            )
+            .with_position_from(&self.source));
+        }
+        let mut doc = self.clone();
+        doc.root_override = Some(root);
+        doc.edits.clear();
+        Ok(doc)
     }
 
     pub(crate) fn rerooted_at_mapping(&self, mapping: NodeId) -> Result<Self, YamlError> {
@@ -980,10 +1014,7 @@ impl YamlDoc {
             )
             .with_position_from(&self.source));
         }
-        let mut doc = self.clone();
-        doc.root_override = Some(mapping);
-        doc.edits.clear();
-        Ok(doc)
+        self.rerooted_at(mapping)
     }
 
     pub(crate) fn queue_edits_from(&mut self, other: &YamlDoc) -> Result<(), YamlError> {

@@ -306,10 +306,20 @@ impl YamlDoc {
                 return Ok(());
             }
         }
-        let replacement = if self.is_flow_context(target) {
-            value.render_flow(self)?
+        let target_is_flow = matches!(
+            self.semantic_kind(target),
+            Some(
+                SemanticKind::Mapping {
+                    style: CollectionStyle::Flow
+                } | SemanticKind::Sequence {
+                    style: CollectionStyle::Flow
+                }
+            )
+        );
+        let replacement = if target_is_flow || self.is_flow_context(target) {
+            value.render_flow_for_replacement(self, target)?
         } else {
-            let yaml = value.prepared(self)?.to_yaml()?;
+            let yaml = value.prepared_for_replacement(self, target)?.to_yaml()?;
             indent_continuation_lines(&yaml, self.node_indent(self.expect_node(target)?))
         };
         self.replace_node_text(target, replacement)?;

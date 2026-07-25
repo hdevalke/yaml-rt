@@ -127,6 +127,12 @@ struct FieldExpansion {
     write_bounds: Vec<WherePredicate>,
 }
 
+#[derive(Clone, Copy)]
+enum FieldAccess {
+    SelfFields,
+    Bindings,
+}
+
 fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
     let DeriveInput {
         attrs,
@@ -155,7 +161,7 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
                 "YamlRoundTrip does not support unit structs",
             )),
         },
-        Data::Enum(data) => expand_unit_enum(attrs, name, generics, data.variants),
+        Data::Enum(data) => expand_enum(attrs, name, generics, data.variants),
         Data::Union(data) => Err(syn::Error::new_spanned(
             data.union_token,
             "YamlRoundTrip cannot be derived for unions",
@@ -170,7 +176,7 @@ fn expand_named_struct(
     fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
     let struct_options = parse_struct_options(&attrs)?;
-    let fields = expand_fields(fields, struct_options.insert_order)?;
+    let fields = expand_fields(fields, struct_options.insert_order, FieldAccess::SelfFields)?;
     validate_struct_options(&name, &struct_options, fields.has_flatten)?;
 
     let ordered_keys_binding = match struct_options.insert_order {
@@ -426,6 +432,22 @@ struct UnitVariant {
     aliases: Vec<String>,
 }
 
+fn expand_enum(
+    attrs: Vec<Attribute>,
+    name: syn::Ident,
+    generics: syn::Generics,
+    variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
+) -> syn::Result<TokenStream2> {
+    if variants
+        .iter()
+        .all(|variant| matches!(variant.fields, Fields::Unit))
+    {
+        expand_unit_enum(attrs, name, generics, variants)
+    } else {
+        expand_tagged_enum(attrs, name, generics, variants)
+    }
+}
+
 fn expand_unit_enum(
     attrs: Vec<Attribute>,
     name: syn::Ident,
@@ -587,6 +609,707 @@ fn expand_unit_enum(
     })
 }
 
+struct PayloadField {
+    ty: syn::Type,
+    with: Option<Path>,
+}
+
+enum EnumVariantKind {
+    Unit,
+    Newtype(PayloadField),
+    Tuple(Vec<PayloadField>),
+    Struct {
+        fields: Vec<syn::Ident>,
+        expansion: FieldExpansion,
+    },
+}
+
+struct EnumVariant {
+    ident: syn::Ident,
+    canonical: String,
+    aliases: Vec<String>,
+    kind: EnumVariantKind,
+}
+
+fn expand_tagged_enum(
+    attrs: Vec<Attribute>,
+    name: syn::Ident,
+    generics: syn::Generics,
+    variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
+) -> syn::Result<TokenStream2> {
+    let options = parse_enum_options(&attrs)?;
+    let mut expanded = Vec::new();
+    let mut names = BTreeMap::<String, String>::new();
+    let mut read_bounds = Vec::new();
+    let mut write_bounds = Vec::new();
+
+    for variant in variants {
+        let variant_options = parse_variant_options(&variant.attrs)?;
+        let rust_name = variant.ident.to_string();
+        let canonical = variant_options
+            .rename
+            .unwrap_or_else(|| apply_rename_rule(&rust_name, options.rename_all));
+        for accepted in std::iter::once(&canonical).chain(variant_options.aliases.iter()) {
+            if let Some(previous) = names.insert(accepted.clone(), rust_name.clone()) {
+                return Err(syn::Error::new_spanned(
+                    &variant.ident,
+                    format!(
+                        "yaml enum variant name `{accepted}` is used by both `{previous}` and `{rust_name}`"
+                    ),
+                ));
+            }
+        }
+
+        let kind = match variant.fields {
+            Fields::Unit => EnumVariantKind::Unit,
+            Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                validate_enum_tag_names(&variant.ident, &canonical, &variant_options.aliases)?;
+                let field = parse_payload_field(
+                    fields
+                        .unnamed
+                        .into_iter()
+                        .next()
+                        .expect("one unnamed field was checked"),
+                    &mut read_bounds,
+                    &mut write_bounds,
+                )?;
+                EnumVariantKind::Newtype(field)
+            }
+            Fields::Unnamed(fields) => {
+                validate_enum_tag_names(&variant.ident, &canonical, &variant_options.aliases)?;
+                let fields = fields
+                    .unnamed
+                    .into_iter()
+                    .map(|field| parse_payload_field(field, &mut read_bounds, &mut write_bounds))
+                    .collect::<syn::Result<Vec<_>>>()?;
+                EnumVariantKind::Tuple(fields)
+            }
+            Fields::Named(fields) => {
+                validate_enum_tag_names(&variant.ident, &canonical, &variant_options.aliases)?;
+                let field_names = fields
+                    .named
+                    .iter()
+                    .filter_map(|field| field.ident.clone())
+                    .collect::<Vec<_>>();
+                let expansion =
+                    expand_fields(fields.named, InsertOrder::Append, FieldAccess::Bindings)?;
+                validate_struct_options(
+                    &variant.ident,
+                    &StructOptions::default(),
+                    expansion.has_flatten,
+                )?;
+                read_bounds.extend(expansion.read_bounds.iter().cloned());
+                write_bounds.extend(expansion.write_bounds.iter().cloned());
+                EnumVariantKind::Struct {
+                    fields: field_names,
+                    expansion,
+                }
+            }
+        };
+        expanded.push(EnumVariant {
+            ident: variant.ident,
+            canonical,
+            aliases: variant_options.aliases,
+            kind,
+        });
+    }
+
+    let expected_units = expanded
+        .iter()
+        .filter(|variant| matches!(variant.kind, EnumVariantKind::Unit))
+        .map(|variant| variant.canonical.as_str())
+        .collect::<Vec<_>>();
+    let expected_tags = expanded
+        .iter()
+        .filter(|variant| !matches!(variant.kind, EnumVariantKind::Unit))
+        .map(|variant| variant.canonical.as_str())
+        .collect::<Vec<_>>();
+    let unit_read_arms = expanded
+        .iter()
+        .filter(|variant| matches!(variant.kind, EnumVariantKind::Unit))
+        .map(|variant| {
+            let ident = &variant.ident;
+            let accepted = accepted_variant_names(variant);
+            quote! { #(#accepted)|* => Ok(Self::#ident) }
+        })
+        .collect::<Vec<_>>();
+    let tagged_read_arms = expanded
+        .iter()
+        .filter(|variant| !matches!(variant.kind, EnumVariantKind::Unit))
+        .map(tagged_variant_read_arm)
+        .collect::<Vec<_>>();
+    let write_arms = expanded
+        .iter()
+        .map(enum_variant_write_arm)
+        .collect::<Vec<_>>();
+    let fragment_arms = expanded
+        .iter()
+        .map(enum_variant_fragment_arm)
+        .collect::<Vec<_>>();
+
+    let read_body = quote! {
+        let __yaml_rt_raw_tag = doc.raw_tag(node);
+        let __yaml_rt_local_tag = __yaml_rt_raw_tag.and_then(|tag| {
+            let suffix = tag.strip_prefix('!')?;
+            (!suffix.is_empty()
+                && !suffix.starts_with('!')
+                && !suffix.starts_with('<'))
+                .then_some(suffix)
+        });
+        if let Some(tag) = __yaml_rt_local_tag {
+            match tag {
+                #(#tagged_read_arms,)*
+                _ => Err(::yaml_rt::__typed_node_error(
+                    doc,
+                    node,
+                    format!("unknown YAML enum tag `!{tag}`"),
+                    &[#(#expected_tags),*],
+                )),
+            }
+        } else if __yaml_rt_raw_tag.is_some_and(|tag| {
+            tag.starts_with('!') && !tag.starts_with("!!")
+        }) {
+            Err(::yaml_rt::__typed_node_error(
+                doc,
+                node,
+                format!(
+                    "unknown YAML enum tag `{}`",
+                    __yaml_rt_raw_tag.unwrap_or_default()
+                ),
+                &[#(#expected_tags),*],
+            ))
+        } else if matches!(
+            doc.semantic_kind(node),
+            Some(::yaml_rt::SemanticKind::Scalar { .. })
+        ) {
+            let value = <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)?;
+            match value.as_str() {
+                #(#unit_read_arms,)*
+                _ => Err(::yaml_rt::__typed_node_error(
+                    doc,
+                    node,
+                    format!("unknown YAML enum variant `{value}`"),
+                    &[#(#expected_units),*],
+                )),
+            }
+        } else {
+            Err(::yaml_rt::__typed_node_error(
+                doc,
+                node,
+                "enum data variant requires a local YAML tag",
+                &[#(#expected_tags),*],
+            ))
+        }
+    };
+
+    let mut read_generics = generics.clone();
+    read_generics
+        .make_where_clause()
+        .predicates
+        .extend(read_bounds.iter().cloned());
+    let mut write_generics = generics.clone();
+    write_generics
+        .make_where_clause()
+        .predicates
+        .extend(write_bounds.iter().cloned());
+    let mut combined_generics = generics;
+    combined_generics
+        .make_where_clause()
+        .predicates
+        .extend(read_bounds);
+    combined_generics
+        .make_where_clause()
+        .predicates
+        .extend(write_bounds);
+    let (read_impl_generics, read_type_generics, read_where_clause) =
+        read_generics.split_for_impl();
+    let (write_impl_generics, write_type_generics, write_where_clause) =
+        write_generics.split_for_impl();
+    let (combined_impl_generics, combined_type_generics, combined_where_clause) =
+        combined_generics.split_for_impl();
+
+    Ok(quote! {
+        impl #read_impl_generics ::yaml_rt::FromYamlDoc for #name #read_type_generics #read_where_clause {
+            fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
+                let node = doc.document_root(0)?.ok_or_else(|| {
+                    ::yaml_rt::YamlError::new(::yaml_rt::Diagnostic::new(
+                        ::yaml_rt::DiagnosticKind::Typed,
+                        "document does not contain a YAML enum value",
+                        ::yaml_rt::Span::empty(0),
+                    ))
+                })?;
+                #read_body
+            }
+        }
+
+        impl #combined_impl_generics ::yaml_rt::ToYamlDoc for #name #combined_type_generics #combined_where_clause {
+            fn apply_to_yaml_doc(&self, doc: &mut ::yaml_rt::YamlDoc) -> Result<(), ::yaml_rt::YamlError> {
+                ::yaml_rt::__write_yaml_document(self, doc)
+            }
+        }
+
+        impl #combined_impl_generics ::yaml_rt::YamlValue for #name #combined_type_generics #combined_where_clause {
+            fn read_yaml(
+                doc: &::yaml_rt::YamlDoc,
+                node: ::yaml_rt::NodeId,
+            ) -> Result<Self, ::yaml_rt::YamlError> {
+                #read_body
+            }
+
+            fn write_yaml(
+                &self,
+                doc: &mut ::yaml_rt::YamlDoc,
+                node: Option<::yaml_rt::NodeId>,
+            ) -> Result<::yaml_rt::NodeId, ::yaml_rt::YamlError> {
+                let node = node.ok_or_else(|| {
+                    ::yaml_rt::YamlError::new(::yaml_rt::Diagnostic::new(
+                        ::yaml_rt::DiagnosticKind::Typed,
+                        "cannot insert a standalone YAML enum without collection context",
+                        ::yaml_rt::Span::empty(0),
+                    ))
+                })?;
+                match self {
+                    #(#write_arms,)*
+                }
+            }
+        }
+
+        impl #write_impl_generics ::yaml_rt::ToYamlFragment for #name #write_type_generics #write_where_clause {
+            fn to_yaml_fragment(
+                &self,
+                indent: usize,
+                line_ending: &str,
+            ) -> Result<String, ::yaml_rt::YamlError> {
+                match self {
+                    #(#fragment_arms,)*
+                }
+            }
+        }
+    })
+}
+
+fn accepted_variant_names(variant: &EnumVariant) -> Vec<&String> {
+    std::iter::once(&variant.canonical)
+        .chain(variant.aliases.iter())
+        .collect()
+}
+
+fn validate_enum_tag_names(
+    ident: &syn::Ident,
+    canonical: &str,
+    aliases: &[String],
+) -> syn::Result<()> {
+    for name in std::iter::once(canonical).chain(aliases.iter().map(String::as_str)) {
+        if name.is_empty()
+            || !name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            return Err(syn::Error::new_spanned(
+                ident,
+                format!(
+                    "`{name}` is not a valid local YAML tag name; use only ASCII letters, digits, `_`, or `-`"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_payload_field(
+    field: syn::Field,
+    read_bounds: &mut Vec<WherePredicate>,
+    write_bounds: &mut Vec<WherePredicate>,
+) -> syn::Result<PayloadField> {
+    let options = parse_field_options(&field.attrs)?;
+    if options.rename.is_some()
+        || !options.aliases.is_empty()
+        || options.default.is_some()
+        || options.comment.is_some()
+        || options.skip
+        || options.skip_serializing_if.is_some()
+        || options.flatten
+    {
+        return Err(syn::Error::new_spanned(
+            &field,
+            "unnamed enum fields support only yaml(with)",
+        ));
+    }
+    let ty = field.ty;
+    if let Some(with) = &options.with {
+        read_bounds.push(syn::parse_quote! {
+            #with::Repr: ::yaml_rt::YamlValue
+        });
+        write_bounds.push(syn::parse_quote! {
+            #with::Repr: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
+        });
+    } else {
+        read_bounds.push(syn::parse_quote! {
+            #ty: ::yaml_rt::YamlValue
+        });
+        write_bounds.push(syn::parse_quote! {
+            #ty: ::yaml_rt::YamlValue + ::yaml_rt::ToYamlFragment
+        });
+    }
+    Ok(PayloadField {
+        ty,
+        with: options.with,
+    })
+}
+
+fn tagged_variant_read_arm(variant: &EnumVariant) -> TokenStream2 {
+    let ident = &variant.ident;
+    let accepted = accepted_variant_names(variant);
+    let read = match &variant.kind {
+        EnumVariantKind::Unit => unreachable!("unit variants do not use YAML tags"),
+        EnumVariantKind::Newtype(field) => {
+            let ty = &field.ty;
+            if let Some(with) = &field.with {
+                quote! {
+                    {
+                        let __yaml_rt_repr =
+                            ::yaml_rt::__read_tagged_yaml_value::<#with::Repr>(doc, node)?;
+                        Ok(Self::#ident(#with::from_yaml(__yaml_rt_repr)?))
+                    }
+                }
+            } else {
+                quote! {
+                    Ok(Self::#ident(
+                        ::yaml_rt::__read_tagged_yaml_value::<#ty>(doc, node)?
+                    ))
+                }
+            }
+        }
+        EnumVariantKind::Tuple(fields) => {
+            let arity = fields.len();
+            let reads = fields.iter().enumerate().map(|(index, field)| {
+                let ty = &field.ty;
+                if let Some(with) = &field.with {
+                    quote! {
+                        {
+                            let __yaml_rt_repr =
+                                <#with::Repr as ::yaml_rt::YamlValue>::read_yaml(
+                                    doc,
+                                    __yaml_rt_items[#index],
+                                )?;
+                            #with::from_yaml(__yaml_rt_repr)?
+                        }
+                    }
+                } else {
+                    quote! {
+                        <#ty as ::yaml_rt::YamlValue>::read_yaml(
+                            doc,
+                            __yaml_rt_items[#index],
+                        )?
+                    }
+                }
+            });
+            quote! {
+                {
+                    if !matches!(
+                        doc.semantic_kind(node),
+                        Some(::yaml_rt::SemanticKind::Sequence { .. })
+                    ) {
+                        return Err(::yaml_rt::__typed_node_error(
+                            doc,
+                            node,
+                            concat!(
+                                "YAML enum variant `",
+                                stringify!(#ident),
+                                "` requires a sequence payload"
+                            ),
+                            &["a YAML sequence"],
+                        ));
+                    }
+                    let __yaml_rt_items =
+                        doc.sequence_items(node).collect::<::std::vec::Vec<_>>();
+                    if __yaml_rt_items.len() != #arity {
+                        return Err(::yaml_rt::__typed_node_error(
+                            doc,
+                            node,
+                            format!(
+                                "YAML enum variant `{}` expects {} tuple fields, found {}",
+                                stringify!(#ident),
+                                #arity,
+                                __yaml_rt_items.len(),
+                            ),
+                            &[concat!(#arity, " sequence items")],
+                        ));
+                    }
+                    Ok(Self::#ident(#(#reads),*))
+                }
+            }
+        }
+        EnumVariantKind::Struct { expansion, .. } => {
+            let reads = &expansion.reads;
+            quote! {
+                ::yaml_rt::__read_mapping_fields(doc, node, |doc| {
+                    Ok(Self::#ident {
+                        #(#reads,)*
+                    })
+                })
+            }
+        }
+    };
+    quote! {
+        #(#accepted)|* => #read
+    }
+}
+
+fn enum_variant_write_arm(variant: &EnumVariant) -> TokenStream2 {
+    let ident = &variant.ident;
+    let accepted = accepted_variant_names(variant);
+    let same_tag = quote! {
+        doc.raw_tag(node)
+            .and_then(|tag| tag.strip_prefix('!'))
+            .is_some_and(|tag| matches!(tag, #(#accepted)|*))
+    };
+
+    match &variant.kind {
+        EnumVariantKind::Unit => {
+            quote! {
+                Self::#ident => {
+                    let __yaml_rt_has_local_tag = doc.raw_tag(node).is_some_and(|tag| {
+                        tag.starts_with('!') && !tag.starts_with("!!")
+                    });
+                    if !__yaml_rt_has_local_tag
+                        && <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)
+                            .is_ok_and(|value| matches!(value.as_str(), #(#accepted)|*))
+                    {
+                        Ok(node)
+                    } else {
+                        ::yaml_rt::__replace_yaml_value(self, doc, node)
+                    }
+                }
+            }
+        }
+        EnumVariantKind::Newtype(field) => {
+            let write = if let Some(with) = &field.with {
+                quote! {
+                    let __yaml_rt_repr = #with::to_yaml(value)?;
+                    ::yaml_rt::__write_tagged_yaml_value(
+                        &__yaml_rt_repr,
+                        doc,
+                        node,
+                    )
+                }
+            } else {
+                quote! {
+                    ::yaml_rt::__write_tagged_yaml_value(value, doc, node)
+                }
+            };
+            quote! {
+                Self::#ident(value) => {
+                    if #same_tag {
+                        #write
+                    } else {
+                        ::yaml_rt::__replace_yaml_value(self, doc, node)
+                    }
+                }
+            }
+        }
+        EnumVariantKind::Tuple(fields) => {
+            let arity = fields.len();
+            let bindings = (0..arity)
+                .map(|index| syn::Ident::new(&format!("field_{index}"), ident.span()))
+                .collect::<Vec<_>>();
+            let writes =
+                fields
+                    .iter()
+                    .zip(bindings.iter())
+                    .enumerate()
+                    .map(|(index, (field, binding))| {
+                        let ty = &field.ty;
+                        if let Some(with) = &field.with {
+                            quote! {
+                                let __yaml_rt_repr = #with::to_yaml(#binding)?;
+                                <#with::Repr as ::yaml_rt::YamlValue>::write_yaml(
+                                    &__yaml_rt_repr,
+                                    doc,
+                                    Some(__yaml_rt_items[#index]),
+                                )?;
+                            }
+                        } else {
+                            quote! {
+                                <#ty as ::yaml_rt::YamlValue>::write_yaml(
+                                    #binding,
+                                    doc,
+                                    Some(__yaml_rt_items[#index]),
+                                )?;
+                            }
+                        }
+                    });
+            quote! {
+                Self::#ident(#(#bindings),*) => {
+                    if !(#same_tag) {
+                        return ::yaml_rt::__replace_yaml_value(self, doc, node);
+                    }
+                    if !matches!(
+                        doc.semantic_kind(node),
+                        Some(::yaml_rt::SemanticKind::Sequence { .. })
+                    ) {
+                        return Err(::yaml_rt::__typed_node_error(
+                            doc,
+                            node,
+                            concat!(
+                                "YAML enum variant `",
+                                stringify!(#ident),
+                                "` requires a sequence payload"
+                            ),
+                            &["a YAML sequence"],
+                        ));
+                    }
+                    let __yaml_rt_items =
+                        doc.sequence_items(node).collect::<::std::vec::Vec<_>>();
+                    if __yaml_rt_items.len() != #arity {
+                        return Err(::yaml_rt::__typed_node_error(
+                            doc,
+                            node,
+                            format!(
+                                "YAML enum variant `{}` expects {} tuple fields, found {}",
+                                stringify!(#ident),
+                                #arity,
+                                __yaml_rt_items.len(),
+                            ),
+                            &[concat!(#arity, " sequence items")],
+                        ));
+                    }
+                    #(#writes)*
+                    Ok(node)
+                }
+            }
+        }
+        EnumVariantKind::Struct { fields, expansion } => {
+            let writes = &expansion.writes;
+            quote! {
+                Self::#ident { #(#fields),* } => {
+                    if !(#same_tag) {
+                        return ::yaml_rt::__replace_yaml_value(self, doc, node);
+                    }
+                    ::yaml_rt::__write_mapping_fields(doc, node, |doc| {
+                        let root = doc.root_mapping()?;
+                        #(#writes)*
+                        Ok(())
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn enum_variant_fragment_arm(variant: &EnumVariant) -> TokenStream2 {
+    let ident = &variant.ident;
+    let canonical = &variant.canonical;
+    match &variant.kind {
+        EnumVariantKind::Unit => quote! {
+            Self::#ident => <String as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                &#canonical.to_owned(),
+                indent,
+                line_ending,
+            )
+        },
+        EnumVariantKind::Newtype(field) => {
+            let payload = if let Some(with) = &field.with {
+                quote! {
+                    let __yaml_rt_repr = #with::to_yaml(value)?;
+                    <#with::Repr as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                        &__yaml_rt_repr,
+                        indent,
+                        line_ending,
+                    )?
+                }
+            } else {
+                let ty = &field.ty;
+                quote! {
+                    <#ty as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                        value,
+                        indent,
+                        line_ending,
+                    )?
+                }
+            };
+            quote! {
+                Self::#ident(value) => {
+                    let __yaml_rt_payload = { #payload };
+                    ::yaml_rt::__tag_yaml_fragment(
+                        #canonical,
+                        __yaml_rt_payload,
+                        indent,
+                        line_ending,
+                    )
+                }
+            }
+        }
+        EnumVariantKind::Tuple(fields) => {
+            let bindings = (0..fields.len())
+                .map(|index| syn::Ident::new(&format!("field_{index}"), ident.span()))
+                .collect::<Vec<_>>();
+            let fragments = fields.iter().zip(bindings.iter()).map(|(field, binding)| {
+                let ty = &field.ty;
+                if let Some(with) = &field.with {
+                    quote! {
+                        {
+                            let __yaml_rt_repr = #with::to_yaml(#binding)?;
+                            <#with::Repr as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                                &__yaml_rt_repr,
+                                indent + 2,
+                                line_ending,
+                            )?
+                        }
+                    }
+                } else {
+                    quote! {
+                        <#ty as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                            #binding,
+                            indent + 2,
+                            line_ending,
+                        )?
+                    }
+                }
+            });
+            quote! {
+                Self::#ident(#(#bindings),*) => {
+                    let __yaml_rt_fields = [#(#fragments),*];
+                    let __yaml_rt_payload = ::yaml_rt::__sequence_fields_to_yaml_fragment(
+                        &__yaml_rt_fields,
+                        indent,
+                        line_ending,
+                    );
+                    ::yaml_rt::__tag_yaml_fragment(
+                        #canonical,
+                        __yaml_rt_payload,
+                        indent,
+                        line_ending,
+                    )
+                }
+            }
+        }
+        EnumVariantKind::Struct { fields, expansion } => {
+            let writes = &expansion.writes;
+            quote! {
+                Self::#ident { #(#fields),* } => {
+                    let __yaml_rt_payload =
+                        ::yaml_rt::__mapping_fields_to_yaml_fragment(
+                            indent,
+                            line_ending,
+                            |doc| {
+                                let root = doc.root_mapping()?;
+                                #(#writes)*
+                                Ok(())
+                            },
+                        )?;
+                    ::yaml_rt::__tag_yaml_fragment(
+                        #canonical,
+                        __yaml_rt_payload,
+                        indent,
+                        line_ending,
+                    )
+                }
+            }
+        }
+    }
+}
+
 fn apply_rename_rule(name: &str, rule: Option<RenameRule>) -> String {
     let name = name.strip_prefix("r#").unwrap_or(name);
     match rule {
@@ -619,6 +1342,7 @@ fn variant_snake_case(name: &str) -> String {
 fn expand_fields(
     fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
     insert_order: InsertOrder,
+    access: FieldAccess,
 ) -> syn::Result<FieldExpansion> {
     let mut expansion = FieldExpansion::default();
 
@@ -633,7 +1357,7 @@ fn expand_fields(
         let field_type = field.ty;
         if options.flatten {
             expansion.has_flatten = true;
-            push_flatten_field(&mut expansion, &field_name, &field_type, &options)?;
+            push_flatten_field(&mut expansion, &field_name, &field_type, &options, access)?;
             continue;
         }
 
@@ -643,6 +1367,7 @@ fn expand_fields(
             &field_type,
             &options,
             insert_order,
+            access,
         )?;
     }
 
@@ -654,6 +1379,7 @@ fn push_flatten_field(
     field_name: &syn::Ident,
     field_type: &syn::Type,
     options: &FieldOptions,
+    access: FieldAccess,
 ) -> syn::Result<()> {
     if options.skip {
         return Err(syn::Error::new_spanned(
@@ -688,8 +1414,9 @@ fn push_flatten_field(
     expansion.reads.push(quote! {
         #field_name: <#field_type as ::yaml_rt::FromYamlDoc>::from_yaml_doc(doc)?
     });
+    let field_value = field_reference(field_name, access);
     expansion.writes.push(quote! {
-        ::yaml_rt::ToYamlDoc::apply_to_yaml_doc(&self.#field_name, doc)?;
+        ::yaml_rt::ToYamlDoc::apply_to_yaml_doc(#field_value, doc)?;
     });
     Ok(())
 }
@@ -700,6 +1427,7 @@ fn push_regular_field(
     field_type: &syn::Type,
     options: &FieldOptions,
     insert_order: InsertOrder,
+    access: FieldAccess,
 ) -> syn::Result<()> {
     let yaml_key = options
         .rename
@@ -718,6 +1446,7 @@ fn push_regular_field(
         quote! { None }
     };
     let skip_serializing_if = options.skip_serializing_if.clone();
+    let field_value = field_reference(field_name, access);
 
     if options.skip {
         if options.with.is_some() {
@@ -764,7 +1493,7 @@ fn push_regular_field(
                 },
                 quote! { #with::Repr },
                 quote! {
-                    let __yaml_rt_repr = #with::to_yaml(&self.#field_name)?;
+                    let __yaml_rt_repr = #with::to_yaml(#field_value)?;
                 },
                 quote! { &__yaml_rt_repr },
             )
@@ -788,7 +1517,7 @@ fn push_regular_field(
                 },
                 quote! { #field_type },
                 quote! {},
-                quote! { &self.#field_name },
+                field_value.clone(),
             )
         };
     let read_value = if let Some(default) = options.default.clone() {
@@ -827,7 +1556,7 @@ fn push_regular_field(
     };
     push_field_write(
         &mut expansion.writes,
-        field_name,
+        &field_value,
         &yaml_key,
         &aliases,
         skip_serializing_if,
@@ -883,7 +1612,7 @@ fn write_field_tokens(
 
 fn push_field_write(
     field_writes: &mut Vec<TokenStream2>,
-    field_name: &syn::Ident,
+    field_value: &TokenStream2,
     yaml_key: &str,
     aliases: &[String],
     skip_serializing_if: Option<Path>,
@@ -891,7 +1620,7 @@ fn push_field_write(
 ) {
     if let Some(predicate) = skip_serializing_if {
         field_writes.push(quote! {
-            if #predicate(&self.#field_name) {
+            if #predicate(#field_value) {
                 if doc.get_mapping_entry(root, #yaml_key)?.is_some() {
                     doc.remove_mapping_entry(root, #yaml_key)?;
                 } else {
@@ -907,6 +1636,13 @@ fn push_field_write(
         });
     } else {
         field_writes.push(write_field);
+    }
+}
+
+fn field_reference(field_name: &syn::Ident, access: FieldAccess) -> TokenStream2 {
+    match access {
+        FieldAccess::SelfFields => quote! { &self.#field_name },
+        FieldAccess::Bindings => quote! { #field_name },
     }
 }
 

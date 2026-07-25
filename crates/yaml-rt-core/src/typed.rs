@@ -242,6 +242,29 @@ pub fn __mapping_overlay_to_yaml_fragment<T>(
 where
     T: ToYamlDoc,
 {
+    mapping_fields_to_yaml_fragment(indent, line_ending, |doc| value.apply_to_yaml_doc(doc))
+}
+
+#[doc(hidden)]
+pub fn __mapping_fields_to_yaml_fragment<F>(
+    indent: usize,
+    line_ending: &str,
+    apply: F,
+) -> Result<String, YamlError>
+where
+    F: FnOnce(&mut YamlDoc) -> Result<(), YamlError>,
+{
+    mapping_fields_to_yaml_fragment(indent, line_ending, apply)
+}
+
+fn mapping_fields_to_yaml_fragment<F>(
+    indent: usize,
+    line_ending: &str,
+    apply: F,
+) -> Result<String, YamlError>
+where
+    F: FnOnce(&mut YamlDoc) -> Result<(), YamlError>,
+{
     let mut doc = YamlDoc::parse("root:\n  __rty_placeholder: null\n")?;
     let root = doc.get_path(&["root"])?.ok_or_else(|| {
         YamlError::new(Diagnostic::new(
@@ -251,7 +274,7 @@ where
         ))
     })?;
     let mut nested = doc.rerooted_at_mapping(root)?;
-    value.apply_to_yaml_doc(&mut nested)?;
+    apply(&mut nested)?;
     doc.queue_edits_from(&nested)?;
     let rendered = doc.to_string();
     let nested_indent = "  ";
@@ -302,6 +325,116 @@ where
 }
 
 #[doc(hidden)]
+pub fn __read_mapping_fields<T, F>(doc: &YamlDoc, node: NodeId, read: F) -> Result<T, YamlError>
+where
+    F: FnOnce(&YamlDoc) -> Result<T, YamlError>,
+{
+    let nested = doc.rerooted_at_mapping(node)?;
+    read(&nested)
+}
+
+#[doc(hidden)]
+pub fn __write_mapping_fields<F>(
+    doc: &mut YamlDoc,
+    node: NodeId,
+    write: F,
+) -> Result<NodeId, YamlError>
+where
+    F: FnOnce(&mut YamlDoc) -> Result<(), YamlError>,
+{
+    let mut nested = doc.rerooted_at_mapping(node)?;
+    write(&mut nested)?;
+    doc.queue_edits_from(&nested)?;
+    Ok(node)
+}
+
+#[doc(hidden)]
+pub fn __read_tagged_yaml_value<T>(doc: &YamlDoc, node: NodeId) -> Result<T, YamlError>
+where
+    T: YamlValue,
+{
+    let nested = doc.rerooted_without_tag(node)?;
+    T::read_yaml(&nested, node)
+}
+
+#[doc(hidden)]
+pub fn __write_tagged_yaml_value<T>(
+    value: &T,
+    doc: &mut YamlDoc,
+    node: NodeId,
+) -> Result<NodeId, YamlError>
+where
+    T: YamlValue,
+{
+    let mut nested = doc.rerooted_without_tag(node)?;
+    value.write_yaml(&mut nested, Some(node))?;
+    doc.queue_edits_from(&nested)?;
+    Ok(node)
+}
+
+#[doc(hidden)]
+pub fn __tag_yaml_fragment(
+    tag: &str,
+    payload: String,
+    indent: usize,
+    line_ending: &str,
+) -> Result<String, YamlError> {
+    if tag.is_empty()
+        || !tag
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Emitter,
+                format!("`{tag}` is not a valid local YAML enum tag"),
+                Span::empty(0),
+            )
+            .with_expected("an ASCII alphanumeric, underscore, or hyphen tag name"),
+        ));
+    }
+    let fragment = parse_typed_fragment(&payload)?;
+    let is_block_collection = matches!(
+        fragment.document().semantic_kind(fragment.root()),
+        Some(
+            SemanticKind::Mapping {
+                style: crate::CollectionStyle::Block
+            } | SemanticKind::Sequence {
+                style: crate::CollectionStyle::Block
+            }
+        )
+    );
+    if is_block_collection || payload.contains('\n') || payload.starts_with(' ') {
+        Ok(format!(
+            "{}!{tag}{line_ending}{payload}",
+            " ".repeat(indent)
+        ))
+    } else {
+        Ok(format!("!{tag} {payload}"))
+    }
+}
+
+#[doc(hidden)]
+pub fn __sequence_fields_to_yaml_fragment(
+    fields: &[String],
+    indent: usize,
+    line_ending: &str,
+) -> String {
+    if fields.is_empty() {
+        return "[]".to_owned();
+    }
+    let indent_text = " ".repeat(indent);
+    let mut output = String::new();
+    for (index, field) in fields.iter().enumerate() {
+        if index > 0 {
+            output.push_str(line_ending);
+        }
+        push_block_sequence_item(&mut output, &indent_text, field, line_ending);
+    }
+    output
+}
+
+#[doc(hidden)]
 pub fn __read_yaml_document<T>(doc: &YamlDoc) -> Result<T, YamlError>
 where
     T: YamlValue,
@@ -337,6 +470,10 @@ where
     if let Some(anchor) = doc.anchor(node).map(str::to_owned) {
         preserve_fragment_root_anchor(&mut yaml, &anchor)?;
     }
+    if let Some(comment) = trailing_inline_comment(doc, node)? {
+        yaml.push(' ');
+        yaml.push_str(&comment);
+    }
     let fragment = parse_typed_fragment(&yaml)?;
     doc.queue_fragment_replacement(node, &fragment)
         .map_err(YamlEditError::into_yaml_error)?;
@@ -368,6 +505,25 @@ fn preserve_fragment_root_anchor(yaml: &mut String, anchor: &str) -> Result<(), 
         yaml.insert_str(0, &format!("&{anchor} "));
     }
     Ok(())
+}
+
+fn trailing_inline_comment(doc: &YamlDoc, node: NodeId) -> Result<Option<String>, YamlError> {
+    let span = doc.expect_node(node)?.span();
+    let comment = doc.tokens()?.into_iter().rfind(|token| {
+        token.kind == crate::TokenKind::Comment
+            && token.span.start >= span.start
+            && token.span.end <= span.end
+    });
+    let Some(comment) = comment else {
+        return Ok(None);
+    };
+    let before = doc
+        .source()
+        .slice(Span::new(span.start, comment.span.start));
+    if before.contains(['\n', '\r']) {
+        return Ok(None);
+    }
+    Ok(Some(doc.source().slice(comment.span).to_owned()))
 }
 
 fn parse_typed_fragment(yaml: &str) -> Result<YamlFragment, YamlError> {

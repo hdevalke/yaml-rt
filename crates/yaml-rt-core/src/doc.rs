@@ -984,6 +984,12 @@ impl YamlDoc {
         Ok(doc)
     }
 
+    pub(crate) fn rerooted_without_tag(&self, root: NodeId) -> Result<Self, YamlError> {
+        let mut doc = self.rerooted_at(root)?;
+        doc.semantics.clear_tag(root);
+        Ok(doc)
+    }
+
     pub(crate) fn rerooted_at_mapping(&self, mapping: NodeId) -> Result<Self, YamlError> {
         let mapping_node = self.expect_node(mapping)?;
         if !matches!(

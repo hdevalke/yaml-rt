@@ -123,6 +123,15 @@ impl SemanticStore {
         (node.property != NO_PROPERTIES).then(|| self.properties[node.property as usize].properties)
     }
 
+    pub(crate) fn clear_tag(&mut self, cst: NodeId) {
+        let Some(property) = self.get(cst).map(|node| node.property) else {
+            return;
+        };
+        if property != NO_PROPERTIES {
+            self.properties[property as usize].properties.tag = None;
+        }
+    }
+
     pub(crate) fn property_document(&self, cst: NodeId) -> Option<NodeId> {
         let node = self.get(cst)?;
         (node.property != NO_PROPERTIES).then(|| self.properties[node.property as usize].document)

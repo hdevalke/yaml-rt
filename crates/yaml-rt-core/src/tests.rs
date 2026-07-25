@@ -3948,6 +3948,22 @@ impl ToYamlDoc for Config {
     }
 }
 
+impl YamlValue for Config {
+    fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        __read_mapping_overlay(doc, node)
+    }
+
+    fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
+        __write_mapping_overlay(self, doc, node)
+    }
+}
+
+impl ToYamlFragment for Config {
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        __mapping_overlay_to_yaml_fragment(self, indent, line_ending)
+    }
+}
+
 #[test]
 fn yaml_value_reads_and_writes_scalar_values() {
     let mut doc =
@@ -4419,6 +4435,50 @@ fn yaml_value_reads_and_writes_btree_map_values() {
   high: 7
 "
     );
+}
+
+#[test]
+fn yaml_value_supports_common_standard_library_config_shapes() {
+    let mut doc = YamlDoc::parse(
+        "unsigned: 340282366920938463463374607431768211455\nsigned: -170141183460469231731687303715884105728\nletter: é\nboxed: 7\nfixed: [1, 2]\nlabels:\n  z: 1\n  \"true\": 2\n",
+    )
+    .expect("valid configuration values");
+
+    let unsigned = doc.get_path(&["unsigned"]).unwrap().unwrap();
+    let signed = doc.get_path(&["signed"]).unwrap().unwrap();
+    let letter = doc.get_path(&["letter"]).unwrap().unwrap();
+    let boxed = doc.get_path(&["boxed"]).unwrap().unwrap();
+    let fixed = doc.get_path(&["fixed"]).unwrap().unwrap();
+    let labels = doc.get_path(&["labels"]).unwrap().unwrap();
+
+    assert_eq!(u128::read_yaml(&doc, unsigned).unwrap(), u128::MAX);
+    assert_eq!(i128::read_yaml(&doc, signed).unwrap(), i128::MIN);
+    assert_eq!(char::read_yaml(&doc, letter).unwrap(), 'é');
+    assert_eq!(Box::<u16>::read_yaml(&doc, boxed).unwrap(), Box::new(7));
+    assert_eq!(<[u16; 2]>::read_yaml(&doc, fixed).unwrap(), [1, 2]);
+
+    let mut replacement = std::collections::HashMap::new();
+    replacement.insert("true".to_owned(), 3_u16);
+    replacement.insert("a".to_owned(), 4_u16);
+    replacement
+        .write_yaml(&mut doc, Some(labels))
+        .expect("hash map writes deterministically");
+
+    assert_eq!(
+        doc.to_string(),
+        "unsigned: 340282366920938463463374607431768211455\nsigned: -170141183460469231731687303715884105728\nletter: é\nboxed: 7\nfixed: [1, 2]\nlabels:\n  \"true\": 3\n  a: 4\n"
+    );
+}
+
+#[test]
+fn yaml_array_reports_a_span_aware_length_error() {
+    let doc = YamlDoc::parse("fixed: [1]\n").expect("valid short array");
+    let fixed = doc.get_path(&["fixed"]).unwrap().unwrap();
+
+    let error = <[u16; 2]>::read_yaml(&doc, fixed).expect_err("array length must match");
+
+    assert!(error.to_string().contains("expected sequence with 2 items"));
+    assert!(error.diagnostic.position.is_some());
 }
 
 #[test]

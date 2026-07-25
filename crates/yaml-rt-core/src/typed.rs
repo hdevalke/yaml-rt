@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use crate::edit::closing_delimiter_offset;
 use crate::{
@@ -117,7 +119,15 @@ impl ToYamlFragment for bool {
     }
 }
 
-impl_plain_yaml_fragment!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
+impl_plain_yaml_fragment!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64
+);
+
+impl ToYamlFragment for char {
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        self.to_string().to_yaml_fragment(indent, line_ending)
+    }
+}
 
 impl<T> ToYamlFragment for Option<T>
 where
@@ -136,19 +146,25 @@ where
     T: ToYamlFragment,
 {
     fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
-        if self.is_empty() {
-            return Ok("[]".to_owned());
-        }
-        let indent_text = " ".repeat(indent);
-        let mut output = String::new();
-        for (index, value) in self.iter().enumerate() {
-            if index > 0 {
-                output.push_str(line_ending);
-            }
-            let value = value.to_yaml_fragment(indent + 2, line_ending)?;
-            push_block_sequence_item(&mut output, &indent_text, &value, line_ending);
-        }
-        Ok(output)
+        sequence_yaml_fragment(self, indent, line_ending)
+    }
+}
+
+impl<T, const N: usize> ToYamlFragment for [T; N]
+where
+    T: ToYamlFragment,
+{
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        sequence_yaml_fragment(self, indent, line_ending)
+    }
+}
+
+impl<T> ToYamlFragment for Box<T>
+where
+    T: ToYamlFragment,
+{
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        (**self).to_yaml_fragment(indent, line_ending)
     }
 }
 
@@ -163,12 +179,12 @@ where
         let indent_text = " ".repeat(indent);
         let mut output = String::new();
         for (index, (key, value)) in self.iter().enumerate() {
-            validate_plain_mapping_fragment(key, "mapping key")?;
+            validate_yaml_chars(key)?;
             if index > 0 {
                 output.push_str(line_ending);
             }
             output.push_str(&indent_text);
-            output.push_str(key);
+            output.push_str(&crate::edit::emit_string_key(key));
             let value = value.to_yaml_fragment(indent + 2, line_ending)?;
             if value.contains('\n') || value.starts_with(' ') {
                 output.push(':');
@@ -183,44 +199,106 @@ where
     }
 }
 
-impl<T> ToYamlFragment for T
+impl<T, S> ToYamlFragment for HashMap<String, T, S>
+where
+    T: ToYamlFragment,
+    S: BuildHasher,
+{
+    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
+        if self.is_empty() {
+            return Ok("{}".to_owned());
+        }
+        let indent_text = " ".repeat(indent);
+        let mut entries = self.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut output = String::new();
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            validate_yaml_chars(key)?;
+            if index > 0 {
+                output.push_str(line_ending);
+            }
+            output.push_str(&indent_text);
+            output.push_str(&crate::edit::emit_string_key(key));
+            let value = value.to_yaml_fragment(indent + 2, line_ending)?;
+            if value.contains('\n') || value.starts_with(' ') {
+                output.push(':');
+                output.push_str(line_ending);
+                output.push_str(&value);
+            } else {
+                output.push_str(": ");
+                output.push_str(&value);
+            }
+        }
+        Ok(output)
+    }
+}
+
+#[doc(hidden)]
+pub fn __mapping_overlay_to_yaml_fragment<T>(
+    value: &T,
+    indent: usize,
+    line_ending: &str,
+) -> Result<String, YamlError>
 where
     T: ToYamlDoc,
 {
-    fn to_yaml_fragment(&self, indent: usize, line_ending: &str) -> Result<String, YamlError> {
-        let mut doc = YamlDoc::parse("root:\n  __rty_placeholder: null\n")?;
-        let root = doc.get_path(&["root"])?.ok_or_else(|| {
-            YamlError::new(Diagnostic::new(
-                DiagnosticKind::Emitter,
-                "temporary nested mapping root was not created",
-                Span::empty(0),
-            ))
-        })?;
-        let mut nested = doc.rerooted_at_mapping(root)?;
-        self.apply_to_yaml_doc(&mut nested)?;
-        doc.queue_edits_from(&nested)?;
-        let rendered = doc.to_string();
-        let nested_indent = "  ";
-        let output_indent = " ".repeat(indent);
-        let mut output = String::new();
+    let mut doc = YamlDoc::parse("root:\n  __rty_placeholder: null\n")?;
+    let root = doc.get_path(&["root"])?.ok_or_else(|| {
+        YamlError::new(Diagnostic::new(
+            DiagnosticKind::Emitter,
+            "temporary nested mapping root was not created",
+            Span::empty(0),
+        ))
+    })?;
+    let mut nested = doc.rerooted_at_mapping(root)?;
+    value.apply_to_yaml_doc(&mut nested)?;
+    doc.queue_edits_from(&nested)?;
+    let rendered = doc.to_string();
+    let nested_indent = "  ";
+    let output_indent = " ".repeat(indent);
+    let mut output = String::new();
 
-        for line in rendered.lines().skip(1) {
-            if line.trim_start().starts_with("__rty_placeholder:") {
-                continue;
-            }
-            if !output.is_empty() {
-                output.push_str(line_ending);
-            }
-            if line.is_empty() {
-                continue;
-            }
-            let line = line.strip_prefix(nested_indent).unwrap_or(line);
-            output.push_str(&output_indent);
-            output.push_str(line);
+    for line in rendered.lines().skip(1) {
+        if line.trim_start().starts_with("__rty_placeholder:") {
+            continue;
         }
-
-        Ok(output)
+        if !output.is_empty() {
+            output.push_str(line_ending);
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let line = line.strip_prefix(nested_indent).unwrap_or(line);
+        output.push_str(&output_indent);
+        output.push_str(line);
     }
+
+    Ok(output)
+}
+
+#[doc(hidden)]
+pub fn __read_mapping_overlay<T>(doc: &YamlDoc, node: NodeId) -> Result<T, YamlError>
+where
+    T: FromYamlDoc,
+{
+    let nested = doc.rerooted_at_mapping(node)?;
+    T::from_yaml_doc(&nested)
+}
+
+#[doc(hidden)]
+pub fn __write_mapping_overlay<T>(
+    value: &T,
+    doc: &mut YamlDoc,
+    node: Option<NodeId>,
+) -> Result<NodeId, YamlError>
+where
+    T: ToYamlDoc,
+{
+    let node = node.ok_or_else(missing_write_node_error)?;
+    let mut nested = doc.rerooted_at_mapping(node)?;
+    value.apply_to_yaml_doc(&mut nested)?;
+    doc.queue_edits_from(&nested)?;
+    Ok(node)
 }
 
 fn missing_write_node_error() -> YamlError {
@@ -374,6 +452,29 @@ fn push_block_sequence_item(
         output.push_str("- ");
         output.push_str(fragment);
     }
+}
+
+fn sequence_yaml_fragment<T>(
+    values: &[T],
+    indent: usize,
+    line_ending: &str,
+) -> Result<String, YamlError>
+where
+    T: ToYamlFragment,
+{
+    if values.is_empty() {
+        return Ok("[]".to_owned());
+    }
+    let indent_text = " ".repeat(indent);
+    let mut output = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push_str(line_ending);
+        }
+        let value = value.to_yaml_fragment(indent + 2, line_ending)?;
+        push_block_sequence_item(&mut output, &indent_text, &value, line_ending);
+    }
+    Ok(output)
 }
 
 fn missing_collection_item_error(doc: &YamlDoc, node: &Node, collection: &str) -> YamlError {
@@ -618,9 +719,49 @@ macro_rules! impl_yaml_float {
     };
 }
 
-impl_yaml_unsigned!(u8, u16, u32, u64, usize);
-impl_yaml_signed!(i8, i16, i32, i64, isize);
+impl_yaml_unsigned!(u8, u16, u32, u64, u128, usize);
+impl_yaml_signed!(i8, i16, i32, i64, i128, isize);
 impl_yaml_float!(f32, f64);
+
+impl YamlValue for char {
+    fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        let value = doc.scalar_value(node)?;
+        let mut characters = value.chars();
+        let Some(character) = characters.next() else {
+            return Err(typed_parse_error(doc, node, "char", &value));
+        };
+        if characters.next().is_some() {
+            return Err(typed_parse_error(doc, node, "char", &value));
+        }
+        Ok(character)
+    }
+
+    fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
+        if let Some(node) = node
+            && Self::read_yaml(doc, node)? == *self
+        {
+            return Ok(node);
+        }
+        write_existing_scalar(doc, node, &self.to_string(), true)
+    }
+}
+
+impl<T> YamlValue for Box<T>
+where
+    T: YamlValue,
+{
+    fn read_yaml_field(doc: &YamlDoc, node: Option<NodeId>, key: &str) -> Result<Self, YamlError> {
+        T::read_yaml_field(doc, node, key).map(Box::new)
+    }
+
+    fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        T::read_yaml(doc, node).map(Box::new)
+    }
+
+    fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
+        (**self).write_yaml(doc, node)
+    }
+}
 
 impl<T> YamlValue for Option<T>
 where
@@ -657,52 +798,29 @@ where
     }
 }
 
-impl<T> YamlValue for Vec<T>
+fn read_yaml_sequence<T>(doc: &YamlDoc, node: NodeId) -> Result<Vec<T>, YamlError>
 where
-    T: YamlValue + ToYamlFragment,
+    T: YamlValue,
 {
-    fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        let sequence = doc.expect_node(node)?;
-        let mut values = Vec::new();
+    let sequence = doc.expect_node(node)?;
+    let mut values = Vec::new();
 
-        match sequence.kind {
-            NodeKind::BlockSequence => {
-                for entry in doc.children(node) {
-                    let entry_node = doc.expect_node(entry)?;
-                    let Some(value_node) = doc.children(entry).next() else {
-                        return Err(missing_collection_item_error(doc, entry_node, "sequence"));
-                    };
-                    values.push(T::read_yaml(doc, value_node)?);
-                }
-            }
-            NodeKind::FlowSequence => {
-                for value_node in doc.sequence_items(node) {
-                    values.push(T::read_yaml(doc, value_node)?);
-                }
-            }
-            _ => {
-                return Err(YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Typed,
-                        format!("expected sequence, found {:?}", sequence.kind),
-                        sequence.span,
-                    )
-                    .with_expected("BlockSequence or FlowSequence"),
-                )
-                .with_position_from(&doc.source));
+    match sequence.kind {
+        NodeKind::BlockSequence => {
+            for entry in doc.children(node) {
+                let entry_node = doc.expect_node(entry)?;
+                let Some(value_node) = doc.children(entry).next() else {
+                    return Err(missing_collection_item_error(doc, entry_node, "sequence"));
+                };
+                values.push(T::read_yaml(doc, value_node)?);
             }
         }
-
-        Ok(values)
-    }
-
-    fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
-        let node = node.ok_or_else(missing_write_node_error)?;
-        let sequence = doc.expect_node(node)?;
-        if !matches!(
-            sequence.kind,
-            NodeKind::BlockSequence | NodeKind::FlowSequence
-        ) {
+        NodeKind::FlowSequence => {
+            for value_node in doc.sequence_items(node) {
+                values.push(T::read_yaml(doc, value_node)?);
+            }
+        }
+        _ => {
             return Err(YamlError::new(
                 Diagnostic::new(
                     DiagnosticKind::Typed,
@@ -713,46 +831,112 @@ where
             )
             .with_position_from(&doc.source));
         }
-        let sequence_kind = sequence.kind;
-        let tail_indent = doc.node_indent(sequence);
-        let insertion_offset = doc.sequence_insertion_offset(sequence);
-        let items = doc.sequence_items(node).collect::<Vec<_>>();
-        let common_len = items.len().min(self.len());
-        for (value_node, value) in items.iter().copied().take(common_len).zip(self) {
-            value.write_yaml(doc, Some(value_node))?;
-        }
+    }
 
-        if self.len() > items.len() {
-            if sequence_kind == NodeKind::FlowSequence {
-                let sequence = doc.expect_node(node)?;
-                let close = closing_delimiter_offset(doc, sequence.span, ']')
-                    .map_err(crate::YamlEditError::into_yaml_error)?;
-                let mut replacement = String::new();
-                for (index, value) in self[items.len()..].iter().enumerate() {
-                    if !items.is_empty() || index > 0 {
-                        replacement.push_str(", ");
-                    }
-                    replacement.push_str(&format_value_as_flow_fragment(doc, value)?);
+    Ok(values)
+}
+
+fn write_yaml_sequence<T>(
+    values: &[T],
+    doc: &mut YamlDoc,
+    node: Option<NodeId>,
+) -> Result<NodeId, YamlError>
+where
+    T: YamlValue + ToYamlFragment,
+{
+    let node = node.ok_or_else(missing_write_node_error)?;
+    let sequence = doc.expect_node(node)?;
+    if !matches!(
+        sequence.kind,
+        NodeKind::BlockSequence | NodeKind::FlowSequence
+    ) {
+        return Err(YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Typed,
+                format!("expected sequence, found {:?}", sequence.kind),
+                sequence.span,
+            )
+            .with_expected("BlockSequence or FlowSequence"),
+        )
+        .with_position_from(&doc.source));
+    }
+    let sequence_kind = sequence.kind;
+    let tail_indent = doc.node_indent(sequence);
+    let insertion_offset = doc.sequence_insertion_offset(sequence);
+    let items = doc.sequence_items(node).collect::<Vec<_>>();
+    let common_len = items.len().min(values.len());
+    for (value_node, value) in items.iter().copied().take(common_len).zip(values) {
+        value.write_yaml(doc, Some(value_node))?;
+    }
+
+    if values.len() > items.len() {
+        if sequence_kind == NodeKind::FlowSequence {
+            let sequence = doc.expect_node(node)?;
+            let close = closing_delimiter_offset(doc, sequence.span, ']')
+                .map_err(crate::YamlEditError::into_yaml_error)?;
+            let mut replacement = String::new();
+            for (index, value) in values[items.len()..].iter().enumerate() {
+                if !items.is_empty() || index > 0 {
+                    replacement.push_str(", ");
                 }
-                doc.queue_edit(Span::empty_from_usize(close), replacement)?;
-            } else {
-                let replacement =
-                    format_block_sequence_tail(doc, tail_indent, &self[items.len()..])?;
-                doc.queue_edit(Span::empty_from_usize(insertion_offset), replacement)?;
+                replacement.push_str(&format_value_as_flow_fragment(doc, value)?);
             }
-            return Ok(node);
+            doc.queue_edit(Span::empty_from_usize(close), replacement)?;
+        } else {
+            let replacement = format_block_sequence_tail(doc, tail_indent, &values[items.len()..])?;
+            doc.queue_edit(Span::empty_from_usize(insertion_offset), replacement)?;
         }
+        return Ok(node);
+    }
 
-        if self.len() < items.len() {
-            let entries = items[self.len()..]
-                .iter()
-                .copied()
-                .map(|item| doc.containing_entry(item).unwrap_or(item))
-                .collect::<Vec<_>>();
-            doc.remove_collection_entries(node, &entries)?;
-        }
+    if values.len() < items.len() {
+        let entries = items[values.len()..]
+            .iter()
+            .copied()
+            .map(|item| doc.containing_entry(item).unwrap_or(item))
+            .collect::<Vec<_>>();
+        doc.remove_collection_entries(node, &entries)?;
+    }
 
-        Ok(node)
+    Ok(node)
+}
+
+impl<T> YamlValue for Vec<T>
+where
+    T: YamlValue + ToYamlFragment,
+{
+    fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        read_yaml_sequence(doc, node)
+    }
+
+    fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
+        write_yaml_sequence(self, doc, node)
+    }
+}
+
+impl<T, const N: usize> YamlValue for [T; N]
+where
+    T: YamlValue + ToYamlFragment,
+{
+    fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+        let values = read_yaml_sequence(doc, node)?;
+        let actual = values.len();
+        values.try_into().map_err(|_| {
+            let span = doc.node(node).map_or(Span::empty(0), |node| node.span);
+            YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Typed,
+                    format!("expected sequence with {N} items, found {actual}"),
+                    span,
+                )
+                .with_expected(format!("{N} sequence items")),
+            )
+            .with_position_from(&doc.source)
+        })
+    }
+
+    fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
+        write_yaml_sequence(self, doc, node)
     }
 }
 
@@ -773,7 +957,7 @@ where
                     let Some(key_node) = children.next() else {
                         continue;
                     };
-                    let key = doc.scalar_text(key_node)?.to_owned();
+                    let key = doc.scalar_value(key_node)?.into_owned();
                     let value_node = if let Some(value_node) = children.next() {
                         value_node
                     } else {
@@ -792,7 +976,7 @@ where
                     let Some(key_node) = children.next() else {
                         continue;
                     };
-                    let key = doc.scalar_text(key_node)?.to_owned();
+                    let key = doc.scalar_value(key_node)?.into_owned();
                     let value_node = children
                         .next()
                         .ok_or_else(|| missing_collection_item_error(doc, entry_node, "mapping"))?;
@@ -848,20 +1032,97 @@ where
     }
 }
 
-impl<T> YamlValue for T
+impl<T, S> YamlValue for HashMap<String, T, S>
 where
-    T: FromYamlDoc + ToYamlDoc,
+    T: YamlValue + ToYamlFragment,
+    S: BuildHasher + Default,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        let nested = doc.rerooted_at_mapping(node)?;
-        Self::from_yaml_doc(&nested)
+        let mapping = doc.expect_node(node)?;
+        let mut values = HashMap::with_hasher(S::default());
+
+        match mapping.kind {
+            NodeKind::BlockMapping => {
+                let mapping_indent = doc.node_indent(mapping);
+                for entry in doc.children(node) {
+                    let entry_node = doc.expect_node(entry)?;
+                    let mut children = doc.children(entry);
+                    let Some(key_node) = children.next() else {
+                        continue;
+                    };
+                    let key = doc.scalar_value(key_node)?.into_owned();
+                    let value_node = if let Some(value_node) = children.next() {
+                        value_node
+                    } else {
+                        doc.find_nested_collection_after(entry_node, mapping_indent)
+                            .ok_or_else(|| {
+                                missing_collection_item_error(doc, entry_node, "mapping")
+                            })?
+                    };
+                    values.insert(key, T::read_yaml(doc, value_node)?);
+                }
+            }
+            NodeKind::FlowMapping => {
+                for entry in doc.children(node) {
+                    let entry_node = doc.expect_node(entry)?;
+                    let mut children = doc.children(entry);
+                    let Some(key_node) = children.next() else {
+                        continue;
+                    };
+                    let key = doc.scalar_value(key_node)?.into_owned();
+                    let value_node = children
+                        .next()
+                        .ok_or_else(|| missing_collection_item_error(doc, entry_node, "mapping"))?;
+                    values.insert(key, T::read_yaml(doc, value_node)?);
+                }
+            }
+            _ => {
+                return Err(YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Typed,
+                        format!("expected mapping, found {:?}", mapping.kind),
+                        mapping.span,
+                    )
+                    .with_expected("BlockMapping or FlowMapping"),
+                )
+                .with_position_from(&doc.source));
+            }
+        }
+
+        Ok(values)
     }
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
         let node = node.ok_or_else(missing_write_node_error)?;
-        let mut nested = doc.rerooted_at_mapping(node)?;
-        self.apply_to_yaml_doc(&mut nested)?;
-        doc.queue_edits_from(&nested)?;
+        let mapping = doc.expect_node(node)?;
+        if !matches!(mapping.kind, NodeKind::BlockMapping | NodeKind::FlowMapping) {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Typed,
+                    format!("expected mapping, found {:?}", mapping.kind),
+                    mapping.span,
+                )
+                .with_expected("BlockMapping or FlowMapping"),
+            )
+            .with_position_from(&doc.source));
+        }
+        let mut entries = self.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, value) in entries {
+            if let Some(value_node) = doc.get_mapping_value(node, key)? {
+                value.write_yaml(doc, Some(value_node))?;
+            } else {
+                doc.insert_mapping_value_with_comment(
+                    node,
+                    key,
+                    value,
+                    MappingEntryStyle::Inherit,
+                    None,
+                )?;
+            }
+        }
+        let allowed_keys = self.keys().map(String::as_str).collect::<Vec<_>>();
+        doc.retain_mapping_entries(node, &allowed_keys)?;
         Ok(node)
     }
 }

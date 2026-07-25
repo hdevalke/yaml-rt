@@ -130,6 +130,33 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
                 Ok(())
             }
         }
+
+        impl ::yaml_rt::YamlValue for #name {
+            fn read_yaml(
+                doc: &::yaml_rt::YamlDoc,
+                node: ::yaml_rt::NodeId,
+            ) -> Result<Self, ::yaml_rt::YamlError> {
+                ::yaml_rt::__read_mapping_overlay(doc, node)
+            }
+
+            fn write_yaml(
+                &self,
+                doc: &mut ::yaml_rt::YamlDoc,
+                node: Option<::yaml_rt::NodeId>,
+            ) -> Result<::yaml_rt::NodeId, ::yaml_rt::YamlError> {
+                ::yaml_rt::__write_mapping_overlay(self, doc, node)
+            }
+        }
+
+        impl ::yaml_rt::ToYamlFragment for #name {
+            fn to_yaml_fragment(
+                &self,
+                indent: usize,
+                line_ending: &str,
+            ) -> Result<String, ::yaml_rt::YamlError> {
+                ::yaml_rt::__mapping_overlay_to_yaml_fragment(self, indent, line_ending)
+            }
+        }
     })
 }
 

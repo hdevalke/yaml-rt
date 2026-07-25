@@ -853,16 +853,7 @@ impl YamlDoc {
     where
         T: ToYamlDoc,
     {
-        let root = match self.document_root_mapping(index) {
-            Ok(root) => root,
-            Err(error) => {
-                if let Some(root) = self.empty_flow_mapping_document_root(index)? {
-                    let replacement = value.to_yaml_fragment(0, self.preferred_line_ending())?;
-                    return self.replace_node_text(root, replacement);
-                }
-                return Err(error);
-            }
-        };
+        let root = self.document_root_mapping(index)?;
         let mut nested = self.rerooted_at_mapping(root)?;
         value.apply_to_yaml_doc(&mut nested)?;
         self.queue_edits_from(&nested)
@@ -933,28 +924,6 @@ impl YamlDoc {
             current = value;
         }
         Ok(Some(current))
-    }
-
-    fn empty_flow_mapping_document_root(&self, index: usize) -> Result<Option<NodeId>, YamlError> {
-        let document = self
-            .semantics
-            .documents
-            .get(index)
-            .copied()
-            .ok_or_else(|| self.document_index_error(index))?;
-        let Some(child) = self.semantic_children(document).next() else {
-            return Ok(None);
-        };
-        let Some(SemanticKind::Mapping { style, .. }) = self.semantic_kind(child) else {
-            return Ok(None);
-        };
-        if style != CollectionStyle::Flow || self.mapping_entries(child).next().is_some() {
-            return Ok(None);
-        }
-        Ok(self
-            .node(child)
-            .is_some_and(|node| node.kind == NodeKind::FlowMapping)
-            .then_some(child))
     }
 
     fn document_index_error(&self, index: usize) -> YamlError {
@@ -1518,8 +1487,8 @@ impl YamlDoc {
             let Some(key_node) = self.children(entry).next() else {
                 continue;
             };
-            let key = self.scalar_text(key_node)?;
-            if !allowed_keys.contains(&key) {
+            let key = self.scalar_value(key_node)?;
+            if !allowed_keys.contains(&key.as_ref()) {
                 removals.push(entry);
             }
         }
@@ -1871,7 +1840,7 @@ impl YamlDoc {
     where
         T: ToYamlFragment,
     {
-        validate_plain_mapping_fragment(key, "mapping key")?;
+        validate_yaml_chars(key)?;
         if let Some(comment) = comment {
             validate_yaml_chars(comment)?;
         }
@@ -1899,7 +1868,7 @@ impl YamlDoc {
             }
         }
         replacement.push_str(&indent_text);
-        replacement.push_str(key);
+        replacement.push_str(&crate::edit::emit_string_key(key));
         if fragment.contains('\n') || fragment.starts_with(' ') {
             replacement.push(':');
             replacement.push_str(line_ending);

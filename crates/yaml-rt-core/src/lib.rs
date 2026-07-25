@@ -34,6 +34,10 @@ pub(crate) use syntax::ParsedYaml;
 pub use syntax::{
     Children, CollectionStyle, Node, NodeKind, YamlEvent, YamlEventKind, YamlScalarStyle, parse_cst,
 };
+#[doc(hidden)]
+pub use typed::{
+    __mapping_overlay_to_yaml_fragment, __read_mapping_overlay, __write_mapping_overlay,
+};
 pub use typed::{FromYamlDoc, ToYamlDoc, ToYamlFragment, YamlValue};
 pub use value::{
     NonFiniteFloat, ResolvedScalar, ScalarResolveError, SemanticValueError, YamlNumber,

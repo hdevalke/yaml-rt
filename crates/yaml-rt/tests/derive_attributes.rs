@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
@@ -322,6 +322,26 @@ struct NestedCollectionsConfig {
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
 struct FlowNestedConfig {
     servers: Vec<ServerFields>,
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct StandardShapeConfig {
+    primary: Box<ServerFields>,
+    fixed: [ServerFields; 2],
+    by_name: HashMap<String, ServerFields>,
+}
+
+#[test]
+fn derived_structs_work_inside_box_arrays_and_hash_maps() {
+    let doc = YamlDoc::parse(
+        "primary:\n  host: one\n  port: 1\nfixed:\n  -\n    host: two\n    port: 2\n  -\n    host: three\n    port: 3\nby_name:\n  z:\n    host: last\n    port: 4\n",
+    )
+    .expect("valid standard shape YAML");
+    let config = StandardShapeConfig::from_yaml_doc(&doc).expect("derive reads standard shapes");
+
+    assert_eq!(config.primary.host, "one");
+    assert_eq!(config.fixed[1].host, "three");
+    assert_eq!(config.by_name.get("z").map(|server| server.port), Some(4));
 }
 
 #[test]

@@ -148,7 +148,10 @@ impl YamlFragment {
                     Ok(format!("{prefix}{}", quote_string(&value)))
                 } else {
                     let source = self.doc.extract_node(node).map_err(FragmentError::from)?;
-                    if source.contains(['\n', '\r']) {
+                    if source.contains(['\n', '\r'])
+                        || style == YamlScalarStyle::Plain
+                            && source.contains(['[', ']', '{', '}', ','])
+                    {
                         let value = self.doc.scalar_value(node).map_err(FragmentError::from)?;
                         Ok(format!("{prefix}{}", quote_string(&value)))
                     } else {

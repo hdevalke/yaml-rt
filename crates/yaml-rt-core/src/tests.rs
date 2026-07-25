@@ -4327,20 +4327,18 @@ fn yaml_value_writes_decorated_nested_flow_collections() {
 }
 
 #[test]
-fn yaml_value_rejects_invalid_flow_fragments_without_editing() {
+fn yaml_value_quotes_block_plain_scalars_that_are_unsafe_in_flow_style() {
     let mut doc = YamlDoc::parse("items: [ok]\n").expect("valid flow sequence");
     let items = doc
         .get_path(&["items"])
         .expect("lookup succeeds")
         .expect("items exists");
 
-    let error = vec!["bad,item".to_owned()]
+    vec!["bad,item".to_owned()]
         .write_yaml(&mut doc, Some(items))
-        .expect_err("invalid flow scalar rejects");
+        .expect("unsafe flow scalar is quoted");
 
-    assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-    assert_eq!(doc.to_string(), "items: [ok]\n");
-    assert!(doc.edits.is_empty());
+    assert_eq!(doc.to_string(), "items: [\"bad,item\"]\n");
 }
 
 #[test]

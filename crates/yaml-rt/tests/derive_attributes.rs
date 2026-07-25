@@ -276,6 +276,48 @@ struct NestedConfig {
     server: ServerFields,
 }
 
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct NestedCollectionsConfig {
+    servers: Vec<ServerFields>,
+    groups: BTreeMap<String, ServerFields>,
+}
+
+#[test]
+fn nested_structs_work_inside_sequences_and_mappings() {
+    let mut doc = YamlDoc::parse(
+        "servers:\n  -\n    host: \"one\" # keep\n    extra: keep\ngroups:\n  primary:\n    host: old\n",
+    )
+    .expect("valid nested collection YAML");
+    let mut config =
+        NestedCollectionsConfig::from_yaml_doc(&doc).expect("derive reads nested collections");
+
+    config.servers[0].host = "updated".to_owned();
+    config.servers.push(ServerFields {
+        host: "two".to_owned(),
+        port: 9090,
+    });
+    config
+        .groups
+        .get_mut("primary")
+        .expect("primary group")
+        .port = 9443;
+    config.groups.insert(
+        "secondary".to_owned(),
+        ServerFields {
+            host: "backup".to_owned(),
+            port: 8081,
+        },
+    );
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive writes nested collections");
+
+    assert_eq!(
+        doc.to_string(),
+        "servers:\n  -\n    host: \"updated\" # keep\n    extra: keep\n    port: 8080\n  -\n    host: two\n    port: 9090\ngroups:\n  primary:\n    host: old\n    port: 9443\n  secondary:\n    host: backup\n    port: 8081\n"
+    );
+}
+
 #[test]
 fn nested_struct_field_reads_and_updates_existing_mapping() {
     let mut doc = YamlDoc::parse("name: app\nserver:\n  host: \"localhost\"\n  extra: keep\n")

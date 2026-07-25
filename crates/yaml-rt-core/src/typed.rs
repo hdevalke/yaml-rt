@@ -2,8 +2,8 @@ use std::borrow::Cow;
 
 use crate::{
     BlockChomp, Diagnostic, DiagnosticKind, MappingEntryStyle, Node, NodeId, NodeKind, Span,
-    YamlDoc, YamlError, format_scalar_value, parse_block_scalar_header, parse_node_properties,
-    validate_plain_mapping_fragment, validate_yaml_chars,
+    YamlDoc, YamlError, YamlFragment, format_scalar_value, parse_block_scalar_header,
+    parse_node_properties, validate_plain_mapping_fragment, validate_yaml_chars,
 };
 
 /// Converts a YAML document into a typed overlay.
@@ -103,10 +103,6 @@ impl ToYamlFragment for bool {
 
 impl_plain_yaml_fragment!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
 
-trait ToFlowYamlFragment {
-    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError>;
-}
-
 fn flow_plain_yaml_fragment(value: &str, role: &str) -> Result<String, YamlError> {
     let value = plain_yaml_fragment(value, role)?;
     if value.contains(['[', ']', '{', '}', ',']) {
@@ -120,97 +116,6 @@ fn flow_plain_yaml_fragment(value: &str, role: &str) -> Result<String, YamlError
         ));
     }
     Ok(value)
-}
-
-macro_rules! impl_plain_flow_yaml_fragment {
-    ($($type:ty),* $(,)?) => {
-        $(
-            impl ToFlowYamlFragment for $type {
-                fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
-                    flow_plain_yaml_fragment(&self.to_string(), "YAML value")
-                }
-            }
-        )*
-    };
-}
-
-impl ToFlowYamlFragment for String {
-    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
-        flow_plain_yaml_fragment(self, "YAML value")
-    }
-}
-
-impl ToFlowYamlFragment for &str {
-    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
-        flow_plain_yaml_fragment(self, "YAML value")
-    }
-}
-
-impl ToFlowYamlFragment for bool {
-    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
-        Ok(if *self { "true" } else { "false" }.to_owned())
-    }
-}
-
-impl_plain_flow_yaml_fragment!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
-
-impl<T> ToFlowYamlFragment for Option<T>
-where
-    T: ToFlowYamlFragment,
-{
-    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
-        match self {
-            Some(value) => value.to_flow_yaml_fragment(),
-            None => Ok("null".to_owned()),
-        }
-    }
-}
-
-impl<T> ToFlowYamlFragment for Vec<T>
-where
-    T: ToFlowYamlFragment,
-{
-    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
-        let mut output = String::from("[");
-        for (index, value) in self.iter().enumerate() {
-            if index > 0 {
-                output.push_str(", ");
-            }
-            output.push_str(&value.to_flow_yaml_fragment()?);
-        }
-        output.push(']');
-        Ok(output)
-    }
-}
-
-impl<T> ToFlowYamlFragment for std::collections::BTreeMap<String, T>
-where
-    T: ToFlowYamlFragment,
-{
-    fn to_flow_yaml_fragment(&self) -> Result<String, YamlError> {
-        let mut output = String::from("{");
-        for (index, (key, value)) in self.iter().enumerate() {
-            validate_plain_mapping_fragment(key, "mapping key")?;
-            if key.contains(['[', ']', '{', '}', ',']) {
-                return Err(YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Emitter,
-                        "plain flow mapping key cannot contain flow collection indicators",
-                        Span::empty(0),
-                    )
-                    .with_expected("plain mapping key without flow indicators"),
-                ));
-            }
-            if index > 0 {
-                output.push_str(", ");
-            }
-            output.push_str(key);
-            output.push_str(": ");
-            output.push_str(&value.to_flow_yaml_fragment()?);
-        }
-        output.push('}');
-        Ok(output)
-    }
 }
 
 impl<T> ToYamlFragment for Option<T>
@@ -514,26 +419,54 @@ where
     Ok(output)
 }
 
-fn format_flow_sequence_replacement<T>(values: &[T]) -> Result<String, YamlError>
+fn format_value_as_flow_fragment<T>(doc: &YamlDoc, value: &T) -> Result<String, YamlError>
 where
-    T: ToFlowYamlFragment,
+    T: ToYamlFragment,
+{
+    let fragment = value.to_yaml_fragment(0, doc.preferred_line_ending())?;
+    let fragment = YamlFragment::parse(&fragment).map_err(|error| {
+        YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Emitter,
+                format!("typed YAML fragment is invalid: {error}"),
+                Span::empty(0),
+            )
+            .with_expected("one valid YAML value"),
+        )
+    })?;
+    fragment.render_flow(doc).map_err(|error| {
+        YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Emitter,
+                format!("typed YAML fragment cannot be rendered in flow style: {error}"),
+                Span::empty(0),
+            )
+            .with_expected("a YAML value representable in flow style"),
+        )
+    })
+}
+
+fn format_flow_sequence_replacement<T>(doc: &YamlDoc, values: &[T]) -> Result<String, YamlError>
+where
+    T: ToYamlFragment,
 {
     let mut output = String::from("[");
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             output.push_str(", ");
         }
-        output.push_str(&value.to_flow_yaml_fragment()?);
+        output.push_str(&format_value_as_flow_fragment(doc, value)?);
     }
     output.push(']');
     Ok(output)
 }
 
 fn format_flow_mapping_replacement<T>(
+    doc: &YamlDoc,
     values: &std::collections::BTreeMap<String, T>,
 ) -> Result<String, YamlError>
 where
-    T: ToFlowYamlFragment,
+    T: ToYamlFragment,
 {
     let mut output = String::from("{");
     for (index, (key, value)) in values.iter().enumerate() {
@@ -543,7 +476,7 @@ where
         }
         output.push_str(key);
         output.push_str(": ");
-        output.push_str(&value.to_flow_yaml_fragment()?);
+        output.push_str(&format_value_as_flow_fragment(doc, value)?);
     }
     output.push('}');
     Ok(output)
@@ -634,7 +567,7 @@ where
 
 impl<T> YamlValue for Vec<T>
 where
-    T: YamlValue + ToYamlFragment + ToFlowYamlFragment,
+    T: YamlValue + ToYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         let sequence = doc.expect_node(node)?;
@@ -676,7 +609,7 @@ where
         let sequence = doc.expect_node(node)?;
         if sequence.kind == NodeKind::FlowSequence {
             let target = doc.collection_replacement_target(node)?;
-            let replacement = format_flow_sequence_replacement(self)?;
+            let replacement = format_flow_sequence_replacement(doc, self)?;
             doc.queue_edit(target.span, replacement)?;
             return Ok(node);
         }
@@ -710,7 +643,7 @@ where
 
 impl<T> YamlValue for std::collections::BTreeMap<String, T>
 where
-    T: YamlValue + ToYamlFragment + ToFlowYamlFragment,
+    T: YamlValue + ToYamlFragment,
 {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         let mapping = doc.expect_node(node)?;
@@ -772,7 +705,7 @@ where
         let mapping = doc.expect_node(node)?;
         if mapping.kind == NodeKind::FlowMapping {
             let target = doc.collection_replacement_target(node)?;
-            let replacement = format_flow_mapping_replacement(self)?;
+            let replacement = format_flow_mapping_replacement(doc, self)?;
             doc.queue_edit(target.span, replacement)?;
             return Ok(node);
         }

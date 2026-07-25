@@ -112,6 +112,13 @@ enum AdaptedPayload {
 }
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[yaml(rename_all = "lowercase")]
+enum EmptyPayload {
+    Tuple(),
+    Struct {},
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
 enum GenericMode<T, const N: usize>
 where
     T: Copy,
@@ -517,6 +524,29 @@ fn data_only_enums_report_a_missing_tag_for_untagged_scalars() {
             .contains("requires a local YAML tag")
     );
     assert!(error.diagnostic.position.is_some());
+}
+
+#[test]
+fn empty_tuple_and_struct_variant_payloads_use_explicit_empty_collections() {
+    assert_eq!(
+        EmptyPayload::Tuple().to_yaml_fragment(0, "\n").unwrap(),
+        "!tuple []"
+    );
+    assert_eq!(
+        EmptyPayload::Struct {}.to_yaml_fragment(0, "\n").unwrap(),
+        "!struct {}"
+    );
+
+    let tuple = YamlDoc::parse("!tuple []\n").expect("valid empty tuple payload");
+    let structure = YamlDoc::parse("!struct {}\n").expect("valid empty struct payload");
+    assert_eq!(
+        EmptyPayload::from_yaml_doc(&tuple).expect("empty tuple reads"),
+        EmptyPayload::Tuple()
+    );
+    assert_eq!(
+        EmptyPayload::from_yaml_doc(&structure).expect("empty struct reads"),
+        EmptyPayload::Struct {}
+    );
 }
 
 #[test]

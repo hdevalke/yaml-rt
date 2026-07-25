@@ -296,6 +296,9 @@ where
         output.push_str(line);
     }
 
+    if output.is_empty() {
+        output.push_str("{}");
+    }
     Ok(output)
 }
 

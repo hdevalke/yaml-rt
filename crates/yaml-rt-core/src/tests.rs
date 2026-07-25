@@ -1066,20 +1066,18 @@ fn yaml_value_writes_empty_decorated_mapping_and_preserves_semantic_metadata_aft
 }
 
 #[test]
-fn yaml_value_rejects_invalid_decorated_collection_fragments_without_editing() {
+fn yaml_value_quotes_multiline_strings_in_decorated_flow_collections() {
     let mut doc = YamlDoc::parse("items: &items [one]\n").expect("valid decorated sequence");
     let items = doc
         .get_path(&["items"])
         .expect("path lookup succeeds")
         .expect("items exists");
 
-    let error = vec!["bad\nvalue".to_owned()]
+    vec!["bad\nvalue".to_owned()]
         .write_yaml(&mut doc, Some(items))
-        .expect_err("invalid plain fragment rejects");
+        .expect("multiline string is quoted");
 
-    assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-    assert_eq!(doc.to_string(), "items: &items [one]\n");
-    assert!(doc.edits.is_empty());
+    assert_eq!(doc.to_string(), "items: &items [\"bad\\nvalue\"]\n");
 }
 
 #[test]
@@ -3638,23 +3636,23 @@ fn patch_writer_inserts_empty_collection_values() {
 }
 
 #[test]
-fn patch_writer_rejects_invalid_plain_collection_fragments() {
+fn patch_writer_quotes_strings_that_are_not_safe_plain_fragments() {
     let mut doc = YamlDoc::parse("host: localhost\n").expect("valid MVP mapping");
     let root = doc.root_mapping().expect("root mapping exists");
 
-    let error = doc
-        .insert_mapping_value_with_comment(
-            root,
-            "names",
-            &vec!["bad\nvalue".to_owned()],
-            MappingEntryStyle::default(),
-            None,
-        )
-        .expect_err("multi-line plain sequence value should reject");
+    doc.insert_mapping_value_with_comment(
+        root,
+        "names",
+        &vec!["bad\nvalue".to_owned()],
+        MappingEntryStyle::default(),
+        None,
+    )
+    .expect("multi-line string is quoted");
 
-    assert_eq!(error.diagnostic.kind, DiagnosticKind::Emitter);
-    assert!(error.diagnostic.message.contains("single-line plain text"));
-    assert_eq!(doc.to_string(), "host: localhost\n");
+    assert_eq!(
+        doc.to_string(),
+        "host: localhost\nnames:\n  - \"bad\\nvalue\"\n"
+    );
 }
 
 #[test]
@@ -3984,6 +3982,44 @@ fn yaml_value_reads_and_writes_scalar_values() {
 }
 
 #[test]
+fn yaml_value_noop_writes_preserve_core_scalar_spelling() {
+    let mut doc =
+        YamlDoc::parse("enabled: TRUE\nport: 0x10\nratio: 1.50\n").expect("valid scalars");
+    let enabled = doc.get_path(&["enabled"]).unwrap().unwrap();
+    let port = doc.get_path(&["port"]).unwrap().unwrap();
+    let ratio = doc.get_path(&["ratio"]).unwrap().unwrap();
+
+    bool::read_yaml(&doc, enabled)
+        .unwrap()
+        .write_yaml(&mut doc, Some(enabled))
+        .unwrap();
+    u16::read_yaml(&doc, port)
+        .unwrap()
+        .write_yaml(&mut doc, Some(port))
+        .unwrap();
+    f64::read_yaml(&doc, ratio)
+        .unwrap()
+        .write_yaml(&mut doc, Some(ratio))
+        .unwrap();
+
+    assert_eq!(doc.to_string(), "enabled: TRUE\nport: 0x10\nratio: 1.50\n");
+    assert!(doc.edits.is_empty());
+}
+
+#[test]
+fn yaml_string_value_quotes_plain_text_that_would_change_schema_type() {
+    let mut doc = YamlDoc::parse("value: old # keep\n").expect("valid string");
+    let value = doc.get_path(&["value"]).unwrap().unwrap();
+
+    "true"
+        .to_owned()
+        .write_yaml(&mut doc, Some(value))
+        .expect("string writes with safe style");
+
+    assert_eq!(doc.to_string(), "value: \"true\" # keep\n");
+}
+
+#[test]
 fn yaml_value_reads_and_writes_option_values() {
     let mut doc = YamlDoc::parse(
         "name: old
@@ -4005,16 +4041,25 @@ keep: yes
         Option::<String>::read_yaml(&doc, name).expect("option reads"),
         Some("old".to_owned())
     );
+    assert_eq!(
+        Option::<String>::read_yaml_field(&doc, None, "missing").expect("missing option reads"),
+        None
+    );
 
     Option::<String>::None
         .write_yaml(&mut doc, Some(maybe))
-        .expect("none removes containing entry");
+        .expect("none writes YAML null");
 
+    assert_eq!(doc.to_string(), "name: old\nmaybe: null\nkeep: yes\n");
+
+    let null_doc = YamlDoc::parse("null\n").expect("valid null");
+    let null = null_doc
+        .document_root(0)
+        .expect("root lookup")
+        .expect("null root");
     assert_eq!(
-        doc.to_string(),
-        "name: old
-keep: yes
-"
+        Option::<String>::read_yaml(&null_doc, null).expect("explicit null reads"),
+        None
     );
 }
 
@@ -4269,7 +4314,7 @@ fn yaml_value_grows_nested_block_mapping_sequence_items_by_appending_tail() {
 
     assert_eq!(
         doc.to_string(),
-        "items:\n  -\n    name: \"new\" # keep name comment\n  -\n    name: newer\n    port: 9090\n"
+        "items:\n  -\n    name: \"new\" # keep name comment\n  -\n    name: newer\n    port: \"9090\"\n"
     );
 }
 

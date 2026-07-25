@@ -2,9 +2,10 @@ use std::borrow::Cow;
 
 use crate::edit::closing_delimiter_offset;
 use crate::{
-    BlockChomp, Diagnostic, DiagnosticKind, MappingEntryStyle, Node, NodeId, NodeKind, Span,
-    YamlDoc, YamlError, YamlFragment, format_scalar_value, parse_block_scalar_header,
-    parse_node_properties, validate_plain_mapping_fragment, validate_yaml_chars,
+    BlockChomp, Diagnostic, DiagnosticKind, MappingEntryStyle, Node, NodeId, NodeKind,
+    NonFiniteFloat, ResolvedScalar, SemanticKind, Span, YamlDoc, YamlEditError, YamlError,
+    YamlFragment, format_scalar_value, parse_block_scalar_header, parse_node_properties,
+    resolve_scalar, validate_plain_mapping_fragment, validate_yaml_chars,
 };
 
 /// Converts a YAML document into a typed overlay.
@@ -34,6 +35,18 @@ pub trait ToYamlDoc {
 
 /// Reads and writes individual YAML node values.
 pub trait YamlValue: Sized {
+    /// Reads a mapping field that may be absent.
+    ///
+    /// The default implementation reports a missing required field. Container
+    /// types such as [`Option`] may override this to define missing-field
+    /// semantics without requiring derive-time type inspection.
+    fn read_yaml_field(doc: &YamlDoc, node: Option<NodeId>, key: &str) -> Result<Self, YamlError> {
+        match node {
+            Some(node) => Self::read_yaml(doc, node),
+            None => Err(missing_required_field_error(key)),
+        }
+    }
+
     /// Reads a typed value from `node`.
     ///
     /// # Errors
@@ -86,13 +99,15 @@ macro_rules! impl_plain_yaml_fragment {
 
 impl ToYamlFragment for String {
     fn to_yaml_fragment(&self, _indent: usize, _line_ending: &str) -> Result<String, YamlError> {
-        plain_yaml_fragment(self, "YAML value")
+        validate_yaml_chars(self)?;
+        Ok(crate::edit::emit_string_key(self))
     }
 }
 
 impl ToYamlFragment for &str {
     fn to_yaml_fragment(&self, _indent: usize, _line_ending: &str) -> Result<String, YamlError> {
-        plain_yaml_fragment(self, "YAML value")
+        validate_yaml_chars(self)?;
+        Ok(crate::edit::emit_string_key(self))
     }
 }
 
@@ -219,10 +234,22 @@ fn missing_write_node_error() -> YamlError {
     )
 }
 
+fn missing_required_field_error(key: &str) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Typed,
+            format!("missing required field `{key}`"),
+            Span::empty(0),
+        )
+        .with_expected(key),
+    )
+}
+
 fn write_existing_scalar(
     doc: &mut YamlDoc,
     node: Option<NodeId>,
     value: &str,
+    string_value: bool,
 ) -> Result<NodeId, YamlError> {
     let node = node.ok_or_else(missing_write_node_error)?;
     if let Some(block_scalar) = doc
@@ -234,13 +261,18 @@ fn write_existing_scalar(
         return Ok(node);
     }
     let (span, style) = doc.scalar_replacement_target(node)?;
-    let replacement = if style == crate::ScalarStyle::Plain
-        && doc.is_flow_context(node)
-        && value.contains(['[', ']', '{', '}', ','])
-    {
+    let requires_quotes = style == crate::ScalarStyle::Plain
+        && string_value
+        && (!crate::edit::safe_plain_string(value)
+            || doc.is_flow_context(node) && value.contains(['[', ']', '{', '}', ',']));
+    let replacement = if requires_quotes {
         crate::fragment::quote_string(value)
     } else {
-        format_scalar_value(value, style)?
+        match format_scalar_value(value, style) {
+            Ok(replacement) => replacement,
+            Err(_) if string_value => crate::fragment::quote_string(value),
+            Err(error) => return Err(error),
+        }
     };
     doc.queue_edit(span, replacement)?;
     Ok(node)
@@ -417,40 +449,70 @@ fn typed_parse_error(doc: &YamlDoc, node: NodeId, type_name: &str, value: &str) 
     .with_position_from(&doc.source)
 }
 
+fn resolved_scalar_at(doc: &YamlDoc, node: NodeId) -> Result<ResolvedScalar, YamlError> {
+    let Some(SemanticKind::Scalar { style }) = doc.semantic_kind(node) else {
+        return Err(typed_parse_error(doc, node, "scalar", ""));
+    };
+    let value = doc.scalar_value(node)?;
+    let tag = doc.resolved_tag(node)?;
+    resolve_scalar(&value, style, tag.as_deref())
+        .map_err(|_| typed_parse_error(doc, node, "YAML 1.2 core scalar", &value))
+}
+
 impl YamlValue for String {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         doc.scalar_value(node).map(Cow::into_owned)
     }
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
-        write_existing_scalar(doc, node, self)
+        if let Some(node) = node
+            && Self::read_yaml(doc, node)? == *self
+        {
+            return Ok(node);
+        }
+        write_existing_scalar(doc, node, self, true)
     }
 }
 
 impl YamlValue for bool {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
         let value = doc.scalar_value(node)?;
-        match value.as_ref() {
-            "true" | "True" | "TRUE" => Ok(true),
-            "false" | "False" | "FALSE" => Ok(false),
+        match resolved_scalar_at(doc, node)? {
+            ResolvedScalar::Bool(value) => Ok(value),
+            ResolvedScalar::String if matches!(value.as_ref(), "true" | "True" | "TRUE") => {
+                Ok(true)
+            }
+            ResolvedScalar::String if matches!(value.as_ref(), "false" | "False" | "FALSE") => {
+                Ok(false)
+            }
             _ => Err(typed_parse_error(doc, node, "bool", &value)),
         }
     }
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
-        write_existing_scalar(doc, node, if *self { "true" } else { "false" })
+        if let Some(node) = node
+            && Self::read_yaml(doc, node)? == *self
+        {
+            return Ok(node);
+        }
+        write_existing_scalar(doc, node, if *self { "true" } else { "false" }, false)
     }
 }
 
-macro_rules! impl_yaml_number {
+macro_rules! impl_yaml_unsigned {
     ($($type:ty),* $(,)?) => {
         $(
             impl YamlValue for $type {
                 fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
                     let value = doc.scalar_value(node)?;
-                    value.parse::<$type>().map_err(|_| {
-                        typed_parse_error(doc, node, stringify!($type), &value)
-                    })
+                    match resolved_scalar_at(doc, node)? {
+                        ResolvedScalar::Number(number) => number
+                            .as_u128()
+                            .and_then(|number| <$type>::try_from(number).ok()),
+                        ResolvedScalar::String => value.parse::<$type>().ok(),
+                        _ => None,
+                    }
+                        .ok_or_else(|| typed_parse_error(doc, node, stringify!($type), &value))
                 }
 
                 fn write_yaml(
@@ -458,21 +520,125 @@ macro_rules! impl_yaml_number {
                     doc: &mut YamlDoc,
                     node: Option<NodeId>,
                 ) -> Result<NodeId, YamlError> {
-                    write_existing_scalar(doc, node, &self.to_string())
+                    if let Some(node) = node
+                        && Self::read_yaml(doc, node)? == *self
+                    {
+                        return Ok(node);
+                    }
+                    write_existing_scalar(doc, node, &self.to_string(), false)
                 }
             }
         )*
     };
 }
 
-impl_yaml_number!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64);
+macro_rules! impl_yaml_signed {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl YamlValue for $type {
+                fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+                    let value = doc.scalar_value(node)?;
+                    match resolved_scalar_at(doc, node)? {
+                        ResolvedScalar::Number(number) => number
+                            .as_i128()
+                            .and_then(|number| <$type>::try_from(number).ok()),
+                        ResolvedScalar::String => value.parse::<$type>().ok(),
+                        _ => None,
+                    }
+                        .ok_or_else(|| typed_parse_error(doc, node, stringify!($type), &value))
+                }
+
+                fn write_yaml(
+                    &self,
+                    doc: &mut YamlDoc,
+                    node: Option<NodeId>,
+                ) -> Result<NodeId, YamlError> {
+                    if let Some(node) = node
+                        && Self::read_yaml(doc, node)? == *self
+                    {
+                        return Ok(node);
+                    }
+                    write_existing_scalar(doc, node, &self.to_string(), false)
+                }
+            }
+        )*
+    };
+}
+
+macro_rules! impl_yaml_float {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl YamlValue for $type {
+                fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
+                    let value = doc.scalar_value(node)?;
+                    let number = match resolved_scalar_at(doc, node)? {
+                        ResolvedScalar::Number(number) => number.as_f64(),
+                        ResolvedScalar::NonFinite(NonFiniteFloat::PositiveInfinity) => {
+                            Some(f64::INFINITY)
+                        }
+                        ResolvedScalar::NonFinite(NonFiniteFloat::NegativeInfinity) => {
+                            Some(f64::NEG_INFINITY)
+                        }
+                        ResolvedScalar::NonFinite(NonFiniteFloat::NaN) => Some(f64::NAN),
+                        ResolvedScalar::String => value.parse::<f64>().ok(),
+                        _ => None,
+                    }
+                    .ok_or_else(|| typed_parse_error(doc, node, stringify!($type), &value))?;
+                    let converted = number as $type;
+                    if number.is_finite() && !converted.is_finite() {
+                        return Err(typed_parse_error(doc, node, stringify!($type), &value));
+                    }
+                    Ok(converted)
+                }
+
+                fn write_yaml(
+                    &self,
+                    doc: &mut YamlDoc,
+                    node: Option<NodeId>,
+                ) -> Result<NodeId, YamlError> {
+                    if let Some(node) = node {
+                        let current = Self::read_yaml(doc, node)?;
+                        if current == *self || current.is_nan() && self.is_nan() {
+                            return Ok(node);
+                        }
+                    }
+                    let value = if self.is_nan() {
+                        ".nan".to_owned()
+                    } else if *self == <$type>::INFINITY {
+                        ".inf".to_owned()
+                    } else if *self == <$type>::NEG_INFINITY {
+                        "-.inf".to_owned()
+                    } else {
+                        self.to_string()
+                    };
+                    write_existing_scalar(doc, node, &value, false)
+                }
+            }
+        )*
+    };
+}
+
+impl_yaml_unsigned!(u8, u16, u32, u64, usize);
+impl_yaml_signed!(i8, i16, i32, i64, isize);
+impl_yaml_float!(f32, f64);
 
 impl<T> YamlValue for Option<T>
 where
     T: YamlValue,
 {
+    fn read_yaml_field(doc: &YamlDoc, node: Option<NodeId>, _key: &str) -> Result<Self, YamlError> {
+        match node {
+            Some(node) => Self::read_yaml(doc, node),
+            None => Ok(None),
+        }
+    }
+
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
-        T::read_yaml(doc, node).map(Some)
+        if matches!(resolved_scalar_at(doc, node), Ok(ResolvedScalar::Null)) {
+            Ok(None)
+        } else {
+            T::read_yaml(doc, node).map(Some)
+        }
     }
 
     fn write_yaml(&self, doc: &mut YamlDoc, node: Option<NodeId>) -> Result<NodeId, YamlError> {
@@ -480,8 +646,12 @@ where
             value.write_yaml(doc, node)
         } else {
             let node = node.ok_or_else(missing_write_node_error)?;
-            let remove_node = doc.containing_entry(node).unwrap_or(node);
-            doc.remove_node(remove_node)?;
+            if matches!(resolved_scalar_at(doc, node), Ok(ResolvedScalar::Null)) {
+                return Ok(node);
+            }
+            let null = YamlFragment::parse("null").expect("static null fragment is valid");
+            doc.queue_fragment_replacement(node, &null)
+                .map_err(YamlEditError::into_yaml_error)?;
             Ok(node)
         }
     }

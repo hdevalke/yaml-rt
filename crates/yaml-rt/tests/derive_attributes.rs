@@ -221,6 +221,43 @@ fn skip_serializing_if_removes_existing_alias_field() {
 }
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct OptionalFields {
+    name: String,
+    optional: Option<String>,
+    #[yaml(default = Some("fallback".to_owned()))]
+    defaulted: Option<String>,
+    #[yaml(skip_serializing_if = "Option::is_none")]
+    omitted: Option<String>,
+}
+
+#[test]
+fn option_fields_distinguish_missing_defaults_and_explicit_null() {
+    let mut doc = YamlDoc::parse("name: app\nomitted: null\n").expect("valid optional YAML");
+    let config = OptionalFields::from_yaml_doc(&doc).expect("derive reads optional fields");
+
+    assert_eq!(config.optional, None);
+    assert_eq!(config.defaulted.as_deref(), Some("fallback"));
+    assert_eq!(config.omitted, None);
+
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("derive writes optional fields");
+
+    assert_eq!(
+        doc.to_string(),
+        "name: app\noptional: null\ndefaulted: fallback\n"
+    );
+
+    let doc =
+        YamlDoc::parse("name: app\noptional: null\ndefaulted: configured\nomitted: present\n")
+            .expect("valid present optional YAML");
+    let config = OptionalFields::from_yaml_doc(&doc).expect("derive reads present optionals");
+    assert_eq!(config.optional, None);
+    assert_eq!(config.defaulted.as_deref(), Some("configured"));
+    assert_eq!(config.omitted.as_deref(), Some("present"));
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
 struct ServerFields {
     host: String,
     #[yaml(default = 8080)]

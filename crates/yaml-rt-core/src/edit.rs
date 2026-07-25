@@ -276,7 +276,7 @@ impl YamlDoc {
         }
     }
 
-    fn queue_fragment_replacement(
+    pub(crate) fn queue_fragment_replacement(
         &mut self,
         target: NodeId,
         value: &YamlFragment,
@@ -638,7 +638,7 @@ pub(crate) fn emit_string_key(value: &str) -> String {
     }
 }
 
-fn safe_plain_string(value: &str) -> bool {
+pub(crate) fn safe_plain_string(value: &str) -> bool {
     if value.is_empty()
         || value.trim() != value
         || value.contains(['\n', '\r', '\t', ':', '#', '[', ']', '{', '}', ','])

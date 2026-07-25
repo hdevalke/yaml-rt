@@ -269,7 +269,18 @@ fn push_regular_field(
         return;
     }
 
-    let missing_read = missing_field_read(&yaml_key, options.default.clone());
+    let read_value = if let Some(default) = options.default.clone() {
+        quote! {
+            match node {
+                Some(node) => <#field_type as ::yaml_rt::YamlValue>::read_yaml(doc, node)?,
+                None => { #default }
+            }
+        }
+    } else {
+        quote! {
+            <#field_type as ::yaml_rt::YamlValue>::read_yaml_field(doc, node, #yaml_key)?
+        }
+    };
     field_reads.push(quote! {
         #field_name: {
             let mut node = doc.get_path(&[#yaml_key])?;
@@ -278,10 +289,7 @@ fn push_regular_field(
                     node = doc.get_path(&[#aliases])?;
                 }
             )*
-            match node {
-                Some(node) => <#field_type as ::yaml_rt::YamlValue>::read_yaml(doc, node)?,
-                None => { #missing_read }
-            }
+            #read_value
         }
     });
 
@@ -301,23 +309,6 @@ fn push_regular_field(
         skip_serializing_if,
         write_field,
     );
-}
-
-fn missing_field_read(yaml_key: &str, default: Option<TokenStream2>) -> TokenStream2 {
-    if let Some(default) = default {
-        quote! { #default }
-    } else {
-        quote! {
-            return Err(::yaml_rt::YamlError::new(
-                ::yaml_rt::Diagnostic::new(
-                    ::yaml_rt::DiagnosticKind::Typed,
-                    concat!("missing required field `", #yaml_key, "`"),
-                    ::yaml_rt::Span::empty(0),
-                )
-                .with_expected(#yaml_key)
-            ));
-        }
-    }
 }
 
 fn write_field_tokens(

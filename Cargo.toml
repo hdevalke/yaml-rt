@@ -11,7 +11,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT OR Apache-2.0"
 authors = ["Hannes De Valkeneer <hannes@de-valkeneer.be>"]
 readme = "README.md"
@@ -20,9 +20,9 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 clap = "4.6.1"
-yaml-rt-core = { version = "0.1.0", path = "crates/yaml-rt-core" }
-yaml-rt-derive = { version = "0.1.0", path = "crates/yaml-rt-derive" }
-yaml-rt-serde = { version = "0.1.0", path = "crates/yaml-rt-serde" }
+yaml-rt-core = { version = "0.1.1", path = "crates/yaml-rt-core" }
+yaml-rt-derive = { version = "0.1.1", path = "crates/yaml-rt-derive" }
+yaml-rt-serde = { version = "0.1.1", path = "crates/yaml-rt-serde" }
 proc-macro2 = "1"
 quote = "1"
 serde = "1"

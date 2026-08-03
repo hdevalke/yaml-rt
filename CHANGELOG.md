@@ -1,5 +1,24 @@
 # Changelog
 
+### v0.1.1 (2026-07-25)
+
+#### Features
+
+* **derive:** support tagged enum payload variants (18fed39)
+* **derive:** support scalar unit enums and variant naming (610b9ba)
+* **derive:** add transparent newtype overlays (794eb75)
+* **core:** support typed overlays at arbitrary document roots (44c1140)
+* **derive:** add yaml with representation adapters (1e10b95)
+* **core:** support common config value shapes (c29ee4b)
+* **core:** patch typed flow collections incrementally (d8c001e)
+
+#### Fixes
+
+* **derive:** emit empty enum collection payloads (62df8a6)
+* **derive:** support generic named structs (4a4e0cd)
+* **core:** make typed scalars and options lossless (3089f56)
+* **core:** remove private flow fragment bound (6f7f173)
+
 ## v0.1.0 (2026-07-24)
 
 ### ⚠ BREAKING CHANGE

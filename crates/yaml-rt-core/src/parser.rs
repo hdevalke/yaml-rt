@@ -17,6 +17,12 @@ struct PreparedFlowCollection {
     ready: bool,
 }
 
+enum PendingFlowEvent {
+    Node(NodeId),
+    SequenceEnd(Span),
+    MappingEnd(Span),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenEventCollection {
     Mapping,
@@ -2784,17 +2790,51 @@ impl<'source> Parser<'source> {
     }
 
     fn emit_node_event(&mut self, node: NodeId) -> Result<(), YamlError> {
-        match self.nodes[node.0 as usize].kind {
-            NodeKind::FlowSequence => self.emit_flow_sequence_events(node),
-            NodeKind::FlowMapping => self.emit_flow_mapping_events(node),
-            NodeKind::Scalar | NodeKind::LiteralScalar | NodeKind::FoldedScalar => {
-                self.emit_scalar_event(node)
+        let mut pending = vec![PendingFlowEvent::Node(node)];
+        while let Some(event) = pending.pop() {
+            match event {
+                PendingFlowEvent::Node(node) => match self.nodes[node.as_usize()].kind {
+                    NodeKind::FlowSequence => {
+                        let span = self.emit_flow_sequence_start(node)?;
+                        pending.push(PendingFlowEvent::SequenceEnd(span));
+                        self.push_flow_children(&mut pending, node);
+                    }
+                    NodeKind::FlowMapping => {
+                        let span = self.emit_flow_mapping_start(node)?;
+                        pending.push(PendingFlowEvent::MappingEnd(span));
+                        self.push_flow_children(&mut pending, node);
+                    }
+                    NodeKind::Scalar | NodeKind::LiteralScalar | NodeKind::FoldedScalar => {
+                        self.emit_scalar_event(node)?;
+                    }
+                    _ => {}
+                },
+                PendingFlowEvent::SequenceEnd(span) => {
+                    self.push_event(YamlEventKind::SequenceEnd, span);
+                }
+                PendingFlowEvent::MappingEnd(span) => {
+                    self.push_event(YamlEventKind::MappingEnd, span);
+                }
             }
-            _ => Ok(()),
         }
+        Ok(())
     }
 
-    fn emit_flow_sequence_events(&mut self, node: NodeId) -> Result<(), YamlError> {
+    fn push_flow_children(&self, pending: &mut Vec<PendingFlowEvent>, node: NodeId) {
+        let mut children = Vec::new();
+        let mut entry = node_link(self.nodes[node.as_usize()].first_child);
+        while let Some(current_entry) = entry {
+            entry = node_link(self.nodes[current_entry.as_usize()].next_sibling);
+            let mut child = node_link(self.nodes[current_entry.as_usize()].first_child);
+            while let Some(current_child) = child {
+                child = node_link(self.nodes[current_child.as_usize()].next_sibling);
+                children.push(current_child);
+            }
+        }
+        pending.extend(children.into_iter().rev().map(PendingFlowEvent::Node));
+    }
+
+    fn emit_flow_sequence_start(&mut self, node: NodeId) -> Result<Span, YamlError> {
         let sequence_span = self.nodes[node.0 as usize].span;
         let mut properties = self.flow_event_properties(sequence_span)?;
         self.resolve_node_properties(&properties, sequence_span)?;
@@ -2810,20 +2850,10 @@ impl<'source> Parser<'source> {
             node,
             semantic_properties,
         );
-        let mut entry = node_link(self.nodes[node.as_usize()].first_child);
-        while let Some(current_entry) = entry {
-            entry = node_link(self.nodes[current_entry.as_usize()].next_sibling);
-            let mut child = node_link(self.nodes[current_entry.as_usize()].first_child);
-            while let Some(current_child) = child {
-                child = node_link(self.nodes[current_child.as_usize()].next_sibling);
-                self.emit_node_event(current_child)?;
-            }
-        }
-        self.push_event(YamlEventKind::SequenceEnd, span);
-        Ok(())
+        Ok(span)
     }
 
-    fn emit_flow_mapping_events(&mut self, node: NodeId) -> Result<(), YamlError> {
+    fn emit_flow_mapping_start(&mut self, node: NodeId) -> Result<Span, YamlError> {
         let mapping_span = self.nodes[node.0 as usize].span;
         let mut properties = self.flow_event_properties(mapping_span)?;
         self.resolve_node_properties(&properties, mapping_span)?;
@@ -2839,17 +2869,7 @@ impl<'source> Parser<'source> {
             node,
             semantic_properties,
         );
-        let mut entry = node_link(self.nodes[node.as_usize()].first_child);
-        while let Some(current_entry) = entry {
-            entry = node_link(self.nodes[current_entry.as_usize()].next_sibling);
-            let mut child = node_link(self.nodes[current_entry.as_usize()].first_child);
-            while let Some(current_child) = child {
-                child = node_link(self.nodes[current_child.as_usize()].next_sibling);
-                self.emit_node_event(current_child)?;
-            }
-        }
-        self.push_event(YamlEventKind::MappingEnd, span);
-        Ok(())
+        Ok(span)
     }
 
     fn apply_pending_event_properties(

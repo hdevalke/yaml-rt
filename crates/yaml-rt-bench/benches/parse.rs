@@ -107,6 +107,29 @@ fn bench_parse(c: &mut Criterion) {
         });
     });
     phases.finish();
+
+    let flow_inputs = [
+        ("shallow_flow_heavy", shallow_flow_heavy(128)),
+        ("wide_flow_1024", wide_flow_sequence(1_024)),
+        ("nested_flow_32", nested_flow_sequence(32)),
+        ("nested_flow_256", nested_flow_sequence(256)),
+        ("nested_flow_1024", nested_flow_sequence(1_024)),
+    ];
+    let mut flow = c.benchmark_group("parse_flow");
+    for (name, input) in &flow_inputs {
+        flow.bench_with_input(
+            BenchmarkId::new("yaml-rt", name),
+            input,
+            |bencher, input| {
+                bencher.iter(|| {
+                    let doc = YamlDoc::parse(black_box(input))
+                        .expect("generated flow collection should parse");
+                    black_box(doc);
+                });
+            },
+        );
+    }
+    flow.finish();
 }
 
 fn bench_input(
@@ -153,6 +176,40 @@ fn flat_mapping(entries: usize) -> String {
         writeln!(input, "key_{index:05}: value_{index:05}")
             .expect("writing to a String cannot fail");
     }
+    input
+}
+
+fn shallow_flow_heavy(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(32));
+    input.push('[');
+    for index in 0..entries {
+        if index > 0 {
+            input.push_str(", ");
+        }
+        write!(input, "{{key_{index}: [one, two]}}").expect("writing to a String cannot fail");
+    }
+    input.push(']');
+    input
+}
+
+fn wide_flow_sequence(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(8));
+    input.push('[');
+    for index in 0..entries {
+        if index > 0 {
+            input.push_str(", ");
+        }
+        write!(input, "{index}").expect("writing to a String cannot fail");
+    }
+    input.push(']');
+    input
+}
+
+fn nested_flow_sequence(depth: usize) -> String {
+    let mut input = String::with_capacity(depth.saturating_mul(2).saturating_add(1));
+    input.extend(std::iter::repeat_n('[', depth));
+    input.push('0');
+    input.extend(std::iter::repeat_n(']', depth));
     input
 }
 

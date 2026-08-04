@@ -7,6 +7,16 @@ use crate::{
     YamlScalarStyle, validate_yaml_chars,
 };
 
+const MAX_FLOW_COLLECTION_DEPTH: usize = 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct PreparedFlowCollection {
+    start: usize,
+    end: usize,
+    node: NodeId,
+    ready: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenEventCollection {
     Mapping,
@@ -52,6 +62,7 @@ pub(crate) struct Parser<'source> {
     document_yaml_directive_seen: bool,
     tag_handles: BTreeMap<String, String>,
     contexts: Vec<ContextFrame>,
+    prepared_flow_collections: Vec<PreparedFlowCollection>,
 }
 
 impl<'source> Parser<'source> {
@@ -70,6 +81,7 @@ impl<'source> Parser<'source> {
             document_yaml_directive_seen: false,
             tag_handles: BTreeMap::new(),
             contexts: Vec::with_capacity(16),
+            prepared_flow_collections: Vec::new(),
         }
     }
 
@@ -1707,14 +1719,14 @@ impl<'source> Parser<'source> {
         let value_start =
             properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
         let value_text = &text[value_start..];
-        if value_text.starts_with('[') {
+        if value_text.starts_with(['[', '{']) {
+            let collection_start = absolute_start + value_start;
             let (node, consumed) =
-                self.parse_flow_sequence(value_text, absolute_start + value_start)?;
-            self.nodes[node.as_usize()].span.start = Span::usize_to_u32(absolute_start);
-            Ok((node, value_start + consumed))
-        } else if value_text.starts_with('{') {
-            let (node, consumed) =
-                self.parse_flow_mapping(value_text, absolute_start + value_start)?;
+                if let Some(collection) = self.ready_flow_collection(collection_start) {
+                    (collection.node, collection.end - collection_start)
+                } else {
+                    self.parse_flow_collection_iterative(value_text, collection_start)?
+                };
             self.nodes[node.as_usize()].span.start = Span::usize_to_u32(absolute_start);
             Ok((node, value_start + consumed))
         } else {
@@ -1732,6 +1744,95 @@ impl<'source> Parser<'source> {
                 end,
             ))
         }
+    }
+
+    fn parse_flow_collection_iterative(
+        &mut self,
+        text: &str,
+        absolute_start: usize,
+    ) -> Result<(NodeId, usize), YamlError> {
+        let collections = collect_flow_collections(text, absolute_start)?;
+        let first_index = self.prepared_flow_collections.len();
+        for collection in collections {
+            let kind = if text[collection.start..].starts_with('[') {
+                NodeKind::FlowSequence
+            } else {
+                NodeKind::FlowMapping
+            };
+            let start = absolute_start + collection.start;
+            let node = self.push_node(kind, Span::from_usize(start, start + 1));
+            self.prepared_flow_collections.push(PreparedFlowCollection {
+                start,
+                end: absolute_start + collection.end,
+                node,
+                ready: false,
+            });
+        }
+
+        for index in (first_index..self.prepared_flow_collections.len()).rev() {
+            let collection = self.prepared_flow_collections[index];
+            let relative_start = collection.start - absolute_start;
+            let relative_end = collection.end - absolute_start;
+            let collection_text = &text[relative_start..relative_end];
+            if collection_text.starts_with('[') {
+                self.parse_flow_sequence_into(collection.node, collection_text, collection.start)?;
+            } else {
+                self.parse_flow_mapping_into(collection.node, collection_text, collection.start)?;
+            }
+            self.prepared_flow_collections[index].ready = true;
+        }
+
+        let root = self.prepared_flow_collections[first_index];
+        self.prepared_flow_collections.truncate(first_index);
+        Ok((root.node, root.end - absolute_start))
+    }
+
+    fn ready_flow_collection(&self, start: usize) -> Option<PreparedFlowCollection> {
+        self.prepared_flow_collections
+            .binary_search_by_key(&start, |collection| collection.start)
+            .ok()
+            .map(|index| self.prepared_flow_collections[index])
+            .filter(|collection| collection.ready)
+    }
+
+    fn flow_mapping_separator(
+        &self,
+        text: &str,
+        start: usize,
+        absolute_start: usize,
+        terminators: &[char],
+    ) -> Result<Option<usize>, YamlError> {
+        let mut position = start;
+        while position < text.len() {
+            let character = text[position..]
+                .chars()
+                .next()
+                .expect("position is inside text");
+            if terminators.contains(&character) {
+                return Ok(None);
+            }
+            match character {
+                ':' if is_flow_mapping_separator_colon(text, position) => {
+                    return Ok(Some(position));
+                }
+                '#' if is_flow_comment_start(text, position) => {
+                    position = flow_comment_end(text, position);
+                }
+                '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
+                '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
+                '[' | '{' => {
+                    let collection_start = absolute_start + position;
+                    if let Some(collection) = self.ready_flow_collection(collection_start) {
+                        position = collection.end - absolute_start;
+                    } else {
+                        position +=
+                            flow_collection_source_end(&text[position..], collection_start)?;
+                    }
+                }
+                _ => position += character.len_utf8(),
+            }
+        }
+        Ok(None)
     }
 
     fn parse_block_scalar(
@@ -1835,17 +1936,13 @@ impl<'source> Parser<'source> {
         Ok((scalar, consumed))
     }
 
-    fn parse_flow_sequence(
+    fn parse_flow_sequence_into(
         &mut self,
+        sequence: NodeId,
         text: &str,
         absolute_start: usize,
-    ) -> Result<(NodeId, usize), YamlError> {
+    ) -> Result<usize, YamlError> {
         debug_assert!(text.starts_with('['));
-
-        let sequence = self.push_node(
-            NodeKind::FlowSequence,
-            Span::from_usize(absolute_start, absolute_start + 1),
-        );
         let mut position = 1;
         let mut expecting_value = true;
         let mut saw_item = false;
@@ -1861,7 +1958,7 @@ impl<'source> Parser<'source> {
                     position += 1;
                     self.nodes[sequence.as_usize()].span.end =
                         Span::usize_to_u32(absolute_start + position);
-                    return Ok((sequence, position));
+                    return Ok(position);
                 }
                 return Err(empty_flow_sequence_item(absolute_start + position));
             }
@@ -1882,7 +1979,7 @@ impl<'source> Parser<'source> {
                 }
                 '[' | '{' => {
                     if let Some(colon) =
-                        flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
+                        self.flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
                     {
                         let (mapping, consumed) = self.parse_implicit_flow_mapping(
                             text,
@@ -1903,7 +2000,7 @@ impl<'source> Parser<'source> {
                 _ => {
                     let value_start = position;
                     if let Some(colon) =
-                        flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
+                        self.flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
                     {
                         let (mapping, consumed) = self.parse_implicit_flow_mapping(
                             text,
@@ -2013,17 +2110,13 @@ impl<'source> Parser<'source> {
         Ok((mapping, value_position))
     }
 
-    fn parse_flow_mapping(
+    fn parse_flow_mapping_into(
         &mut self,
+        mapping: NodeId,
         text: &str,
         absolute_start: usize,
-    ) -> Result<(NodeId, usize), YamlError> {
+    ) -> Result<usize, YamlError> {
         debug_assert!(text.starts_with('{'));
-
-        let mapping = self.push_node(
-            NodeKind::FlowMapping,
-            Span::from_usize(absolute_start, absolute_start + 1),
-        );
         let mut position = 1;
         let mut expecting_pair = true;
         let mut saw_pair = false;
@@ -2040,7 +2133,7 @@ impl<'source> Parser<'source> {
                         position += 1;
                         self.nodes[mapping.as_usize()].span.end =
                             Span::usize_to_u32(absolute_start + position);
-                        return Ok((mapping, position));
+                        return Ok(position);
                     }
                     return Err(empty_flow_mapping_pair(absolute_start + position));
                 }
@@ -2162,7 +2255,8 @@ impl<'source> Parser<'source> {
             return Ok((key, position + consumed));
         }
 
-        let key_separator = flow_mapping_separator(text, position, absolute_start, &[',', '}'])?;
+        let key_separator =
+            self.flow_mapping_separator(text, position, absolute_start, &[',', '}'])?;
         let key_end = match key_separator {
             Some(separator) => separator,
             None => flow_scalar_end(text, position, absolute_start, &[',', '}'])?,
@@ -2239,7 +2333,8 @@ impl<'source> Parser<'source> {
         }
 
         let terminators = [',', close];
-        let colon = flow_mapping_separator(text, key_position, absolute_start, &terminators)?;
+        let colon =
+            self.flow_mapping_separator(text, key_position, absolute_start, &terminators)?;
         let (key_end, has_value) = if let Some(colon) = colon {
             (colon, true)
         } else {
@@ -4373,6 +4468,75 @@ fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FlowCollectionRange {
+    start: usize,
+    end: usize,
+}
+
+fn collect_flow_collections(
+    text: &str,
+    absolute_start: usize,
+) -> Result<Vec<FlowCollectionRange>, YamlError> {
+    let mut collections = Vec::with_capacity(16);
+    let mut stack = Vec::<(char, usize)>::with_capacity(16);
+    let mut position = 0;
+
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        match character {
+            '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
+            '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
+            '#' if is_flow_comment_start(text, position) => {
+                position = flow_comment_end(text, position);
+            }
+            '[' | '{' => {
+                if stack.len() >= MAX_FLOW_COLLECTION_DEPTH {
+                    return Err(flow_collection_depth_limit_exceeded(
+                        absolute_start + position,
+                    ));
+                }
+                let collection_index = collections.len();
+                collections.push(FlowCollectionRange {
+                    start: position,
+                    end: position + 1,
+                });
+                stack.push((if character == '[' { ']' } else { '}' }, collection_index));
+                position += 1;
+            }
+            ']' | '}' => {
+                let Some((expected, collection_index)) = stack.pop() else {
+                    return Err(expected_flow_separator(
+                        absolute_start + position,
+                        character,
+                    ));
+                };
+                if expected != character {
+                    return Err(expected_flow_separator(
+                        absolute_start + position,
+                        character,
+                    ));
+                }
+                position += 1;
+                collections[collection_index].end = position;
+                if stack.is_empty() {
+                    return Ok(collections);
+                }
+            }
+            _ => position += character.len_utf8(),
+        }
+    }
+
+    if text.starts_with('[') {
+        Err(missing_flow_sequence_end(absolute_start, text.len()))
+    } else {
+        Err(missing_flow_mapping_end(absolute_start, text.len()))
+    }
+}
+
 fn skip_flow_whitespace(text: &str, mut position: usize) -> usize {
     while let Some(character) = text[position..].chars().next() {
         if character.is_whitespace() {
@@ -4679,6 +4843,14 @@ fn empty_flow_value(offset: usize) -> YamlError {
         )
         .with_expected("a scalar or nested flow collection"),
     )
+}
+
+fn flow_collection_depth_limit_exceeded(offset: usize) -> YamlError {
+    YamlError::new(Diagnostic::new(
+        DiagnosticKind::Parser,
+        format!("flow collection nesting limit of {MAX_FLOW_COLLECTION_DEPTH} exceeded"),
+        Span::from_usize(offset, offset + 1),
+    ))
 }
 
 fn unexpected_flow_comma(offset: usize) -> YamlError {

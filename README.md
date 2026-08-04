@@ -382,6 +382,8 @@ cargo test -p yaml-rt-core --test yaml_test_suite
 - Collection identity is positional for sequences. Mapping insertion accepts
   string keys only; newly inserted `HashMap` keys are sorted for deterministic
   output while existing source order is retained.
+- Flow collections may be nested up to 1,024 levels. Deeper input is rejected
+  with a span-aware parser diagnostic.
 
 These constraints are checked rather than silently producing lossy or
 surprising output.

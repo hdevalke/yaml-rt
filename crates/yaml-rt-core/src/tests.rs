@@ -2220,6 +2220,92 @@ fn parser_builds_nested_root_flow_sequences() {
     );
 }
 
+fn nested_sequence(depth: usize) -> String {
+    let mut yaml = String::with_capacity(depth * 2 + 1);
+    yaml.extend(std::iter::repeat_n('[', depth));
+    yaml.push('0');
+    yaml.extend(std::iter::repeat_n(']', depth));
+    yaml
+}
+
+fn nested_mapping(depth: usize) -> String {
+    let mut yaml = String::with_capacity(depth * 5 + 1);
+    for _ in 0..depth {
+        yaml.push_str("{k: ");
+    }
+    yaml.push('0');
+    yaml.extend(std::iter::repeat_n('}', depth));
+    yaml
+}
+
+fn nested_mixed_flow_collections(depth: usize) -> String {
+    let mut yaml = String::with_capacity(depth * 4 + 1);
+    let mut closing = Vec::with_capacity(depth);
+    for level in 0..depth {
+        if level % 2 == 0 {
+            yaml.push('[');
+            closing.push(']');
+        } else {
+            yaml.push_str("{k: ");
+            closing.push('}');
+        }
+    }
+    yaml.push('0');
+    yaml.extend(closing.into_iter().rev());
+    yaml
+}
+
+#[test]
+fn parser_accepts_flow_collections_at_the_depth_limit() {
+    for yaml in [
+        nested_sequence(1_024),
+        nested_mapping(1_024),
+        nested_mixed_flow_collections(1_024),
+    ] {
+        let doc = YamlDoc::parse(&yaml).expect("depth limit should be accepted");
+        assert_eq!(doc.to_string(), yaml);
+    }
+}
+
+#[test]
+fn parser_rejects_flow_collections_beyond_the_depth_limit() {
+    for yaml in [
+        nested_sequence(1_025),
+        nested_mapping(1_025),
+        nested_mixed_flow_collections(1_025),
+    ] {
+        let error = YamlDoc::parse(&yaml).expect_err("depth beyond limit should be rejected");
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        assert_eq!(
+            error.diagnostic.message,
+            "flow collection nesting limit of 1024 exceeded"
+        );
+        assert_eq!(error.diagnostic.span.len(), 1);
+    }
+}
+
+#[test]
+fn iterative_flow_parser_preserves_nested_state_transitions() {
+    let input = "[&seq [one, {nested: [two]}], {[key]: {value: []}}, ? {explicit: key} : [value], empty: ]\n";
+    let doc = YamlDoc::parse(input).expect("nested flow states should parse iteratively");
+
+    assert_eq!(doc.to_string(), input);
+    assert!(
+        doc.nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::FlowSequence)
+            .count()
+            >= 5
+    );
+    assert!(
+        doc.nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::FlowMapping)
+            .count()
+            >= 5
+    );
+}
+
 #[test]
 fn yaml_value_reads_flow_sequence_values() {
     let doc = YamlDoc::parse("items: [one, two]\n").expect("valid flow sequence mapping");

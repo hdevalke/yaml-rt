@@ -90,6 +90,38 @@ fn value_file_and_document_selection_work() {
 }
 
 #[test]
+fn query_supports_document_selection_and_output_files() {
+    let directory = temp_dir();
+    let input = directory.join("document.yaml");
+    let result = directory.join("result.txt");
+    fs::write(
+        &input,
+        "---\nusers: [{name: first}]\n---\nusers: [{name: second}]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "query",
+            "$.users[*].name",
+            "--doc",
+            "1",
+            "--output",
+            result.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fs::read(&result).unwrap(),
+        b"\"/users/0/name\": \"second\"\n"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn stdin_mutation_and_failed_test_have_expected_streams() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
         .args(["add", "/port", "--value", "8080"])

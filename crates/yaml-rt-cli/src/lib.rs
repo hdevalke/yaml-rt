@@ -1,8 +1,8 @@
-//! Command-line editing operations for the `yaml-rt` binary.
+//! Command-line querying and editing operations for the `yaml-rt` binary.
 //!
-//! The binary applies JSON Pointer operations to YAML documents while retaining
-//! unrelated presentation. [`run`] is public so integrations can supply their
-//! own argument and I/O streams.
+//! The binary searches YAML documents with JSONPath and applies JSON Pointer
+//! operations while retaining unrelated presentation. [`run`] is public so
+//! integrations can supply their own argument and I/O streams.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment};
+
+mod query;
+
+use query::run_query;
 
 const FAILURE: i32 = 1;
 const USAGE: i32 = 2;
@@ -60,7 +64,7 @@ where
 #[command(
     name = "yaml-rt",
     version,
-    about = "Edit YAML through JSON Pointers while preserving presentation",
+    about = "Query and edit YAML while preserving presentation",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -71,6 +75,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Operation {
+    /// Search a YAML document with RFC 9535 JSONPath.
+    Query(QueryArgs),
     /// Print a selected YAML node.
     Get(ReadArgs),
     /// Add or replace a value.
@@ -151,6 +157,17 @@ struct ReadArgs {
 }
 
 #[derive(Args)]
+struct QueryArgs {
+    /// RFC 9535 JSONPath query.
+    #[arg(value_name = "QUERY")]
+    query: String,
+    #[command(flatten)]
+    target: TargetArgs,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Args)]
 struct MutationArgs {
     #[command(flatten)]
     path: PathArgs,
@@ -194,15 +211,26 @@ fn execute(
     let mut doc = YamlDoc::parse_owned(input).map_err(RunError::display)?;
     let document = select_document(&doc, target.doc)?;
 
+    if let Operation::Query(arguments) = operation {
+        let output = run_query(&doc, document, &arguments.query).map_err(RunError::display)?;
+        return write_result(
+            output.as_bytes(),
+            arguments.output.output.as_deref(),
+            input_path,
+            stdout,
+        );
+    }
+
     let path = JsonPointer::parse(operation.path()).map_err(RunError::display)?;
     let from = operation
         .from()
-        .map(|value| JsonPointer::parse(value))
+        .map(JsonPointer::parse)
         .transpose()
         .map_err(RunError::display)?;
     let value = read_value(operation.value(), target_uses_stdin, stdin)?;
 
     match operation {
+        Operation::Query(_) => unreachable!("query returned before pointer operations"),
         Operation::Get(arguments) => {
             let node = doc
                 .resolve_pointer(document, &path)
@@ -270,6 +298,7 @@ fn execute(
 impl Operation {
     fn target(&self) -> &TargetArgs {
         match self {
+            Self::Query(args) => &args.target,
             Self::Get(args) => &args.path.target,
             Self::Add(args) | Self::Replace(args) => &args.value.path.target,
             Self::Remove(args) => &args.path.target,
@@ -280,6 +309,7 @@ impl Operation {
 
     fn path(&self) -> &str {
         match self {
+            Self::Query(_) => unreachable!("query does not use a JSON Pointer argument"),
             Self::Get(args) => &args.path.path,
             Self::Add(args) | Self::Replace(args) => &args.value.path.path,
             Self::Remove(args) => &args.path.path,
@@ -560,6 +590,21 @@ mod tests {
         );
         assert_eq!(status, 0, "{stderr}");
         assert_eq!(stdout, "server:\n  host: example.com\n");
+    }
+
+    #[test]
+    fn query_works_with_stdin_and_no_matches_succeed() {
+        let input = "users:\n  - {name: Ada, active: true}\n  - {name: Linus, active: false}\n";
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "query", "$.users[?@.active == true].name"],
+            input,
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "\"/users/0/name\": \"Ada\"\n");
+
+        let (status, stdout, stderr) = invoke(&["yaml-rt", "query", "$.missing"], input);
+        assert_eq!(status, 0, "{stderr}");
+        assert!(stdout.is_empty());
     }
 
     #[test]

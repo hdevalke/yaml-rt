@@ -12,8 +12,9 @@ Do not create the release tag manually.
 
 1. Create a protected GitHub environment named `release`.
 2. Add `CARGO_REGISTRY_TOKEN` as an environment secret. The token needs publish
-   access to `yaml-rt-core`, `yaml-rt-derive`, `yaml-rt-serde`, `yaml-rt-cli`,
-   and `yaml-rt`.
+   access to `yaml-rt-core`, `yaml-rt-rfc9535`, `yaml-rt-derive`,
+   `yaml-rt-serde`, `yaml-rt-cli`, and `yaml-rt`, including permission to create
+   the initially unpublished `yaml-rt-rfc9535` package.
 3. Require any desired reviewers or branch protections on that environment.
 4. Ensure GitHub Actions may create repository contents so the workflow can
    push the release commit and tag and create a release.
@@ -32,7 +33,7 @@ For a local release-readiness run:
 cargo fmt --all -- --check
 cargo test --workspace --all-features --locked
 cargo clippy \
-  -p yaml-rt-core -p yaml-rt-derive -p yaml-rt-serde \
+  -p yaml-rt-core -p yaml-rt-rfc9535 -p yaml-rt-derive -p yaml-rt-serde \
   -p yaml-rt -p yaml-rt-cli \
   --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" \
@@ -72,7 +73,7 @@ workflow rejects invalid versions and existing tags before changing Git.
    and annotated tag.
 3. Check out the tag and build Linux musl, macOS, and Windows CLI archives with
    SHA-256 files.
-4. Enter the protected `release` environment and publish all five crates in
+4. Enter the protected `release` environment and publish all six crates in
    dependency order.
 5. Wait for crates.io, compile external consumers across facade feature
    combinations, install the published CLI, and perform a lossless edit.
@@ -97,7 +98,7 @@ publication and smoke tests succeeded.
 
 ## Post-release checks
 
-Confirm that all five crates show the same version on crates.io, the four target
+Confirm that all six crates show the same version on crates.io, the four target
 archives and their checksums appear on GitHub, installation from crates.io
 reports the expected `yaml-rt --version`, and `main` contains the generated
 release commit.

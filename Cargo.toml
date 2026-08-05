@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/yaml-rt-core",
+    "crates/yaml-rt-rfc9535",
     "crates/yaml-rt-derive",
     "crates/yaml-rt-serde",
     "crates/yaml-rt-cli",
@@ -21,9 +22,11 @@ rust-version = "1.96"
 [workspace.dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 yaml-rt-core = { version = "0.1.1", path = "crates/yaml-rt-core" }
+yaml-rt-rfc9535 = { version = "0.1.1", path = "crates/yaml-rt-rfc9535" }
 yaml-rt-derive = { version = "0.1.1", path = "crates/yaml-rt-derive" }
 yaml-rt-serde = { version = "0.1.1", path = "crates/yaml-rt-serde" }
 proc-macro2 = "1"
 quote = "1"
+regex = "1"
 serde = "1"
 syn = { version = "2", features = ["derive"] }

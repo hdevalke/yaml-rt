@@ -283,12 +283,15 @@ Serde serialization emits deterministic block-style YAML. Use a typed
 round-trip overlay instead when comments, quoting, whitespace, or other source
 presentation must be retained.
 
-## Command-line editor
+## Command-line query and editor
 
-The CLI applies JSON Pointer operations while preserving the rest of the
-document:
+The CLI queries YAML with RFC 9535 JSONPath and applies JSON Pointer operations
+while preserving the rest of the document:
 
 ```sh
+# Find every service port and print JSON Pointer/value pairs.
+yaml-rt query '$.services[*].port' config.yaml
+
 # Read a node.
 yaml-rt get /server/port config.yaml
 
@@ -305,10 +308,15 @@ yaml-rt add /server/tls --value-file tls.yaml config.yaml
 yaml-rt get /name --doc 1 stream.yaml
 ```
 
-Available operations are `get`, `add`, `remove`, `replace`, `move`, `copy`, and
-`test`. An omitted input file, or `-`, reads YAML from standard input.
-Mutations write to standard output unless `--output` or `--in-place` is used.
-Values passed with `--value` or `--value-file` must be complete YAML nodes.
+Available operations are `query`, `get`, `add`, `remove`, `replace`, `move`,
+`copy`, and `test`. Query results are emitted in nodelist order as one compact
+JSON Pointer/value pair per line. JSONPath evaluation uses the YAML 1.2 core
+schema and rejects YAML values that are not JSON-compatible, including
+non-string or duplicate mapping keys and non-finite numbers.
+
+An omitted input file, or `-`, reads YAML from standard input. Mutations write
+to standard output unless `--output` or `--in-place` is used. Values passed with
+`--value` or `--value-file` must be complete YAML nodes.
 
 Run `yaml-rt help <operation>` for operation-specific arguments.
 
@@ -317,6 +325,7 @@ Run `yaml-rt help <operation>` for operation-specific arguments.
 | Package | Purpose | Published |
 | --- | --- | --- |
 | `yaml-rt-core` | Dependency-free source model, parser, CST, semantic graph, diagnostics, editor, and emitter | Yes |
+| `yaml-rt-rfc9535` | Native RFC 9535 JSONPath parsing and evaluation over `YamlDoc` | Yes |
 | `yaml-rt-derive` | `YamlRoundTrip` procedural derive | Yes |
 | `yaml-rt-serde` | Serde serializer and deserializer | Yes |
 | `yaml-rt` | Facade re-exporting the public APIs | Yes |
@@ -331,7 +340,13 @@ The facade features are:
 | `derive` | Yes | Re-exports `yaml_rt_derive::YamlRoundTrip` |
 | `serde` | No | Re-exports the `yaml-rt-serde` conversion API |
 
-`yaml-rt-core` has no third-party dependencies.
+`yaml-rt-core` has no third-party dependencies and retains the foundational RFC
+6901 `JsonPointer` API. The independently usable `yaml-rt-rfc9535` crate depends
+on `regex` for the standard `match()` and `search()` functions. Its JSONPath
+parser, semantic evaluator, compatibility validator, and pointer construction
+operate directly on `YamlDoc` without a generic JSON value dependency. Compact
+JSON rendering remains private to `yaml-rt-cli`; the RFC 9535 crate is not
+re-exported by the `yaml-rt` facade.
 
 ## YAML 1.2.2 conformance
 

@@ -71,6 +71,7 @@ jobs:
         run: >-
           cargo clippy
           -p yaml-rt-core
+          -p yaml-rt-rfc9535
           -p yaml-rt-derive
           -p yaml-rt-serde
           -p yaml-rt
@@ -86,6 +87,7 @@ jobs:
         run: >-
           cargo doc
           -p yaml-rt-core
+          -p yaml-rt-rfc9535
           -p yaml-rt-derive
           -p yaml-rt-serde
           -p yaml-rt
@@ -104,6 +106,7 @@ jobs:
           set -euo pipefail
           packages=(
             yaml-rt-core
+            yaml-rt-rfc9535
             yaml-rt-derive
             yaml-rt-serde
             yaml-rt
@@ -363,6 +366,7 @@ jobs:
           set -euo pipefail
           packages=(
             yaml-rt-core
+            yaml-rt-rfc9535
             yaml-rt-derive
             yaml-rt-serde
             yaml-rt-cli
@@ -396,6 +400,11 @@ jobs:
           cargo new --quiet --lib "${ROOT}/default"
           cargo add --manifest-path "${ROOT}/default/Cargo.toml" "yaml-rt@=${VERSION}"
           cargo check --manifest-path "${ROOT}/default/Cargo.toml" --locked
+
+          cargo new --quiet --lib "${ROOT}/rfc9535"
+          cargo add --manifest-path "${ROOT}/rfc9535/Cargo.toml" \
+            "yaml-rt-core@=${VERSION}" "yaml-rt-rfc9535@=${VERSION}"
+          cargo check --manifest-path "${ROOT}/rfc9535/Cargo.toml" --locked
 
           cargo new --quiet --lib "${ROOT}/no-default"
           cargo add --manifest-path "${ROOT}/no-default/Cargo.toml" \

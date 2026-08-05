@@ -108,6 +108,7 @@ jobs:
         run: >-
           cargo clippy
           -p yaml-rt-core
+          -p yaml-rt-rfc9535
           -p yaml-rt-derive
           -p yaml-rt-serde
           -p yaml-rt
@@ -123,6 +124,7 @@ jobs:
         run: >-
           cargo doc
           -p yaml-rt-core
+          -p yaml-rt-rfc9535
           -p yaml-rt-derive
           -p yaml-rt-serde
           -p yaml-rt
@@ -165,6 +167,7 @@ jobs:
           set -euo pipefail
           packages=(
             yaml-rt-core
+            yaml-rt-rfc9535
             yaml-rt-derive
             yaml-rt-serde
             yaml-rt
@@ -191,6 +194,7 @@ jobs:
               .packages[]
               | select(
                   .name == "yaml-rt-core"
+                  or .name == "yaml-rt-rfc9535"
                   or .name == "yaml-rt-derive"
                   or .name == "yaml-rt-serde"
                   or .name == "yaml-rt-cli"
@@ -201,7 +205,8 @@ jobs:
             | [
                 .packages[]
                 | select(
-                    .name == "yaml-rt-serde"
+                    .name == "yaml-rt-rfc9535"
+                    or .name == "yaml-rt-serde"
                     or .name == "yaml-rt-cli"
                     or .name == "yaml-rt"
                   )
@@ -211,9 +216,9 @@ jobs:
                     and (.name | startswith("yaml-rt"))
                   )
               ] as $dependencies
-            | ($versions | length == 5)
+            | ($versions | length == 6)
               and all($versions[]; . == $version)
-              and ($dependencies | length == 5)
+              and ($dependencies | length == 7)
               and all($dependencies[]; .req == $requirement)
           ' "${metadata}"
 

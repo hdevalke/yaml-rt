@@ -7,15 +7,20 @@ The concrete syntax tree (CST) and original source are always authoritative.
 ## Workspace boundaries
 
 - `yaml-rt-core` owns source storage, spans, lexing, parsing, the CST, semantic
-  metadata, diagnostics, JSON Pointer lookup, edit operations, typed-overlay
-  traits, and patch emission. It intentionally has no third-party
+  metadata, diagnostics, RFC 6901 JSON Pointer lookup, edit operations,
+  typed-overlay traits, and patch emission. It intentionally has no third-party
   dependencies.
+- `yaml-rt-rfc9535` owns native JSONPath parsing, evaluation, regex functions,
+  strict JSON-data-model validation, and located pointer construction. It runs
+  directly against core semantic nodes and depends on `regex` only for the
+  standard `match()` and `search()` functions.
 - `yaml-rt-derive` generates typed round-trip overlay implementations. Its
   procedural macro dependencies do not enter the core parser.
 - `yaml-rt-serde` converts between YAML and Serde data models when presentation
   preservation is not required.
 - `yaml-rt` is the public facade and feature switchboard.
-- `yaml-rt-cli` exposes patch-oriented editing through JSON Pointer operations.
+- `yaml-rt-cli` orchestrates JSONPath queries, renders compact JSON values, and
+  exposes patch-oriented editing through JSON Pointer operations.
 - `yaml-rt-bench` and the separate `fuzz` workspace are development-only.
 
 ## Parse and edit flow

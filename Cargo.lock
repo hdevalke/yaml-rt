@@ -1442,6 +1442,7 @@ version = "0.1.1"
 dependencies = [
  "clap",
  "yaml-rt-core",
+ "yaml-rt-rfc9535",
 ]
 
 [[package]]
@@ -1455,6 +1456,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "yaml-rt-rfc9535"
+version = "0.1.1"
+dependencies = [
+ "regex",
+ "yaml-rt-core",
 ]
 
 [[package]]

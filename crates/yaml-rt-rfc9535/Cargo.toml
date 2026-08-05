@@ -1,0 +1,21 @@
+[package]
+name = "yaml-rt-rfc9535"
+description = "RFC 9535 JSONPath queries for yaml-rt documents"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+documentation = "https://docs.rs/yaml-rt-rfc9535"
+keywords = ["yaml", "jsonpath", "query", "rfc9535", "configuration"]
+categories = ["config", "parser-implementations"]
+
+[lib]
+name = "yaml_rt_rfc9535"
+path = "src/lib.rs"
+
+[dependencies]
+regex.workspace = true
+yaml-rt-core.workspace = true

@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
@@ -12,6 +13,9 @@ const SEQ_TAG: &str = "tag:yaml.org,2002:seq";
 const MAP_TAG: &str = "tag:yaml.org,2002:map";
 
 /// An exact, finite YAML number normalized for semantic comparison.
+///
+/// Ordering compares mathematical values without floating-point conversion.
+/// Its display form is canonical JSON-compatible decimal syntax.
 #[derive(Debug, Clone)]
 pub struct YamlNumber {
     negative: bool,
@@ -77,6 +81,71 @@ impl PartialEq for YamlNumber {
 }
 
 impl Eq for YamlNumber {}
+
+impl PartialOrd for YamlNumber {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for YamlNumber {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.digits == "0" && other.digits == "0" {
+            return Ordering::Equal;
+        }
+        if self.negative != other.negative {
+            return if self.negative {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        let magnitude = compare_number_magnitude(self, other);
+        if self.negative {
+            magnitude.reverse()
+        } else {
+            magnitude
+        }
+    }
+}
+
+impl fmt::Display for YamlNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.negative {
+            formatter.write_str("-")?;
+        }
+        formatter.write_str(&self.digits)?;
+        if self.integer_syntax {
+            for _ in 0..self.exponent {
+                formatter.write_str("0")?;
+            }
+            Ok(())
+        } else {
+            write!(formatter, "e{}", self.exponent)
+        }
+    }
+}
+
+fn compare_number_magnitude(left: &YamlNumber, right: &YamlNumber) -> Ordering {
+    let left_places = left.digits.len() as i128 + i128::from(left.exponent);
+    let right_places = right.digits.len() as i128 + i128::from(right.exponent);
+    match left_places.cmp(&right_places) {
+        Ordering::Equal => {}
+        ordering => return ordering,
+    }
+    let compared = left.digits.len().max(right.digits.len());
+    let left_bytes = left.digits.as_bytes();
+    let right_bytes = right.digits.as_bytes();
+    for index in 0..compared {
+        let left = left_bytes.get(index).copied().unwrap_or(b'0');
+        let right = right_bytes.get(index).copied().unwrap_or(b'0');
+        match left.cmp(&right) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    Ordering::Equal
+}
 
 /// A non-finite YAML float, which is outside the JSON-compatible data model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,6 +617,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(numbers.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn exact_numbers_order_and_format_without_float_conversion() {
+        let number = |value| {
+            let ResolvedScalar::Number(number) =
+                resolve_scalar(value, YamlScalarStyle::Plain, None).unwrap()
+            else {
+                panic!("expected number");
+            };
+            number
+        };
+
+        assert!(number("-1e1000") < number("-9e999"));
+        assert!(number("9e999") < number("1e1000"));
+        assert_eq!(number("0x10").to_string(), "16");
+        assert_eq!(number("1.50").to_string(), "15e-1");
+        assert_eq!(number("1e1000").to_string(), "1e1000");
     }
 
     #[test]

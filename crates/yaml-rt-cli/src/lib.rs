@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command, error::ErrorKind};
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment};
 
 const FAILURE: i32 = 1;
@@ -28,8 +28,8 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let matches = match command().try_get_matches_from(args) {
-        Ok(matches) => matches,
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
         Err(error) => {
             let display_only = matches!(
                 error.kind(),
@@ -46,7 +46,7 @@ where
             return if display_only { 0 } else { USAGE };
         }
     };
-    match execute(&matches, stdin, stdout) {
+    match execute(&cli.operation, stdin, stdout) {
         Ok(()) => 0,
         Err(RunError::BrokenPipe) => 0,
         Err(RunError::Message(message)) => {
@@ -56,192 +56,170 @@ where
     }
 }
 
-fn command() -> Command {
-    Command::new("yaml-rt")
-        .version(env!("CARGO_PKG_VERSION"))
-        .about("Edit YAML through JSON Pointers while preserving presentation")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .subcommand(read_command("get", "Print a selected YAML node", true))
-        .subcommand(value_command("add", "Add or replace a value", true))
-        .subcommand(mutation_command(
-            "remove",
-            "Remove an existing value",
-            OperationArgs::Path,
-        ))
-        .subcommand(value_command("replace", "Replace an existing value", true))
-        .subcommand(mutation_command(
-            "move",
-            "Move an existing value",
-            OperationArgs::FromPath,
-        ))
-        .subcommand(mutation_command(
-            "copy",
-            "Copy an existing value",
-            OperationArgs::FromPath,
-        ))
-        .subcommand(value_command(
-            "test",
-            "Test semantic equality at a path",
-            false,
-        ))
+#[derive(Parser)]
+#[command(
+    name = "yaml-rt",
+    version,
+    about = "Edit YAML through JSON Pointers while preserving presentation",
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    operation: Operation,
 }
 
-#[derive(Clone, Copy)]
-enum OperationArgs {
-    Path,
-    FromPath,
+#[derive(Subcommand)]
+enum Operation {
+    /// Print a selected YAML node.
+    Get(ReadArgs),
+    /// Add or replace a value.
+    Add(ValueMutationArgs),
+    /// Remove an existing value.
+    Remove(MutationArgs),
+    /// Replace an existing value.
+    Replace(ValueMutationArgs),
+    /// Move an existing value.
+    Move(FromMutationArgs),
+    /// Copy an existing value.
+    Copy(FromMutationArgs),
+    /// Test semantic equality at a path.
+    Test(ValueArgs),
 }
 
-fn base_command(name: &'static str, about: &'static str, args: OperationArgs) -> Command {
-    let mut command = Command::new(name).about(about);
-    match args {
-        OperationArgs::Path => {
-            command = command.arg(path_arg("path", 1));
-        }
-        OperationArgs::FromPath => {
-            command = command.arg(path_arg("from", 1)).arg(path_arg("path", 2));
-        }
-    }
-    command
-        .arg(
-            Arg::new("file")
-                .value_name("FILE")
-                .index(match args {
-                    OperationArgs::Path => 2,
-                    OperationArgs::FromPath => 3,
-                })
-                .help("Input YAML file; defaults to stdin"),
-        )
-        .arg(
-            Arg::new("doc")
-                .long("doc")
-                .value_name("INDEX")
-                .value_parser(clap::value_parser!(usize))
-                .help("Zero-based YAML document index"),
-        )
+#[derive(Args)]
+struct TargetArgs {
+    /// Input YAML file; defaults to stdin.
+    #[arg(value_name = "FILE")]
+    file: Option<PathBuf>,
+    /// Zero-based YAML document index.
+    #[arg(long, value_name = "INDEX")]
+    doc: Option<usize>,
 }
 
-fn path_arg(name: &'static str, index: usize) -> Arg {
-    Arg::new(name)
-        .value_name(if name == "from" { "FROM" } else { "PATH" })
-        .index(index)
-        .required(true)
-        .allow_hyphen_values(true)
+#[derive(Args)]
+struct PathArgs {
+    #[arg(value_name = "PATH", allow_hyphen_values = true)]
+    path: String,
+    #[command(flatten)]
+    target: TargetArgs,
 }
 
-fn output_arg() -> Arg {
-    Arg::new("output")
-        .short('o')
-        .long("output")
-        .value_name("FILE")
-        .help("Write output to a file")
+#[derive(Args)]
+struct FromPathArgs {
+    #[arg(value_name = "FROM", allow_hyphen_values = true)]
+    from: String,
+    #[arg(value_name = "PATH", allow_hyphen_values = true)]
+    path: String,
+    #[command(flatten)]
+    target: TargetArgs,
 }
 
-fn read_command(name: &'static str, about: &'static str, output: bool) -> Command {
-    let command = base_command(name, about, OperationArgs::Path);
-    if output {
-        command.arg(output_arg())
-    } else {
-        command
-    }
+#[derive(Args)]
+struct OutputArgs {
+    /// Write output to a file.
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
 }
 
-fn mutation_command(name: &'static str, about: &'static str, args: OperationArgs) -> Command {
-    base_command(name, about, args).arg(output_arg()).arg(
-        Arg::new("in-place")
-            .short('i')
-            .long("in-place")
-            .action(ArgAction::SetTrue)
-            .conflicts_with("output")
-            .help("Atomically replace the input file"),
-    )
+#[derive(Args)]
+struct MutationOutputArgs {
+    #[command(flatten)]
+    output: OutputArgs,
+    /// Atomically replace the input file.
+    #[arg(short, long, conflicts_with = "output")]
+    in_place: bool,
 }
 
-fn value_command(name: &'static str, about: &'static str, mutation: bool) -> Command {
-    let command = base_command(name, about, OperationArgs::Path)
-        .arg(
-            Arg::new("value")
-                .long("value")
-                .value_name("YAML")
-                .allow_hyphen_values(true)
-                .help("Complete YAML node"),
-        )
-        .arg(
-            Arg::new("value-file")
-                .long("value-file")
-                .value_name("FILE")
-                .help("Read the YAML node from a file"),
-        )
-        .group(
-            ArgGroup::new("value-source")
-                .args(["value", "value-file"])
-                .required(true)
-                .multiple(false),
-        );
-    if mutation {
-        command.arg(output_arg()).arg(
-            Arg::new("in-place")
-                .short('i')
-                .long("in-place")
-                .action(ArgAction::SetTrue)
-                .conflicts_with("output")
-                .help("Atomically replace the input file"),
-        )
-    } else {
-        command
-    }
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct ValueSourceArgs {
+    /// Complete YAML node.
+    #[arg(long, value_name = "YAML", allow_hyphen_values = true)]
+    value: Option<String>,
+    /// Read the YAML node from a file.
+    #[arg(long, value_name = "FILE")]
+    value_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ReadArgs {
+    #[command(flatten)]
+    path: PathArgs,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Args)]
+struct MutationArgs {
+    #[command(flatten)]
+    path: PathArgs,
+    #[command(flatten)]
+    output: MutationOutputArgs,
+}
+
+#[derive(Args)]
+struct FromMutationArgs {
+    #[command(flatten)]
+    path: FromPathArgs,
+    #[command(flatten)]
+    output: MutationOutputArgs,
+}
+
+#[derive(Args)]
+struct ValueArgs {
+    #[command(flatten)]
+    path: PathArgs,
+    #[command(flatten)]
+    value: ValueSourceArgs,
+}
+
+#[derive(Args)]
+struct ValueMutationArgs {
+    #[command(flatten)]
+    value: ValueArgs,
+    #[command(flatten)]
+    output: MutationOutputArgs,
 }
 
 fn execute(
-    matches: &ArgMatches,
+    operation: &Operation,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
 ) -> Result<(), RunError> {
-    let (operation, arguments) = matches
-        .subcommand()
-        .ok_or_else(|| RunError::message("missing subcommand"))?;
-    let input_path = arguments.get_one::<String>("file").map(PathBuf::from);
-    let target_uses_stdin = input_path
-        .as_deref()
-        .is_none_or(|path| path == Path::new("-"));
-    let input = read_target(input_path.as_deref(), stdin)?;
+    let target = operation.target();
+    let input_path = target.file.as_deref();
+    let target_uses_stdin = input_path.is_none_or(|path| path == Path::new("-"));
+    let input = read_target(input_path, stdin)?;
     let mut doc = YamlDoc::parse_owned(input).map_err(RunError::display)?;
-    let document = select_document(&doc, arguments.get_one::<usize>("doc").copied())?;
+    let document = select_document(&doc, target.doc)?;
 
-    let path = arguments
-        .get_one::<String>("path")
+    let path = JsonPointer::parse(operation.path()).map_err(RunError::display)?;
+    let from = operation
+        .from()
         .map(|value| JsonPointer::parse(value))
         .transpose()
         .map_err(RunError::display)?;
-    let from = arguments
-        .try_get_one::<String>("from")
-        .ok()
-        .flatten()
-        .map(|value| JsonPointer::parse(value))
-        .transpose()
-        .map_err(RunError::display)?;
-    let value = read_value(arguments, target_uses_stdin, stdin)?;
+    let value = read_value(operation.value(), target_uses_stdin, stdin)?;
 
     match operation {
-        "get" => {
-            let pointer = path.as_ref().expect("Clap requires path");
+        Operation::Get(arguments) => {
             let node = doc
-                .resolve_pointer(document, pointer)
+                .resolve_pointer(document, &path)
                 .map_err(RunError::display)?;
             let output = doc.extract_node(node).map_err(RunError::display)?;
             write_result(
                 output.as_bytes(),
-                arguments.get_one::<String>("output").map(Path::new),
-                input_path.as_deref(),
+                arguments.output.output.as_deref(),
+                input_path,
                 stdout,
             )
         }
-        "test" => {
+        Operation::Test(_) => {
             let equal = doc
                 .test_at(
                     document,
-                    path.as_ref().expect("Clap requires path"),
+                    &path,
                     value.as_ref().expect("Clap requires a value"),
                 )
                 .map_err(RunError::display)?;
@@ -250,52 +228,79 @@ fn execute(
             } else {
                 Err(RunError::message(format!(
                     "test failed at {:?}: values are not semantically equal",
-                    path.as_ref().map_or("", JsonPointer::as_str)
+                    path.as_str()
                 )))
             }
         }
-        "add" => {
+        Operation::Add(arguments) => {
             doc.add_at(
                 document,
-                path.as_ref().expect("Clap requires path"),
+                &path,
                 value.as_ref().expect("Clap requires a value"),
             )
             .map_err(RunError::display)?;
-            write_mutation(&doc, arguments, input_path.as_deref(), stdout)
+            write_mutation(&doc, &arguments.output, input_path, stdout)
         }
-        "remove" => {
-            doc.remove_at(document, path.as_ref().expect("Clap requires path"))
-                .map_err(RunError::display)?;
-            write_mutation(&doc, arguments, input_path.as_deref(), stdout)
+        Operation::Remove(arguments) => {
+            doc.remove_at(document, &path).map_err(RunError::display)?;
+            write_mutation(&doc, &arguments.output, input_path, stdout)
         }
-        "replace" => {
+        Operation::Replace(arguments) => {
             doc.replace_at(
                 document,
-                path.as_ref().expect("Clap requires path"),
+                &path,
                 value.as_ref().expect("Clap requires a value"),
             )
             .map_err(RunError::display)?;
-            write_mutation(&doc, arguments, input_path.as_deref(), stdout)
+            write_mutation(&doc, &arguments.output, input_path, stdout)
         }
-        "move" => {
-            doc.move_at(
-                document,
-                from.as_ref().expect("Clap requires from"),
-                path.as_ref().expect("Clap requires path"),
-            )
-            .map_err(RunError::display)?;
-            write_mutation(&doc, arguments, input_path.as_deref(), stdout)
+        Operation::Move(arguments) => {
+            doc.move_at(document, from.as_ref().expect("Clap requires from"), &path)
+                .map_err(RunError::display)?;
+            write_mutation(&doc, &arguments.output, input_path, stdout)
         }
-        "copy" => {
-            doc.copy_at(
-                document,
-                from.as_ref().expect("Clap requires from"),
-                path.as_ref().expect("Clap requires path"),
-            )
-            .map_err(RunError::display)?;
-            write_mutation(&doc, arguments, input_path.as_deref(), stdout)
+        Operation::Copy(arguments) => {
+            doc.copy_at(document, from.as_ref().expect("Clap requires from"), &path)
+                .map_err(RunError::display)?;
+            write_mutation(&doc, &arguments.output, input_path, stdout)
         }
-        _ => Err(RunError::message("unknown subcommand")),
+    }
+}
+
+impl Operation {
+    fn target(&self) -> &TargetArgs {
+        match self {
+            Self::Get(args) => &args.path.target,
+            Self::Add(args) | Self::Replace(args) => &args.value.path.target,
+            Self::Remove(args) => &args.path.target,
+            Self::Move(args) | Self::Copy(args) => &args.path.target,
+            Self::Test(args) => &args.path.target,
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Self::Get(args) => &args.path.path,
+            Self::Add(args) | Self::Replace(args) => &args.value.path.path,
+            Self::Remove(args) => &args.path.path,
+            Self::Move(args) | Self::Copy(args) => &args.path.path,
+            Self::Test(args) => &args.path.path,
+        }
+    }
+
+    fn from(&self) -> Option<&str> {
+        match self {
+            Self::Move(args) | Self::Copy(args) => Some(&args.path.from),
+            _ => None,
+        }
+    }
+
+    fn value(&self) -> Option<&ValueSourceArgs> {
+        match self {
+            Self::Add(args) | Self::Replace(args) => Some(&args.value.value),
+            Self::Test(args) => Some(&args.value),
+            _ => None,
+        }
     }
 }
 
@@ -309,14 +314,14 @@ fn read_target(path: Option<&Path>, stdin: &mut dyn Read) -> Result<String, RunE
 }
 
 fn read_value(
-    arguments: &ArgMatches,
+    arguments: Option<&ValueSourceArgs>,
     target_uses_stdin: bool,
     stdin: &mut dyn Read,
 ) -> Result<Option<YamlFragment>, RunError> {
-    let input = if let Some(value) = arguments.try_get_one::<String>("value").ok().flatten() {
+    let input = if let Some(value) = arguments.and_then(|arguments| arguments.value.as_ref()) {
         Some(value.clone())
-    } else if let Some(path) = arguments.try_get_one::<String>("value-file").ok().flatten() {
-        if path == "-" {
+    } else if let Some(path) = arguments.and_then(|arguments| arguments.value_file.as_deref()) {
+        if path == Path::new("-") {
             if target_uses_stdin {
                 return Err(RunError::message(
                     "target YAML and --value-file cannot both read stdin",
@@ -325,7 +330,10 @@ fn read_value(
             Some(read_stream(stdin, "value stdin")?)
         } else {
             Some(fs::read_to_string(path).map_err(|error| {
-                RunError::message(format!("cannot read value file {path}: {error}"))
+                RunError::message(format!(
+                    "cannot read value file {}: {error}",
+                    path.display()
+                ))
             })?)
         }
     } else {
@@ -362,11 +370,11 @@ fn select_document(doc: &YamlDoc, selected: Option<usize>) -> Result<usize, RunE
 
 fn write_mutation(
     doc: &YamlDoc,
-    arguments: &ArgMatches,
+    arguments: &MutationOutputArgs,
     input: Option<&Path>,
     stdout: &mut dyn Write,
 ) -> Result<(), RunError> {
-    if arguments.get_flag("in-place") {
+    if arguments.in_place {
         let input = input
             .filter(|path| *path != Path::new("-"))
             .ok_or_else(|| RunError::message("--in-place requires a real input filename"))?;
@@ -374,7 +382,7 @@ fn write_mutation(
     } else {
         write_result(
             doc.as_source().as_bytes(),
-            arguments.get_one::<String>("output").map(Path::new),
+            arguments.output.output.as_deref(),
             input,
             stdout,
         )
@@ -568,5 +576,59 @@ mod tests {
         let (status, _, stderr) = invoke(&["yaml-rt", "get", ""], "--- one\n--- two\n");
         assert_eq!(status, FAILURE);
         assert!(stderr.contains("--doc"));
+    }
+
+    #[test]
+    fn derive_arguments_enforce_value_and_output_conflicts() {
+        let (status, stdout, stderr) = invoke(&["yaml-rt", "replace", "/value"], "value: 1\n");
+        assert_eq!(status, USAGE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("--value"));
+
+        let (status, stdout, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "replace",
+                "/value",
+                "--value",
+                "1",
+                "--value-file",
+                "value.yaml",
+            ],
+            "value: 1\n",
+        );
+        assert_eq!(status, USAGE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("cannot be used with"));
+
+        let (status, stdout, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "remove",
+                "/value",
+                "--output",
+                "out.yaml",
+                "--in-place",
+            ],
+            "value: 1\n",
+        );
+        assert_eq!(status, USAGE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("cannot be used with"));
+    }
+
+    #[test]
+    fn hyphen_prefixed_inline_yaml_is_accepted() {
+        let (status, stdout, stderr) = invoke(&["yaml-rt", "get", "-invalid"], "value: old\n");
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("JSON Pointer"));
+
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "replace", "/value", "--value", "-1"],
+            "value: old\n",
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "value: -1\n");
     }
 }

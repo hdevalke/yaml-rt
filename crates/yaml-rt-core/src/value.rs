@@ -337,118 +337,99 @@ pub fn semantically_equal(
     right_doc: &YamlDoc,
     right: NodeId,
 ) -> Result<bool, SemanticValueError> {
+    enum CompareAction {
+        Compare(NodeId, NodeId, usize),
+        Exit(NodeId, NodeId),
+    }
+
     let mut active = HashSet::new();
-    compare_nodes(left_doc, left, right_doc, right, &mut active, 0)
-}
-
-fn compare_nodes(
-    left_doc: &YamlDoc,
-    left: NodeId,
-    right_doc: &YamlDoc,
-    right: NodeId,
-    active: &mut HashSet<(NodeId, NodeId)>,
-    depth: usize,
-) -> Result<bool, SemanticValueError> {
-    if depth > 1024 {
-        return Err(SemanticValueError::new(
-            "semantic comparison recursion limit exceeded",
-        ));
-    }
-    let left = resolve_alias_chain(left_doc, left)?;
-    let right = resolve_alias_chain(right_doc, right)?;
-    if !active.insert((left, right)) {
-        return Err(SemanticValueError::new(
-            "cyclic YAML values are not JSON-compatible",
-        ));
-    }
-    let result = compare_resolved(left_doc, left, right_doc, right, active, depth);
-    active.remove(&(left, right));
-    result
-}
-
-fn compare_resolved(
-    left_doc: &YamlDoc,
-    left: NodeId,
-    right_doc: &YamlDoc,
-    right: NodeId,
-    active: &mut HashSet<(NodeId, NodeId)>,
-    depth: usize,
-) -> Result<bool, SemanticValueError> {
-    match (left_doc.semantic_kind(left), right_doc.semantic_kind(right)) {
-        (
-            Some(SemanticKind::Scalar { style: left_style }),
-            Some(SemanticKind::Scalar { style: right_style }),
-        ) => {
-            let left = resolved_scalar_at(left_doc, left, left_style)?;
-            let right = resolved_scalar_at(right_doc, right, right_style)?;
-            if matches!(left, ResolvedScalar::NonFinite(_))
-                || matches!(right, ResolvedScalar::NonFinite(_))
-            {
-                return Err(SemanticValueError::new(
-                    "infinities and NaN are not JSON-compatible",
-                ));
-            }
-            Ok(left == right)
+    let mut pending = vec![CompareAction::Compare(left, right, 0)];
+    while let Some(action) = pending.pop() {
+        let CompareAction::Compare(left, right, depth) = action else {
+            let CompareAction::Exit(left, right) = action else {
+                unreachable!();
+            };
+            active.remove(&(left, right));
+            continue;
+        };
+        if depth > 1024 {
+            return Err(SemanticValueError::new(
+                "semantic comparison recursion limit exceeded",
+            ));
         }
-        (
-            Some(SemanticKind::Sequence { style: left_style }),
-            Some(SemanticKind::Sequence { style: right_style }),
-        ) => {
-            validate_collection_tag(left_doc, left, left_style, false)?;
-            validate_collection_tag(right_doc, right, right_style, false)?;
-            let left_items = left_doc.sequence_items(left).collect::<Vec<_>>();
-            let right_items = right_doc.sequence_items(right).collect::<Vec<_>>();
-            if left_items.len() != right_items.len() {
-                return Ok(false);
-            }
-            for (left_item, right_item) in left_items.into_iter().zip(right_items) {
-                if !compare_nodes(
-                    left_doc,
-                    left_item,
-                    right_doc,
-                    right_item,
-                    active,
-                    depth + 1,
-                )? {
+        let left = resolve_alias_chain(left_doc, left)?;
+        let right = resolve_alias_chain(right_doc, right)?;
+        if !active.insert((left, right)) {
+            return Err(SemanticValueError::new(
+                "cyclic YAML values are not JSON-compatible",
+            ));
+        }
+        match (left_doc.semantic_kind(left), right_doc.semantic_kind(right)) {
+            (
+                Some(SemanticKind::Scalar { style: left_style }),
+                Some(SemanticKind::Scalar { style: right_style }),
+            ) => {
+                let left_scalar = resolved_scalar_at(left_doc, left, left_style)?;
+                let right_scalar = resolved_scalar_at(right_doc, right, right_style)?;
+                if matches!(left_scalar, ResolvedScalar::NonFinite(_))
+                    || matches!(right_scalar, ResolvedScalar::NonFinite(_))
+                {
+                    return Err(SemanticValueError::new(
+                        "infinities and NaN are not JSON-compatible",
+                    ));
+                }
+                active.remove(&(left, right));
+                if left_scalar != right_scalar {
                     return Ok(false);
                 }
             }
-            Ok(true)
-        }
-        (
-            Some(SemanticKind::Mapping { style: left_style }),
-            Some(SemanticKind::Mapping { style: right_style }),
-        ) => {
-            validate_collection_tag(left_doc, left, left_style, true)?;
-            validate_collection_tag(right_doc, right, right_style, true)?;
-            let left_entries = json_mapping(left_doc, left)?;
-            let right_entries = json_mapping(right_doc, right)?;
-            if left_entries.len() != right_entries.len() {
-                return Ok(false);
-            }
-            for (key, left_value) in left_entries {
-                let Some(right_value) = right_entries.get(&key).copied() else {
-                    return Ok(false);
-                };
-                if !compare_nodes(
-                    left_doc,
-                    left_value,
-                    right_doc,
-                    right_value,
-                    active,
-                    depth + 1,
-                )? {
+            (
+                Some(SemanticKind::Sequence { style: left_style }),
+                Some(SemanticKind::Sequence { style: right_style }),
+            ) => {
+                validate_collection_tag(left_doc, left, left_style, false)?;
+                validate_collection_tag(right_doc, right, right_style, false)?;
+                let left_items = left_doc.sequence_items(left).collect::<Vec<_>>();
+                let right_items = right_doc.sequence_items(right).collect::<Vec<_>>();
+                if left_items.len() != right_items.len() {
                     return Ok(false);
                 }
+                pending.push(CompareAction::Exit(left, right));
+                for (left_item, right_item) in left_items.into_iter().zip(right_items).rev() {
+                    pending.push(CompareAction::Compare(left_item, right_item, depth + 1));
+                }
             }
-            Ok(true)
+            (
+                Some(SemanticKind::Mapping { style: left_style }),
+                Some(SemanticKind::Mapping { style: right_style }),
+            ) => {
+                validate_collection_tag(left_doc, left, left_style, true)?;
+                validate_collection_tag(right_doc, right, right_style, true)?;
+                let left_entries = json_mapping(left_doc, left)?;
+                let right_entries = json_mapping(right_doc, right)?;
+                if left_entries.len() != right_entries.len() {
+                    return Ok(false);
+                }
+                let mut children = Vec::with_capacity(left_entries.len());
+                for (key, left_value) in left_entries {
+                    let Some(right_value) = right_entries.get(&key).copied() else {
+                        return Ok(false);
+                    };
+                    children.push((left_value, right_value));
+                }
+                pending.push(CompareAction::Exit(left, right));
+                for (left_value, right_value) in children.into_iter().rev() {
+                    pending.push(CompareAction::Compare(left_value, right_value, depth + 1));
+                }
+            }
+            (Some(SemanticKind::Alias), _) | (_, Some(SemanticKind::Alias)) => {
+                unreachable!("aliases are resolved before comparison")
+            }
+            (Some(_), Some(_)) => return Ok(false),
+            _ => return Err(SemanticValueError::new("unknown semantic YAML node")),
         }
-        (Some(SemanticKind::Alias), _) | (_, Some(SemanticKind::Alias)) => {
-            unreachable!("aliases are resolved before comparison")
-        }
-        (Some(_), Some(_)) => Ok(false),
-        _ => Err(SemanticValueError::new("unknown semantic YAML node")),
     }
+    Ok(true)
 }
 
 fn resolved_scalar_at(
@@ -531,6 +512,27 @@ fn validate_collection_tag(
 mod tests {
     use super::*;
 
+    fn nested_block_mapping(depth: usize, value: &str) -> String {
+        let mut yaml = String::new();
+        for level in 0..depth {
+            yaml.push_str(&"  ".repeat(level));
+            yaml.push_str("key:\n");
+        }
+        yaml.push_str(&"  ".repeat(depth));
+        yaml.push_str(value);
+        yaml.push('\n');
+        yaml
+    }
+
+    fn roots_are_equal(left: &YamlDoc, right: &YamlDoc) -> Result<bool, SemanticValueError> {
+        semantically_equal(
+            left,
+            left.document_root(0).unwrap().unwrap(),
+            right,
+            right.document_root(0).unwrap().unwrap(),
+        )
+    }
+
     #[test]
     fn exact_numbers_compare_across_yaml_spellings() {
         let values = ["1", "1.0", "1e0", "0x1"];
@@ -577,6 +579,42 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("non-string")
+        );
+    }
+
+    #[test]
+    fn semantic_equality_handles_deep_equal_and_unequal_values_iteratively() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let left = YamlDoc::parse(&nested_block_mapping(1024, "1")).unwrap();
+                let equal = YamlDoc::parse(&nested_block_mapping(1024, "1.0")).unwrap();
+                let unequal = YamlDoc::parse(&nested_block_mapping(1024, "2")).unwrap();
+                assert!(roots_are_equal(&left, &equal).unwrap());
+                assert!(!roots_are_equal(&left, &unequal).unwrap());
+
+                let too_deep = YamlDoc::parse(&nested_block_mapping(1025, "1")).unwrap();
+                assert!(
+                    roots_are_equal(&too_deep, &too_deep)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("recursion limit")
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn semantic_equality_still_rejects_cyclic_alias_values() {
+        let left = YamlDoc::parse("&root [*root]\n").unwrap();
+        let right = YamlDoc::parse("&root [*root]\n").unwrap();
+        assert!(
+            roots_are_equal(&left, &right)
+                .unwrap_err()
+                .to_string()
+                .contains("cyclic YAML values")
         );
     }
 }

@@ -761,96 +761,107 @@ where
 }
 
 fn render_value(value: &SerValue, indent: usize, output: &mut String) {
-    match value {
-        SerValue::Null
-        | SerValue::Bool(_)
-        | SerValue::Signed(_)
-        | SerValue::Unsigned(_)
-        | SerValue::Float(_)
-        | SerValue::String(_) => {
-            push_indent(output, indent);
-            render_scalar(value, output);
-        }
-        SerValue::Sequence(values) => render_sequence(values, indent, output),
-        SerValue::Mapping(entries) => render_mapping(entries, indent, output),
-        SerValue::Tagged(tag, inner) => {
-            push_indent(output, indent);
-            output.push('!');
-            output.push_str(tag);
-            if is_inline(inner) {
-                output.push(' ');
-                render_inline(inner, output);
-            } else {
-                output.push('\n');
-                render_value(inner, indent, output);
-            }
-        }
+    enum RenderAction<'a> {
+        Value(&'a SerValue, usize),
+        Nested(&'a SerValue, usize),
+        Inline(&'a SerValue),
+        Indent(usize),
+        Text(&'static str),
     }
-}
 
-fn render_sequence(values: &[SerValue], indent: usize, output: &mut String) {
-    if values.is_empty() {
-        push_indent(output, indent);
-        output.push_str("[]");
-        return;
-    }
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            output.push('\n');
-        }
-        push_indent(output, indent);
-        output.push('-');
-        render_nested(value, indent + 2, output);
-    }
-}
-
-fn render_mapping(entries: &[(SerValue, SerValue)], indent: usize, output: &mut String) {
-    if entries.is_empty() {
-        push_indent(output, indent);
-        output.push_str("{}");
-        return;
-    }
-    for (index, (key, value)) in entries.iter().enumerate() {
-        if index > 0 {
-            output.push('\n');
-        }
-        if is_inline(key) {
-            push_indent(output, indent);
-            render_inline(key, output);
-            output.push(':');
-        } else {
-            push_indent(output, indent);
-            output.push('?');
-            render_nested(key, indent + 2, output);
-            output.push('\n');
-            push_indent(output, indent);
-            output.push(':');
-        }
-        render_nested(value, indent + 2, output);
-    }
-}
-
-fn render_nested(value: &SerValue, indent: usize, output: &mut String) {
-    match value {
-        SerValue::Tagged(tag, inner) if !is_inline(inner) => {
-            output.push(' ');
-            output.push('!');
-            output.push_str(tag);
-            output.push('\n');
-            render_value(inner, indent, output);
-        }
-        _ if is_inline(value) => {
-            output.push(' ');
-            render_inline(value, output);
-        }
-        _ => {
-            output.push('\n');
-            render_value(value, indent, output);
+    let mut pending = vec![RenderAction::Value(value, indent)];
+    while let Some(action) = pending.pop() {
+        match action {
+            RenderAction::Text(text) => output.push_str(text),
+            RenderAction::Indent(indent) => push_indent(output, indent),
+            RenderAction::Inline(value) => render_inline(value, output),
+            RenderAction::Nested(value, indent) => match value {
+                SerValue::Tagged(tag, inner) if !is_inline(inner) => {
+                    output.push(' ');
+                    output.push('!');
+                    output.push_str(tag);
+                    output.push('\n');
+                    pending.push(RenderAction::Value(inner, indent));
+                }
+                _ if is_inline(value) => {
+                    output.push(' ');
+                    pending.push(RenderAction::Inline(value));
+                }
+                _ => {
+                    output.push('\n');
+                    pending.push(RenderAction::Value(value, indent));
+                }
+            },
+            RenderAction::Value(value, indent) => match value {
+                SerValue::Null
+                | SerValue::Bool(_)
+                | SerValue::Signed(_)
+                | SerValue::Unsigned(_)
+                | SerValue::Float(_)
+                | SerValue::String(_) => {
+                    push_indent(output, indent);
+                    render_scalar(value, output);
+                }
+                SerValue::Sequence(values) if values.is_empty() => {
+                    push_indent(output, indent);
+                    output.push_str("[]");
+                }
+                SerValue::Sequence(values) => {
+                    for (index, value) in values.iter().enumerate().rev() {
+                        pending.push(RenderAction::Nested(value, indent + 2));
+                        pending.push(RenderAction::Text("-"));
+                        pending.push(RenderAction::Indent(indent));
+                        if index > 0 {
+                            pending.push(RenderAction::Text("\n"));
+                        }
+                    }
+                }
+                SerValue::Mapping(entries) if entries.is_empty() => {
+                    push_indent(output, indent);
+                    output.push_str("{}");
+                }
+                SerValue::Mapping(entries) => {
+                    for (index, (key, value)) in entries.iter().enumerate().rev() {
+                        pending.push(RenderAction::Nested(value, indent + 2));
+                        if is_inline(key) {
+                            pending.push(RenderAction::Text(":"));
+                            pending.push(RenderAction::Inline(key));
+                            pending.push(RenderAction::Indent(indent));
+                        } else {
+                            pending.push(RenderAction::Text(":"));
+                            pending.push(RenderAction::Indent(indent));
+                            pending.push(RenderAction::Text("\n"));
+                            pending.push(RenderAction::Nested(key, indent + 2));
+                            pending.push(RenderAction::Text("?"));
+                            pending.push(RenderAction::Indent(indent));
+                        }
+                        if index > 0 {
+                            pending.push(RenderAction::Text("\n"));
+                        }
+                    }
+                }
+                SerValue::Tagged(tag, inner) => {
+                    push_indent(output, indent);
+                    output.push('!');
+                    output.push_str(tag);
+                    if is_inline(inner) {
+                        output.push(' ');
+                        pending.push(RenderAction::Inline(inner));
+                    } else {
+                        output.push('\n');
+                        pending.push(RenderAction::Value(inner, indent));
+                    }
+                }
+            },
         }
     }
 }
 
 fn is_inline(value: &SerValue) -> bool {
+    let mut value = value;
+    while let SerValue::Tagged(_, inner) = value {
+        value = inner;
+    }
     matches!(
         value,
         SerValue::Null
@@ -861,19 +872,18 @@ fn is_inline(value: &SerValue) -> bool {
             | SerValue::String(_)
     ) || matches!(value, SerValue::Sequence(values) if values.is_empty())
         || matches!(value, SerValue::Mapping(entries) if entries.is_empty())
-        || matches!(value, SerValue::Tagged(_, inner) if is_inline(inner))
 }
 
-fn render_inline(value: &SerValue, output: &mut String) {
+fn render_inline(mut value: &SerValue, output: &mut String) {
+    while let SerValue::Tagged(tag, inner) = value {
+        output.push('!');
+        output.push_str(tag);
+        output.push(' ');
+        value = inner;
+    }
     match value {
         SerValue::Sequence(values) if values.is_empty() => output.push_str("[]"),
         SerValue::Mapping(entries) if entries.is_empty() => output.push_str("{}"),
-        SerValue::Tagged(tag, inner) => {
-            output.push('!');
-            output.push_str(tag);
-            output.push(' ');
-            render_inline(inner, output);
-        }
         _ => render_scalar(value, output),
     }
 }
@@ -996,4 +1006,36 @@ fn looks_numeric(value: &str) -> bool {
 
 fn push_indent(output: &mut String, indent: usize) {
     output.extend(std::iter::repeat_n(' ', indent));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renderer_handles_deep_sequences_iteratively() {
+        let depth = 1024;
+        let mut value = SerValue::String("value".to_owned());
+        for _ in 0..depth {
+            value = SerValue::Sequence(vec![value]);
+        }
+
+        let mut output = String::new();
+        render_value(&value, 0, &mut output);
+        assert_eq!(output.matches('-').count(), depth);
+        assert!(output.ends_with(&format!("{}- value", "  ".repeat(depth - 1))));
+    }
+
+    #[test]
+    fn renderer_handles_tag_chains_iteratively() {
+        let mut value = SerValue::String("value".to_owned());
+        for index in (0..1024).rev() {
+            value = SerValue::Tagged(format!("tag{index}"), Box::new(value));
+        }
+
+        let mut output = String::new();
+        render_value(&value, 0, &mut output);
+        assert!(output.starts_with("!tag0 !tag1 !tag2 "));
+        assert!(output.ends_with("!tag1023 value"));
+    }
 }

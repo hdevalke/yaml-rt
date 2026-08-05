@@ -154,69 +154,88 @@ impl YamlFragment {
     }
 
     fn render_node_flow(&self, node: NodeId, depth: usize) -> Result<String, FragmentError> {
-        if depth > 1024 {
-            return Err(FragmentError::new(
-                "fragment rendering recursion limit exceeded",
-            ));
+        enum RenderAction {
+            Node(NodeId, usize),
+            Text(&'static str),
         }
-        match self.doc.semantic_kind(node) {
-            Some(SemanticKind::Alias) => Ok(format!(
-                "*{}",
-                self.doc.alias_name(node).unwrap_or_default()
-            )),
-            Some(SemanticKind::Scalar { style }) => {
-                let prefix = self.property_prefix(node);
-                if matches!(style, YamlScalarStyle::Literal | YamlScalarStyle::Folded)
-                    || self
-                        .doc
-                        .node(node)
-                        .is_some_and(|node| node.span().is_empty())
-                {
-                    let value = self.doc.scalar_value(node).map_err(FragmentError::from)?;
-                    Ok(format!("{prefix}{}", quote_string(&value)))
-                } else {
-                    let source = self.doc.extract_node(node).map_err(FragmentError::from)?;
-                    if source.contains(['\n', '\r'])
-                        || style == YamlScalarStyle::Plain
-                            && source.contains(['[', ']', '{', '}', ','])
+
+        let mut output = String::new();
+        let mut pending = vec![RenderAction::Node(node, depth)];
+        while let Some(action) = pending.pop() {
+            let RenderAction::Node(node, depth) = action else {
+                let RenderAction::Text(text) = action else {
+                    unreachable!();
+                };
+                output.push_str(text);
+                continue;
+            };
+            if depth > 1024 {
+                return Err(FragmentError::new(
+                    "fragment rendering recursion limit exceeded",
+                ));
+            }
+            match self.doc.semantic_kind(node) {
+                Some(SemanticKind::Alias) => {
+                    output.push('*');
+                    output.push_str(self.doc.alias_name(node).unwrap_or_default());
+                }
+                Some(SemanticKind::Scalar { style }) => {
+                    let prefix = self.property_prefix(node);
+                    if matches!(style, YamlScalarStyle::Literal | YamlScalarStyle::Folded)
+                        || self
+                            .doc
+                            .node(node)
+                            .is_some_and(|node| node.span().is_empty())
                     {
                         let value = self.doc.scalar_value(node).map_err(FragmentError::from)?;
-                        Ok(format!("{prefix}{}", quote_string(&value)))
+                        output.push_str(&prefix);
+                        output.push_str(&quote_string(&value));
                     } else {
-                        Ok(source)
+                        let source = self.doc.extract_node(node).map_err(FragmentError::from)?;
+                        if source.contains(['\n', '\r'])
+                            || style == YamlScalarStyle::Plain
+                                && source.contains(['[', ']', '{', '}', ','])
+                        {
+                            let value = self.doc.scalar_value(node).map_err(FragmentError::from)?;
+                            output.push_str(&prefix);
+                            output.push_str(&quote_string(&value));
+                        } else {
+                            output.push_str(&source);
+                        }
                     }
                 }
-            }
-            Some(SemanticKind::Sequence { .. }) => {
-                let mut output = self.property_prefix(node);
-                output.push('[');
-                for (index, item) in self.doc.sequence_items(node).enumerate() {
-                    if index > 0 {
-                        output.push_str(", ");
+                Some(SemanticKind::Sequence { .. }) => {
+                    output.push_str(&self.property_prefix(node));
+                    output.push('[');
+                    pending.push(RenderAction::Text("]"));
+                    let items = self.doc.sequence_items(node).collect::<Vec<_>>();
+                    for (index, item) in items.into_iter().enumerate().rev() {
+                        pending.push(RenderAction::Node(item, depth + 1));
+                        if index > 0 {
+                            pending.push(RenderAction::Text(", "));
+                        }
                     }
-                    output.push_str(&self.render_node_flow(item, depth + 1)?);
                 }
-                output.push(']');
-                Ok(output)
-            }
-            Some(SemanticKind::Mapping { .. }) => {
-                let mut output = self.property_prefix(node);
-                output.push('{');
-                for (index, (key, value)) in self.doc.mapping_entries(node).enumerate() {
-                    if index > 0 {
-                        output.push_str(", ");
+                Some(SemanticKind::Mapping { .. }) => {
+                    output.push_str(&self.property_prefix(node));
+                    output.push('{');
+                    pending.push(RenderAction::Text("}"));
+                    let entries = self.doc.mapping_entries(node).collect::<Vec<_>>();
+                    for (index, (key, value)) in entries.into_iter().enumerate().rev() {
+                        pending.push(RenderAction::Node(value, depth + 1));
+                        pending.push(RenderAction::Text(": "));
+                        pending.push(RenderAction::Node(key, depth + 1));
+                        if index > 0 {
+                            pending.push(RenderAction::Text(", "));
+                        }
                     }
-                    output.push_str(&self.render_node_flow(key, depth + 1)?);
-                    output.push_str(": ");
-                    output.push_str(&self.render_node_flow(value, depth + 1)?);
                 }
-                output.push('}');
-                Ok(output)
-            }
-            Some(SemanticKind::Document) | None => {
-                Err(FragmentError::new("cannot render unknown YAML node"))
+                Some(SemanticKind::Document) | None => {
+                    return Err(FragmentError::new("cannot render unknown YAML node"));
+                }
             }
         }
+        Ok(output)
     }
 
     fn property_prefix(&self, node: NodeId) -> String {
@@ -413,6 +432,17 @@ impl From<YamlError> for FragmentError {
 mod tests {
     use super::*;
 
+    fn nested_block_sequence(depth: usize) -> String {
+        let mut yaml = String::new();
+        for level in 0..depth {
+            yaml.push_str(&"  ".repeat(level));
+            yaml.push_str("-\n");
+        }
+        yaml.push_str(&"  ".repeat(depth));
+        yaml.push_str("value\n");
+        yaml
+    }
+
     #[test]
     fn fragment_requires_one_nonempty_document() {
         assert!(YamlFragment::parse("").is_err());
@@ -443,5 +473,28 @@ mod tests {
         let fragment = YamlFragment::parse("one:\n  - a\n  - b\n").unwrap();
         let target = YamlDoc::parse("target: []\n").unwrap();
         assert_eq!(fragment.render_flow(&target).unwrap(), "{one: [a, b]}");
+    }
+
+    #[test]
+    fn flow_rendering_preserves_the_existing_depth_limit() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let target = YamlDoc::parse("target: []\n").unwrap();
+                let accepted = YamlFragment::parse(&nested_block_sequence(1024)).unwrap();
+                assert!(accepted.render_flow(&target).is_ok());
+
+                let rejected = YamlFragment::parse(&nested_block_sequence(1025)).unwrap();
+                assert!(
+                    rejected
+                        .render_flow(&target)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("recursion limit")
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

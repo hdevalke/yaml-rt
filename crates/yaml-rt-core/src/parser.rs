@@ -57,6 +57,30 @@ enum FlowNode {
     Collection(FlowFrame, usize),
 }
 
+struct FlowParseState<'text> {
+    text: &'text str,
+    absolute_start: usize,
+    root: NodeId,
+    frames: Vec<FlowFrame>,
+    completed: Option<(NodeId, usize)>,
+    position: usize,
+}
+
+impl<'text> FlowParseState<'text> {
+    fn new(text: &'text str, absolute_start: usize, root: NodeId, open: char) -> Self {
+        let mut frames = Vec::with_capacity(16);
+        frames.push(flow_frame(root, open));
+        Self {
+            text,
+            absolute_start,
+            root,
+            frames,
+            completed: None,
+            position: open.len_utf8(),
+        }
+    }
+}
+
 enum PendingFlowEvent {
     Node(NodeId),
     Entries(u32),
@@ -1873,10 +1897,6 @@ impl<'source> Parser<'source> {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the one-pass flow state machine keeps all stack transitions together"
-    )]
     fn parse_flow_collection_iterative(
         &mut self,
         text: &str,
@@ -1893,498 +1913,541 @@ impl<'source> Parser<'source> {
             },
             Span::from_usize(absolute_start, absolute_start + open.len_utf8()),
         );
-        let mut frames = Vec::with_capacity(16);
-        frames.push(flow_frame(root, open));
-        let mut position = open.len_utf8();
-        let mut completed = None::<(NodeId, usize)>;
+        let mut flow = FlowParseState::new(text, absolute_start, root, open);
 
         loop {
-            if let Some((child, child_end)) = completed.take() {
-                position = child_end;
-                let Some(frame_index) = frames.len().checked_sub(1) else {
-                    return Ok((root, position));
-                };
-                let frame = frames[frame_index];
-                match frame.state {
-                    FlowFrameState::SequenceAwaitItem {
-                        entry,
-                        entry_start,
-                        explicit,
-                    } => {
-                        position = skip_flow_whitespace(text, position);
-                        if text[position..].starts_with(':') {
-                            if !explicit {
-                                reject_split_implicit_flow_mapping_key(
-                                    text,
-                                    entry_start,
-                                    position,
-                                    absolute_start,
-                                )?;
-                            }
-                            let mapping = self.push_node(
-                                NodeKind::FlowMapping,
-                                Span::from_usize(
-                                    absolute_start + entry_start,
-                                    absolute_start + position,
-                                ),
-                            );
-                            let mapping_entry = self.push_node(
-                                NodeKind::MappingEntry,
-                                Span::from_usize(
-                                    absolute_start + entry_start,
-                                    absolute_start + position,
-                                ),
-                            );
-                            self.attach_child_at(mapping.as_usize(), mapping_entry);
-                            self.attach_child_at(mapping_entry.as_usize(), child);
-                            position = skip_flow_whitespace(text, position + 1);
-                            if text[position..].starts_with([',', ']']) {
-                                let value = self.push_empty_scalar(absolute_start + position);
-                                self.attach_child_at(mapping_entry.as_usize(), value);
-                                self.finish_flow_mapping_sequence_item(
-                                    frame.node,
-                                    entry,
-                                    mapping,
-                                    mapping_entry,
-                                    position,
-                                    absolute_start,
-                                );
-                                frames[frame_index].state = FlowFrameState::SequenceAfterItem;
-                            } else {
-                                frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
-                                    entry,
-                                    mapping,
-                                    mapping_entry,
-                                };
-                                self.start_flow_node(
-                                    text,
-                                    position,
-                                    absolute_start,
-                                    frame.close,
-                                    &mut frames,
-                                    &mut completed,
-                                    &mut position,
-                                )?;
-                            }
-                        } else if explicit {
-                            let mapping = self.push_node(
-                                NodeKind::FlowMapping,
-                                Span::from_usize(
-                                    absolute_start + entry_start,
-                                    absolute_start + position,
-                                ),
-                            );
-                            let mapping_entry = self.push_node(
-                                NodeKind::MappingEntry,
-                                Span::from_usize(
-                                    absolute_start + entry_start,
-                                    absolute_start + position,
-                                ),
-                            );
-                            let value = self.push_empty_scalar(absolute_start + position);
-                            self.attach_child_at(mapping.as_usize(), mapping_entry);
-                            self.attach_child_at(mapping_entry.as_usize(), child);
-                            self.attach_child_at(mapping_entry.as_usize(), value);
-                            self.finish_flow_mapping_sequence_item(
-                                frame.node,
-                                entry,
-                                mapping,
-                                mapping_entry,
-                                position,
-                                absolute_start,
-                            );
-                            frames[frame_index].state = FlowFrameState::SequenceAfterItem;
-                        } else {
-                            self.attach_child_at(entry.as_usize(), child);
-                            self.nodes[entry.as_usize()].span.end =
-                                Span::usize_to_u32(absolute_start + position);
-                            self.attach_child_at(frame.node.as_usize(), entry);
-                            frames[frame_index].state = FlowFrameState::SequenceAfterItem;
-                        }
-                    }
-                    FlowFrameState::SequenceAwaitValue {
-                        entry,
-                        mapping,
-                        mapping_entry,
-                    } => {
-                        self.attach_child_at(mapping_entry.as_usize(), child);
-                        self.finish_flow_mapping_sequence_item(
-                            frame.node,
-                            entry,
-                            mapping,
-                            mapping_entry,
-                            position,
-                            absolute_start,
-                        );
-                        frames[frame_index].state = FlowFrameState::SequenceAfterItem;
-                    }
-                    FlowFrameState::MappingAwaitKey {
-                        entry,
-                        entry_start,
-                        explicit,
-                    } => {
-                        self.attach_child_at(entry.as_usize(), child);
-                        position = skip_flow_whitespace(text, position);
-                        if text[position..].starts_with(':') {
-                            let value_start = position + 1;
-                            position = skip_flow_whitespace(text, value_start);
-                            reject_unindented_split_flow_mapping_value(
-                                text,
-                                value_start,
-                                position,
-                                absolute_start,
-                                self.source_indent_at(absolute_start),
-                            )?;
-                            if text[position..].starts_with([',', '}']) {
-                                let value = self.push_empty_scalar(absolute_start + position);
-                                self.attach_child_at(entry.as_usize(), value);
-                                self.finish_flow_mapping_entry(
-                                    frame.node,
-                                    entry,
-                                    entry_start,
-                                    position,
-                                    absolute_start,
-                                );
-                                frames[frame_index].state = FlowFrameState::MappingAfterPair;
-                            } else {
-                                frames[frame_index].state =
-                                    FlowFrameState::MappingAwaitValue { entry, entry_start };
-                                self.start_flow_node(
-                                    text,
-                                    position,
-                                    absolute_start,
-                                    frame.close,
-                                    &mut frames,
-                                    &mut completed,
-                                    &mut position,
-                                )?;
-                            }
-                        } else if explicit || text[position..].starts_with(',') {
-                            let value = self.push_empty_scalar(absolute_start + position);
-                            self.attach_child_at(entry.as_usize(), value);
-                            self.finish_flow_mapping_entry(
-                                frame.node,
-                                entry,
-                                entry_start,
-                                position,
-                                absolute_start,
-                            );
-                            frames[frame_index].state = FlowFrameState::MappingAfterPair;
-                        } else {
-                            let found = text[position..].chars().next().unwrap_or(frame.close);
-                            return Err(missing_flow_mapping_colon(
-                                absolute_start + position,
-                                found,
-                            ));
-                        }
-                    }
-                    FlowFrameState::MappingAwaitValue { entry, entry_start } => {
-                        self.attach_child_at(entry.as_usize(), child);
-                        self.finish_flow_mapping_entry(
-                            frame.node,
-                            entry,
-                            entry_start,
-                            position,
-                            absolute_start,
-                        );
-                        frames[frame_index].state = FlowFrameState::MappingAfterPair;
-                    }
-                    _ => {
-                        return Err(invalid_flow_parser_state(absolute_start + position));
-                    }
+            if let Some((child, child_end)) = flow.completed.take() {
+                if let Some(end) = self.resume_completed_flow_node(&mut flow, child, child_end)? {
+                    return Ok((flow.root, end));
                 }
                 continue;
             }
-
-            let frame_index = frames.len() - 1;
-            let frame = frames[frame_index];
-            position = skip_flow_whitespace(text, position);
-            let Some(character) = text[position..].chars().next() else {
-                return Err(if frame.kind == FlowCollectionKind::Sequence {
-                    missing_flow_sequence_end(absolute_start, text.len())
-                } else {
-                    missing_flow_mapping_end(absolute_start, text.len())
-                });
-            };
-
-            match frame.state {
-                FlowFrameState::SequenceExpectItem => {
-                    if character == frame.close {
-                        position += character.len_utf8();
-                        self.nodes[frame.node.as_usize()].span.end =
-                            Span::usize_to_u32(absolute_start + position);
-                        frames.pop();
-                        completed = Some((frame.node, position));
-                        continue;
-                    }
-                    if character == ',' {
-                        return Err(unexpected_flow_comma(absolute_start + position));
-                    }
-                    if matches!(character, ']' | '}') {
-                        return Err(expected_flow_separator(
-                            absolute_start + position,
-                            character,
-                        ));
-                    }
-
-                    let entry_start = position;
-                    let entry = self.push_node(
-                        NodeKind::SequenceEntry,
-                        Span::empty_from_usize(absolute_start + entry_start),
-                    );
-                    let explicit =
-                        character == '?' && is_flow_explicit_key_indicator(text, position);
-                    if explicit {
-                        position = skip_flow_whitespace(text, position + 1);
-                    }
-                    if text[position..].starts_with(':')
-                        && is_flow_mapping_separator_colon(text, position)
-                    {
-                        let mapping = self.push_node(
-                            NodeKind::FlowMapping,
-                            Span::empty_from_usize(absolute_start + entry_start),
-                        );
-                        let mapping_entry = self.push_node(
-                            NodeKind::MappingEntry,
-                            Span::empty_from_usize(absolute_start + entry_start),
-                        );
-                        let key = self.push_empty_scalar(absolute_start + position);
-                        self.attach_child_at(mapping.as_usize(), mapping_entry);
-                        self.attach_child_at(mapping_entry.as_usize(), key);
-                        position = skip_flow_whitespace(text, position + 1);
-                        if text[position..].starts_with([',', ']']) {
-                            let value = self.push_empty_scalar(absolute_start + position);
-                            self.attach_child_at(mapping_entry.as_usize(), value);
-                            self.finish_flow_mapping_sequence_item(
-                                frame.node,
-                                entry,
-                                mapping,
-                                mapping_entry,
-                                position,
-                                absolute_start,
-                            );
-                            frames[frame_index].state = FlowFrameState::SequenceAfterItem;
-                        } else {
-                            frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
-                                entry,
-                                mapping,
-                                mapping_entry,
-                            };
-                            self.start_flow_node(
-                                text,
-                                position,
-                                absolute_start,
-                                frame.close,
-                                &mut frames,
-                                &mut completed,
-                                &mut position,
-                            )?;
-                        }
-                    } else if explicit && text[position..].starts_with([',', ']']) {
-                        let mapping = self.push_node(
-                            NodeKind::FlowMapping,
-                            Span::empty_from_usize(absolute_start + entry_start),
-                        );
-                        let mapping_entry = self.push_node(
-                            NodeKind::MappingEntry,
-                            Span::empty_from_usize(absolute_start + entry_start),
-                        );
-                        let key = self.push_empty_scalar(absolute_start + position);
-                        let value = self.push_empty_scalar(absolute_start + position);
-                        self.attach_child_at(mapping.as_usize(), mapping_entry);
-                        self.attach_child_at(mapping_entry.as_usize(), key);
-                        self.attach_child_at(mapping_entry.as_usize(), value);
-                        self.finish_flow_mapping_sequence_item(
-                            frame.node,
-                            entry,
-                            mapping,
-                            mapping_entry,
-                            position,
-                            absolute_start,
-                        );
-                        frames[frame_index].state = FlowFrameState::SequenceAfterItem;
-                    } else {
-                        frames[frame_index].state = FlowFrameState::SequenceAwaitItem {
-                            entry,
-                            entry_start,
-                            explicit,
-                        };
-                        self.start_flow_node(
-                            text,
-                            position,
-                            absolute_start,
-                            frame.close,
-                            &mut frames,
-                            &mut completed,
-                            &mut position,
-                        )?;
-                    }
-                }
-                FlowFrameState::SequenceAfterItem => match character {
-                    ',' => {
-                        position += 1;
-                        frames[frame_index].state = FlowFrameState::SequenceExpectItem;
-                    }
-                    character if character == frame.close => {
-                        position += character.len_utf8();
-                        self.nodes[frame.node.as_usize()].span.end =
-                            Span::usize_to_u32(absolute_start + position);
-                        frames.pop();
-                        completed = Some((frame.node, position));
-                    }
-                    _ => {
-                        return Err(expected_flow_separator(
-                            absolute_start + position,
-                            character,
-                        ));
-                    }
-                },
-                FlowFrameState::MappingExpectKey => {
-                    if character == frame.close {
-                        position += character.len_utf8();
-                        self.nodes[frame.node.as_usize()].span.end =
-                            Span::usize_to_u32(absolute_start + position);
-                        frames.pop();
-                        completed = Some((frame.node, position));
-                        continue;
-                    }
-                    if character == ',' {
-                        return Err(unexpected_flow_mapping_comma(absolute_start + position));
-                    }
-                    if matches!(character, ']' | '}') {
-                        return Err(expected_flow_mapping_separator(
-                            absolute_start + position,
-                            character,
-                        ));
-                    }
-
-                    let entry_start = position;
-                    let entry = self.push_node(
-                        NodeKind::MappingEntry,
-                        Span::empty_from_usize(absolute_start + entry_start),
-                    );
-                    let explicit =
-                        character == '?' && is_flow_explicit_key_indicator(text, position);
-                    if explicit {
-                        position = skip_flow_whitespace(text, position + 1);
-                    }
-                    if text[position..].starts_with(':')
-                        && is_flow_mapping_separator_colon(text, position)
-                    {
-                        let key = self.push_empty_scalar(absolute_start + position);
-                        self.attach_child_at(entry.as_usize(), key);
-                        let value_start = position + 1;
-                        position = skip_flow_whitespace(text, value_start);
-                        reject_unindented_split_flow_mapping_value(
-                            text,
-                            value_start,
-                            position,
-                            absolute_start,
-                            self.source_indent_at(absolute_start),
-                        )?;
-                        if text[position..].starts_with([',', '}']) {
-                            let value = self.push_empty_scalar(absolute_start + position);
-                            self.attach_child_at(entry.as_usize(), value);
-                            self.finish_flow_mapping_entry(
-                                frame.node,
-                                entry,
-                                entry_start,
-                                position,
-                                absolute_start,
-                            );
-                            frames[frame_index].state = FlowFrameState::MappingAfterPair;
-                        } else {
-                            frames[frame_index].state =
-                                FlowFrameState::MappingAwaitValue { entry, entry_start };
-                            self.start_flow_node(
-                                text,
-                                position,
-                                absolute_start,
-                                frame.close,
-                                &mut frames,
-                                &mut completed,
-                                &mut position,
-                            )?;
-                        }
-                    } else if explicit && text[position..].starts_with([',', '}']) {
-                        let key = self.push_empty_scalar(absolute_start + position);
-                        let value = self.push_empty_scalar(absolute_start + position);
-                        self.attach_child_at(entry.as_usize(), key);
-                        self.attach_child_at(entry.as_usize(), value);
-                        self.finish_flow_mapping_entry(
-                            frame.node,
-                            entry,
-                            entry_start,
-                            position,
-                            absolute_start,
-                        );
-                        frames[frame_index].state = FlowFrameState::MappingAfterPair;
-                    } else {
-                        frames[frame_index].state = FlowFrameState::MappingAwaitKey {
-                            entry,
-                            entry_start,
-                            explicit,
-                        };
-                        self.start_flow_node(
-                            text,
-                            position,
-                            absolute_start,
-                            frame.close,
-                            &mut frames,
-                            &mut completed,
-                            &mut position,
-                        )?;
-                    }
-                }
-                FlowFrameState::MappingAfterPair => match character {
-                    ',' => {
-                        position += 1;
-                        frames[frame_index].state = FlowFrameState::MappingExpectKey;
-                    }
-                    character if character == frame.close => {
-                        position += character.len_utf8();
-                        self.nodes[frame.node.as_usize()].span.end =
-                            Span::usize_to_u32(absolute_start + position);
-                        frames.pop();
-                        completed = Some((frame.node, position));
-                    }
-                    _ => {
-                        return Err(expected_flow_mapping_separator(
-                            absolute_start + position,
-                            character,
-                        ));
-                    }
-                },
-                _ => {
-                    return Err(invalid_flow_parser_state(absolute_start + position));
-                }
-            }
+            self.advance_flow_frame(&mut flow)?;
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn resume_completed_flow_node(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        child: NodeId,
+        child_end: usize,
+    ) -> Result<Option<usize>, YamlError> {
+        flow.position = child_end;
+        let Some(frame_index) = flow.frames.len().checked_sub(1) else {
+            return Ok(Some(flow.position));
+        };
+        let frame = flow.frames[frame_index];
+        match frame.state {
+            FlowFrameState::SequenceAwaitItem {
+                entry: _,
+                entry_start: _,
+                explicit: _,
+            } => self.resume_flow_sequence_item(flow, frame_index, frame, child)?,
+            FlowFrameState::SequenceAwaitValue {
+                entry,
+                mapping,
+                mapping_entry,
+            } => {
+                self.attach_child_at(mapping_entry.as_usize(), child);
+                self.finish_flow_mapping_sequence_item(
+                    frame.node,
+                    entry,
+                    mapping,
+                    mapping_entry,
+                    flow.position,
+                    flow.absolute_start,
+                );
+                flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+            }
+            FlowFrameState::MappingAwaitKey {
+                entry: _,
+                entry_start: _,
+                explicit: _,
+            } => self.resume_flow_mapping_key(flow, frame_index, frame, child)?,
+            FlowFrameState::MappingAwaitValue { entry, entry_start } => {
+                self.attach_child_at(entry.as_usize(), child);
+                self.finish_flow_mapping_entry(
+                    frame.node,
+                    entry,
+                    entry_start,
+                    flow.position,
+                    flow.absolute_start,
+                );
+                flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
+            }
+            _ => {
+                return Err(invalid_flow_parser_state(
+                    flow.absolute_start + flow.position,
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    fn resume_flow_sequence_item(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        frame_index: usize,
+        frame: FlowFrame,
+        child: NodeId,
+    ) -> Result<(), YamlError> {
+        let FlowFrameState::SequenceAwaitItem {
+            entry,
+            entry_start,
+            explicit,
+        } = frame.state
+        else {
+            return Err(invalid_flow_parser_state(
+                flow.absolute_start + flow.position,
+            ));
+        };
+        flow.position = skip_flow_whitespace(flow.text, flow.position);
+        if flow.text[flow.position..].starts_with(':') {
+            if !explicit {
+                reject_split_implicit_flow_mapping_key(
+                    flow.text,
+                    entry_start,
+                    flow.position,
+                    flow.absolute_start,
+                )?;
+            }
+            let mapping = self.push_node(
+                NodeKind::FlowMapping,
+                Span::from_usize(
+                    flow.absolute_start + entry_start,
+                    flow.absolute_start + flow.position,
+                ),
+            );
+            let mapping_entry = self.push_node(
+                NodeKind::MappingEntry,
+                Span::from_usize(
+                    flow.absolute_start + entry_start,
+                    flow.absolute_start + flow.position,
+                ),
+            );
+            self.attach_child_at(mapping.as_usize(), mapping_entry);
+            self.attach_child_at(mapping_entry.as_usize(), child);
+            flow.position = skip_flow_whitespace(flow.text, flow.position + 1);
+            if flow.text[flow.position..].starts_with([',', ']']) {
+                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                self.attach_child_at(mapping_entry.as_usize(), value);
+                self.finish_flow_mapping_sequence_item(
+                    frame.node,
+                    entry,
+                    mapping,
+                    mapping_entry,
+                    flow.position,
+                    flow.absolute_start,
+                );
+                flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+            } else {
+                flow.frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
+                    entry,
+                    mapping,
+                    mapping_entry,
+                };
+                self.start_flow_node(flow, frame.close)?;
+            }
+        } else if explicit {
+            let mapping = self.push_node(
+                NodeKind::FlowMapping,
+                Span::from_usize(
+                    flow.absolute_start + entry_start,
+                    flow.absolute_start + flow.position,
+                ),
+            );
+            let mapping_entry = self.push_node(
+                NodeKind::MappingEntry,
+                Span::from_usize(
+                    flow.absolute_start + entry_start,
+                    flow.absolute_start + flow.position,
+                ),
+            );
+            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            self.attach_child_at(mapping.as_usize(), mapping_entry);
+            self.attach_child_at(mapping_entry.as_usize(), child);
+            self.attach_child_at(mapping_entry.as_usize(), value);
+            self.finish_flow_mapping_sequence_item(
+                frame.node,
+                entry,
+                mapping,
+                mapping_entry,
+                flow.position,
+                flow.absolute_start,
+            );
+            flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+        } else {
+            self.attach_child_at(entry.as_usize(), child);
+            self.nodes[entry.as_usize()].span.end =
+                Span::usize_to_u32(flow.absolute_start + flow.position);
+            self.attach_child_at(frame.node.as_usize(), entry);
+            flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+        }
+        Ok(())
+    }
+
+    fn resume_flow_mapping_key(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        frame_index: usize,
+        frame: FlowFrame,
+        child: NodeId,
+    ) -> Result<(), YamlError> {
+        let FlowFrameState::MappingAwaitKey {
+            entry,
+            entry_start,
+            explicit,
+        } = frame.state
+        else {
+            return Err(invalid_flow_parser_state(
+                flow.absolute_start + flow.position,
+            ));
+        };
+        self.attach_child_at(entry.as_usize(), child);
+        flow.position = skip_flow_whitespace(flow.text, flow.position);
+        if flow.text[flow.position..].starts_with(':') {
+            let value_start = flow.position + 1;
+            flow.position = skip_flow_whitespace(flow.text, value_start);
+            reject_unindented_split_flow_mapping_value(
+                flow.text,
+                value_start,
+                flow.position,
+                flow.absolute_start,
+                self.source_indent_at(flow.absolute_start),
+            )?;
+            if flow.text[flow.position..].starts_with([',', '}']) {
+                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                self.attach_child_at(entry.as_usize(), value);
+                self.finish_flow_mapping_entry(
+                    frame.node,
+                    entry,
+                    entry_start,
+                    flow.position,
+                    flow.absolute_start,
+                );
+                flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
+            } else {
+                flow.frames[frame_index].state =
+                    FlowFrameState::MappingAwaitValue { entry, entry_start };
+                self.start_flow_node(flow, frame.close)?;
+            }
+        } else if explicit || flow.text[flow.position..].starts_with(',') {
+            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            self.attach_child_at(entry.as_usize(), value);
+            self.finish_flow_mapping_entry(
+                frame.node,
+                entry,
+                entry_start,
+                flow.position,
+                flow.absolute_start,
+            );
+            flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
+        } else {
+            let found = flow.text[flow.position..]
+                .chars()
+                .next()
+                .unwrap_or(frame.close);
+            return Err(missing_flow_mapping_colon(
+                flow.absolute_start + flow.position,
+                found,
+            ));
+        }
+        Ok(())
+    }
+
+    fn advance_flow_frame(&mut self, flow: &mut FlowParseState<'_>) -> Result<(), YamlError> {
+        let frame_index = flow.frames.len() - 1;
+        let frame = flow.frames[frame_index];
+        flow.position = skip_flow_whitespace(flow.text, flow.position);
+        let Some(character) = flow.text[flow.position..].chars().next() else {
+            return Err(if frame.kind == FlowCollectionKind::Sequence {
+                missing_flow_sequence_end(flow.absolute_start, flow.text.len())
+            } else {
+                missing_flow_mapping_end(flow.absolute_start, flow.text.len())
+            });
+        };
+        match frame.state {
+            FlowFrameState::SequenceExpectItem => {
+                self.start_flow_sequence_item(flow, frame_index, frame, character)
+            }
+            FlowFrameState::SequenceAfterItem => {
+                self.advance_flow_sequence_separator(flow, frame_index, frame, character)
+            }
+            FlowFrameState::MappingExpectKey => {
+                self.start_flow_mapping_entry(flow, frame_index, frame, character)
+            }
+            FlowFrameState::MappingAfterPair => {
+                self.advance_flow_mapping_separator(flow, frame_index, frame, character)
+            }
+            _ => Err(invalid_flow_parser_state(
+                flow.absolute_start + flow.position,
+            )),
+        }
+    }
+
+    fn start_flow_sequence_item(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        frame_index: usize,
+        frame: FlowFrame,
+        character: char,
+    ) -> Result<(), YamlError> {
+        if character == frame.close {
+            self.complete_flow_collection(flow, frame, character);
+            return Ok(());
+        }
+        if character == ',' {
+            return Err(unexpected_flow_comma(flow.absolute_start + flow.position));
+        }
+        if matches!(character, ']' | '}') {
+            return Err(expected_flow_separator(
+                flow.absolute_start + flow.position,
+                character,
+            ));
+        }
+
+        let entry_start = flow.position;
+        let entry = self.push_node(
+            NodeKind::SequenceEntry,
+            Span::empty_from_usize(flow.absolute_start + entry_start),
+        );
+        let explicit = character == '?' && is_flow_explicit_key_indicator(flow.text, flow.position);
+        if explicit {
+            flow.position = skip_flow_whitespace(flow.text, flow.position + 1);
+        }
+        if flow.text[flow.position..].starts_with(':')
+            && is_flow_mapping_separator_colon(flow.text, flow.position)
+        {
+            let mapping = self.push_node(
+                NodeKind::FlowMapping,
+                Span::empty_from_usize(flow.absolute_start + entry_start),
+            );
+            let mapping_entry = self.push_node(
+                NodeKind::MappingEntry,
+                Span::empty_from_usize(flow.absolute_start + entry_start),
+            );
+            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
+            self.attach_child_at(mapping.as_usize(), mapping_entry);
+            self.attach_child_at(mapping_entry.as_usize(), key);
+            flow.position = skip_flow_whitespace(flow.text, flow.position + 1);
+            if flow.text[flow.position..].starts_with([',', ']']) {
+                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                self.attach_child_at(mapping_entry.as_usize(), value);
+                self.finish_flow_mapping_sequence_item(
+                    frame.node,
+                    entry,
+                    mapping,
+                    mapping_entry,
+                    flow.position,
+                    flow.absolute_start,
+                );
+                flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+            } else {
+                flow.frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
+                    entry,
+                    mapping,
+                    mapping_entry,
+                };
+                self.start_flow_node(flow, frame.close)?;
+            }
+        } else if explicit && flow.text[flow.position..].starts_with([',', ']']) {
+            let mapping = self.push_node(
+                NodeKind::FlowMapping,
+                Span::empty_from_usize(flow.absolute_start + entry_start),
+            );
+            let mapping_entry = self.push_node(
+                NodeKind::MappingEntry,
+                Span::empty_from_usize(flow.absolute_start + entry_start),
+            );
+            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            self.attach_child_at(mapping.as_usize(), mapping_entry);
+            self.attach_child_at(mapping_entry.as_usize(), key);
+            self.attach_child_at(mapping_entry.as_usize(), value);
+            self.finish_flow_mapping_sequence_item(
+                frame.node,
+                entry,
+                mapping,
+                mapping_entry,
+                flow.position,
+                flow.absolute_start,
+            );
+            flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+        } else {
+            flow.frames[frame_index].state = FlowFrameState::SequenceAwaitItem {
+                entry,
+                entry_start,
+                explicit,
+            };
+            self.start_flow_node(flow, frame.close)?;
+        }
+        Ok(())
+    }
+
+    fn start_flow_mapping_entry(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        frame_index: usize,
+        frame: FlowFrame,
+        character: char,
+    ) -> Result<(), YamlError> {
+        if character == frame.close {
+            self.complete_flow_collection(flow, frame, character);
+            return Ok(());
+        }
+        if character == ',' {
+            return Err(unexpected_flow_mapping_comma(
+                flow.absolute_start + flow.position,
+            ));
+        }
+        if matches!(character, ']' | '}') {
+            return Err(expected_flow_mapping_separator(
+                flow.absolute_start + flow.position,
+                character,
+            ));
+        }
+
+        let entry_start = flow.position;
+        let entry = self.push_node(
+            NodeKind::MappingEntry,
+            Span::empty_from_usize(flow.absolute_start + entry_start),
+        );
+        let explicit = character == '?' && is_flow_explicit_key_indicator(flow.text, flow.position);
+        if explicit {
+            flow.position = skip_flow_whitespace(flow.text, flow.position + 1);
+        }
+        if flow.text[flow.position..].starts_with(':')
+            && is_flow_mapping_separator_colon(flow.text, flow.position)
+        {
+            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
+            self.attach_child_at(entry.as_usize(), key);
+            let value_start = flow.position + 1;
+            flow.position = skip_flow_whitespace(flow.text, value_start);
+            reject_unindented_split_flow_mapping_value(
+                flow.text,
+                value_start,
+                flow.position,
+                flow.absolute_start,
+                self.source_indent_at(flow.absolute_start),
+            )?;
+            if flow.text[flow.position..].starts_with([',', '}']) {
+                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                self.attach_child_at(entry.as_usize(), value);
+                self.finish_flow_mapping_entry(
+                    frame.node,
+                    entry,
+                    entry_start,
+                    flow.position,
+                    flow.absolute_start,
+                );
+                flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
+            } else {
+                flow.frames[frame_index].state =
+                    FlowFrameState::MappingAwaitValue { entry, entry_start };
+                self.start_flow_node(flow, frame.close)?;
+            }
+        } else if explicit && flow.text[flow.position..].starts_with([',', '}']) {
+            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            self.attach_child_at(entry.as_usize(), key);
+            self.attach_child_at(entry.as_usize(), value);
+            self.finish_flow_mapping_entry(
+                frame.node,
+                entry,
+                entry_start,
+                flow.position,
+                flow.absolute_start,
+            );
+            flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
+        } else {
+            flow.frames[frame_index].state = FlowFrameState::MappingAwaitKey {
+                entry,
+                entry_start,
+                explicit,
+            };
+            self.start_flow_node(flow, frame.close)?;
+        }
+        Ok(())
+    }
+
+    fn advance_flow_sequence_separator(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        frame_index: usize,
+        frame: FlowFrame,
+        character: char,
+    ) -> Result<(), YamlError> {
+        match character {
+            ',' => {
+                flow.position += 1;
+                flow.frames[frame_index].state = FlowFrameState::SequenceExpectItem;
+                Ok(())
+            }
+            character if character == frame.close => {
+                self.complete_flow_collection(flow, frame, character);
+                Ok(())
+            }
+            _ => Err(expected_flow_separator(
+                flow.absolute_start + flow.position,
+                character,
+            )),
+        }
+    }
+
+    fn advance_flow_mapping_separator(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        frame_index: usize,
+        frame: FlowFrame,
+        character: char,
+    ) -> Result<(), YamlError> {
+        match character {
+            ',' => {
+                flow.position += 1;
+                flow.frames[frame_index].state = FlowFrameState::MappingExpectKey;
+                Ok(())
+            }
+            character if character == frame.close => {
+                self.complete_flow_collection(flow, frame, character);
+                Ok(())
+            }
+            _ => Err(expected_flow_mapping_separator(
+                flow.absolute_start + flow.position,
+                character,
+            )),
+        }
+    }
+
+    fn complete_flow_collection(
+        &mut self,
+        flow: &mut FlowParseState<'_>,
+        frame: FlowFrame,
+        character: char,
+    ) {
+        flow.position += character.len_utf8();
+        self.nodes[frame.node.as_usize()].span.end =
+            Span::usize_to_u32(flow.absolute_start + flow.position);
+        flow.frames.pop();
+        flow.completed = Some((frame.node, flow.position));
+    }
+
     fn start_flow_node(
         &mut self,
-        text: &str,
-        start: usize,
-        absolute_start: usize,
+        flow: &mut FlowParseState<'_>,
         close: char,
-        frames: &mut Vec<FlowFrame>,
-        completed: &mut Option<(NodeId, usize)>,
-        position: &mut usize,
     ) -> Result<(), YamlError> {
-        match self.prepare_flow_node(text, start, absolute_start, close)? {
+        match self.prepare_flow_node(flow.text, flow.position, flow.absolute_start, close)? {
             FlowNode::Scalar(node, end) => {
-                *completed = Some((node, end));
+                flow.completed = Some((node, end));
             }
             FlowNode::Collection(frame, after_open) => {
-                if frames.len() >= MAX_FLOW_COLLECTION_DEPTH {
+                if flow.frames.len() >= MAX_FLOW_COLLECTION_DEPTH {
                     return Err(flow_collection_depth_limit_exceeded(
-                        absolute_start + after_open - 1,
+                        flow.absolute_start + after_open - 1,
                     ));
                 }
-                frames.push(frame);
-                *position = after_open;
+                flow.frames.push(frame);
+                flow.position = after_open;
             }
         }
         Ok(())

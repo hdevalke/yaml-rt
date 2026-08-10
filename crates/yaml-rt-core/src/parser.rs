@@ -449,7 +449,10 @@ impl<'source> Parser<'source> {
 
     // These inputs describe one already-analyzed source line. Keeping them
     // explicit avoids duplicating or obscuring the parser's offset bookkeeping.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the analyzed source line, offsets, and mapping facts must stay synchronized"
+    )]
     fn parse_simple_plain_mapping_entry(
         &mut self,
         document: NodeId,
@@ -477,7 +480,10 @@ impl<'source> Parser<'source> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the existing mapping and analyzed source-line context are independently meaningful"
+    )]
     fn append_simple_plain_mapping_entry(
         &mut self,
         mapping: NodeId,
@@ -655,7 +661,10 @@ impl<'source> Parser<'source> {
 
     // Mapping parsing needs both the source-line view and its absolute offsets;
     // bundling them would only move this context into a single-use wrapper.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mapping parsing requires the source-line view and its exact absolute offsets"
+    )]
     #[expect(
         clippy::too_many_lines,
         reason = "mapping entry parsing shares one span and indentation context"

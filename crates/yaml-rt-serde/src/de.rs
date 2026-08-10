@@ -63,7 +63,10 @@ pub struct Deserializer<'de> {
 impl<'de> Deserializer<'de> {
     /// Creates a deserializer borrowing a UTF-8 YAML string.
     #[must_use]
-    #[allow(clippy::should_implement_trait)]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "FromStr cannot retain the borrowed input lifetime or this constructor's deferred errors"
+    )]
     pub fn from_str(input: &'de str) -> Self {
         Self::new(Input::parsed(input.to_owned(), Some(input)))
     }

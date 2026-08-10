@@ -236,7 +236,7 @@ fn report(
     started: Instant,
 ) {
     let elapsed = started.elapsed();
-    let mib = total_bytes as f64 / (1024.0 * 1024.0);
+    let mib = count_as_f64(total_bytes) / (1024.0 * 1024.0);
     let throughput = mib / elapsed.as_secs_f64();
 
     println!("mode: {mode}");
@@ -246,4 +246,12 @@ fn report(
     println!("total bytes: {total_bytes}");
     println!("elapsed: {elapsed:.3?}");
     println!("throughput: {throughput:.2} MiB/s");
+}
+
+fn count_as_f64(value: usize) -> f64 {
+    // Benchmark byte counts are displayed approximately above `f64`'s exact
+    // integer range.
+    #[allow(clippy::cast_precision_loss)]
+    let converted = value as f64;
+    converted
 }

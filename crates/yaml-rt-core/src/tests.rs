@@ -4226,6 +4226,33 @@ fn yaml_value_noop_writes_preserve_core_scalar_spelling() {
 }
 
 #[test]
+fn yaml_value_float_conversions_check_f32_range_and_preserve_equivalent_spelling() {
+    let source = "round: 0.1\nmax: 3.4028235e38\noverflow: 3.5e38\nzero: -0.0\nnan: .NaN\n";
+    let mut doc = YamlDoc::parse(source).expect("valid float scalars");
+    let round = doc.get_path(&["round"]).unwrap().unwrap();
+    let max = doc.get_path(&["max"]).unwrap().unwrap();
+    let overflow = doc.get_path(&["overflow"]).unwrap().unwrap();
+    let zero = doc.get_path(&["zero"]).unwrap().unwrap();
+    let nan = doc.get_path(&["nan"]).unwrap().unwrap();
+
+    assert_eq!(
+        f32::read_yaml(&doc, round).unwrap().to_bits(),
+        0.1_f32.to_bits()
+    );
+    assert_eq!(
+        f32::read_yaml(&doc, max).unwrap().to_bits(),
+        f32::MAX.to_bits()
+    );
+    assert!(f32::read_yaml(&doc, overflow).is_err());
+
+    0.0_f32.write_yaml(&mut doc, Some(zero)).unwrap();
+    f32::NAN.write_yaml(&mut doc, Some(nan)).unwrap();
+
+    assert_eq!(doc.to_string(), source);
+    assert!(doc.edits.is_empty());
+}
+
+#[test]
 fn yaml_string_value_quotes_plain_text_that_would_change_schema_type() {
     let mut doc = YamlDoc::parse("value: old # keep\n").expect("valid string");
     let value = doc.get_path(&["value"]).unwrap().unwrap();

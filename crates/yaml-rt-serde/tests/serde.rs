@@ -223,6 +223,34 @@ fn core_schema_and_explicit_tags_are_resolved() {
 }
 
 #[test]
+fn float_deserialization_checks_f32_range_and_uses_rust_rounding() {
+    assert_eq!(
+        from_str::<f32>("0.1\n").unwrap().to_bits(),
+        0.1_f32.to_bits()
+    );
+    assert_eq!(
+        from_str::<f32>("3.4028235e38\n").unwrap().to_bits(),
+        f32::MAX.to_bits()
+    );
+    assert!(from_str::<f32>(".inf\n").unwrap().is_infinite());
+
+    let overflow = from_str::<f32>("3.5e38\n").unwrap_err();
+    assert!(overflow.to_string().contains("expected an f32 in range"));
+    assert!(overflow.location().is_some());
+
+    let rounded_unsigned = from_str::<f64>("9007199254740993\n").unwrap();
+    assert_eq!(
+        rounded_unsigned.to_bits(),
+        9_007_199_254_740_992_f64.to_bits()
+    );
+    let rounded_signed = from_str::<f64>("-9007199254740993\n").unwrap();
+    assert_eq!(
+        rounded_signed.to_bits(),
+        (-9_007_199_254_740_992_f64).to_bits()
+    );
+}
+
+#[test]
 fn collection_keys_use_explicit_key_syntax() {
     let value = BTreeMap::from([(vec![1_u8, 2], "pair".to_owned())]);
     let yaml = to_string(&value).unwrap();

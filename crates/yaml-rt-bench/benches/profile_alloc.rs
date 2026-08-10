@@ -144,21 +144,29 @@ fn main() {
     );
     println!(
         "time: {:.1} us/op",
-        elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64
+        elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations)
     );
     println!(
         "allocations: {:.1}/op",
-        allocations as f64 / iterations as f64
+        count_as_f64(allocations) / f64::from(iterations)
     );
     println!(
         "allocated bytes: {:.1}/op",
-        allocated_bytes as f64 / iterations as f64
+        count_as_f64(allocated_bytes) / f64::from(iterations)
     );
     println!("repeated peak live bytes: {repeated_peak_bytes}");
     println!("retained allocations: {retained_allocations}");
     println!("retained allocated bytes: {retained_allocated_bytes}");
     println!("retained peak live bytes: {retained_peak_bytes}");
     println!("retained bytes: {retained_bytes}");
+}
+
+fn count_as_f64(value: usize) -> f64 {
+    // Benchmark reporting is approximate once counters exceed `f64`'s exact
+    // integer range, which is acceptable for human-readable rates.
+    #[allow(clippy::cast_precision_loss)]
+    let converted = value as f64;
+    converted
 }
 
 fn parse_input(mode: Mode, input: &str) -> Parsed {

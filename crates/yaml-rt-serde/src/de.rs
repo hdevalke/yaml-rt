@@ -552,7 +552,9 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_, 'de> {
         V: Visitor<'de>,
     {
         deserialize_float(self, visitor, |visitor, value| {
-            visitor.visit_f32(value as f32)
+            let value = checked_f64_to_f32(value)
+                .ok_or_else(|| Error::message("expected an f32 in range"))?;
+            visitor.visit_f32(value)
         })
     }
 
@@ -842,12 +844,35 @@ where
     let de = de.resolved()?;
     let value = match de.scalar_kind()? {
         ScalarKind::Float(value) => Some(value),
-        ScalarKind::Signed(value) => Some(value as f64),
-        ScalarKind::Unsigned(value) => Some(value as f64),
+        ScalarKind::Signed(value) => Some(i128_to_f64(value)),
+        ScalarKind::Unsigned(value) => Some(u128_to_f64(value)),
         _ => None,
     }
     .ok_or_else(|| Error::message("expected a number"));
     de.annotate(value.and_then(|value| visit(visitor, value)))
+}
+
+fn checked_f64_to_f32(value: f64) -> Option<f32> {
+    // Rust defines this conversion as rounding to the nearest representable
+    // `f32`; reject only finite overflow instead of silently producing infinity.
+    #[allow(clippy::cast_possible_truncation)]
+    let converted = value as f32;
+    (!value.is_finite() || converted.is_finite()).then_some(converted)
+}
+
+fn i128_to_f64(value: i128) -> f64 {
+    // Deserializing an integer into an explicitly requested floating-point type
+    // follows Rust's rounding semantics when the integer exceeds 53 bits.
+    #[allow(clippy::cast_precision_loss)]
+    let converted = value as f64;
+    converted
+}
+
+fn u128_to_f64(value: u128) -> f64 {
+    // See `i128_to_f64`; all `u128` values remain finite as `f64`.
+    #[allow(clippy::cast_precision_loss)]
+    let converted = value as f64;
+    converted
 }
 
 struct EmptyAccess;

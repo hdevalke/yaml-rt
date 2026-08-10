@@ -929,7 +929,7 @@ macro_rules! impl_yaml_signed {
 }
 
 macro_rules! impl_yaml_float {
-    ($($type:ty),* $(,)?) => {
+    ($($type:ty => $convert:path),* $(,)?) => {
         $(
             impl YamlValue for $type {
                 fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {
@@ -947,7 +947,7 @@ macro_rules! impl_yaml_float {
                         _ => None,
                     }
                     .ok_or_else(|| typed_parse_error(doc, node, stringify!($type), &value))?;
-                    let converted = number as $type;
+                    let converted: $type = $convert(number);
                     if number.is_finite() && !converted.is_finite() {
                         return Err(typed_parse_error(doc, node, stringify!($type), &value));
                     }
@@ -961,7 +961,10 @@ macro_rules! impl_yaml_float {
                 ) -> Result<NodeId, YamlError> {
                     if let Some(node) = node {
                         let current = Self::read_yaml(doc, node)?;
-                        if current == *self || current.is_nan() && self.is_nan() {
+                        let unchanged = current
+                            .partial_cmp(self)
+                            .is_some_and(std::cmp::Ordering::is_eq);
+                        if unchanged || current.is_nan() && self.is_nan() {
                             return Ok(node);
                         }
                     }
@@ -981,9 +984,17 @@ macro_rules! impl_yaml_float {
     };
 }
 
+fn f64_to_f32(value: f64) -> f32 {
+    // Narrowing is required by `YamlValue for f32`; the implementation above
+    // separately rejects finite values that overflow to infinity.
+    #[allow(clippy::cast_possible_truncation)]
+    let converted = value as f32;
+    converted
+}
+
 impl_yaml_unsigned!(u8, u16, u32, u64, u128, usize);
 impl_yaml_signed!(i8, i16, i32, i64, i128, isize);
-impl_yaml_float!(f32, f64);
+impl_yaml_float!(f32 => f64_to_f32, f64 => std::convert::identity);
 
 impl YamlValue for char {
     fn read_yaml(doc: &YamlDoc, node: NodeId) -> Result<Self, YamlError> {

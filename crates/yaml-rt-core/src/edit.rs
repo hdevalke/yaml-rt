@@ -76,6 +76,11 @@ enum AddLocation {
 
 impl YamlDoc {
     /// Applies RFC 6902 `add` semantics at a JSON Pointer destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document or destination does not exist, the
+    /// destination cannot accept the value, or the edit cannot be emitted.
     pub fn add_at(
         &mut self,
         document: usize,
@@ -89,6 +94,11 @@ impl YamlDoc {
     }
 
     /// Removes an existing value. Removing a document root is unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document or target does not exist, the target
+    /// is a document root, or removing it would invalidate the document.
     pub fn remove_at(
         &mut self,
         document: usize,
@@ -106,6 +116,11 @@ impl YamlDoc {
     }
 
     /// Replaces an existing value while preserving its surrounding syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document or target does not exist or the
+    /// replacement cannot be emitted at that location.
     pub fn replace_at(
         &mut self,
         document: usize,
@@ -119,6 +134,11 @@ impl YamlDoc {
     }
 
     /// Moves a value using RFC 6902 remove-then-add semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either pointer is invalid for the document, the
+    /// move would be recursive, or anchors, aliases, or syntax prevent it.
     pub fn move_at(
         &mut self,
         document: usize,
@@ -156,6 +176,11 @@ impl YamlDoc {
     }
 
     /// Deep-copies a value using RFC 6902 `copy` semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either pointer is invalid for the document, the
+    /// source contains an anchor, or the copied value cannot be inserted.
     pub fn copy_at(
         &mut self,
         document: usize,
@@ -174,6 +199,11 @@ impl YamlDoc {
     }
 
     /// Compares a pointer-selected target with a YAML value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document or target does not exist or either
+    /// value cannot be compared using RFC 6902 equality.
     pub fn test_at(
         &self,
         document: usize,

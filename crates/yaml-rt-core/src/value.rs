@@ -196,6 +196,11 @@ impl fmt::Display for ScalarResolveError {
 impl std::error::Error for ScalarResolveError {}
 
 /// Resolves a decoded scalar value using the YAML 1.2 core schema.
+///
+/// # Errors
+///
+/// Returns an error when an explicit tag is unsupported or the scalar spelling
+/// is invalid for its explicit core-schema tag.
 pub fn resolve_scalar(
     value: &str,
     style: YamlScalarStyle,
@@ -400,6 +405,11 @@ impl fmt::Display for SemanticValueError {
 impl std::error::Error for SemanticValueError {}
 
 /// Compares two YAML nodes using RFC 6902 JSON-value equality.
+///
+/// # Errors
+///
+/// Returns an error when either graph contains an unresolved or cyclic alias,
+/// an unsupported semantic node, or exceeds the comparison depth limit.
 pub fn semantically_equal(
     left_doc: &YamlDoc,
     left: NodeId,

@@ -12,6 +12,11 @@ pub struct YamlFragment {
 
 impl YamlFragment {
     /// Parses an owned YAML value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is invalid YAML, does not contain exactly
+    /// one rooted document, or contains an alias that escapes the value root.
     pub fn parse_owned(input: String) -> Result<Self, FragmentError> {
         let doc = YamlDoc::parse_owned(input).map_err(FragmentError::from)?;
         if doc.document_count() != 1 {
@@ -30,6 +35,10 @@ impl YamlFragment {
     }
 
     /// Parses a borrowed YAML value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`Self::parse_owned`].
     pub fn parse(input: &str) -> Result<Self, FragmentError> {
         Self::parse_owned(input.to_owned())
     }
@@ -47,6 +56,10 @@ impl YamlFragment {
     }
 
     /// Returns the root as minimally de-indented standalone YAML.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored root node is no longer valid.
     pub fn to_yaml(&self) -> Result<String, FragmentError> {
         self.doc
             .extract_node(self.root)
@@ -302,6 +315,10 @@ impl YamlFragment {
 
 impl YamlDoc {
     /// Extracts one semantic node as valid standalone YAML where possible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `node` does not identify a node in this document.
     pub fn extract_node(&self, node: NodeId) -> Result<String, YamlError> {
         let node = self.expect_node(node)?;
         let source = self.source.slice(node.span);

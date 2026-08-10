@@ -1,4 +1,4 @@
-//! Native RFC 9535 JSONPath queries over yaml-rt semantic documents.
+//! Native RFC 9535 `JSONPath` queries over yaml-rt semantic documents.
 //!
 //! Queries are parsed once and can be evaluated repeatedly without converting
 //! YAML into an intermediate JSON value tree.
@@ -35,7 +35,7 @@ const MAX_VALUE_DEPTH: usize = 1024;
 const MAP_TAG: &str = "tag:yaml.org,2002:map";
 const SEQ_TAG: &str = "tag:yaml.org,2002:seq";
 
-/// Classification of a JSONPath parse or evaluation failure.
+/// Classification of a `JSONPath` parse or evaluation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// Invalid RFC 9535 syntax.
@@ -56,7 +56,7 @@ pub enum ErrorKind {
     Semantic,
 }
 
-/// A structured JSONPath parse or evaluation error.
+/// A structured `JSONPath` parse or evaluation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     kind: ErrorKind,
@@ -104,7 +104,7 @@ impl std::error::Error for Error {}
 
 type QueryError = Error;
 
-/// A parsed and reusable RFC 9535 JSONPath query.
+/// A parsed and reusable RFC 9535 `JSONPath` query.
 #[derive(Debug, Clone)]
 pub struct JsonPath {
     segments: Vec<Segment>,
@@ -112,6 +112,11 @@ pub struct JsonPath {
 
 impl JsonPath {
     /// Parses and type-checks one RFC 9535 query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query has invalid syntax, exceeds a parser
+    /// limit, or contains an ill-typed expression.
     pub fn parse(source: &str) -> Result<Self, Error> {
         Parser::new(source).parse()
     }
@@ -121,6 +126,11 @@ impl JsonPath {
     /// The complete document is first validated against the JSON-compatible
     /// data model. Result order and duplicate matches follow RFC 9535 nodelist
     /// semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document does not exist, is outside the JSON
+    /// data model, contains invalid alias structure, or evaluation fails.
     pub fn query(&self, doc: &YamlDoc, document: usize) -> Result<QueryMatches, Error> {
         let root = Candidate {
             node: doc
@@ -157,7 +167,7 @@ impl std::str::FromStr for JsonPath {
     }
 }
 
-/// One located JSONPath match.
+/// One located `JSONPath` match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryMatch {
     pointer: JsonPointer,
@@ -178,7 +188,7 @@ impl QueryMatch {
     }
 }
 
-/// Ordered JSONPath query results.
+/// Ordered `JSONPath` query results.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryMatches {
     matches: Vec<QueryMatch>,

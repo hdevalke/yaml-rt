@@ -167,6 +167,11 @@ impl<'de> Iterator for Deserializer<'de> {
 }
 
 /// Deserializes exactly one YAML document from a string.
+///
+/// # Errors
+///
+/// Returns an error when the YAML is invalid, does not contain exactly one
+/// document, or cannot be deserialized as `T`.
 pub fn from_str<'de, T>(input: &'de str) -> Result<T>
 where
     T: serde::Deserialize<'de>,
@@ -175,6 +180,11 @@ where
 }
 
 /// Deserializes exactly one YAML document from a byte slice.
+///
+/// # Errors
+///
+/// Returns an error when the bytes are not UTF-8, the YAML is invalid, or the
+/// document cannot be deserialized as `T`.
 pub fn from_slice<'de, T>(input: &'de [u8]) -> Result<T>
 where
     T: serde::Deserialize<'de>,
@@ -183,6 +193,11 @@ where
 }
 
 /// Deserializes exactly one owned YAML document from a reader.
+///
+/// # Errors
+///
+/// Returns an error when reading fails, the YAML is invalid, or the document
+/// cannot be deserialized as `T`.
 pub fn from_reader<R, T>(reader: R) -> Result<T>
 where
     R: Read,

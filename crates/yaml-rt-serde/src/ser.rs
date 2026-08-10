@@ -5,6 +5,10 @@ use serde::{Serialize, ser};
 use crate::{Error, Result};
 
 /// Serializes a value to a UTF-8 YAML string.
+///
+/// # Errors
+///
+/// Returns an error when `value` cannot be represented as YAML.
 pub fn to_string<T>(value: &T) -> Result<String>
 where
     T: ?Sized + Serialize,
@@ -15,6 +19,10 @@ where
 }
 
 /// Serializes a value as one YAML document.
+///
+/// # Errors
+///
+/// Returns an error when serialization or writing to `writer` fails.
 pub fn to_writer<W, T>(writer: W, value: &T) -> Result<()>
 where
     W: Write,
@@ -43,11 +51,19 @@ where
     }
 
     /// Flushes the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying writer cannot be flushed.
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush().map_err(Error::io)
     }
 
     /// Flushes and returns the underlying writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the underlying writer cannot be flushed.
     pub fn into_inner(mut self) -> Result<W> {
         self.flush()?;
         Ok(self.writer)

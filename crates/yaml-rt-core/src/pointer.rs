@@ -24,6 +24,10 @@ pub struct JsonPointer {
 
 impl JsonPointer {
     /// Parses a plain JSON Pointer. URI fragment syntax is not accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `input` is not valid RFC 6901 pointer syntax.
     pub fn parse(input: &str) -> Result<Self, PointerError> {
         if input.is_empty() {
             return Ok(Self {
@@ -231,6 +235,11 @@ impl YamlDoc {
     ///
     /// Alias nodes are traversed when another reference token remains. A
     /// pointer that ends on an alias returns the alias occurrence itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document, path, or selected mapping or sequence
+    /// element does not exist, or when alias traversal fails.
     pub fn resolve_pointer(
         &self,
         document: usize,

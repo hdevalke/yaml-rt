@@ -629,6 +629,10 @@ impl YamlDoc {
     }
 
     /// Resolves an explicit tag through the built-in or document-local handle table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the tag spelling or its document-local handle is invalid.
     pub fn resolved_tag(&self, node: NodeId) -> Result<Option<Cow<'_, str>>, YamlError> {
         let Some(raw) = self.raw_tag(node) else {
             return Ok(None);

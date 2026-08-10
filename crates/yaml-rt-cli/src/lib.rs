@@ -1,6 +1,6 @@
 //! Command-line querying and editing operations for the `yaml-rt` binary.
 //!
-//! The binary searches YAML documents with JSONPath and applies JSON Pointer
+//! The binary searches YAML documents with `JSONPath` and applies JSON Pointer
 //! operations while retaining unrelated presentation. [`run`] is public so
 //! integrations can supply their own argument and I/O streams.
 
@@ -75,7 +75,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Operation {
-    /// Search a YAML document with RFC 9535 JSONPath.
+    /// Search a YAML document with RFC 9535 `JSONPath`.
     Query(QueryArgs),
     /// Print a selected YAML node.
     Get(ReadArgs),
@@ -158,7 +158,7 @@ struct ReadArgs {
 
 #[derive(Args)]
 struct QueryArgs {
-    /// RFC 9535 JSONPath query.
+    /// RFC 9535 `JSONPath` query.
     #[arg(value_name = "QUERY")]
     query: String,
     #[command(flatten)]

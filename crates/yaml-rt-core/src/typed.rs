@@ -42,6 +42,11 @@ pub trait YamlValue: Sized {
     /// The default implementation reports a missing required field. Container
     /// types such as [`Option`] may override this to define missing-field
     /// semantics without requiring derive-time type inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required field is absent or the selected node
+    /// cannot be decoded as `Self`.
     fn read_yaml_field(doc: &YamlDoc, node: Option<NodeId>, key: &str) -> Result<Self, YamlError> {
         match node {
             Some(node) => Self::read_yaml(doc, node),

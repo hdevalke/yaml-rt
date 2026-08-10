@@ -1,6 +1,18 @@
 # Changelog
 
-### v0.1.1 (2026-07-25)
+### v0.1.2 (2026-08-10)
+
+#### Features
+
+* add yaml-rt query command (59760fa)
+
+#### Fixes
+
+* validate numeric conversions (40183f0)
+* replace speculative flow parsing with a one-pass state machine (3f4e1fb)
+* limit collection depth (21a92d6)
+
+### v0.1.1 (2026-08-03)
 
 #### Features
 

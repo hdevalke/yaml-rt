@@ -33,7 +33,7 @@ extra: keep-me
     config.debug = true;
     config.apply_to_yaml_doc(&mut doc)?;
 
-    println!("edited:\n{}", doc);
+    println!("edited:\n{doc}");
 
     Ok(())
 }

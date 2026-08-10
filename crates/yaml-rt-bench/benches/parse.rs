@@ -19,12 +19,12 @@ struct Fixture {
 const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "small_config",
-        input: r#"host: localhost
+        input: r"host: localhost
 ports:
   - 8080
   - 9090
 enabled: true
-"#,
+",
     },
     Fixture {
         name: "medium_nested",
@@ -49,7 +49,7 @@ limits:
     },
     Fixture {
         name: "block_scalars",
-        input: r#"literal: |
+        input: r"literal: |
   first line
   second line
 
@@ -59,11 +59,11 @@ folded: >
   continues here
 
   next paragraph
-"#,
+",
     },
     Fixture {
         name: "multi_document",
-        input: r#"---
+        input: r"---
 name: first
 items:
   - one
@@ -72,7 +72,7 @@ items:
 name: second
 settings: {mode: fast, retries: 3}
 ...
-"#,
+",
     },
 ];
 

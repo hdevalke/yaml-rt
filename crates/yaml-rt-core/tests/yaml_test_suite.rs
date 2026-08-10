@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -169,18 +170,16 @@ fn yaml_test_suite_data_harness() {
             .collect::<Vec<_>>()
             .join("\n");
         panic!(
-            "{} YAML Test Suite case(s) failed:\n{}\n\n{}",
-            failure_count, failure_summary, failure_details
+            "{failure_count} YAML Test Suite case(s) failed:\n{failure_summary}\n\n{failure_details}"
         );
     }
 
-    if !unexpected_passes.is_empty() {
-        panic!(
-            "{} expected YAML Test Suite failure(s) now pass; remove them from EXPECTED_FAILURES:\n{}",
-            unexpected_passes.len(),
-            unexpected_passes.join("\n")
-        );
-    }
+    assert!(
+        unexpected_passes.is_empty(),
+        "{} expected YAML Test Suite failure(s) now pass; remove them from EXPECTED_FAILURES:\n{}",
+        unexpected_passes.len(),
+        unexpected_passes.join("\n")
+    );
 }
 
 fn failure_category_summary(failures: &[(FailureCategory, String)]) -> String {
@@ -191,28 +190,28 @@ fn failure_category_summary(failures: &[(FailureCategory, String)]) -> String {
             .filter(|(failure_category, _)| *failure_category == category)
             .count();
         if count > 0 {
-            summary.push_str(&format!("\n  {category}: {count}"));
+            write!(summary, "\n  {category}: {count}").expect("writing to a String cannot fail");
         }
     }
     summary
 }
 
 fn suite_root() -> PathBuf {
-    let root = env::var_os(SUITE_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let root = env::var_os(SUITE_DIR_ENV).map_or_else(
+        || {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
                 .join("third_party")
                 .join("yaml-test-suite")
-        });
+        },
+        PathBuf::from,
+    );
 
-    if !root.is_dir() {
-        panic!(
-            "YAML Test Suite data directory {} does not exist; initialize the submodule with `git submodule update --init --recursive` or set {SUITE_DIR_ENV}",
-            root.display()
-        );
-    }
+    assert!(
+        root.is_dir(),
+        "YAML Test Suite data directory {} does not exist; initialize the submodule with `git submodule update --init --recursive` or set {SUITE_DIR_ENV}",
+        root.display()
+    );
 
     let data = root.join("data");
     if data.is_dir() { data } else { root }
@@ -524,7 +523,7 @@ fn graph_key_to_json_key(
                 context.anchors.insert(anchor.to_owned(), node);
             }
             doc.scalar_value(node)
-                .map(|value| value.into_owned())
+                .map(std::borrow::Cow::into_owned)
                 .map_err(|error| error.to_string())
         }
         SemanticKind::Alias => {
@@ -663,7 +662,9 @@ fn escape_json_string(value: &str) -> String {
             '\t' => escaped.push_str("\\t"),
             '\u{08}' => escaped.push_str("\\b"),
             '\u{0c}' => escaped.push_str("\\f"),
-            char if char < ' ' => escaped.push_str(&format!("\\u{:04x}", char as u32)),
+            char if char < ' ' => {
+                write!(escaped, "\\u{:04x}", char as u32).expect("writing to a String cannot fail");
+            }
             char => escaped.push(char),
         }
     }

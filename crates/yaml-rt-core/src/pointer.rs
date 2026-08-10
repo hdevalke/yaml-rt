@@ -294,7 +294,7 @@ impl YamlDoc {
                         )
                     })?
                 }
-                Some(SemanticKind::Scalar { .. }) | Some(SemanticKind::Alias) => {
+                Some(SemanticKind::Scalar { .. } | SemanticKind::Alias) => {
                     return Err(PointerError::new(
                         pointer.as_str(),
                         Some(index),

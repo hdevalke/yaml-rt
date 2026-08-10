@@ -135,7 +135,7 @@ impl Deserializer<'static> {
     }
 }
 
-impl<'de> Iterator for Deserializer<'de> {
+impl Iterator for Deserializer<'_> {
     type Item = Self;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -278,7 +278,7 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
 
     fn span(&self) -> Span {
         self.node
-            .and_then(|node| self.doc().node(node).map(|node| node.span()))
+            .and_then(|node| self.doc().node(node).map(yaml_rt_core::Node::span))
             .unwrap_or_else(|| Span::empty(0))
     }
 
@@ -367,9 +367,8 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
         let Some(node) = self.node else {
             return Ok(ScalarKind::Null);
         };
-        let style = match self.doc().semantic_kind(node) {
-            Some(SemanticKind::Scalar { style }) => style,
-            _ => return Err(Error::message("expected a scalar value")),
+        let Some(SemanticKind::Scalar { style }) = self.doc().semantic_kind(node) else {
+            return Err(Error::message("expected a scalar value"));
         };
         let value = self.doc().scalar_value(node).map_err(Error::from)?;
         let tag = self

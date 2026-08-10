@@ -288,7 +288,7 @@ fn tagged_payload_adapters_read_write_and_format() {
     assert_eq!(doc.to_string(), "!delayed 45\n");
 
     assert_eq!(
-        Mode::Delayed(Duration::from_secs(60))
+        Mode::Delayed(Duration::from_mins(1))
             .to_yaml_fragment(0, "\n")
             .expect("adapted variant formats"),
         "!delayed 60"
@@ -300,7 +300,7 @@ fn tagged_payload_adapters_support_collections_and_propagate_errors() {
     let mut doc =
         YamlDoc::parse("!network [127, 0, 0, 1]\n").expect("valid collection adapter payload");
     let mut value = AdaptedPayload::from_yaml_doc(&doc).expect("collection adapter reads");
-    assert_eq!(value, AdaptedPayload::Network(Ipv4Addr::new(127, 0, 0, 1)));
+    assert_eq!(value, AdaptedPayload::Network(Ipv4Addr::LOCALHOST));
 
     value = AdaptedPayload::Network(Ipv4Addr::new(10, 0, 0, 1));
     value

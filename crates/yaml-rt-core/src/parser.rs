@@ -2945,7 +2945,7 @@ impl<'source> Parser<'source> {
                         }
                     }
                     NodeKind::LiteralScalar | NodeKind::FoldedScalar => {
-                        self.emit_scalar_event(node)?
+                        self.emit_scalar_event(node)?;
                     }
                     _ => {}
                 },
@@ -3596,13 +3596,12 @@ fn skip_property_whitespace(text: &str, mut position: usize) -> usize {
 
 fn next_property_character_is_not_whitespace(text: &str, position: usize) -> bool {
     match text.as_bytes().get(position) {
-        Some(b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) => false,
+        Some(b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) | None => false,
         Some(byte) if byte.is_ascii() => true,
         Some(_) => text[position..]
             .chars()
             .next()
             .is_some_and(|next| !next.is_whitespace()),
-        None => false,
     }
 }
 
@@ -3909,8 +3908,7 @@ impl<'source> LineTable<'source> {
         let start = starts[index] as usize;
         let next_start = starts
             .get(index + 1)
-            .map(|start| *start as usize)
-            .unwrap_or(self.source.len());
+            .map_or(self.source.len(), |start| *start as usize);
 
         let mut content_end = next_start;
         let text = self.source.as_str();

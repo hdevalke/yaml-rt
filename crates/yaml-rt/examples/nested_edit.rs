@@ -31,12 +31,12 @@ ports:
     println!("original:\n{}", doc.as_source());
     println!("decoded: {config:#?}");
 
-    config.server.host = "example.com".to_owned();
+    "example.com".clone_into(&mut config.server.host);
     config.server.port = 9443;
     config.ports = vec![3000, 3001, 3002];
     config.apply_to_yaml_doc(&mut doc)?;
 
-    println!("edited:\n{}", doc);
+    println!("edited:\n{doc}");
 
     Ok(())
 }

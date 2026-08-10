@@ -244,6 +244,6 @@ fn report(
     println!("input bytes: {input_bytes}");
     println!("repeat: {repeat}");
     println!("total bytes: {total_bytes}");
-    println!("elapsed: {:.3?}", elapsed);
+    println!("elapsed: {elapsed:.3?}");
     println!("throughput: {throughput:.2} MiB/s");
 }

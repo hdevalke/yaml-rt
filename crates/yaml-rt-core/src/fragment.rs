@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use crate::{NodeId, SemanticKind, YamlDoc, YamlError, YamlScalarStyle};
 
@@ -266,7 +266,7 @@ impl YamlFragment {
     }
 
     fn subtree_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
-        let span = self.doc.node(self.root).map(|node| node.span());
+        let span = self.doc.node(self.root).map(super::syntax::Node::span);
         self.doc
             .nodes
             .iter()
@@ -286,7 +286,7 @@ impl YamlFragment {
         let root_span = self
             .doc
             .node(self.root)
-            .map(|node| node.span())
+            .map(super::syntax::Node::span)
             .ok_or_else(|| FragmentError::new("fragment root node is missing"))?;
         for node in self.subtree_nodes() {
             if !matches!(self.doc.semantic_kind(node), Some(SemanticKind::Alias)) {
@@ -301,7 +301,7 @@ impl YamlFragment {
             let target_span = self
                 .doc
                 .node(target)
-                .map(|node| node.span())
+                .map(super::syntax::Node::span)
                 .ok_or_else(|| FragmentError::new("alias target is missing"))?;
             if target_span.start < root_span.start || target_span.end > root_span.end {
                 return Err(FragmentError::new(
@@ -408,7 +408,8 @@ pub(crate) fn quote_string(value: &str) -> String {
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),
             character if character.is_control() => {
-                output.push_str(&format!("\\u{:04X}", u32::from(character)));
+                write!(output, "\\u{:04X}", u32::from(character))
+                    .expect("writing to a String cannot fail");
             }
             character => output.push(character),
         }

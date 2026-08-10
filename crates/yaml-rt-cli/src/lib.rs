@@ -51,8 +51,7 @@ where
         }
     };
     match execute(&cli.operation, stdin, stdout) {
-        Ok(()) => 0,
-        Err(RunError::BrokenPipe) => 0,
+        Ok(()) | Err(RunError::BrokenPipe) => 0,
         Err(RunError::Message(message)) => {
             let _ = writeln!(stderr, "yaml-rt: {message}");
             FAILURE

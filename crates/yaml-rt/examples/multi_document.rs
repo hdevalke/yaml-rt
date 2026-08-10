@@ -25,7 +25,7 @@ extra: keep
     selected.port = 9090;
     doc.write_document(1, &selected)?;
 
-    println!("edited stream:\n{}", doc);
+    println!("edited stream:\n{doc}");
 
     Ok(())
 }

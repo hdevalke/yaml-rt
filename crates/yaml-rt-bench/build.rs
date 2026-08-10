@@ -34,12 +34,11 @@ fn main() {
     }
 
     let rapidyaml = workspace_root().join("third_party/rapidyaml");
-    if !rapidyaml.join("CMakeLists.txt").is_file() {
-        panic!(
-            "Rapid YAML sources are missing; run \
+    assert!(
+        rapidyaml.join("CMakeLists.txt").is_file(),
+        "Rapid YAML sources are missing; run \
              `git submodule update --init third_party/rapidyaml`"
-        );
-    }
+    );
 
     println!("cargo:rerun-if-changed={}", rapidyaml.display());
 

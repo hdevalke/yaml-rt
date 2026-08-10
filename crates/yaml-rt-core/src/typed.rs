@@ -423,6 +423,7 @@ pub fn __tag_yaml_fragment(
 }
 
 #[doc(hidden)]
+#[must_use]
 pub fn __sequence_fields_to_yaml_fragment(
     fields: &[String],
     indent: usize,

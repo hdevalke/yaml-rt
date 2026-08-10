@@ -485,13 +485,13 @@ impl<W: Write> ser::SerializeSeq for DocumentSequence<'_, W> {
     {
         match self {
             Self::Sequence { values, .. } => values.push(value),
-            _ => unreachable!(),
+            Self::Mapping { .. } => unreachable!(),
         }
     }
     fn end(self) -> Result<()> {
         match self {
             Self::Sequence { serializer, values } => serializer.write_document(values.finish()),
-            _ => unreachable!(),
+            Self::Mapping { .. } => unreachable!(),
         }
     }
 }
@@ -543,7 +543,7 @@ impl<W: Write> ser::SerializeMap for DocumentSequence<'_, W> {
     {
         match self {
             Self::Mapping { values, .. } => ser::SerializeMap::serialize_key(values, key),
-            _ => unreachable!(),
+            Self::Sequence { .. } => unreachable!(),
         }
     }
     fn serialize_value<T>(&mut self, value: &T) -> Result<()>
@@ -552,7 +552,7 @@ impl<W: Write> ser::SerializeMap for DocumentSequence<'_, W> {
     {
         match self {
             Self::Mapping { values, .. } => ser::SerializeMap::serialize_value(values, value),
-            _ => unreachable!(),
+            Self::Sequence { .. } => unreachable!(),
         }
     }
     fn serialize_entry<K, V>(&mut self, key: &K, value: &V) -> Result<()>
@@ -562,13 +562,13 @@ impl<W: Write> ser::SerializeMap for DocumentSequence<'_, W> {
     {
         match self {
             Self::Mapping { values, .. } => ser::SerializeMap::serialize_entry(values, key, value),
-            _ => unreachable!(),
+            Self::Sequence { .. } => unreachable!(),
         }
     }
     fn end(self) -> Result<()> {
         match self {
             Self::Mapping { serializer, values } => serializer.write_document(values.finish()?),
-            _ => unreachable!(),
+            Self::Sequence { .. } => unreachable!(),
         }
     }
 }
@@ -583,7 +583,7 @@ impl<W: Write> ser::SerializeStruct for DocumentSequence<'_, W> {
             Self::Mapping { values, .. } => {
                 ser::SerializeStruct::serialize_field(values, key, value)
             }
-            _ => unreachable!(),
+            Self::Sequence { .. } => unreachable!(),
         }
     }
     fn end(self) -> Result<()> {
@@ -601,7 +601,7 @@ impl<W: Write> ser::SerializeStructVariant for DocumentSequence<'_, W> {
             Self::Mapping { values, .. } => {
                 ser::SerializeStruct::serialize_field(values, key, value)
             }
-            _ => unreachable!(),
+            Self::Sequence { .. } => unreachable!(),
         }
     }
     fn end(self) -> Result<()> {

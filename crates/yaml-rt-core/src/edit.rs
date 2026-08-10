@@ -369,7 +369,7 @@ impl YamlDoc {
             self.remove_node(target)?;
             return Ok(());
         };
-        let Some(collection) = self.node(entry).and_then(|node| node.parent()) else {
+        let Some(collection) = self.node(entry).and_then(super::syntax::Node::parent) else {
             self.remove_node(entry)?;
             return Ok(());
         };
@@ -544,7 +544,7 @@ impl YamlDoc {
     }
 
     pub(crate) fn is_flow_context(&self, mut node: NodeId) -> bool {
-        while let Some(parent) = self.node(node).and_then(|node| node.parent()) {
+        while let Some(parent) = self.node(node).and_then(super::syntax::Node::parent) {
             if matches!(
                 self.semantic_kind(parent),
                 Some(
@@ -563,7 +563,7 @@ impl YamlDoc {
     }
 
     fn anchor_has_external_alias(&self, root: NodeId) -> bool {
-        let Some(root_span) = self.node(root).map(|node| node.span()) else {
+        let Some(root_span) = self.node(root).map(super::syntax::Node::span) else {
             return false;
         };
         let anchored = self

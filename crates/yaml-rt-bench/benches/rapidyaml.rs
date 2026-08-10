@@ -15,6 +15,7 @@ impl Drop for Tree<'_> {
     }
 }
 
+#[must_use]
 pub fn parse_in_arena(input: &str) -> Option<Tree<'static>> {
     // SAFETY: Rapid YAML receives a valid pointer and length for the duration
     // of the call and copies the source into the returned tree's arena.

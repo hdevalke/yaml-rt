@@ -31,7 +31,7 @@ mode: !server
     let mut config = Config::from_yaml_doc(&doc)?;
 
     if let Mode::Server { host, port } = &mut config.mode {
-        *host = "web".to_owned();
+        "web".clone_into(host);
         *port = 9090;
     }
     config.apply_to_yaml_doc(&mut doc)?;

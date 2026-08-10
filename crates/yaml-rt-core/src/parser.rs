@@ -142,7 +142,7 @@ impl<'source> Parser<'source> {
         let lines = LineTable::new(self.source);
         let mut index = 0;
         while index < lines.len() {
-            index += self.parse_line(&lines, index)?;
+            index += self.parse_line(lines, index)?;
         }
         if self.document.is_some() {
             self.close_document(false, Span::empty_from_usize(self.source.len()))?;
@@ -171,7 +171,7 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn parse_line(&mut self, lines: &LineTable<'_>, index: usize) -> Result<usize, YamlError> {
+    fn parse_line(&mut self, lines: LineTable<'_>, index: usize) -> Result<usize, YamlError> {
         let line = lines.line(index);
         let content = line.content_without_break;
         if let Some(indent) = line.facts.indent()
@@ -303,7 +303,7 @@ impl<'source> Parser<'source> {
     fn parse_content_body(
         &mut self,
         document: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -421,7 +421,7 @@ impl<'source> Parser<'source> {
     fn parse_simple_plain_mapping_entry(
         &mut self,
         document: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -449,7 +449,7 @@ impl<'source> Parser<'source> {
     fn append_simple_plain_mapping_entry(
         &mut self,
         mapping: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -518,7 +518,7 @@ impl<'source> Parser<'source> {
 
     fn parse_quoted_scalar_lines(
         &mut self,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         absolute_start: usize,
         quote: char,
@@ -568,7 +568,7 @@ impl<'source> Parser<'source> {
 
     fn parse_flow_value_lines(
         &mut self,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         absolute_start: usize,
     ) -> Result<(NodeId, usize, usize), YamlError> {
@@ -627,7 +627,7 @@ impl<'source> Parser<'source> {
     fn parse_mapping_entry(
         &mut self,
         document: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -782,7 +782,7 @@ impl<'source> Parser<'source> {
     fn parse_explicit_mapping_entry(
         &mut self,
         document: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -861,7 +861,7 @@ impl<'source> Parser<'source> {
     fn parse_following_explicit_key_block(
         &mut self,
         entry: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
@@ -906,7 +906,7 @@ impl<'source> Parser<'source> {
     fn parse_explicit_mapping_key_node(
         &mut self,
         entry: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         parent_indent: usize,
         key_text: &str,
@@ -971,7 +971,7 @@ impl<'source> Parser<'source> {
     fn parse_explicit_mapping_value(
         &mut self,
         entry: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -1076,7 +1076,7 @@ impl<'source> Parser<'source> {
     fn parse_following_explicit_value_block(
         &mut self,
         entry: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
@@ -1122,7 +1122,7 @@ impl<'source> Parser<'source> {
     fn parse_nested_mapping_entry_value(
         &mut self,
         entry: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
@@ -1356,7 +1356,7 @@ impl<'source> Parser<'source> {
     fn parse_sequence_entry(
         &mut self,
         document: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
@@ -1642,7 +1642,7 @@ impl<'source> Parser<'source> {
     fn parse_nested_sequence_entry_value(
         &mut self,
         entry: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         parent_indent: usize,
     ) -> Result<usize, YamlError> {
@@ -1652,7 +1652,7 @@ impl<'source> Parser<'source> {
     fn parse_nested_block_value(
         &mut self,
         parent: NodeId,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         parent_indent: usize,
         allow_same_indent_sequence: bool,
@@ -1751,7 +1751,7 @@ impl<'source> Parser<'source> {
 
     fn parse_block_plain_scalar(
         &mut self,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         parent_indent: usize,
         value_start: usize,
@@ -2471,7 +2471,7 @@ impl<'source> Parser<'source> {
 
     fn parse_block_scalar(
         &mut self,
-        lines: &LineTable<'_>,
+        lines: LineTable<'_>,
         index: usize,
         header_start: usize,
         parent_indent: usize,
@@ -3316,7 +3316,7 @@ fn block_scalar_after_node_properties(
 
 fn property_only_block_collection_indent(
     body: &str,
-    lines: &LineTable<'_>,
+    lines: LineTable<'_>,
     index: usize,
     absolute_start: usize,
 ) -> Result<Option<usize>, YamlError> {
@@ -3339,7 +3339,7 @@ fn property_only_block_collection_indent(
 
 fn property_only_mapping_value_collection_indent(
     body: &str,
-    lines: &LineTable<'_>,
+    lines: LineTable<'_>,
     index: usize,
     absolute_start: usize,
     parent_indent: usize,
@@ -3367,7 +3367,7 @@ fn property_only_mapping_value_collection_indent(
 
 fn reject_invalid_anchor_only_nested_property_mapping(
     body: &str,
-    lines: &LineTable<'_>,
+    lines: LineTable<'_>,
     index: usize,
     absolute_start: usize,
 ) -> Result<(), YamlError> {
@@ -3409,22 +3409,22 @@ fn reject_invalid_anchor_only_nested_property_mapping(
     Ok(())
 }
 
-fn first_non_property_node_after<'source>(
-    lines: &LineTable<'source>,
+fn first_non_property_node_after(
+    lines: LineTable<'_>,
     index: usize,
     absolute_start: usize,
-) -> Result<Option<(usize, &'source str)>, YamlError> {
+) -> Result<Option<(usize, &str)>, YamlError> {
     Ok(
         first_non_property_node_after_with_index(lines, index, absolute_start)?
             .map(|(_, indent, body)| (indent, body)),
     )
 }
 
-fn first_non_property_node_after_with_index<'source>(
-    lines: &LineTable<'source>,
+fn first_non_property_node_after_with_index(
+    lines: LineTable<'_>,
     index: usize,
     absolute_start: usize,
-) -> Result<Option<(usize, usize, &'source str)>, YamlError> {
+) -> Result<Option<(usize, usize, &str)>, YamlError> {
     let mut scan_index = index;
     while let Some((next_index, indent, nested_body)) =
         next_significant_body_with_index(lines, scan_index)
@@ -3447,7 +3447,7 @@ fn first_non_property_node_after_with_index<'source>(
 
 fn property_only_node_indent(
     body: &str,
-    lines: &LineTable<'_>,
+    lines: LineTable<'_>,
     index: usize,
     absolute_start: usize,
 ) -> Result<Option<usize>, YamlError> {
@@ -3466,10 +3466,10 @@ fn property_only_node_indent(
     Ok(first_non_property_node_after(lines, index, absolute_start)?.map(|(indent, _)| indent))
 }
 
-fn next_significant_body_with_index<'source>(
-    lines: &LineTable<'source>,
+fn next_significant_body_with_index(
+    lines: LineTable<'_>,
     current_index: usize,
-) -> Option<(usize, usize, &'source str)> {
+) -> Option<(usize, usize, &str)> {
     for (relative_index, line) in lines.iter_from(current_index + 1).enumerate() {
         let index = current_index + 1 + relative_index;
         let trimmed = line.content_without_break.trim();
@@ -3969,7 +3969,7 @@ impl<'source> LineTable<'source> {
 }
 
 fn next_significant_indent(
-    lines: &LineTable<'_>,
+    lines: LineTable<'_>,
     current_index: usize,
 ) -> Result<Option<usize>, YamlError> {
     for line in lines.iter_from(current_index + 1) {

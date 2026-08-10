@@ -164,7 +164,10 @@ fn main() {
 fn count_as_f64(value: usize) -> f64 {
     // Benchmark reporting is approximate once counters exceed `f64`'s exact
     // integer range, which is acceptable for human-readable rates.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "human-readable benchmark rates may approximate counters above 53 bits"
+    )]
     let converted = value as f64;
     converted
 }

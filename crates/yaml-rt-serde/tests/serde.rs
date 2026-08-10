@@ -250,6 +250,13 @@ fn float_deserialization_checks_f32_range_and_uses_rust_rounding() {
         rounded_signed.to_bits(),
         (-9_007_199_254_740_992_f64).to_bits()
     );
+
+    let signed_min = from_str::<f64>("-170141183460469231731687303715884105728\n").unwrap();
+    assert_eq!(signed_min.to_bits(), (-2_f64.powi(127)).to_bits());
+    let signed_max = from_str::<f64>("170141183460469231731687303715884105727\n").unwrap();
+    assert_eq!(signed_max.to_bits(), 2_f64.powi(127).to_bits());
+    let unsigned_max = from_str::<f64>("340282366920938463463374607431768211455\n").unwrap();
+    assert_eq!(unsigned_max.to_bits(), 2_f64.powi(128).to_bits());
 }
 
 #[test]

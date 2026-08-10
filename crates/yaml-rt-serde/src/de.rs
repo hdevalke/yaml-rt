@@ -855,7 +855,10 @@ where
 fn checked_f64_to_f32(value: f64) -> Option<f32> {
     // Rust defines this conversion as rounding to the nearest representable
     // `f32`; reject only finite overflow instead of silently producing infinity.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f32 deserialization applies Rust narrowing and then rejects finite overflow"
+    )]
     let converted = value as f32;
     (!value.is_finite() || converted.is_finite()).then_some(converted)
 }
@@ -863,14 +866,20 @@ fn checked_f64_to_f32(value: f64) -> Option<f32> {
 fn i128_to_f64(value: i128) -> f64 {
     // Deserializing an integer into an explicitly requested floating-point type
     // follows Rust's rounding semantics when the integer exceeds 53 bits.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Serde floating-point requests intentionally use Rust integer rounding semantics"
+    )]
     let converted = value as f64;
     converted
 }
 
 fn u128_to_f64(value: u128) -> f64 {
     // See `i128_to_f64`; all `u128` values remain finite as `f64`.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Serde floating-point requests intentionally use Rust integer rounding semantics"
+    )]
     let converted = value as f64;
     converted
 }

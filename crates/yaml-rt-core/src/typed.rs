@@ -987,7 +987,10 @@ macro_rules! impl_yaml_float {
 fn f64_to_f32(value: f64) -> f32 {
     // Narrowing is required by `YamlValue for f32`; the implementation above
     // separately rejects finite values that overflow to infinity.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "YamlValue for f32 requires Rust narrowing before finite-overflow validation"
+    )]
     let converted = value as f32;
     converted
 }

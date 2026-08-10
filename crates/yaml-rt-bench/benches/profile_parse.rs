@@ -251,7 +251,10 @@ fn report(
 fn count_as_f64(value: usize) -> f64 {
     // Benchmark byte counts are displayed approximately above `f64`'s exact
     // integer range.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "human-readable benchmark throughput may approximate byte counts above 53 bits"
+    )]
     let converted = value as f64;
     converted
 }

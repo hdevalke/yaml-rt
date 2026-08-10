@@ -479,16 +479,20 @@ fn expand_enum(
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "unit-enum validation and generated match arms share one name table"
-)]
 fn expand_unit_enum(
     attrs: &[Attribute],
     name: &syn::Ident,
     generics: &syn::Generics,
     variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
+    let expanded = parse_unit_variants(attrs, variants)?;
+    Ok(render_unit_enum(name, generics, &expanded))
+}
+
+fn parse_unit_variants(
+    attrs: &[Attribute],
+    variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
+) -> syn::Result<Vec<UnitVariant>> {
     let options = parse_enum_options(attrs)?;
     let mut expanded = Vec::new();
     let mut names = BTreeMap::<String, String>::new();
@@ -504,75 +508,36 @@ fn expand_unit_enum(
         let canonical = variant_options
             .rename
             .unwrap_or_else(|| apply_rename_rule(&rust_name, options.rename_all));
-        for accepted in std::iter::once(&canonical).chain(variant_options.aliases.iter()) {
-            if let Some(previous) = names.insert(accepted.clone(), rust_name.clone()) {
-                return Err(syn::Error::new_spanned(
-                    &variant.ident,
-                    format!(
-                        "yaml enum variant name `{accepted}` is used by both `{previous}` and `{rust_name}`"
-                    ),
-                ));
-            }
-        }
+        register_enum_variant_names(
+            &variant.ident,
+            &canonical,
+            &variant_options.aliases,
+            &mut names,
+        )?;
         expanded.push(UnitVariant {
             ident: variant.ident,
             canonical,
             aliases: variant_options.aliases,
         });
     }
+    Ok(expanded)
+}
 
+fn render_unit_enum(
+    name: &syn::Ident,
+    generics: &syn::Generics,
+    expanded: &[UnitVariant],
+) -> TokenStream2 {
     let expected = expanded
         .iter()
         .map(|variant| variant.canonical.as_str())
         .collect::<Vec<_>>();
-    let read_arms = expanded.iter().map(|variant| {
-        let ident = &variant.ident;
-        let names = std::iter::once(&variant.canonical)
-            .chain(variant.aliases.iter())
-            .collect::<Vec<_>>();
-        quote! {
-            #(#names)|* => Ok(Self::#ident)
-        }
-    });
-    let write_arms = expanded.iter().map(|variant| {
-        let ident = &variant.ident;
-        let canonical = &variant.canonical;
-        let names = std::iter::once(&variant.canonical)
-            .chain(variant.aliases.iter())
-            .collect::<Vec<_>>();
-        quote! {
-            Self::#ident => {
-                let __yaml_rt_has_local_tag = doc.raw_tag(node).is_some_and(|tag| {
-                    tag.starts_with('!') && !tag.starts_with("!!")
-                });
-                if !__yaml_rt_has_local_tag
-                    && <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)
-                        .is_ok_and(|value| matches!(value.as_str(), #(#names)|*))
-                {
-                    return Ok(node);
-                }
-                <String as ::yaml_rt::YamlValue>::write_yaml(
-                    &#canonical.to_owned(),
-                    doc,
-                    Some(node),
-                )
-            }
-        }
-    });
-    let fragment_arms = expanded.iter().map(|variant| {
-        let ident = &variant.ident;
-        let canonical = &variant.canonical;
-        quote! {
-            Self::#ident => <String as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
-                &#canonical.to_owned(),
-                indent,
-                line_ending,
-            )
-        }
-    });
+    let read_arms = expanded.iter().map(unit_variant_read_arm);
+    let write_arms = expanded.iter().map(unit_variant_write_arm);
+    let fragment_arms = expanded.iter().map(unit_variant_fragment_arm);
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
 
-    Ok(quote! {
+    quote! {
         impl #impl_generics ::yaml_rt::FromYamlDoc for #name #type_generics #where_clause {
             fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
                 ::yaml_rt::__read_yaml_document(doc)
@@ -641,7 +606,57 @@ fn expand_unit_enum(
                 }
             }
         }
-    })
+    }
+}
+
+fn unit_variant_read_arm(variant: &UnitVariant) -> TokenStream2 {
+    let ident = &variant.ident;
+    let names = unit_variant_names(variant);
+    quote! {
+        #(#names)|* => Ok(Self::#ident)
+    }
+}
+
+fn unit_variant_write_arm(variant: &UnitVariant) -> TokenStream2 {
+    let ident = &variant.ident;
+    let canonical = &variant.canonical;
+    let names = unit_variant_names(variant);
+    quote! {
+        Self::#ident => {
+            let __yaml_rt_has_local_tag = doc.raw_tag(node).is_some_and(|tag| {
+                tag.starts_with('!') && !tag.starts_with("!!")
+            });
+            if !__yaml_rt_has_local_tag
+                && <String as ::yaml_rt::YamlValue>::read_yaml(doc, node)
+                    .is_ok_and(|value| matches!(value.as_str(), #(#names)|*))
+            {
+                return Ok(node);
+            }
+            <String as ::yaml_rt::YamlValue>::write_yaml(
+                &#canonical.to_owned(),
+                doc,
+                Some(node),
+            )
+        }
+    }
+}
+
+fn unit_variant_fragment_arm(variant: &UnitVariant) -> TokenStream2 {
+    let ident = &variant.ident;
+    let canonical = &variant.canonical;
+    quote! {
+        Self::#ident => <String as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+            &#canonical.to_owned(),
+            indent,
+            line_ending,
+        )
+    }
+}
+
+fn unit_variant_names(variant: &UnitVariant) -> Vec<&String> {
+    std::iter::once(&variant.canonical)
+        .chain(variant.aliases.iter())
+        .collect()
 }
 
 struct PayloadField {
@@ -666,16 +681,26 @@ struct EnumVariant {
     kind: EnumVariantKind,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "tagged-enum validation and code generation share variant metadata"
-)]
+struct TaggedEnumExpansion {
+    variants: Vec<EnumVariant>,
+    read_bounds: Vec<syn::WherePredicate>,
+    write_bounds: Vec<syn::WherePredicate>,
+}
+
 fn expand_tagged_enum(
     attrs: &[Attribute],
     name: &syn::Ident,
     generics: syn::Generics,
     variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
+    let expansion = parse_tagged_enum_variants(attrs, variants)?;
+    Ok(render_tagged_enum(name, generics, expansion))
+}
+
+fn parse_tagged_enum_variants(
+    attrs: &[Attribute],
+    variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
+) -> syn::Result<TaggedEnumExpansion> {
     let options = parse_enum_options(attrs)?;
     let mut expanded = Vec::new();
     let mut names = BTreeMap::<String, String>::new();
@@ -688,16 +713,12 @@ fn expand_tagged_enum(
         let canonical = variant_options
             .rename
             .unwrap_or_else(|| apply_rename_rule(&rust_name, options.rename_all));
-        for accepted in std::iter::once(&canonical).chain(variant_options.aliases.iter()) {
-            if let Some(previous) = names.insert(accepted.clone(), rust_name.clone()) {
-                return Err(syn::Error::new_spanned(
-                    &variant.ident,
-                    format!(
-                        "yaml enum variant name `{accepted}` is used by both `{previous}` and `{rust_name}`"
-                    ),
-                ));
-            }
-        }
+        register_enum_variant_names(
+            &variant.ident,
+            &canonical,
+            &variant_options.aliases,
+            &mut names,
+        )?;
 
         let kind = match variant.fields {
             Fields::Unit => EnumVariantKind::Unit,
@@ -753,6 +774,14 @@ fn expand_tagged_enum(
         });
     }
 
+    Ok(TaggedEnumExpansion {
+        variants: expanded,
+        read_bounds,
+        write_bounds,
+    })
+}
+
+fn tagged_enum_read_body(expanded: &[EnumVariant]) -> TokenStream2 {
     let expected_units = expanded
         .iter()
         .filter(|variant| matches!(variant.kind, EnumVariantKind::Unit))
@@ -776,14 +805,6 @@ fn expand_tagged_enum(
         .iter()
         .filter(|variant| !matches!(variant.kind, EnumVariantKind::Unit))
         .map(tagged_variant_read_arm)
-        .collect::<Vec<_>>();
-    let write_arms = expanded
-        .iter()
-        .map(enum_variant_write_arm)
-        .collect::<Vec<_>>();
-    let fragment_arms = expanded
-        .iter()
-        .map(enum_variant_fragment_arm)
         .collect::<Vec<_>>();
     let untagged_scalar_read = if unit_read_arms.is_empty() {
         quote! {
@@ -809,7 +830,7 @@ fn expand_tagged_enum(
         }
     };
 
-    let read_body = quote! {
+    quote! {
         let __yaml_rt_raw_tag = doc.raw_tag(node);
         let __yaml_rt_local_tag = __yaml_rt_raw_tag.and_then(|tag| {
             let suffix = tag.strip_prefix('!')?;
@@ -853,27 +874,24 @@ fn expand_tagged_enum(
                 &[#(#expected_tags),*],
             ))
         }
-    };
+    }
+}
 
-    let mut read_generics = generics.clone();
-    read_generics
-        .make_where_clause()
-        .predicates
-        .extend(read_bounds.iter().cloned());
-    let mut write_generics = generics.clone();
-    write_generics
-        .make_where_clause()
-        .predicates
-        .extend(write_bounds.iter().cloned());
-    let mut combined_generics = generics;
-    combined_generics
-        .make_where_clause()
-        .predicates
-        .extend(read_bounds);
-    combined_generics
-        .make_where_clause()
-        .predicates
-        .extend(write_bounds);
+fn render_tagged_enum(
+    name: &syn::Ident,
+    generics: syn::Generics,
+    expansion: TaggedEnumExpansion,
+) -> TokenStream2 {
+    let TaggedEnumExpansion {
+        variants,
+        read_bounds,
+        write_bounds,
+    } = expansion;
+    let read_body = tagged_enum_read_body(&variants);
+    let write_arms = variants.iter().map(enum_variant_write_arm);
+    let fragment_arms = variants.iter().map(enum_variant_fragment_arm);
+    let (read_generics, write_generics, combined_generics) =
+        enum_generics_with_bounds(generics, read_bounds, write_bounds);
     let (read_impl_generics, read_type_generics, read_where_clause) =
         read_generics.split_for_impl();
     let (write_impl_generics, write_type_generics, write_where_clause) =
@@ -881,7 +899,7 @@ fn expand_tagged_enum(
     let (combined_impl_generics, combined_type_generics, combined_where_clause) =
         combined_generics.split_for_impl();
 
-    Ok(quote! {
+    quote! {
         impl #read_impl_generics ::yaml_rt::FromYamlDoc for #name #read_type_generics #read_where_clause {
             fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
                 let node = doc.document_root(0)?.ok_or_else(|| {
@@ -938,13 +956,60 @@ fn expand_tagged_enum(
                 }
             }
         }
-    })
+    }
+}
+
+fn enum_generics_with_bounds(
+    generics: syn::Generics,
+    read_bounds: Vec<syn::WherePredicate>,
+    write_bounds: Vec<syn::WherePredicate>,
+) -> (syn::Generics, syn::Generics, syn::Generics) {
+    let mut read_generics = generics.clone();
+    read_generics
+        .make_where_clause()
+        .predicates
+        .extend(read_bounds.iter().cloned());
+    let mut write_generics = generics.clone();
+    write_generics
+        .make_where_clause()
+        .predicates
+        .extend(write_bounds.iter().cloned());
+    let mut combined_generics = generics;
+    combined_generics
+        .make_where_clause()
+        .predicates
+        .extend(read_bounds);
+    combined_generics
+        .make_where_clause()
+        .predicates
+        .extend(write_bounds);
+    (read_generics, write_generics, combined_generics)
 }
 
 fn accepted_variant_names(variant: &EnumVariant) -> Vec<&String> {
     std::iter::once(&variant.canonical)
         .chain(variant.aliases.iter())
         .collect()
+}
+
+fn register_enum_variant_names(
+    ident: &syn::Ident,
+    canonical: &str,
+    aliases: &[String],
+    names: &mut BTreeMap<String, String>,
+) -> syn::Result<()> {
+    let rust_name = ident.to_string();
+    for accepted in std::iter::once(canonical).chain(aliases.iter().map(String::as_str)) {
+        if let Some(previous) = names.insert(accepted.to_owned(), rust_name.clone()) {
+            return Err(syn::Error::new_spanned(
+                ident,
+                format!(
+                    "yaml enum variant name `{accepted}` is used by both `{previous}` and `{rust_name}`"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_enum_tag_names(

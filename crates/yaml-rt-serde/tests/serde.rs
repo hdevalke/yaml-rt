@@ -105,6 +105,8 @@ fn serde_attributes_are_honored_by_standard_derives() {
 }
 
 mod string_u16 {
+    #![allow(clippy::trivially_copy_pass_by_ref)]
+
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(value: &u16, serializer: S) -> Result<S::Ok, S::Error>

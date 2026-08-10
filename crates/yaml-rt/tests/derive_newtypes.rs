@@ -11,6 +11,8 @@ where
     T: Copy;
 
 mod duration_seconds {
+    #![allow(clippy::unnecessary_wraps)]
+
     use std::time::Duration;
 
     use yaml_rt::YamlError;

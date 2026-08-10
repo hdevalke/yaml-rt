@@ -6,6 +6,8 @@ use std::{
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
 
 mod duration_seconds {
+    #![allow(clippy::unnecessary_wraps)]
+
     use std::time::Duration;
     use yaml_rt::YamlError;
 
@@ -24,6 +26,8 @@ mod duration_seconds {
 struct PortSet(Vec<u16>);
 
 mod port_list {
+    #![allow(clippy::unnecessary_wraps)]
+
     use super::PortSet;
     use yaml_rt::YamlError;
 
@@ -301,6 +305,7 @@ fn skip_attribute_defaults_field_and_preserves_source_key() {
     assert_eq!(doc.to_string(), "name: app\ncached_port: 3000\n");
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
     !*value
 }

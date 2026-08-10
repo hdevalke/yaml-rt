@@ -28,6 +28,8 @@ struct UnitEnumConfig {
 }
 
 mod duration_seconds {
+    #![allow(clippy::unnecessary_wraps)]
+
     use std::time::Duration;
 
     use yaml_rt::YamlError;
@@ -44,6 +46,8 @@ mod duration_seconds {
 }
 
 mod ipv4_octets {
+    #![allow(clippy::trivially_copy_pass_by_ref, clippy::unnecessary_wraps)]
+
     use std::net::Ipv4Addr;
 
     use yaml_rt::YamlError;
@@ -60,6 +64,8 @@ mod ipv4_octets {
 }
 
 mod positive_i16 {
+    #![allow(clippy::trivially_copy_pass_by_ref)]
+
     use yaml_rt::{Diagnostic, DiagnosticKind, Span, YamlError};
 
     pub type Repr = i16;

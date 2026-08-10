@@ -54,6 +54,13 @@ punctuation, and document markers. The parser builds a CST whose node spans
 cover source regions without normalizing them. Rendering an unedited
 `YamlDoc` therefore returns the original bytes.
 
+Flow collections use a one-pass frame machine. Sequence and mapping frames
+record the next grammatical state while a single source cursor advances;
+nested collections push frames and completed collections resume their parent.
+This keeps nesting off the call stack, enforces the documented depth limit,
+and prevents speculative nodes from being attached outside their source
+context.
+
 ### Semantic metadata
 
 Composition records document roots, mapping entries, sequence items, tags,

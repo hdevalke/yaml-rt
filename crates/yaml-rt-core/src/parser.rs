@@ -9,12 +9,51 @@ use crate::{
 
 const MAX_FLOW_COLLECTION_DEPTH: usize = 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowCollectionKind {
+    Sequence,
+    Mapping,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct PreparedFlowCollection {
-    start: usize,
-    end: usize,
+enum FlowFrameState {
+    SequenceExpectItem,
+    SequenceAwaitItem {
+        entry: NodeId,
+        entry_start: usize,
+        explicit: bool,
+    },
+    SequenceAwaitValue {
+        entry: NodeId,
+        mapping: NodeId,
+        mapping_entry: NodeId,
+    },
+    SequenceAfterItem,
+    MappingExpectKey,
+    MappingAwaitKey {
+        entry: NodeId,
+        entry_start: usize,
+        explicit: bool,
+    },
+    MappingAwaitValue {
+        entry: NodeId,
+        entry_start: usize,
+    },
+    MappingAfterPair,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FlowFrame {
+    kind: FlowCollectionKind,
     node: NodeId,
-    ready: bool,
+    close: char,
+    state: FlowFrameState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FlowNode {
+    Scalar(NodeId, usize),
+    Collection(FlowFrame, usize),
 }
 
 enum PendingFlowEvent {
@@ -68,7 +107,6 @@ pub(crate) struct Parser<'source> {
     document_yaml_directive_seen: bool,
     tag_handles: BTreeMap<String, String>,
     contexts: Vec<ContextFrame>,
-    prepared_flow_collections: Vec<PreparedFlowCollection>,
 }
 
 impl<'source> Parser<'source> {
@@ -87,7 +125,6 @@ impl<'source> Parser<'source> {
             document_yaml_directive_seen: false,
             tag_handles: BTreeMap::new(),
             contexts: Vec::with_capacity(16),
-            prepared_flow_collections: Vec::new(),
         }
     }
 
@@ -275,7 +312,7 @@ impl<'source> Parser<'source> {
         if is_sequence_entry(body) {
             self.parse_sequence_entry(document, lines, index, indent, body)
         } else if is_explicit_mapping_key(body) {
-            self.parse_explicit_mapping_entry(document, lines, index, indent, body)
+            self.parse_explicit_mapping_entry(document, lines, index, indent, body, absolute_start)
         } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, absolute_start, indent, body, true)?;
@@ -293,9 +330,8 @@ impl<'source> Parser<'source> {
                 absolute_start,
             )
         } else if body_starts_flow_value(body, absolute_start)? {
-            let (flow_text, consumed) = self.flow_value_text(lines, index, absolute_start, body)?;
-            let (node, end) = self.parse_flow_value(flow_text, absolute_start)?;
-            reject_trailing_flow_content(flow_text, end, absolute_start)?;
+            let (node, _end, consumed) =
+                self.parse_flow_value_lines(lines, index, absolute_start)?;
             self.attach_child_at(document.0 as usize, node);
             self.emit_node_event(node)?;
             Ok(consumed)
@@ -442,27 +478,37 @@ impl<'source> Parser<'source> {
         ))
     }
 
-    fn flow_collection_text<'lines>(
-        &self,
-        lines: &'lines LineTable<'_>,
+    fn parse_flow_value_lines(
+        &mut self,
+        lines: &LineTable<'_>,
         index: usize,
         absolute_start: usize,
-    ) -> Result<(&'source str, usize), YamlError> {
+    ) -> Result<(NodeId, usize, usize), YamlError> {
         let source_tail = &self.source.as_str()[absolute_start..];
-        let end = flow_collection_source_end(source_tail, absolute_start)?;
-        let validate_sequence_indent = source_tail
+        let properties = parse_node_properties(
+            source_tail,
+            Span::from_usize(absolute_start, self.source.len()),
+        )?;
+        reject_invalid_node_property_placement(source_tail, absolute_start, &properties)?;
+        let marker_offset = properties.value_start
+            + leading_flow_whitespace(&source_tail[properties.value_start..]);
+        let marker_start = absolute_start + marker_offset;
+        let (node, end) = self.parse_flow_value(source_tail, absolute_start)?;
+        let validate_sequence_indent = source_tail[marker_offset..]
             .chars()
             .find(|character| !character.is_whitespace())
             == Some('[')
-            && absolute_start
-                > lines.line(index).content_start + self.source_indent_at(absolute_start);
+            && marker_start > lines.line(index).content_start + self.source_indent_at(marker_start);
         let absolute_end = absolute_start + end;
         let mut consumed = 1;
-        let mut validation_end = lines.line(index).content_end;
-        let flow_indent = self.source_indent_at(absolute_start);
+        // Include the line break in the validation window. The one-pass cursor may
+        // stop immediately after separation at the end of a line, while trailing
+        // content is still bounded by the last source line the value consumed.
+        let mut validation_end = lines.line(index).line_end;
+        let flow_indent = self.source_indent_at(marker_start);
         let current_line = lines.line(index);
         let marker_prefix = &current_line.content_without_break
-            [..absolute_start.saturating_sub(current_line.content_start)];
+            [..marker_start.saturating_sub(current_line.content_start)];
         let allow_tab_continuation = marker_prefix.as_bytes().contains(&b'\t');
         for line in lines.iter_from(index + 1) {
             if line.content_start < absolute_end {
@@ -474,36 +520,17 @@ impl<'source> Parser<'source> {
                     )?;
                 }
                 consumed += 1;
-                validation_end = line.content_end;
+                validation_end = line.line_end;
             } else {
                 break;
             }
         }
-        let collection_text = &self.source.as_str()[absolute_start..validation_end];
-        reject_trailing_flow_content(collection_text, end, absolute_start)?;
-        Ok((collection_text, consumed))
-    }
-
-    fn flow_value_text<'lines>(
-        &self,
-        lines: &'lines LineTable<'_>,
-        index: usize,
-        value_start: usize,
-        value_text: &str,
-    ) -> Result<(&'source str, usize), YamlError> {
-        let properties = parse_node_properties(
-            value_text,
-            Span::from_usize(value_start, value_start + value_text.len()),
+        reject_trailing_flow_content(
+            &source_tail[..validation_end - absolute_start],
+            end,
+            absolute_start,
         )?;
-        reject_invalid_node_property_placement(value_text, value_start, &properties)?;
-        let marker_offset =
-            properties.value_start + leading_flow_whitespace(&value_text[properties.value_start..]);
-        let marker_start = value_start + marker_offset;
-        let (marker_text, consumed) = self.flow_collection_text(lines, index, marker_start)?;
-        Ok((
-            &self.source.as_str()[value_start..marker_start + marker_text.len()],
-            consumed,
-        ))
+        Ok((node, end, consumed))
     }
 
     // Mapping parsing needs both the source-line view and its absolute offsets;
@@ -622,10 +649,8 @@ impl<'source> Parser<'source> {
                 self.extend_node_span(mapping, end);
                 return Ok(consumed);
             } else if body_starts_flow_value(raw_value_trimmed, value_start)? {
-                let (flow_text, consumed) =
-                    self.flow_value_text(lines, index, value_start, raw_value_trimmed)?;
-                let (node, end) = self.parse_flow_value(flow_text, value_start)?;
-                reject_trailing_flow_content(flow_text, end, value_start)?;
+                let (node, _end, consumed) =
+                    self.parse_flow_value_lines(lines, index, value_start)?;
                 self.attach_child_at(entry.0 as usize, node);
                 self.emit_node_event(node)?;
                 return Ok(consumed);
@@ -673,6 +698,7 @@ impl<'source> Parser<'source> {
         index: usize,
         indent: usize,
         body: &str,
+        absolute_start: usize,
     ) -> Result<usize, YamlError> {
         let line = lines.line(index);
         let mapping = self.ensure_mapping(
@@ -688,7 +714,7 @@ impl<'source> Parser<'source> {
         self.extend_node_span(mapping, line.content_end);
 
         let after_question = if body == "?" { "" } else { &body[1..] };
-        reject_invalid_indicator_tab(body, line.content_start + indent)?;
+        reject_invalid_indicator_tab(body, absolute_start)?;
         let key_text = strip_inline_comment(after_question).trim_start();
         let key_consumed = if key_text.is_empty() {
             if next_significant_body_with_index(lines, index).is_some_and(
@@ -698,14 +724,14 @@ impl<'source> Parser<'source> {
             ) {
                 self.parse_following_explicit_key_block(entry, lines, index, indent)?
             } else {
-                let key = self.push_empty_scalar(line.content_start + indent + 1);
+                let key = self.push_empty_scalar(absolute_start + 1);
                 self.attach_child_at(entry.0 as usize, key);
                 self.emit_scalar_event(key)?;
                 1
             }
         } else {
             let leading = after_question.len() - after_question.trim_start().len();
-            let key_start = line.content_start + indent + 1 + leading;
+            let key_start = absolute_start + 1 + leading;
             let key_properties = parse_node_properties(
                 key_text,
                 Span::from_usize(key_start, key_start + key_text.len()),
@@ -837,9 +863,7 @@ impl<'source> Parser<'source> {
         } else if let Some(colon_byte) = flow_collection_mapping_key_colon(key_text, key_start)? {
             self.parse_compact_block_mapping_node(entry, key_text, key_start, colon_byte)
         } else if body_starts_flow_value(key_text, key_start)? {
-            let (flow_text, consumed) = self.flow_value_text(lines, index, key_start, key_text)?;
-            let (key, end) = self.parse_flow_value(flow_text, key_start)?;
-            reject_trailing_flow_content(flow_text, end, key_start)?;
+            let (key, _end, consumed) = self.parse_flow_value_lines(lines, index, key_start)?;
             self.attach_child_at(entry.0 as usize, key);
             self.emit_node_event(key)?;
             Ok(consumed)
@@ -945,10 +969,8 @@ impl<'source> Parser<'source> {
             self.parse_compact_block_mapping_node(entry, value_trimmed, value_start, colon_byte)?;
             Ok(1)
         } else if body_starts_flow_value(raw_value_trimmed, value_start)? {
-            let (flow_text, consumed) =
-                self.flow_value_text(lines, index, value_start, raw_value_trimmed)?;
-            let (value_node, end) = self.parse_flow_value(flow_text, value_start)?;
-            reject_trailing_flow_content(flow_text, end, value_start)?;
+            let (value_node, _end, consumed) =
+                self.parse_flow_value_lines(lines, index, value_start)?;
             self.attach_child_at(entry.0 as usize, value_node);
             self.emit_node_event(value_node)?;
             Ok(consumed)
@@ -1342,10 +1364,8 @@ impl<'source> Parser<'source> {
                     value,
                 );
             } else if body_starts_flow_value(value, value_start)? {
-                let (flow_text, consumed) =
-                    self.flow_value_text(lines, index, value_start, value)?;
-                let (value_node, end) = self.parse_flow_value(flow_text, value_start)?;
-                reject_trailing_flow_content(flow_text, end, value_start)?;
+                let (value_node, _end, consumed) =
+                    self.parse_flow_value_lines(lines, index, value_start)?;
                 self.attach_child_at(entry.0 as usize, value_node);
                 self.emit_node_event(value_node)?;
                 return Ok(consumed);
@@ -1356,6 +1376,7 @@ impl<'source> Parser<'source> {
                     index,
                     value_start - line.content_start,
                     value,
+                    value_start,
                 );
             } else if is_compact_explicit_empty_key_mapping(value) {
                 self.parse_compact_explicit_empty_key_mapping(
@@ -1728,11 +1749,7 @@ impl<'source> Parser<'source> {
         if value_text.starts_with(['[', '{']) {
             let collection_start = absolute_start + value_start;
             let (node, consumed) =
-                if let Some(collection) = self.ready_flow_collection(collection_start) {
-                    (collection.node, collection.end - collection_start)
-                } else {
-                    self.parse_flow_collection_iterative(value_text, collection_start)?
-                };
+                self.parse_flow_collection_iterative(value_text, collection_start)?;
             self.nodes[node.as_usize()].span.start = Span::usize_to_u32(absolute_start);
             Ok((node, value_start + consumed))
         } else {
@@ -1757,88 +1774,611 @@ impl<'source> Parser<'source> {
         text: &str,
         absolute_start: usize,
     ) -> Result<(NodeId, usize), YamlError> {
-        let collections = collect_flow_collections(text, absolute_start)?;
-        let first_index = self.prepared_flow_collections.len();
-        for collection in collections {
-            let kind = if text[collection.start..].starts_with('[') {
+        let Some(open) = text.chars().next() else {
+            return Err(empty_flow_value(absolute_start));
+        };
+        let root = self.push_node(
+            if open == '[' {
                 NodeKind::FlowSequence
             } else {
                 NodeKind::FlowMapping
-            };
-            let start = absolute_start + collection.start;
-            let node = self.push_node(kind, Span::from_usize(start, start + 1));
-            self.prepared_flow_collections.push(PreparedFlowCollection {
-                start,
-                end: absolute_start + collection.end,
-                node,
-                ready: false,
-            });
-        }
+            },
+            Span::from_usize(absolute_start, absolute_start + open.len_utf8()),
+        );
+        let mut frames = Vec::with_capacity(16);
+        frames.push(flow_frame(root, open));
+        let mut position = open.len_utf8();
+        let mut completed = None::<(NodeId, usize)>;
 
-        for index in (first_index..self.prepared_flow_collections.len()).rev() {
-            let collection = self.prepared_flow_collections[index];
-            let relative_start = collection.start - absolute_start;
-            let relative_end = collection.end - absolute_start;
-            let collection_text = &text[relative_start..relative_end];
-            if collection_text.starts_with('[') {
-                self.parse_flow_sequence_into(collection.node, collection_text, collection.start)?;
-            } else {
-                self.parse_flow_mapping_into(collection.node, collection_text, collection.start)?;
+        loop {
+            if let Some((child, child_end)) = completed.take() {
+                position = child_end;
+                let Some(frame_index) = frames.len().checked_sub(1) else {
+                    return Ok((root, position));
+                };
+                let frame = frames[frame_index];
+                match frame.state {
+                    FlowFrameState::SequenceAwaitItem {
+                        entry,
+                        entry_start,
+                        explicit,
+                    } => {
+                        position = skip_flow_whitespace(text, position);
+                        if text[position..].starts_with(':') {
+                            if !explicit {
+                                reject_split_implicit_flow_mapping_key(
+                                    text,
+                                    entry_start,
+                                    position,
+                                    absolute_start,
+                                )?;
+                            }
+                            let mapping = self.push_node(
+                                NodeKind::FlowMapping,
+                                Span::from_usize(
+                                    absolute_start + entry_start,
+                                    absolute_start + position,
+                                ),
+                            );
+                            let mapping_entry = self.push_node(
+                                NodeKind::MappingEntry,
+                                Span::from_usize(
+                                    absolute_start + entry_start,
+                                    absolute_start + position,
+                                ),
+                            );
+                            self.attach_child_at(mapping.as_usize(), mapping_entry);
+                            self.attach_child_at(mapping_entry.as_usize(), child);
+                            position = skip_flow_whitespace(text, position + 1);
+                            if text[position..].starts_with([',', ']']) {
+                                let value = self.push_empty_scalar(absolute_start + position);
+                                self.attach_child_at(mapping_entry.as_usize(), value);
+                                self.finish_flow_mapping_sequence_item(
+                                    frame.node,
+                                    entry,
+                                    mapping,
+                                    mapping_entry,
+                                    position,
+                                    absolute_start,
+                                );
+                                frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+                            } else {
+                                frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
+                                    entry,
+                                    mapping,
+                                    mapping_entry,
+                                };
+                                self.start_flow_node(
+                                    text,
+                                    position,
+                                    absolute_start,
+                                    frame.close,
+                                    &mut frames,
+                                    &mut completed,
+                                    &mut position,
+                                )?;
+                            }
+                        } else if explicit {
+                            let mapping = self.push_node(
+                                NodeKind::FlowMapping,
+                                Span::from_usize(
+                                    absolute_start + entry_start,
+                                    absolute_start + position,
+                                ),
+                            );
+                            let mapping_entry = self.push_node(
+                                NodeKind::MappingEntry,
+                                Span::from_usize(
+                                    absolute_start + entry_start,
+                                    absolute_start + position,
+                                ),
+                            );
+                            let value = self.push_empty_scalar(absolute_start + position);
+                            self.attach_child_at(mapping.as_usize(), mapping_entry);
+                            self.attach_child_at(mapping_entry.as_usize(), child);
+                            self.attach_child_at(mapping_entry.as_usize(), value);
+                            self.finish_flow_mapping_sequence_item(
+                                frame.node,
+                                entry,
+                                mapping,
+                                mapping_entry,
+                                position,
+                                absolute_start,
+                            );
+                            frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+                        } else {
+                            self.attach_child_at(entry.as_usize(), child);
+                            self.nodes[entry.as_usize()].span.end =
+                                Span::usize_to_u32(absolute_start + position);
+                            self.attach_child_at(frame.node.as_usize(), entry);
+                            frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+                        }
+                    }
+                    FlowFrameState::SequenceAwaitValue {
+                        entry,
+                        mapping,
+                        mapping_entry,
+                    } => {
+                        self.attach_child_at(mapping_entry.as_usize(), child);
+                        self.finish_flow_mapping_sequence_item(
+                            frame.node,
+                            entry,
+                            mapping,
+                            mapping_entry,
+                            position,
+                            absolute_start,
+                        );
+                        frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+                    }
+                    FlowFrameState::MappingAwaitKey {
+                        entry,
+                        entry_start,
+                        explicit,
+                    } => {
+                        self.attach_child_at(entry.as_usize(), child);
+                        position = skip_flow_whitespace(text, position);
+                        if text[position..].starts_with(':') {
+                            let value_start = position + 1;
+                            position = skip_flow_whitespace(text, value_start);
+                            reject_unindented_split_flow_mapping_value(
+                                text,
+                                value_start,
+                                position,
+                                absolute_start,
+                                self.source_indent_at(absolute_start),
+                            )?;
+                            if text[position..].starts_with([',', '}']) {
+                                let value = self.push_empty_scalar(absolute_start + position);
+                                self.attach_child_at(entry.as_usize(), value);
+                                self.finish_flow_mapping_entry(
+                                    frame.node,
+                                    entry,
+                                    entry_start,
+                                    position,
+                                    absolute_start,
+                                );
+                                frames[frame_index].state = FlowFrameState::MappingAfterPair;
+                            } else {
+                                frames[frame_index].state =
+                                    FlowFrameState::MappingAwaitValue { entry, entry_start };
+                                self.start_flow_node(
+                                    text,
+                                    position,
+                                    absolute_start,
+                                    frame.close,
+                                    &mut frames,
+                                    &mut completed,
+                                    &mut position,
+                                )?;
+                            }
+                        } else if explicit || text[position..].starts_with(',') {
+                            let value = self.push_empty_scalar(absolute_start + position);
+                            self.attach_child_at(entry.as_usize(), value);
+                            self.finish_flow_mapping_entry(
+                                frame.node,
+                                entry,
+                                entry_start,
+                                position,
+                                absolute_start,
+                            );
+                            frames[frame_index].state = FlowFrameState::MappingAfterPair;
+                        } else {
+                            let found = text[position..].chars().next().unwrap_or(frame.close);
+                            return Err(missing_flow_mapping_colon(
+                                absolute_start + position,
+                                found,
+                            ));
+                        }
+                    }
+                    FlowFrameState::MappingAwaitValue { entry, entry_start } => {
+                        self.attach_child_at(entry.as_usize(), child);
+                        self.finish_flow_mapping_entry(
+                            frame.node,
+                            entry,
+                            entry_start,
+                            position,
+                            absolute_start,
+                        );
+                        frames[frame_index].state = FlowFrameState::MappingAfterPair;
+                    }
+                    _ => {
+                        return Err(invalid_flow_parser_state(absolute_start + position));
+                    }
+                }
+                continue;
             }
-            self.prepared_flow_collections[index].ready = true;
+
+            let frame_index = frames.len() - 1;
+            let frame = frames[frame_index];
+            position = skip_flow_whitespace(text, position);
+            let Some(character) = text[position..].chars().next() else {
+                return Err(if frame.kind == FlowCollectionKind::Sequence {
+                    missing_flow_sequence_end(absolute_start, text.len())
+                } else {
+                    missing_flow_mapping_end(absolute_start, text.len())
+                });
+            };
+
+            match frame.state {
+                FlowFrameState::SequenceExpectItem => {
+                    if character == frame.close {
+                        position += character.len_utf8();
+                        self.nodes[frame.node.as_usize()].span.end =
+                            Span::usize_to_u32(absolute_start + position);
+                        frames.pop();
+                        completed = Some((frame.node, position));
+                        continue;
+                    }
+                    if character == ',' {
+                        return Err(unexpected_flow_comma(absolute_start + position));
+                    }
+                    if matches!(character, ']' | '}') {
+                        return Err(expected_flow_separator(
+                            absolute_start + position,
+                            character,
+                        ));
+                    }
+
+                    let entry_start = position;
+                    let entry = self.push_node(
+                        NodeKind::SequenceEntry,
+                        Span::empty_from_usize(absolute_start + entry_start),
+                    );
+                    let explicit =
+                        character == '?' && is_flow_explicit_key_indicator(text, position);
+                    if explicit {
+                        position = skip_flow_whitespace(text, position + 1);
+                    }
+                    if text[position..].starts_with(':')
+                        && is_flow_mapping_separator_colon(text, position)
+                    {
+                        let mapping = self.push_node(
+                            NodeKind::FlowMapping,
+                            Span::empty_from_usize(absolute_start + entry_start),
+                        );
+                        let mapping_entry = self.push_node(
+                            NodeKind::MappingEntry,
+                            Span::empty_from_usize(absolute_start + entry_start),
+                        );
+                        let key = self.push_empty_scalar(absolute_start + position);
+                        self.attach_child_at(mapping.as_usize(), mapping_entry);
+                        self.attach_child_at(mapping_entry.as_usize(), key);
+                        position = skip_flow_whitespace(text, position + 1);
+                        if text[position..].starts_with([',', ']']) {
+                            let value = self.push_empty_scalar(absolute_start + position);
+                            self.attach_child_at(mapping_entry.as_usize(), value);
+                            self.finish_flow_mapping_sequence_item(
+                                frame.node,
+                                entry,
+                                mapping,
+                                mapping_entry,
+                                position,
+                                absolute_start,
+                            );
+                            frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+                        } else {
+                            frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
+                                entry,
+                                mapping,
+                                mapping_entry,
+                            };
+                            self.start_flow_node(
+                                text,
+                                position,
+                                absolute_start,
+                                frame.close,
+                                &mut frames,
+                                &mut completed,
+                                &mut position,
+                            )?;
+                        }
+                    } else if explicit && text[position..].starts_with([',', ']']) {
+                        let mapping = self.push_node(
+                            NodeKind::FlowMapping,
+                            Span::empty_from_usize(absolute_start + entry_start),
+                        );
+                        let mapping_entry = self.push_node(
+                            NodeKind::MappingEntry,
+                            Span::empty_from_usize(absolute_start + entry_start),
+                        );
+                        let key = self.push_empty_scalar(absolute_start + position);
+                        let value = self.push_empty_scalar(absolute_start + position);
+                        self.attach_child_at(mapping.as_usize(), mapping_entry);
+                        self.attach_child_at(mapping_entry.as_usize(), key);
+                        self.attach_child_at(mapping_entry.as_usize(), value);
+                        self.finish_flow_mapping_sequence_item(
+                            frame.node,
+                            entry,
+                            mapping,
+                            mapping_entry,
+                            position,
+                            absolute_start,
+                        );
+                        frames[frame_index].state = FlowFrameState::SequenceAfterItem;
+                    } else {
+                        frames[frame_index].state = FlowFrameState::SequenceAwaitItem {
+                            entry,
+                            entry_start,
+                            explicit,
+                        };
+                        self.start_flow_node(
+                            text,
+                            position,
+                            absolute_start,
+                            frame.close,
+                            &mut frames,
+                            &mut completed,
+                            &mut position,
+                        )?;
+                    }
+                }
+                FlowFrameState::SequenceAfterItem => match character {
+                    ',' => {
+                        position += 1;
+                        frames[frame_index].state = FlowFrameState::SequenceExpectItem;
+                    }
+                    character if character == frame.close => {
+                        position += character.len_utf8();
+                        self.nodes[frame.node.as_usize()].span.end =
+                            Span::usize_to_u32(absolute_start + position);
+                        frames.pop();
+                        completed = Some((frame.node, position));
+                    }
+                    _ => {
+                        return Err(expected_flow_separator(
+                            absolute_start + position,
+                            character,
+                        ));
+                    }
+                },
+                FlowFrameState::MappingExpectKey => {
+                    if character == frame.close {
+                        position += character.len_utf8();
+                        self.nodes[frame.node.as_usize()].span.end =
+                            Span::usize_to_u32(absolute_start + position);
+                        frames.pop();
+                        completed = Some((frame.node, position));
+                        continue;
+                    }
+                    if character == ',' {
+                        return Err(unexpected_flow_mapping_comma(absolute_start + position));
+                    }
+                    if matches!(character, ']' | '}') {
+                        return Err(expected_flow_mapping_separator(
+                            absolute_start + position,
+                            character,
+                        ));
+                    }
+
+                    let entry_start = position;
+                    let entry = self.push_node(
+                        NodeKind::MappingEntry,
+                        Span::empty_from_usize(absolute_start + entry_start),
+                    );
+                    let explicit =
+                        character == '?' && is_flow_explicit_key_indicator(text, position);
+                    if explicit {
+                        position = skip_flow_whitespace(text, position + 1);
+                    }
+                    if text[position..].starts_with(':')
+                        && is_flow_mapping_separator_colon(text, position)
+                    {
+                        let key = self.push_empty_scalar(absolute_start + position);
+                        self.attach_child_at(entry.as_usize(), key);
+                        let value_start = position + 1;
+                        position = skip_flow_whitespace(text, value_start);
+                        reject_unindented_split_flow_mapping_value(
+                            text,
+                            value_start,
+                            position,
+                            absolute_start,
+                            self.source_indent_at(absolute_start),
+                        )?;
+                        if text[position..].starts_with([',', '}']) {
+                            let value = self.push_empty_scalar(absolute_start + position);
+                            self.attach_child_at(entry.as_usize(), value);
+                            self.finish_flow_mapping_entry(
+                                frame.node,
+                                entry,
+                                entry_start,
+                                position,
+                                absolute_start,
+                            );
+                            frames[frame_index].state = FlowFrameState::MappingAfterPair;
+                        } else {
+                            frames[frame_index].state =
+                                FlowFrameState::MappingAwaitValue { entry, entry_start };
+                            self.start_flow_node(
+                                text,
+                                position,
+                                absolute_start,
+                                frame.close,
+                                &mut frames,
+                                &mut completed,
+                                &mut position,
+                            )?;
+                        }
+                    } else if explicit && text[position..].starts_with([',', '}']) {
+                        let key = self.push_empty_scalar(absolute_start + position);
+                        let value = self.push_empty_scalar(absolute_start + position);
+                        self.attach_child_at(entry.as_usize(), key);
+                        self.attach_child_at(entry.as_usize(), value);
+                        self.finish_flow_mapping_entry(
+                            frame.node,
+                            entry,
+                            entry_start,
+                            position,
+                            absolute_start,
+                        );
+                        frames[frame_index].state = FlowFrameState::MappingAfterPair;
+                    } else {
+                        frames[frame_index].state = FlowFrameState::MappingAwaitKey {
+                            entry,
+                            entry_start,
+                            explicit,
+                        };
+                        self.start_flow_node(
+                            text,
+                            position,
+                            absolute_start,
+                            frame.close,
+                            &mut frames,
+                            &mut completed,
+                            &mut position,
+                        )?;
+                    }
+                }
+                FlowFrameState::MappingAfterPair => match character {
+                    ',' => {
+                        position += 1;
+                        frames[frame_index].state = FlowFrameState::MappingExpectKey;
+                    }
+                    character if character == frame.close => {
+                        position += character.len_utf8();
+                        self.nodes[frame.node.as_usize()].span.end =
+                            Span::usize_to_u32(absolute_start + position);
+                        frames.pop();
+                        completed = Some((frame.node, position));
+                    }
+                    _ => {
+                        return Err(expected_flow_mapping_separator(
+                            absolute_start + position,
+                            character,
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(invalid_flow_parser_state(absolute_start + position));
+                }
+            }
         }
-
-        let root = self.prepared_flow_collections[first_index];
-        self.prepared_flow_collections.truncate(first_index);
-        Ok((root.node, root.end - absolute_start))
     }
 
-    fn ready_flow_collection(&self, start: usize) -> Option<PreparedFlowCollection> {
-        self.prepared_flow_collections
-            .binary_search_by_key(&start, |collection| collection.start)
-            .ok()
-            .map(|index| self.prepared_flow_collections[index])
-            .filter(|collection| collection.ready)
-    }
-
-    fn flow_mapping_separator(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    fn start_flow_node(
+        &mut self,
         text: &str,
         start: usize,
         absolute_start: usize,
-        terminators: &[char],
-    ) -> Result<Option<usize>, YamlError> {
-        let mut position = start;
-        while position < text.len() {
-            let character = text[position..]
-                .chars()
-                .next()
-                .expect("position is inside text");
-            if terminators.contains(&character) {
-                return Ok(None);
+        close: char,
+        frames: &mut Vec<FlowFrame>,
+        completed: &mut Option<(NodeId, usize)>,
+        position: &mut usize,
+    ) -> Result<(), YamlError> {
+        match self.prepare_flow_node(text, start, absolute_start, close)? {
+            FlowNode::Scalar(node, end) => {
+                *completed = Some((node, end));
             }
-            match character {
-                ':' if is_flow_mapping_separator_colon(text, position) => {
-                    return Ok(Some(position));
+            FlowNode::Collection(frame, after_open) => {
+                if frames.len() >= MAX_FLOW_COLLECTION_DEPTH {
+                    return Err(flow_collection_depth_limit_exceeded(
+                        absolute_start + after_open - 1,
+                    ));
                 }
-                '#' if is_flow_comment_start(text, position) => {
-                    position = flow_comment_end(text, position);
-                }
-                '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
-                '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
-                '[' | '{' => {
-                    let collection_start = absolute_start + position;
-                    if let Some(collection) = self.ready_flow_collection(collection_start) {
-                        position = collection.end - absolute_start;
-                    } else {
-                        position +=
-                            flow_collection_source_end(&text[position..], collection_start)?;
-                    }
-                }
-                _ => position += character.len_utf8(),
+                frames.push(frame);
+                *position = after_open;
             }
         }
-        Ok(None)
+        Ok(())
+    }
+
+    fn prepare_flow_node(
+        &mut self,
+        text: &str,
+        start: usize,
+        absolute_start: usize,
+        close: char,
+    ) -> Result<FlowNode, YamlError> {
+        let properties = parse_node_properties(
+            &text[start..],
+            Span::from_usize(absolute_start + start, absolute_start + text.len()),
+        )?;
+        reject_invalid_node_property_placement(
+            &text[start..],
+            absolute_start + start,
+            &properties,
+        )?;
+        let marker = start
+            + properties.value_start
+            + leading_flow_whitespace(&text[start + properties.value_start..]);
+        let Some(character) = text[marker..].chars().next() else {
+            return Err(empty_flow_value(absolute_start + start));
+        };
+        if (properties.anchor.is_some() || properties.tag.is_some())
+            && (character == ','
+                || character == close
+                || character == ':' && is_flow_mapping_separator_colon(text, marker))
+        {
+            let property_end = marker - trailing_flow_whitespace(&text[start..marker]);
+            return Ok(FlowNode::Scalar(
+                self.push_node(
+                    NodeKind::Scalar,
+                    Span::from_usize(absolute_start + start, absolute_start + property_end),
+                ),
+                marker,
+            ));
+        }
+        if matches!(character, '[' | '{') {
+            let node = self.push_node(
+                if character == '[' {
+                    NodeKind::FlowSequence
+                } else {
+                    NodeKind::FlowMapping
+                },
+                Span::from_usize(
+                    absolute_start + start,
+                    absolute_start + marker + character.len_utf8(),
+                ),
+            );
+            return Ok(FlowNode::Collection(
+                flow_frame(node, character),
+                marker + character.len_utf8(),
+            ));
+        }
+
+        let end = flow_frame_scalar_end(text, marker, absolute_start, close)?;
+        let trimmed_end = end - trailing_flow_whitespace(&text[start..end]);
+        if marker >= trimmed_end {
+            return Err(empty_flow_value(absolute_start + start));
+        }
+        Ok(FlowNode::Scalar(
+            self.push_node(
+                NodeKind::Scalar,
+                Span::from_usize(absolute_start + start, absolute_start + trimmed_end),
+            ),
+            end,
+        ))
+    }
+
+    fn finish_flow_mapping_sequence_item(
+        &mut self,
+        sequence: NodeId,
+        entry: NodeId,
+        mapping: NodeId,
+        mapping_entry: NodeId,
+        end: usize,
+        absolute_start: usize,
+    ) {
+        let absolute_end = Span::usize_to_u32(absolute_start + end);
+        self.nodes[mapping_entry.as_usize()].span.end = absolute_end;
+        self.nodes[mapping.as_usize()].span.end = absolute_end;
+        self.attach_child_at(entry.as_usize(), mapping);
+        self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + end);
+        self.attach_child_at(sequence.as_usize(), entry);
+    }
+
+    fn finish_flow_mapping_entry(
+        &mut self,
+        mapping: NodeId,
+        entry: NodeId,
+        entry_start: usize,
+        end: usize,
+        absolute_start: usize,
+    ) {
+        self.nodes[entry.as_usize()].span =
+            Span::from_usize(absolute_start + entry_start, absolute_start + end);
+        self.attach_child_at(mapping.as_usize(), entry);
+        self.nodes[mapping.as_usize()].span.end = Span::usize_to_u32(absolute_start + end);
     }
 
     fn parse_block_scalar(
@@ -1940,521 +2480,6 @@ impl<'source> Parser<'source> {
             indent: content_indent,
         });
         Ok((scalar, consumed))
-    }
-
-    fn parse_flow_sequence_into(
-        &mut self,
-        sequence: NodeId,
-        text: &str,
-        absolute_start: usize,
-    ) -> Result<usize, YamlError> {
-        debug_assert!(text.starts_with('['));
-        let mut position = 1;
-        let mut expecting_value = true;
-        let mut saw_item = false;
-
-        loop {
-            position = skip_flow_whitespace(text, position);
-            let Some(character) = text[position..].chars().next() else {
-                return Err(missing_flow_sequence_end(absolute_start, text.len()));
-            };
-
-            if character == ']' {
-                if expecting_value || saw_item {
-                    position += 1;
-                    self.nodes[sequence.as_usize()].span.end =
-                        Span::usize_to_u32(absolute_start + position);
-                    return Ok(position);
-                }
-                return Err(empty_flow_sequence_item(absolute_start + position));
-            }
-            if character == ',' {
-                return Err(unexpected_flow_comma(absolute_start + position));
-            }
-
-            let entry = self.push_node(
-                NodeKind::SequenceEntry,
-                Span::empty_from_usize(absolute_start + position),
-            );
-            match character {
-                '?' if is_flow_explicit_key_indicator(text, position) => {
-                    let (mapping, consumed) =
-                        self.parse_explicit_flow_mapping_item(text, position, absolute_start, ']')?;
-                    self.attach_child_at(entry.0 as usize, mapping);
-                    position = consumed;
-                }
-                '[' | '{' => {
-                    if let Some(colon) =
-                        self.flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
-                    {
-                        let (mapping, consumed) = self.parse_implicit_flow_mapping(
-                            text,
-                            position,
-                            colon,
-                            absolute_start,
-                        )?;
-                        self.attach_child_at(entry.0 as usize, mapping);
-                        position = consumed;
-                    } else {
-                        let child_start = absolute_start + position;
-                        let (child, consumed) =
-                            self.parse_flow_value(&text[position..], child_start)?;
-                        self.attach_child_at(entry.0 as usize, child);
-                        position += consumed;
-                    }
-                }
-                _ => {
-                    let value_start = position;
-                    if let Some(colon) =
-                        self.flow_mapping_separator(text, position, absolute_start, &[',', ']'])?
-                    {
-                        let (mapping, consumed) = self.parse_implicit_flow_mapping(
-                            text,
-                            value_start,
-                            colon,
-                            absolute_start,
-                        )?;
-                        self.attach_child_at(entry.0 as usize, mapping);
-                        position = consumed;
-                    } else if body_starts_flow_value(&text[position..], absolute_start + position)?
-                    {
-                        let (value, consumed) =
-                            self.parse_flow_value(&text[position..], absolute_start + position)?;
-                        self.attach_child_at(entry.0 as usize, value);
-                        position += consumed;
-                    } else {
-                        let value_end =
-                            flow_scalar_end(text, position, absolute_start, &[',', ']'])?;
-                        let scalar_start =
-                            value_start + leading_flow_whitespace(&text[value_start..value_end]);
-                        let scalar_end =
-                            value_end - trailing_flow_whitespace(&text[value_start..value_end]);
-                        if scalar_start >= scalar_end {
-                            return Err(empty_flow_sequence_item(absolute_start + position));
-                        }
-                        let scalar = self.push_node(
-                            NodeKind::Scalar,
-                            Span::from_usize(
-                                absolute_start + scalar_start,
-                                absolute_start + scalar_end,
-                            ),
-                        );
-                        self.attach_child_at(entry.0 as usize, scalar);
-                        position = value_end;
-                    }
-                }
-            }
-
-            self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + position);
-            self.attach_child_at(sequence.0 as usize, entry);
-
-            saw_item = true;
-            position = skip_flow_whitespace(text, position);
-            let Some(separator) = text[position..].chars().next() else {
-                return Err(missing_flow_sequence_end(absolute_start, text.len()));
-            };
-
-            match separator {
-                ',' => {
-                    position += 1;
-                    expecting_value = true;
-                }
-                ']' => {
-                    expecting_value = false;
-                }
-                _ => {
-                    return Err(expected_flow_separator(
-                        absolute_start + position,
-                        separator,
-                    ));
-                }
-            }
-        }
-    }
-
-    fn parse_implicit_flow_mapping(
-        &mut self,
-        text: &str,
-        entry_start: usize,
-        colon: usize,
-        absolute_start: usize,
-    ) -> Result<(NodeId, usize), YamlError> {
-        let mapping = self.push_node(
-            NodeKind::FlowMapping,
-            Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
-        );
-        let entry = self.push_node(
-            NodeKind::MappingEntry,
-            Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
-        );
-        let key = self.parse_flow_node_segment(text, entry_start, colon, absolute_start)?;
-        reject_split_implicit_flow_mapping_key(text, entry_start, colon, absolute_start)?;
-        self.attach_child_at(entry.0 as usize, key);
-
-        let mut value_position = skip_flow_whitespace(text, colon + 1);
-        match text[value_position..].chars().next() {
-            Some(',' | ']') => {
-                let value = self.push_empty_scalar(absolute_start + value_position);
-                self.attach_child_at(entry.0 as usize, value);
-            }
-            Some(_) => {
-                value_position = self.parse_flow_mapping_value_with_close(
-                    text,
-                    value_position,
-                    absolute_start,
-                    entry,
-                    ']',
-                )?;
-            }
-            None => return Err(missing_flow_sequence_end(absolute_start, text.len())),
-        }
-
-        self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + value_position);
-        self.nodes[mapping.as_usize()].span.end =
-            Span::usize_to_u32(absolute_start + value_position);
-        self.attach_child_at(mapping.0 as usize, entry);
-        Ok((mapping, value_position))
-    }
-
-    fn parse_flow_mapping_into(
-        &mut self,
-        mapping: NodeId,
-        text: &str,
-        absolute_start: usize,
-    ) -> Result<usize, YamlError> {
-        debug_assert!(text.starts_with('{'));
-        let mut position = 1;
-        let mut expecting_pair = true;
-        let mut saw_pair = false;
-
-        loop {
-            position = skip_flow_whitespace(text, position);
-            let Some(character) = text[position..].chars().next() else {
-                return Err(missing_flow_mapping_end(absolute_start, text.len()));
-            };
-
-            match character {
-                '}' => {
-                    if expecting_pair || saw_pair {
-                        position += 1;
-                        self.nodes[mapping.as_usize()].span.end =
-                            Span::usize_to_u32(absolute_start + position);
-                        return Ok(position);
-                    }
-                    return Err(empty_flow_mapping_pair(absolute_start + position));
-                }
-                ',' => return Err(unexpected_flow_mapping_comma(absolute_start + position)),
-                _ => {}
-            }
-
-            if character == '?' && is_flow_explicit_key_indicator(text, position) {
-                let (entry, consumed) =
-                    self.parse_explicit_flow_mapping_entry(text, position, absolute_start, '}')?;
-                self.attach_child_at(mapping.0 as usize, entry);
-                self.nodes[entry.as_usize()].span.end =
-                    Span::usize_to_u32(absolute_start + consumed);
-                self.nodes[mapping.as_usize()].span.end =
-                    Span::usize_to_u32(absolute_start + consumed);
-                saw_pair = true;
-                position = skip_flow_whitespace(text, consumed);
-                let Some(separator) = text[position..].chars().next() else {
-                    return Err(missing_flow_mapping_end(absolute_start, text.len()));
-                };
-                match separator {
-                    ',' => {
-                        position += 1;
-                        expecting_pair = true;
-                    }
-                    '}' => {
-                        expecting_pair = false;
-                    }
-                    _ => {
-                        return Err(expected_flow_mapping_separator(
-                            absolute_start + position,
-                            separator,
-                        ));
-                    }
-                }
-                continue;
-            }
-
-            let entry_start = position;
-            let entry = self.push_node(
-                NodeKind::MappingEntry,
-                Span::from_usize(absolute_start + entry_start, absolute_start + entry_start),
-            );
-            let (key, key_end) =
-                self.parse_flow_mapping_key(text, position, absolute_start, character)?;
-            position = key_end;
-            self.attach_child_at(entry.0 as usize, key);
-
-            let separator_position = skip_flow_whitespace(text, position);
-            position = separator_position;
-            let Some(separator) = text[position..].chars().next() else {
-                return Err(missing_flow_mapping_end(absolute_start, text.len()));
-            };
-            if separator == ',' {
-                let value = self.push_empty_scalar(absolute_start + position);
-                self.attach_child_at(entry.0 as usize, value);
-                self.nodes[entry.as_usize()].span.end =
-                    Span::usize_to_u32(absolute_start + position);
-                self.attach_child_at(mapping.0 as usize, entry);
-                saw_pair = true;
-                position += 1;
-                expecting_pair = true;
-                continue;
-            }
-            if separator != ':' {
-                return Err(missing_flow_mapping_colon(
-                    absolute_start + position,
-                    separator,
-                ));
-            }
-            position += 1;
-            let value_start = position;
-            position = skip_flow_whitespace(text, position);
-            reject_unindented_split_flow_mapping_value(
-                text,
-                value_start,
-                position,
-                absolute_start,
-                self.source_indent_at(absolute_start),
-            )?;
-            position = self.parse_flow_mapping_value(text, position, absolute_start, entry)?;
-
-            self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + position);
-            self.attach_child_at(mapping.0 as usize, entry);
-            saw_pair = true;
-            position = skip_flow_whitespace(text, position);
-            let Some(separator) = text[position..].chars().next() else {
-                return Err(missing_flow_mapping_end(absolute_start, text.len()));
-            };
-
-            match separator {
-                ',' => {
-                    position += 1;
-                    expecting_pair = true;
-                }
-                '}' => {
-                    expecting_pair = false;
-                }
-                _ => {
-                    return Err(expected_flow_mapping_separator(
-                        absolute_start + position,
-                        separator,
-                    ));
-                }
-            }
-        }
-    }
-
-    fn parse_flow_mapping_key(
-        &mut self,
-        text: &str,
-        position: usize,
-        absolute_start: usize,
-        character: char,
-    ) -> Result<(NodeId, usize), YamlError> {
-        if character == '[' || character == '{' {
-            let (key, consumed) =
-                self.parse_flow_value(&text[position..], absolute_start + position)?;
-            return Ok((key, position + consumed));
-        }
-
-        let key_separator =
-            self.flow_mapping_separator(text, position, absolute_start, &[',', '}'])?;
-        let key_end = match key_separator {
-            Some(separator) => separator,
-            None => flow_scalar_end(text, position, absolute_start, &[',', '}'])?,
-        };
-        if body_starts_flow_value(&text[position..key_end], absolute_start + position)? {
-            let (key, consumed) =
-                self.parse_flow_value(&text[position..key_end], absolute_start + position)?;
-            reject_trailing_flow_content(
-                &text[position..key_end],
-                consumed,
-                absolute_start + position,
-            )?;
-            return Ok((key, position + consumed));
-        }
-        let key_start = position + leading_flow_whitespace(&text[position..key_end]);
-        let key_trimmed_end = key_end - trailing_flow_whitespace(&text[position..key_end]);
-
-        if key_start >= key_trimmed_end && text[key_end..].starts_with(':') {
-            Ok((self.push_empty_scalar(absolute_start + key_start), key_end))
-        } else if key_start >= key_trimmed_end {
-            Err(empty_flow_mapping_key(absolute_start + position))
-        } else {
-            Ok((
-                self.push_node(
-                    NodeKind::Scalar,
-                    Span::from_usize(absolute_start + key_start, absolute_start + key_trimmed_end),
-                ),
-                key_end,
-            ))
-        }
-    }
-
-    fn parse_explicit_flow_mapping_item(
-        &mut self,
-        text: &str,
-        position: usize,
-        absolute_start: usize,
-        close: char,
-    ) -> Result<(NodeId, usize), YamlError> {
-        let mapping = self.push_node(
-            NodeKind::FlowMapping,
-            Span::from_usize(absolute_start + position, absolute_start + position),
-        );
-        let (entry, consumed) =
-            self.parse_explicit_flow_mapping_entry(text, position, absolute_start, close)?;
-        self.attach_child_at(mapping.0 as usize, entry);
-        self.nodes[mapping.as_usize()].span.end = Span::usize_to_u32(absolute_start + consumed);
-        Ok((mapping, consumed))
-    }
-
-    fn parse_explicit_flow_mapping_entry(
-        &mut self,
-        text: &str,
-        position: usize,
-        absolute_start: usize,
-        close: char,
-    ) -> Result<(NodeId, usize), YamlError> {
-        debug_assert!(text[position..].starts_with('?'));
-        let entry = self.push_node(
-            NodeKind::MappingEntry,
-            Span::from_usize(absolute_start + position, absolute_start + position),
-        );
-        let key_position = skip_flow_whitespace(text, position + '?'.len_utf8());
-        if text[key_position..]
-            .chars()
-            .next()
-            .is_some_and(|character| character == ',' || character == close)
-        {
-            let key = self.push_empty_scalar(absolute_start + key_position);
-            let value = self.push_empty_scalar(absolute_start + key_position);
-            self.attach_child_at(entry.0 as usize, key);
-            self.attach_child_at(entry.0 as usize, value);
-            return Ok((entry, key_position));
-        }
-
-        let terminators = [',', close];
-        let colon =
-            self.flow_mapping_separator(text, key_position, absolute_start, &terminators)?;
-        let (key_end, has_value) = if let Some(colon) = colon {
-            (colon, true)
-        } else {
-            (
-                flow_scalar_end(text, key_position, absolute_start, &terminators)?,
-                false,
-            )
-        };
-        let key = self.parse_flow_node_segment(text, key_position, key_end, absolute_start)?;
-        self.attach_child_at(entry.0 as usize, key);
-
-        let consumed = if has_value {
-            let value_position = skip_flow_whitespace(text, key_end + ':'.len_utf8());
-            self.parse_flow_mapping_value_with_close(
-                text,
-                value_position,
-                absolute_start,
-                entry,
-                close,
-            )?
-        } else {
-            let value = self.push_empty_scalar(absolute_start + key_end);
-            self.attach_child_at(entry.0 as usize, value);
-            key_end
-        };
-        Ok((entry, consumed))
-    }
-
-    fn parse_flow_node_segment(
-        &mut self,
-        text: &str,
-        start: usize,
-        end: usize,
-        absolute_start: usize,
-    ) -> Result<NodeId, YamlError> {
-        let node_start = start + leading_flow_whitespace(&text[start..end]);
-        let node_end = end - trailing_flow_whitespace(&text[start..end]);
-        if node_start >= node_end {
-            return Ok(self.push_empty_scalar(absolute_start + node_start));
-        }
-        let segment = &text[node_start..node_end];
-        if body_starts_flow_value(segment, absolute_start + node_start)? {
-            let (node, consumed) = self.parse_flow_value(segment, absolute_start + node_start)?;
-            reject_trailing_flow_content(segment, consumed, absolute_start + node_start)?;
-            Ok(node)
-        } else {
-            Ok(self.push_node(
-                NodeKind::Scalar,
-                Span::from_usize(absolute_start + node_start, absolute_start + node_end),
-            ))
-        }
-    }
-
-    fn parse_flow_mapping_value(
-        &mut self,
-        text: &str,
-        position: usize,
-        absolute_start: usize,
-        entry: NodeId,
-    ) -> Result<usize, YamlError> {
-        self.parse_flow_mapping_value_with_close(text, position, absolute_start, entry, '}')
-    }
-
-    fn parse_flow_mapping_value_with_close(
-        &mut self,
-        text: &str,
-        mut position: usize,
-        absolute_start: usize,
-        entry: NodeId,
-        close: char,
-    ) -> Result<usize, YamlError> {
-        if body_starts_flow_value(&text[position..], absolute_start + position)? {
-            let (value, consumed) =
-                self.parse_flow_value(&text[position..], absolute_start + position)?;
-            self.attach_child_at(entry.0 as usize, value);
-            return Ok(position + consumed);
-        }
-
-        match text[position..].chars().next() {
-            None => return Err(missing_flow_mapping_end(absolute_start, text.len())),
-            Some(',') => {
-                let value = self.push_empty_scalar(absolute_start + position);
-                self.attach_child_at(entry.0 as usize, value);
-            }
-            Some(character) if character == close => {
-                let value = self.push_empty_scalar(absolute_start + position);
-                self.attach_child_at(entry.0 as usize, value);
-            }
-            Some(_) => {
-                let terminators = [',', close];
-                let value_end = flow_scalar_end(text, position, absolute_start, &terminators)?;
-                let value_start = position + leading_flow_whitespace(&text[position..value_end]);
-                let value_trimmed_end =
-                    value_end - trailing_flow_whitespace(&text[position..value_end]);
-                if value_start < value_trimmed_end {
-                    reject_flow_plain_scalar_mapping_separator(
-                        text,
-                        value_start,
-                        value_trimmed_end,
-                        absolute_start,
-                    )?;
-                    let value = self.push_node(
-                        NodeKind::Scalar,
-                        Span::from_usize(
-                            absolute_start + value_start,
-                            absolute_start + value_trimmed_end,
-                        ),
-                    );
-                    self.attach_child_at(entry.0 as usize, value);
-                }
-                position = value_end;
-            }
-        }
-        Ok(position)
     }
 
     fn ensure_mapping(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
@@ -4405,7 +4430,9 @@ fn reject_trailing_flow_content(
     parsed_end: usize,
     absolute_start: usize,
 ) -> Result<(), YamlError> {
-    let trailing = &text[parsed_end..];
+    let trailing = text
+        .get(parsed_end..)
+        .ok_or_else(|| invalid_flow_parser_state(absolute_start + text.len()))?;
     let trailing_whitespace = trailing
         .chars()
         .take_while(|character| character.is_whitespace())
@@ -4488,75 +4515,6 @@ fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct FlowCollectionRange {
-    start: usize,
-    end: usize,
-}
-
-fn collect_flow_collections(
-    text: &str,
-    absolute_start: usize,
-) -> Result<Vec<FlowCollectionRange>, YamlError> {
-    let mut collections = Vec::with_capacity(16);
-    let mut stack = Vec::<(char, usize)>::with_capacity(16);
-    let mut position = 0;
-
-    while position < text.len() {
-        let character = text[position..]
-            .chars()
-            .next()
-            .expect("position is inside text");
-        match character {
-            '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
-            '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
-            '#' if is_flow_comment_start(text, position) => {
-                position = flow_comment_end(text, position);
-            }
-            '[' | '{' => {
-                if stack.len() >= MAX_FLOW_COLLECTION_DEPTH {
-                    return Err(flow_collection_depth_limit_exceeded(
-                        absolute_start + position,
-                    ));
-                }
-                let collection_index = collections.len();
-                collections.push(FlowCollectionRange {
-                    start: position,
-                    end: position + 1,
-                });
-                stack.push((if character == '[' { ']' } else { '}' }, collection_index));
-                position += 1;
-            }
-            ']' | '}' => {
-                let Some((expected, collection_index)) = stack.pop() else {
-                    return Err(expected_flow_separator(
-                        absolute_start + position,
-                        character,
-                    ));
-                };
-                if expected != character {
-                    return Err(expected_flow_separator(
-                        absolute_start + position,
-                        character,
-                    ));
-                }
-                position += 1;
-                collections[collection_index].end = position;
-                if stack.is_empty() {
-                    return Ok(collections);
-                }
-            }
-            _ => position += character.len_utf8(),
-        }
-    }
-
-    if text.starts_with('[') {
-        Err(missing_flow_sequence_end(absolute_start, text.len()))
-    } else {
-        Err(missing_flow_mapping_end(absolute_start, text.len()))
-    }
-}
-
 fn skip_flow_whitespace(text: &str, mut position: usize) -> usize {
     while let Some(character) = text[position..].chars().next() {
         if character.is_whitespace() {
@@ -4584,39 +4542,6 @@ fn trailing_flow_whitespace(text: &str) -> usize {
         }
     }
     length
-}
-
-fn flow_mapping_separator(
-    text: &str,
-    start: usize,
-    absolute_start: usize,
-    terminators: &[char],
-) -> Result<Option<usize>, YamlError> {
-    let mut position = start;
-    while position < text.len() {
-        let character = text[position..]
-            .chars()
-            .next()
-            .expect("position is inside text");
-        if terminators.contains(&character) {
-            return Ok(None);
-        }
-        match character {
-            ':' if is_flow_mapping_separator_colon(text, position) => return Ok(Some(position)),
-            '#' if is_flow_comment_start(text, position) => {
-                position = flow_comment_end(text, position);
-            }
-            '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
-            '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
-            '[' | '{' => {
-                position +=
-                    flow_collection_source_end(&text[position..], absolute_start + position)?;
-            }
-            _ => position += character.len_utf8(),
-        }
-    }
-
-    Ok(None)
 }
 
 fn is_flow_mapping_separator_colon(text: &str, position: usize) -> bool {
@@ -4691,27 +4616,78 @@ fn flow_scalar_end(
     Ok(position)
 }
 
-fn reject_flow_plain_scalar_mapping_separator(
+fn flow_frame(node: NodeId, open: char) -> FlowFrame {
+    if open == '[' {
+        FlowFrame {
+            kind: FlowCollectionKind::Sequence,
+            node,
+            close: ']',
+            state: FlowFrameState::SequenceExpectItem,
+        }
+    } else {
+        FlowFrame {
+            kind: FlowCollectionKind::Mapping,
+            node,
+            close: '}',
+            state: FlowFrameState::MappingExpectKey,
+        }
+    }
+}
+
+fn flow_frame_scalar_end(
     text: &str,
     start: usize,
-    end: usize,
     absolute_start: usize,
-) -> Result<(), YamlError> {
-    if let Some(colon) = flow_mapping_separator(&text[start..end], 0, absolute_start + start, &[])?
-    {
-        return Err(YamlError::new(
-            Diagnostic::new(
-                DiagnosticKind::Parser,
-                "mapping separator is not allowed inside a flow plain scalar",
-                Span::from_usize(
-                    absolute_start + start + colon,
-                    absolute_start + start + colon + 1,
-                ),
-            )
-            .with_expected("a comma before the next flow mapping entry"),
-        ));
+    close: char,
+) -> Result<usize, YamlError> {
+    let mut position = start;
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        if character == ',' || character == close {
+            return Ok(position);
+        }
+        match character {
+            ':' if is_flow_mapping_separator_colon(text, position) => return Ok(position),
+            '[' | '{' => {
+                return Err(unexpected_flow_collection_after_scalar(
+                    absolute_start + position,
+                    character,
+                ));
+            }
+            ']' | '}' => {
+                return Err(expected_flow_separator(
+                    absolute_start + position,
+                    character,
+                ));
+            }
+            '-' if is_forbidden_flow_plain_indicator(text, position, "---") => {
+                return Err(forbidden_flow_plain_indicator(
+                    absolute_start + position,
+                    "---",
+                ));
+            }
+            '.' if is_forbidden_flow_plain_indicator(text, position, "...") => {
+                return Err(forbidden_flow_plain_indicator(
+                    absolute_start + position,
+                    "...",
+                ));
+            }
+            '-' if is_bare_flow_dash(text, position) => {
+                return Err(forbidden_flow_plain_indicator(
+                    absolute_start + position,
+                    "-",
+                ));
+            }
+            '#' if is_flow_comment_start(text, position) => return Ok(position),
+            '"' => position = double_quoted_flow_end(text, position, absolute_start)?,
+            '\'' => position = single_quoted_flow_end(text, position, absolute_start)?,
+            _ => position += character.len_utf8(),
+        }
     }
-    Ok(())
+    Ok(position)
 }
 
 fn is_forbidden_flow_plain_indicator(text: &str, position: usize, indicator: &str) -> bool {
@@ -4843,17 +4819,6 @@ fn missing_flow_sequence_end(absolute_start: usize, text_len: usize) -> YamlErro
     )
 }
 
-fn empty_flow_sequence_item(offset: usize) -> YamlError {
-    YamlError::new(
-        Diagnostic::new(
-            DiagnosticKind::Parser,
-            "empty flow sequence item",
-            Span::empty_from_usize(offset),
-        )
-        .with_expected("a scalar or nested flow sequence"),
-    )
-}
-
 fn empty_flow_value(offset: usize) -> YamlError {
     YamlError::new(
         Diagnostic::new(
@@ -4863,6 +4828,25 @@ fn empty_flow_value(offset: usize) -> YamlError {
         )
         .with_expected("a scalar or nested flow collection"),
     )
+}
+
+fn unexpected_flow_collection_after_scalar(offset: usize, found: char) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("unexpected token `{found}` after flow scalar"),
+            Span::from_usize(offset, offset + found.len_utf8()),
+        )
+        .with_expected("a comma or the end of the flow collection"),
+    )
+}
+
+fn invalid_flow_parser_state(offset: usize) -> YamlError {
+    YamlError::new(Diagnostic::new(
+        DiagnosticKind::Parser,
+        "invalid flow parser state",
+        Span::empty_from_usize(offset),
+    ))
 }
 
 fn flow_collection_depth_limit_exceeded(offset: usize) -> YamlError {
@@ -4903,28 +4887,6 @@ fn missing_flow_mapping_end(absolute_start: usize, text_len: usize) -> YamlError
             Span::empty_from_usize(absolute_start + text_len),
         )
         .with_expected("}"),
-    )
-}
-
-fn empty_flow_mapping_pair(offset: usize) -> YamlError {
-    YamlError::new(
-        Diagnostic::new(
-            DiagnosticKind::Parser,
-            "empty flow mapping pair",
-            Span::empty_from_usize(offset),
-        )
-        .with_expected("a mapping key"),
-    )
-}
-
-fn empty_flow_mapping_key(offset: usize) -> YamlError {
-    YamlError::new(
-        Diagnostic::new(
-            DiagnosticKind::Parser,
-            "empty flow mapping key",
-            Span::empty_from_usize(offset),
-        )
-        .with_expected("a mapping key"),
     )
 }
 

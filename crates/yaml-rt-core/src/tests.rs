@@ -2859,6 +2859,45 @@ fn parser_reports_malformed_flow_sequences() {
 }
 
 #[test]
+fn parser_rejects_flow_collections_after_scalar_nodes_without_panicking() {
+    let reported = "---\n{\n a:*anchor [\n  b, c, {\n   d: [e, f]\n  }\n ]\n}\n";
+    for input in [
+        reported,
+        "{a:*x [b,{d: e}]}\n",
+        "{a:*x {b: c}}\n",
+        "[*x [b]]\n",
+        "[plain {b: c}]\n",
+        "{outer: [one, *x {nested: value}]}\n",
+        "--- ? \t[[!>+- ? \t[[!>+ \"\n \"\n",
+    ] {
+        let error = YamlDoc::parse(input).expect_err("trailing collection must be rejected");
+
+        assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+        assert!(
+            error.diagnostic.message.contains("after flow scalar"),
+            "unexpected diagnostic for {input:?}: {error}"
+        );
+        assert!(error.diagnostic.position.is_some());
+    }
+}
+
+#[test]
+fn one_pass_flow_parser_preserves_indicator_neighbors_and_cst_ownership() {
+    for input in [
+        "{a: *anchor, b: [c]}\n",
+        "{a: \"*anchor [\", b: '*anchor {'}\n",
+        "[plain # [ ignored in comment\n, {nested: value}]\n",
+        "{ &a [a, &b b]: *b, *a : [c, *b, d]}\n",
+        "[[[b,c]]: d, e]\n",
+    ] {
+        let doc = YamlDoc::parse(input).expect("nearby valid flow syntax must parse");
+
+        assert_eq!(doc.to_string(), input);
+        assert_unique_cst_ownership(&doc);
+    }
+}
+
+#[test]
 fn parser_rejects_tabs_used_as_block_indicator_separation() {
     for input in ["-\t-\n", "?\t-\n", "?\tkey:\n", "? key:\n:\tkey:\n"] {
         let error = YamlDoc::parse(input).expect_err("tab must not enable block structure");
@@ -3960,6 +3999,29 @@ fn flow_mapping_scalar_pairs(doc: &YamlDoc, mapping: NodeId) -> Vec<(&str, &str)
             Some((doc.scalar_text(key).ok()?, doc.scalar_text(value).ok()?))
         })
         .collect()
+}
+
+fn assert_unique_cst_ownership(doc: &YamlDoc) {
+    let mut appearances = vec![0usize; doc.nodes.len()];
+    for parent_index in 0..doc.nodes.len() {
+        let parent = NodeId::from_usize(parent_index);
+        for child in doc.children(parent) {
+            appearances[child.as_usize()] += 1;
+            assert_eq!(
+                doc.node(child).and_then(Node::parent),
+                Some(parent),
+                "child {child:?} must link back to {parent:?}"
+            );
+        }
+    }
+
+    for (index, node) in doc.nodes.iter().enumerate() {
+        let expected = usize::from(node.parent().is_some());
+        assert_eq!(
+            appearances[index], expected,
+            "node {index} must appear in exactly one parent child chain"
+        );
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

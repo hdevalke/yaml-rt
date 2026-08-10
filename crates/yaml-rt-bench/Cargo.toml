@@ -26,10 +26,12 @@ criterion = "0.8.2"
 yaml-rt-core.workspace = true
 
 [dependencies]
-fyaml = { version = "0.5.2", optional = true }
 saphyr = { version = "0.0.6", optional = true }
 
+[build-dependencies]
+cc = "1.2.65"
+
 [features]
-baselines = ["fyaml-baseline", "saphyr-baseline"]
-fyaml-baseline = ["dep:fyaml"]
+baselines = ["rapidyaml-baseline", "saphyr-baseline"]
+rapidyaml-baseline = []
 saphyr-baseline = ["dep:saphyr"]

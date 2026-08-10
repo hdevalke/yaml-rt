@@ -3,16 +3,31 @@
 Parse-only benchmarks for yaml-rt against ordinary YAML loader baselines.
 
 yaml-rt preserves lossless round-trip state such as source spans, comments, trivia,
-CST nodes, and semantic metadata. Tokens and events are lazy. `fyaml` and Saphyr are included as
-useful parser baselines, but they are not feature-equivalent to yaml-rt's
+CST nodes, and semantic metadata. Tokens and events are lazy. Rapid YAML and Saphyr are included
+as useful parser baselines, but they are not feature-equivalent to yaml-rt's
 round-trip model. Treat benchmark results as contextual parse-throughput data,
 not as a complete product comparison.
 
-Run yaml-rt against Saphyr without requiring the native fyaml build:
+Run yaml-rt against Saphyr without requiring a C++ compiler or the Rapid YAML submodule:
 
 ```sh
 cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
 ```
+
+Rapid YAML v0.16.0 is pinned as a Git submodule at commit
+`f8ac8dd50f4f7916579d55a05ebf9c6488e52670`. Initialize it and run its
+benchmarks with:
+
+```sh
+git submodule update --init third_party/rapidyaml
+cargo bench -p yaml-rt-bench --features rapidyaml-baseline --bench parse
+```
+
+The Rapid YAML baseline requires a C++11 compiler. `rapidyaml-arena` accepts
+the same immutable input as yaml-rt and includes Rapid YAML's copy into its
+tree arena. `rapidyaml-in-place` measures parsing a mutable buffer; Criterion
+creates that buffer outside the timed routine, so this is Rapid YAML's parser
+ceiling rather than an end-to-end immutable-input comparison.
 
 Run every available baseline with:
 
@@ -22,6 +37,10 @@ cargo bench -p yaml-rt-bench --features baselines --bench parse
 
 The `parse_scaling` group generates flat mappings containing 100, 1,000, and
 5,000 entries with fixed-width keys and values so bytes per entry stay constant.
+The `parse_large` gate compares Rapid YAML's immutable-input arena parser with
+1,000- and 5,000-entry flat mappings, a 1,000-item mixed block/flow document,
+a shallow flow-heavy document, and a 1,024-item wide flow sequence. Rapid
+YAML's in-place results remain informational and are not used for the gate.
 Use the standalone allocation profiler to measure allocation count, total
 allocated bytes, transient peak live bytes, and retained bytes for the same
 shape:
@@ -33,8 +52,10 @@ cargo bench -p yaml-rt-bench --bench profile_alloc -- 1000 100 cst
 
 The positional arguments are mapping entries, parse iterations, and measurement
 mode. `full` (the default) retains a complete `YamlDoc`; `cst` retains only an
-owned `Source` and its CST arena. The `parse_phases` Criterion group provides
-the corresponding 1,000-entry throughput comparison.
+owned `Source` and its CST arena. The `parse_phases` Criterion group separates
+source construction, parsing an already prepared `Source`, end-to-end CST
+construction, borrowed-input parsing, and owned-input parsing for the
+corresponding 1,000-entry document.
 
 For stable comparisons, run Criterion with its default sampling three times and
 compare the median of the three reported medians. Do not use `--quick` for a
@@ -133,6 +154,44 @@ uses CST wrappers as the semantic topology, reads lines through the source
 index, keeps decorated-node properties sparse and span-backed, and specializes
 ordinary property-free plain nodes. Tokens are lexed on request and events are
 streamed from CST topology without a retained or transient event arena.
+
+## Rapid YAML optimization result
+
+Machine-local results on 2026-08-10 use the median of the medians from three
+complete default-sampling Criterion runs. The Rapid YAML comparison is its
+immutable-input arena path; lower ratios are better.
+
+| large fixture | yaml-rt median | Rapid YAML arena median | yaml-rt / Rapid YAML |
+| --- | ---: | ---: | ---: |
+| flat mapping, 1,000 entries | 74.373 us | 77.860 us | 0.955x |
+| flat mapping, 5,000 entries | 394.01 us | 435.65 us | 0.904x |
+| mixed block/flow, 1,000 items | 2.6553 ms | 0.74309 ms | 3.573x |
+| shallow flow, 128 entries | 57.184 us | 25.668 us | 2.228x |
+| wide flow sequence, 1,024 items | 77.074 us | 40.460 us | 1.905x |
+
+The flat-mapping geometric mean is **0.929x**, improving the original roughly
+1.9x gap to slightly faster than Rapid YAML's arena path. The complete
+five-fixture geometric mean is **1.67x**, so it does not meet the 1.25x broad
+cohort gate. The remaining mixed block/flow and flow-collection work is a
+separate second optimization stage; the lossless and conformance guarantees
+were not weakened to meet the target.
+
+The corresponding three-run phase medians for the 1,000-entry flat mapping are:
+
+| phase | median |
+| --- | ---: |
+| source construction and line analysis | 38.962 us |
+| parse prepared `Source` to CST and semantics | 38.189 us |
+| end-to-end CST construction | 77.976 us |
+| borrowed `YamlDoc::parse` | 80.183 us |
+| owned `YamlDoc::parse_owned` | 80.210 us |
+
+The full 1,000-entry allocation profile uses 10 allocations, allocates 168,920
+bytes, peaks at 166,044 live bytes, and retains 165,148 bytes. Relative to the
+direct compact parser result, peak live and retained bytes both increase by
+5.1%, within the 15% and 10% limits. The CST-only path retains 120,956 bytes.
+The 308-case non-error YAML Test Suite profile reached 22.13 MiB/s over 1,000
+repetitions, compared with 20.84 MiB/s at the start of this pass.
 
 ## yaml-rt-only perf profiling
 

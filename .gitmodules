@@ -1,3 +1,6 @@
 [submodule "third_party/yaml-test-suite"]
 	path = third_party/yaml-test-suite
 	url = https://github.com/yaml/yaml-test-suite.git
+[submodule "third_party/rapidyaml"]
+	path = third_party/rapidyaml
+	url = https://github.com/biojppm/rapidyaml.git

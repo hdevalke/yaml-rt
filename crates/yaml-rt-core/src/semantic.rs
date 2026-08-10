@@ -191,6 +191,94 @@ impl SemanticBuilder {
         }
     }
 
+    pub(crate) fn register_cst_node(&mut self) {
+        self.store.slots.push(NO_SEMANTIC_NODE);
+    }
+
+    pub(crate) fn push_property_free_plain_scalar(&mut self, cst: NodeId, span: Span) {
+        if self.error.is_some() {
+            return;
+        }
+        self.store.insert(
+            cst,
+            SemanticNode::new(
+                SemanticKind::Scalar {
+                    style: YamlScalarStyle::Plain,
+                },
+                span,
+                false,
+                NO_PROPERTIES,
+            ),
+        );
+        if let Err(error) = self.attach_child(cst, span) {
+            self.error = Some(error);
+        }
+    }
+
+    pub(crate) fn push_collection_start(
+        &mut self,
+        cst: NodeId,
+        span: Span,
+        style: CollectionStyle,
+        mapping: bool,
+        properties: SemanticProperties,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let property = self.insert_properties(cst, properties);
+        let kind = if mapping {
+            SemanticKind::Mapping { style }
+        } else {
+            SemanticKind::Sequence { style }
+        };
+        self.store
+            .insert(cst, SemanticNode::new(kind, span, false, property));
+        if mapping {
+            self.open.push(OpenNode::Mapping {
+                cst,
+                waiting_for_value: false,
+            });
+        } else {
+            self.open.push(OpenNode::Sequence { cst });
+        }
+    }
+
+    pub(crate) fn push_collection_end(&mut self, span: Span, mapping: bool) {
+        if self.error.is_some() {
+            return;
+        }
+        let result = if mapping {
+            let Some(OpenNode::Mapping {
+                cst,
+                waiting_for_value,
+            }) = self.open.pop()
+            else {
+                self.error = Some(structure_error("mismatched mapping end event", span));
+                return;
+            };
+            if waiting_for_value {
+                self.error = Some(structure_error(
+                    "mapping entry does not contain a value",
+                    span,
+                ));
+                return;
+            }
+            self.store.close(cst, span, None);
+            self.attach_child(cst, span)
+        } else {
+            let Some(OpenNode::Sequence { cst }) = self.open.pop() else {
+                self.error = Some(structure_error("mismatched sequence end event", span));
+                return;
+            };
+            self.store.close(cst, span, None);
+            self.attach_child(cst, span)
+        };
+        if let Err(error) = result {
+            self.error = Some(error);
+        }
+    }
+
     fn try_push(
         &mut self,
         kind: YamlEventKind,

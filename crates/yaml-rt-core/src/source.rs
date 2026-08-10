@@ -118,6 +118,56 @@ pub struct LineCol {
 pub struct Source {
     text: String,
     line_starts: Vec<u32>,
+    line_facts: Vec<LineFacts>,
+}
+
+const NO_LINE_OFFSET: u16 = u16::MAX;
+const LINE_BLANK: u16 = 1 << 0;
+const LINE_SIMPLE_MAPPING: u16 = 1 << 1;
+const LINE_OFFSET_OVERFLOW: u16 = 1 << 2;
+const LINE_FACTS_MIN_SOURCE_BYTES: usize = 1024;
+
+/// Compact facts for the common block-line parser path.
+///
+/// Offsets are relative to the start of the line. Exceptionally long lines use
+/// the existing full scanners instead of retaining wider offsets for every
+/// ordinary line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineFacts {
+    indent: u16,
+    mapping_colon: u16,
+    value_start: u16,
+    flags: u16,
+}
+
+impl LineFacts {
+    const FALLBACK: Self = Self {
+        indent: NO_LINE_OFFSET,
+        mapping_colon: NO_LINE_OFFSET,
+        value_start: NO_LINE_OFFSET,
+        flags: LINE_OFFSET_OVERFLOW,
+    };
+
+    pub(crate) fn indent(self) -> Option<usize> {
+        (!self.has(LINE_OFFSET_OVERFLOW)).then_some(self.indent as usize)
+    }
+
+    pub(crate) fn simple_mapping(self) -> Option<(usize, usize)> {
+        self.has(LINE_SIMPLE_MAPPING)
+            .then_some((self.mapping_colon as usize, self.value_start as usize))
+    }
+
+    pub(crate) fn mapping_colon(self) -> Option<usize> {
+        (self.mapping_colon != NO_LINE_OFFSET).then_some(self.mapping_colon as usize)
+    }
+
+    pub(crate) const fn is_blank(self) -> bool {
+        self.has(LINE_BLANK)
+    }
+
+    const fn has(self, flag: u16) -> bool {
+        self.flags & flag != 0
+    }
 }
 
 impl Source {
@@ -150,8 +200,17 @@ impl Source {
                 }
             }
         }
+        let line_facts = if text.len() >= LINE_FACTS_MIN_SOURCE_BYTES {
+            build_line_facts(&text, &line_starts)
+        } else {
+            Vec::new()
+        };
 
-        Ok(Self { text, line_starts })
+        Ok(Self {
+            text,
+            line_starts,
+            line_facts,
+        })
     }
 
     /// Returns the original input text.
@@ -176,6 +235,13 @@ impl Source {
     #[must_use]
     pub fn line_starts(&self) -> &[u32] {
         &self.line_starts
+    }
+
+    pub(crate) fn line_facts(&self, index: usize) -> LineFacts {
+        self.line_facts
+            .get(index)
+            .copied()
+            .unwrap_or(LineFacts::FALLBACK)
     }
 
     /// Returns the source slice for `span`.
@@ -240,6 +306,116 @@ impl Source {
     }
 }
 
+fn build_line_facts(text: &str, line_starts: &[u32]) -> Vec<LineFacts> {
+    let mut facts = Vec::with_capacity(line_starts.len());
+    for (index, &start) in line_starts.iter().enumerate() {
+        let start = start as usize;
+        let mut end = line_starts
+            .get(index + 1)
+            .map_or(text.len(), |next| *next as usize);
+        if end > start && text.as_bytes()[end - 1] == b'\n' {
+            end -= 1;
+            if end > start && text.as_bytes()[end - 1] == b'\r' {
+                end -= 1;
+            }
+        } else if end > start && text.as_bytes()[end - 1] == b'\r' {
+            end -= 1;
+        }
+        facts.push(analyze_line(&text.as_bytes()[start..end]));
+    }
+    facts
+}
+
+fn analyze_line(line: &[u8]) -> LineFacts {
+    let indent = line.iter().take_while(|byte| **byte == b' ').count();
+    let mut flags = 0;
+    if line[indent..].is_empty() {
+        flags |= LINE_BLANK;
+    }
+
+    if line.len() >= NO_LINE_OFFSET as usize {
+        return LineFacts {
+            flags: flags | LINE_OFFSET_OVERFLOW,
+            ..LineFacts::FALLBACK
+        };
+    }
+
+    let Some(indent) = u16::try_from(indent)
+        .ok()
+        .filter(|value| *value != NO_LINE_OFFSET)
+    else {
+        return LineFacts {
+            indent: NO_LINE_OFFSET,
+            mapping_colon: NO_LINE_OFFSET,
+            value_start: NO_LINE_OFFSET,
+            flags: flags | LINE_OFFSET_OVERFLOW,
+        };
+    };
+
+    let body = &line[indent as usize..];
+    if let Some((colon, value_start)) = plain_key_mapping_offsets(body)
+        && let Ok(colon) = u16::try_from(colon)
+        && colon != NO_LINE_OFFSET
+    {
+        let value_start = value_start
+            .and_then(|offset| u16::try_from(offset).ok())
+            .filter(|offset| *offset != NO_LINE_OFFSET);
+        if value_start.is_some() {
+            flags |= LINE_SIMPLE_MAPPING;
+        }
+        return LineFacts {
+            indent,
+            mapping_colon: colon,
+            value_start: value_start.unwrap_or(NO_LINE_OFFSET),
+            flags,
+        };
+    }
+
+    LineFacts {
+        indent,
+        mapping_colon: NO_LINE_OFFSET,
+        value_start: NO_LINE_OFFSET,
+        flags,
+    }
+}
+
+fn plain_key_mapping_offsets(body: &[u8]) -> Option<(usize, Option<usize>)> {
+    let mut colon = 0;
+    while colon < body.len() && body[colon] != b':' {
+        if !is_simple_plain_byte(body[colon]) {
+            return None;
+        }
+        colon += 1;
+    }
+    if colon == 0 || colon == body.len() {
+        return None;
+    }
+
+    let mut value_start = colon + 1;
+    if value_start == body.len() {
+        return Some((colon, None));
+    }
+    if body.get(value_start) != Some(&b' ') {
+        return None;
+    }
+    while body.get(value_start) == Some(&b' ') {
+        value_start += 1;
+    }
+    if value_start == body.len() || &body[value_start..] == b"-" {
+        return Some((colon, None));
+    }
+    for &byte in &body[value_start..] {
+        if !is_simple_plain_byte(byte) {
+            return Some((colon, None));
+        }
+    }
+    Some((colon, Some(value_start)))
+}
+
+const fn is_simple_plain_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/')
+}
+
 fn invalid_yaml_character(offset: usize, character: char) -> YamlError {
     let span = Span::from_usize(offset, offset + character.len_utf8());
     YamlError::new(
@@ -282,4 +458,61 @@ const fn is_yaml_printable(character: char) -> bool {
         character as u32,
         0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0x85 | 0xA0..=0xD7FF | 0xE000..=0xFFFD | 0x001_0000..=0x0010_FFFF
     )
+}
+
+#[cfg(test)]
+mod line_facts_tests {
+    use std::fmt::Write;
+
+    use super::*;
+    use crate::YamlDoc;
+
+    #[test]
+    fn caches_common_lines_and_leaves_complex_lines_on_the_fallback_path() {
+        let source = Source::new(
+            "alpha: beta\r\nunicode: café\n\tbad: tab\n\"quoted\": value\n&anchor key: value\nflow: [one, two]\nkey: value # comment\n# comment\nliteral: |\n  text\n"
+                .to_owned(),
+        )
+        .expect("fixture is printable YAML");
+
+        let facts = build_line_facts(source.as_str(), source.line_starts());
+        assert_eq!(facts[0].simple_mapping(), Some((5, 7)));
+        assert_eq!(facts[1].mapping_colon(), Some(7));
+        assert_eq!(facts[1].simple_mapping(), None);
+        assert_eq!(facts[2].mapping_colon(), None);
+        assert_eq!(facts[3].mapping_colon(), None);
+        assert_eq!(facts[4].mapping_colon(), None);
+        assert_eq!(facts[5].mapping_colon(), Some(4));
+        assert_eq!(facts[5].simple_mapping(), None);
+        assert_eq!(facts[6].mapping_colon(), Some(3));
+        assert_eq!(facts[6].simple_mapping(), None);
+        assert_eq!(facts[7].mapping_colon(), None);
+        assert_eq!(facts[8].mapping_colon(), Some(7));
+        assert_eq!(facts[9].indent(), Some(2));
+    }
+
+    #[test]
+    fn cached_common_mapping_path_preserves_the_complete_source() {
+        let mut input = String::new();
+        for index in 0..100 {
+            writeln!(input, "key_{index:04}: value_{index:04}")
+                .expect("writing to a String cannot fail");
+        }
+        let source = Source::new(input.clone()).expect("generated mapping is printable YAML");
+        assert_eq!(source.line_facts(0).simple_mapping(), Some((8, 10)));
+
+        let doc = YamlDoc::parse(&input).expect("cached mapping should parse");
+        assert_eq!(doc.to_string(), input);
+    }
+
+    #[test]
+    fn long_line_offsets_fall_back_without_changing_parse_behavior() {
+        let key = "k".repeat(u16::MAX as usize);
+        let input = format!("{key}: value\n");
+        let source = Source::new(input.clone()).expect("long fixture is printable YAML");
+        assert_eq!(source.line_facts(0).mapping_colon(), None);
+
+        let doc = YamlDoc::parse(&input).expect("long mapping key should use the full scanner");
+        assert_eq!(doc.to_string(), input);
+    }
 }

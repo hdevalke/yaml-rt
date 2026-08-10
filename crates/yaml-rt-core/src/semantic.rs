@@ -281,6 +281,10 @@ impl SemanticBuilder {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive match maintains semantic transitions for every event kind"
+    )]
     fn try_push(
         &mut self,
         kind: &YamlEventKind,

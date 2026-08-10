@@ -302,6 +302,10 @@ fn expand_named_struct(
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the generated trait implementations share validated newtype metadata"
+)]
 fn expand_newtype_struct(
     attrs: &[Attribute],
     name: &syn::Ident,
@@ -475,6 +479,10 @@ fn expand_enum(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "unit-enum validation and generated match arms share one name table"
+)]
 fn expand_unit_enum(
     attrs: &[Attribute],
     name: &syn::Ident,
@@ -658,6 +666,10 @@ struct EnumVariant {
     kind: EnumVariantKind,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "tagged-enum validation and code generation share variant metadata"
+)]
 fn expand_tagged_enum(
     attrs: &[Attribute],
     name: &syn::Ident,
@@ -1097,6 +1109,10 @@ fn tagged_variant_read_arm(variant: &EnumVariant) -> TokenStream2 {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "all variant shapes must generate parallel write match arms"
+)]
 fn enum_variant_write_arm(variant: &EnumVariant) -> TokenStream2 {
     let ident = &variant.ident;
     let accepted = accepted_variant_names(variant);
@@ -1238,6 +1254,10 @@ fn enum_variant_write_arm(variant: &EnumVariant) -> TokenStream2 {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "all variant shapes must generate parallel fragment match arms"
+)]
 fn enum_variant_fragment_arm(variant: &EnumVariant) -> TokenStream2 {
     let ident = &variant.ident;
     let canonical = &variant.canonical;
@@ -1462,6 +1482,10 @@ fn push_flatten_field(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "field read, write, and insertion tokens share one validated option set"
+)]
 fn push_regular_field(
     expansion: &mut FieldExpansion,
     field_name: &syn::Ident,

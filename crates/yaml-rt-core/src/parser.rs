@@ -171,6 +171,10 @@ impl<'source> Parser<'source> {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "top-level YAML line dispatch must preserve grammar precedence"
+    )]
     fn parse_line(&mut self, lines: LineTable<'_>, index: usize) -> Result<usize, YamlError> {
         let line = lines.line(index);
         let content = line.content_without_break;
@@ -300,6 +304,10 @@ impl<'source> Parser<'source> {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "block-content dispatch keeps context-sensitive cases in precedence order"
+    )]
     fn parse_content_body(
         &mut self,
         document: NodeId,
@@ -624,6 +632,10 @@ impl<'source> Parser<'source> {
     // Mapping parsing needs both the source-line view and its absolute offsets;
     // bundling them would only move this context into a single-use wrapper.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mapping entry parsing shares one span and indentation context"
+    )]
     fn parse_mapping_entry(
         &mut self,
         document: NodeId,
@@ -1353,6 +1365,10 @@ impl<'source> Parser<'source> {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequence entry parsing shares one span and indentation context"
+    )]
     fn parse_sequence_entry(
         &mut self,
         document: NodeId,
@@ -1857,6 +1873,10 @@ impl<'source> Parser<'source> {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the one-pass flow state machine keeps all stack transitions together"
+    )]
     fn parse_flow_collection_iterative(
         &mut self,
         text: &str,

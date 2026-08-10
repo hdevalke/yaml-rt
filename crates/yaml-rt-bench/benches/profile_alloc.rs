@@ -23,8 +23,8 @@ enum Mode {
 }
 
 impl Mode {
-    fn parse(value: Option<String>) -> Self {
-        match value.as_deref() {
+    fn parse(value: Option<&str>) -> Self {
+        match value {
             None | Some("full") => Self::Full,
             Some("cst") => Self::Cst,
             Some(value) => panic!("mode must be `full` or `cst`, got `{value}`"),
@@ -105,7 +105,8 @@ fn main() {
     let iterations = env::args().nth(2).map_or(100, |value| {
         value.parse().expect("iterations must be numeric")
     });
-    let mode = Mode::parse(env::args().nth(3));
+    let mode_arg = env::args().nth(3);
+    let mode = Mode::parse(mode_arg.as_deref());
     let input = flat_mapping(entries);
 
     reset_counters();

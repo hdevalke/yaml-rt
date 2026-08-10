@@ -186,7 +186,9 @@ impl SemanticBuilder {
         if self.error.is_some() {
             return;
         }
-        if let Err(error) = self.try_push(kind, span, cst, properties) {
+        let result = self.try_push(&kind, span, cst, properties);
+        drop(kind);
+        if let Err(error) = result {
             self.error = Some(error);
         }
     }
@@ -281,7 +283,7 @@ impl SemanticBuilder {
 
     fn try_push(
         &mut self,
-        kind: YamlEventKind,
+        kind: &YamlEventKind,
         span: Span,
         cst: Option<NodeId>,
         properties: SemanticProperties,
@@ -303,7 +305,7 @@ impl SemanticBuilder {
                 let property = self.insert_properties(cst, properties);
                 self.store.insert(
                     cst,
-                    SemanticNode::new(SemanticKind::Document, span, explicit, property),
+                    SemanticNode::new(SemanticKind::Document, span, *explicit, property),
                 );
                 self.open.push(OpenNode::Document { cst, children: 0 });
                 Ok(())
@@ -313,7 +315,12 @@ impl SemanticBuilder {
                 let property = self.insert_properties(cst, properties);
                 self.store.insert(
                     cst,
-                    SemanticNode::new(SemanticKind::Mapping { style }, span, false, property),
+                    SemanticNode::new(
+                        SemanticKind::Mapping { style: *style },
+                        span,
+                        false,
+                        property,
+                    ),
                 );
                 self.open.push(OpenNode::Mapping {
                     cst,
@@ -326,7 +333,12 @@ impl SemanticBuilder {
                 let property = self.insert_properties(cst, properties);
                 self.store.insert(
                     cst,
-                    SemanticNode::new(SemanticKind::Sequence { style }, span, false, property),
+                    SemanticNode::new(
+                        SemanticKind::Sequence { style: *style },
+                        span,
+                        false,
+                        property,
+                    ),
                 );
                 self.open.push(OpenNode::Sequence { cst });
                 Ok(())
@@ -336,7 +348,12 @@ impl SemanticBuilder {
                 let property = self.insert_properties(cst, properties);
                 self.store.insert(
                     cst,
-                    SemanticNode::new(SemanticKind::Scalar { style }, span, false, property),
+                    SemanticNode::new(
+                        SemanticKind::Scalar { style: *style },
+                        span,
+                        false,
+                        property,
+                    ),
                 );
                 self.attach_child(cst, span)
             }
@@ -377,7 +394,7 @@ impl SemanticBuilder {
                 let Some(OpenNode::Document { cst, .. }) = self.open.pop() else {
                     return Err(structure_error("mismatched document end event", span));
                 };
-                self.store.close(cst, span, Some(explicit));
+                self.store.close(cst, span, Some(*explicit));
                 Ok(())
             }
         }

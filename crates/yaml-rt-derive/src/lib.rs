@@ -170,14 +170,14 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
     } = input;
     match data {
         Data::Struct(struct_data) => match struct_data.fields {
-            Fields::Named(fields) => expand_named_struct(attrs, name, generics, fields.named),
+            Fields::Named(fields) => expand_named_struct(&attrs, &name, generics, fields.named),
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                 let field = fields
                     .unnamed
                     .into_iter()
                     .next()
                     .expect("one unnamed field was checked");
-                expand_newtype_struct(attrs, name, generics, field)
+                expand_newtype_struct(&attrs, &name, generics, field)
             }
             Fields::Unnamed(fields) => Err(syn::Error::new_spanned(
                 fields,
@@ -188,7 +188,7 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
                 "YamlRoundTrip does not support unit structs",
             )),
         },
-        Data::Enum(data) => expand_enum(attrs, name, generics, data.variants),
+        Data::Enum(data) => expand_enum(&attrs, &name, generics, data.variants),
         Data::Union(data) => Err(syn::Error::new_spanned(
             data.union_token,
             "YamlRoundTrip cannot be derived for unions",
@@ -197,14 +197,14 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
 }
 
 fn expand_named_struct(
-    attrs: Vec<Attribute>,
-    name: syn::Ident,
+    attrs: &[Attribute],
+    name: &syn::Ident,
     generics: syn::Generics,
     fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
-    let struct_options = parse_struct_options(&attrs)?;
+    let struct_options = parse_struct_options(attrs)?;
     let fields = expand_fields(fields, struct_options.insert_order, FieldAccess::SelfFields)?;
-    validate_struct_options(&name, &struct_options, fields.has_flatten)?;
+    validate_struct_options(name, &struct_options, fields.has_flatten)?;
 
     let ordered_keys_binding = match struct_options.insert_order {
         InsertOrder::Append => quote! {},
@@ -303,8 +303,8 @@ fn expand_named_struct(
 }
 
 fn expand_newtype_struct(
-    attrs: Vec<Attribute>,
-    name: syn::Ident,
+    attrs: &[Attribute],
+    name: &syn::Ident,
     generics: syn::Generics,
     field: syn::Field,
 ) -> syn::Result<TokenStream2> {
@@ -460,8 +460,8 @@ struct UnitVariant {
 }
 
 fn expand_enum(
-    attrs: Vec<Attribute>,
-    name: syn::Ident,
+    attrs: &[Attribute],
+    name: &syn::Ident,
     generics: syn::Generics,
     variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
@@ -469,19 +469,19 @@ fn expand_enum(
         .iter()
         .all(|variant| matches!(variant.fields, Fields::Unit))
     {
-        expand_unit_enum(attrs, name, generics, variants)
+        expand_unit_enum(attrs, name, &generics, variants)
     } else {
         expand_tagged_enum(attrs, name, generics, variants)
     }
 }
 
 fn expand_unit_enum(
-    attrs: Vec<Attribute>,
-    name: syn::Ident,
-    generics: syn::Generics,
+    attrs: &[Attribute],
+    name: &syn::Ident,
+    generics: &syn::Generics,
     variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
-    let options = parse_enum_options(&attrs)?;
+    let options = parse_enum_options(attrs)?;
     let mut expanded = Vec::new();
     let mut names = BTreeMap::<String, String>::new();
     for variant in variants {
@@ -659,12 +659,12 @@ struct EnumVariant {
 }
 
 fn expand_tagged_enum(
-    attrs: Vec<Attribute>,
-    name: syn::Ident,
+    attrs: &[Attribute],
+    name: &syn::Ident,
     generics: syn::Generics,
     variants: syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
-    let options = parse_enum_options(&attrs)?;
+    let options = parse_enum_options(attrs)?;
     let mut expanded = Vec::new();
     let mut names = BTreeMap::<String, String>::new();
     let mut read_bounds = Vec::new();
@@ -1274,7 +1274,7 @@ fn enum_variant_fragment_arm(variant: &EnumVariant) -> TokenStream2 {
                     let __yaml_rt_payload = { #payload };
                     ::yaml_rt::__tag_yaml_fragment(
                         #canonical,
-                        __yaml_rt_payload,
+                        &__yaml_rt_payload,
                         indent,
                         line_ending,
                     )
@@ -1318,7 +1318,7 @@ fn enum_variant_fragment_arm(variant: &EnumVariant) -> TokenStream2 {
                     );
                     ::yaml_rt::__tag_yaml_fragment(
                         #canonical,
-                        __yaml_rt_payload,
+                        &__yaml_rt_payload,
                         indent,
                         line_ending,
                     )
@@ -1341,7 +1341,7 @@ fn enum_variant_fragment_arm(variant: &EnumVariant) -> TokenStream2 {
                         )?;
                     ::yaml_rt::__tag_yaml_fragment(
                         #canonical,
-                        __yaml_rt_payload,
+                        &__yaml_rt_payload,
                         indent,
                         line_ending,
                     )

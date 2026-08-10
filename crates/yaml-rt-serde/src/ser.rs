@@ -69,12 +69,12 @@ where
         Ok(self.writer)
     }
 
-    fn write_document(&mut self, value: SerValue) -> Result<()> {
+    fn write_document(&mut self, value: &SerValue) -> Result<()> {
         if self.documents > 0 {
             self.writer.write_all(b"---\n").map_err(Error::io)?;
         }
         let mut output = String::new();
-        render_value(&value, 0, &mut output);
+        render_value(value, 0, &mut output);
         if !output.ends_with('\n') {
             output.push('\n');
         }
@@ -89,7 +89,8 @@ where
     where
         T: ?Sized + Serialize,
     {
-        self.write_document(value.serialize(ValueSerializer)?)
+        let value = value.serialize(ValueSerializer)?;
+        self.write_document(&value)
     }
 }
 
@@ -490,7 +491,7 @@ impl<W: Write> ser::SerializeSeq for DocumentSequence<'_, W> {
     }
     fn end(self) -> Result<()> {
         match self {
-            Self::Sequence { serializer, values } => serializer.write_document(values.finish()),
+            Self::Sequence { serializer, values } => serializer.write_document(&values.finish()),
             Self::Mapping { .. } => unreachable!(),
         }
     }
@@ -567,7 +568,7 @@ impl<W: Write> ser::SerializeMap for DocumentSequence<'_, W> {
     }
     fn end(self) -> Result<()> {
         match self {
-            Self::Mapping { serializer, values } => serializer.write_document(values.finish()?),
+            Self::Mapping { serializer, values } => serializer.write_document(&values.finish()?),
             Self::Sequence { .. } => unreachable!(),
         }
     }
@@ -624,7 +625,7 @@ where
     type SerializeStructVariant = DocumentSequence<'a, W>;
 
     fn serialize_bool(self, value: bool) -> Result<()> {
-        self.write_document(SerValue::Bool(value))
+        self.write_document(&SerValue::Bool(value))
     }
     fn serialize_i8(self, value: i8) -> Result<()> {
         self.serialize_i128(value.into())
@@ -639,7 +640,7 @@ where
         self.serialize_i128(value.into())
     }
     fn serialize_i128(self, value: i128) -> Result<()> {
-        self.write_document(SerValue::Signed(value))
+        self.write_document(&SerValue::Signed(value))
     }
     fn serialize_u8(self, value: u8) -> Result<()> {
         self.serialize_u128(value.into())
@@ -654,19 +655,19 @@ where
         self.serialize_u128(value.into())
     }
     fn serialize_u128(self, value: u128) -> Result<()> {
-        self.write_document(SerValue::Unsigned(value))
+        self.write_document(&SerValue::Unsigned(value))
     }
     fn serialize_f32(self, value: f32) -> Result<()> {
-        self.write_document(SerValue::Float(value.into()))
+        self.write_document(&SerValue::Float(value.into()))
     }
     fn serialize_f64(self, value: f64) -> Result<()> {
-        self.write_document(SerValue::Float(value))
+        self.write_document(&SerValue::Float(value))
     }
     fn serialize_char(self, value: char) -> Result<()> {
-        self.write_document(SerValue::String(value.to_string()))
+        self.write_document(&SerValue::String(value.to_string()))
     }
     fn serialize_str(self, value: &str) -> Result<()> {
-        self.write_document(SerValue::String(value.to_owned()))
+        self.write_document(&SerValue::String(value.to_owned()))
     }
     fn serialize_bytes(self, _value: &[u8]) -> Result<()> {
         Err(Error::message(
@@ -674,7 +675,7 @@ where
         ))
     }
     fn serialize_none(self) -> Result<()> {
-        self.write_document(SerValue::Null)
+        self.write_document(&SerValue::Null)
     }
     fn serialize_some<T>(self, value: &T) -> Result<()>
     where
@@ -683,7 +684,7 @@ where
         self.collect(value)
     }
     fn serialize_unit(self) -> Result<()> {
-        self.write_document(SerValue::Null)
+        self.write_document(&SerValue::Null)
     }
     fn serialize_unit_struct(self, _name: &'static str) -> Result<()> {
         self.serialize_unit()
@@ -694,7 +695,7 @@ where
         _index: u32,
         variant: &'static str,
     ) -> Result<()> {
-        self.write_document(SerValue::String(variant.to_owned()))
+        self.write_document(&SerValue::String(variant.to_owned()))
     }
     fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<()>
     where
@@ -718,7 +719,7 @@ where
                 "serializing nested enums in YAML is not supported",
             ));
         }
-        self.write_document(SerValue::Tagged(variant.to_owned(), Box::new(value)))
+        self.write_document(&SerValue::Tagged(variant.to_owned(), Box::new(value)))
     }
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
         Ok(DocumentSequence::sequence(self, len, None))

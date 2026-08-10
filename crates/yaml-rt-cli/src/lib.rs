@@ -434,8 +434,10 @@ fn write_result(
             RunError::message(format!("cannot write {}: {error}", output.display()))
         })
     } else {
-        stdout.write_all(bytes).map_err(RunError::io)?;
-        stdout.flush().map_err(RunError::io)
+        stdout
+            .write_all(bytes)
+            .map_err(|error| RunError::io(&error))?;
+        stdout.flush().map_err(|error| RunError::io(&error))
     }
 }
 
@@ -479,9 +481,10 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), RunError> {
                 path.display()
             ))
         })?;
-    file.write_all(bytes).map_err(RunError::io)?;
-    file.flush().map_err(RunError::io)?;
-    file.sync_all().map_err(RunError::io)?;
+    file.write_all(bytes)
+        .map_err(|error| RunError::io(&error))?;
+    file.flush().map_err(|error| RunError::io(&error))?;
+    file.sync_all().map_err(|error| RunError::io(&error))?;
     drop(file);
     fs::rename(&temporary, path).map_err(|error| {
         RunError::message(format!(
@@ -543,7 +546,7 @@ impl RunError {
         Self::Message(error.to_string())
     }
 
-    fn io(error: io::Error) -> Self {
+    fn io(error: &io::Error) -> Self {
         if error.kind() == io::ErrorKind::BrokenPipe {
             Self::BrokenPipe
         } else {

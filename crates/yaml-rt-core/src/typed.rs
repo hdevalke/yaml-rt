@@ -383,7 +383,7 @@ where
 #[doc(hidden)]
 pub fn __tag_yaml_fragment(
     tag: &str,
-    payload: String,
+    payload: &str,
     indent: usize,
     line_ending: &str,
 ) -> Result<String, YamlError> {
@@ -401,7 +401,7 @@ pub fn __tag_yaml_fragment(
             .with_expected("an ASCII alphanumeric, underscore, or hyphen tag name"),
         ));
     }
-    let fragment = parse_typed_fragment(&payload)?;
+    let fragment = parse_typed_fragment(payload)?;
     let is_block_collection = matches!(
         fragment.document().semantic_kind(fragment.root()),
         Some(

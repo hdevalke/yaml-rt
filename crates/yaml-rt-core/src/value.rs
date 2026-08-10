@@ -283,7 +283,7 @@ fn parse_integer(value: &str) -> Option<YamlNumber> {
     } else {
         radix_to_decimal(digits, radix)?
     };
-    normalize_number(negative, decimal, 0, true)
+    normalize_number(negative, &decimal, 0, true)
 }
 
 fn radix_to_decimal(digits: &str, radix: u32) -> Option<String> {
@@ -331,12 +331,12 @@ fn parse_decimal(value: &str, integer_syntax: bool) -> Option<YamlNumber> {
     }
     let digits = format!("{whole}{fraction}");
     let exponent = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
-    normalize_number(negative, digits, exponent, integer_syntax)
+    normalize_number(negative, &digits, exponent, integer_syntax)
 }
 
 fn normalize_number(
     mut negative: bool,
-    digits: String,
+    digits: &str,
     mut exponent: i64,
     integer_syntax: bool,
 ) -> Option<YamlNumber> {

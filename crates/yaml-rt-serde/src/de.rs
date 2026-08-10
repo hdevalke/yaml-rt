@@ -403,6 +403,7 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum ScalarKind {
     Null,
     Bool(bool),

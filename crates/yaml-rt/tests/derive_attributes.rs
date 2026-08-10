@@ -6,17 +6,23 @@ use std::{
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
 
 mod duration_seconds {
-    #![allow(clippy::unnecessary_wraps)]
-
     use std::time::Duration;
     use yaml_rt::YamlError;
 
     pub type Repr = u64;
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn from_yaml(value: Repr) -> Result<Duration, YamlError> {
         Ok(Duration::from_secs(value))
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn to_yaml(value: &Duration) -> Result<Repr, YamlError> {
         Ok(value.as_secs())
     }
@@ -26,17 +32,23 @@ mod duration_seconds {
 struct PortSet(Vec<u16>);
 
 mod port_list {
-    #![allow(clippy::unnecessary_wraps)]
-
     use super::PortSet;
     use yaml_rt::YamlError;
 
     pub type Repr = Vec<u16>;
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn from_yaml(value: Repr) -> Result<PortSet, YamlError> {
         Ok(PortSet(value))
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn to_yaml(value: &PortSet) -> Result<Repr, YamlError> {
         Ok(value.0.clone())
     }
@@ -305,7 +317,10 @@ fn skip_attribute_defaults_field_and_preserves_source_key() {
     assert_eq!(doc.to_string(), "name: app\ncached_port: 3000\n");
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "yaml(skip_serializing_if) predicates receive a reference to the field"
+)]
 fn is_false(value: &bool) -> bool {
     !*value
 }

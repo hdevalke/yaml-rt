@@ -3,18 +3,24 @@ use std::time::Duration;
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRoundTrip};
 
 mod duration_seconds {
-    #![allow(clippy::unnecessary_wraps)]
-
     use std::time::Duration;
 
     use yaml_rt::YamlError;
 
     pub type Repr = u64;
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn from_yaml(value: Repr) -> Result<Duration, YamlError> {
         Ok(Duration::from_secs(value))
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn to_yaml(value: &Duration) -> Result<Repr, YamlError> {
         Ok(value.as_secs())
     }

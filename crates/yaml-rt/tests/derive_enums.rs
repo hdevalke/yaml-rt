@@ -28,44 +28,58 @@ struct UnitEnumConfig {
 }
 
 mod duration_seconds {
-    #![allow(clippy::unnecessary_wraps)]
-
     use std::time::Duration;
 
     use yaml_rt::YamlError;
 
     pub type Repr = u64;
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn from_yaml(value: Repr) -> Result<Duration, YamlError> {
         Ok(Duration::from_secs(value))
     }
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn to_yaml(value: &Duration) -> Result<Repr, YamlError> {
         Ok(value.as_secs())
     }
 }
 
 mod ipv4_octets {
-    #![allow(clippy::trivially_copy_pass_by_ref, clippy::unnecessary_wraps)]
-
     use std::net::Ipv4Addr;
 
     use yaml_rt::YamlError;
 
     pub type Repr = [u8; 4];
 
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn from_yaml(value: Repr) -> Result<Ipv4Addr, YamlError> {
         Ok(Ipv4Addr::from(value))
     }
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "yaml(with) adapter write callbacks receive a reference to the field"
+    )]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "yaml(with) adapters require fallible conversion signatures"
+    )]
     pub fn to_yaml(value: &Ipv4Addr) -> Result<Repr, YamlError> {
         Ok(value.octets())
     }
 }
 
 mod positive_i16 {
-    #![allow(clippy::trivially_copy_pass_by_ref)]
-
     use yaml_rt::{Diagnostic, DiagnosticKind, Span, YamlError};
 
     pub type Repr = i16;
@@ -78,6 +92,10 @@ mod positive_i16 {
         }
     }
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "yaml(with) adapter write callbacks receive a reference to the field"
+    )]
     pub fn to_yaml(value: &i16) -> Result<Repr, YamlError> {
         if *value >= 0 {
             Ok(*value)

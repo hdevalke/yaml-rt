@@ -1,9 +1,14 @@
+use crate::inline_vec::InlineVec;
+use crate::syntax::{
+    COMMON_SEMANTIC_NODE, NO_SEMANTIC_NODE, NODE_EXPLICIT_END, NODE_EXPLICIT_START,
+    NODE_SCALAR_DOUBLE_QUOTED, NODE_SCALAR_PLAIN, NODE_SCALAR_SINGLE_QUOTED,
+    NODE_SCALAR_STYLE_MASK, NODE_SEMANTIC_ALIAS,
+};
 use crate::{
-    CollectionStyle, Diagnostic, DiagnosticKind, NodeId, Span, YamlError, YamlEventKind,
-    YamlScalarStyle,
+    CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, Span, YamlError,
+    YamlEventKind, YamlScalarStyle,
 };
 
-const NO_SEMANTIC_NODE: u32 = u32::MAX;
 const NO_PROPERTIES: u32 = u32::MAX;
 const EXPLICIT_START: u8 = 1 << 0;
 const EXPLICIT_END: u8 = 1 << 1;
@@ -37,7 +42,6 @@ pub(crate) struct SemanticNode {
     pub(crate) kind: SemanticKind,
     flags: u8,
     padding: u8,
-    pub(crate) span_start: u32,
     pub(crate) end_offset: u32,
     property: u32,
 }
@@ -83,47 +87,65 @@ struct TagDirectiveBinding {
     document: NodeId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticMetadata {
+    end_offset: u32,
+    property: u32,
+}
+
 /// Compact semantic side arena indexed through CST `NodeId`s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SemanticStore {
-    slots: Vec<u32>,
-    nodes: Vec<SemanticNode>,
+    metadata: Vec<SemanticMetadata>,
     properties: Vec<PropertyRecord>,
     anchors: Vec<AnchorBinding>,
     tag_directives: Vec<TagDirectiveBinding>,
-    pub(crate) documents: Vec<NodeId>,
+    pub(crate) documents: InlineVec<NodeId, 1>,
 }
 
 impl SemanticStore {
-    fn insert(&mut self, cst: NodeId, node: SemanticNode) {
-        if self.slots.len() <= cst.as_usize() {
-            self.slots
-                .resize(cst.as_usize().saturating_add(1), NO_SEMANTIC_NODE);
+    pub(crate) fn get(&self, node: &Node) -> Option<SemanticNode> {
+        let index = node.semantic;
+        if index == NO_SEMANTIC_NODE {
+            return None;
         }
-        let index = u32::try_from(self.nodes.len()).expect("semantic arena exceeds u32 capacity");
-        self.slots[cst.as_usize()] = index;
-        self.nodes.push(node);
+        let metadata = if index == COMMON_SEMANTIC_NODE {
+            SemanticMetadata {
+                end_offset: node.span.end,
+                property: NO_PROPERTIES,
+            }
+        } else {
+            self.metadata[index as usize]
+        };
+        Some(SemanticNode {
+            kind: semantic_kind_from_node(node),
+            flags: (u8::from(node.syntax_flags & NODE_EXPLICIT_START != 0) * EXPLICIT_START)
+                | (u8::from(node.syntax_flags & NODE_EXPLICIT_END != 0) * EXPLICIT_END),
+            padding: 0,
+            end_offset: metadata.end_offset,
+            property: metadata.property,
+        })
     }
 
-    fn close(&mut self, cst: NodeId, span: Span, explicit: Option<bool>) {
-        let index = self.slots[cst.as_usize()] as usize;
-        self.nodes[index].end_offset = span.end;
-        if let Some(explicit) = explicit {
-            self.nodes[index].set_flag(EXPLICIT_END, explicit);
-        }
-    }
-
-    pub(crate) fn get(&self, cst: NodeId) -> Option<&SemanticNode> {
-        let index = *self.slots.get(cst.as_usize())?;
-        (index != NO_SEMANTIC_NODE).then(|| &self.nodes[index as usize])
-    }
-
-    pub(crate) fn properties(&self, cst: NodeId) -> Option<SemanticProperties> {
+    pub(crate) fn properties(&self, cst: &Node) -> Option<SemanticProperties> {
         let node = self.get(cst)?;
         (node.property != NO_PROPERTIES).then(|| self.properties[node.property as usize].properties)
     }
 
-    pub(crate) fn clear_tag(&mut self, cst: NodeId) {
+    pub(crate) fn span_start(&self, cst: &Node, cst_start: u32) -> u32 {
+        let Some(properties) = self.properties(cst) else {
+            return cst_start;
+        };
+        let tag_start = properties.tag.map(|span| span.start);
+        let anchor_start = properties.anchor.map(|span| span.start.saturating_sub(1));
+        let alias_start = properties.alias.map(|span| span.start.saturating_sub(1));
+        [tag_start, anchor_start, alias_start]
+            .into_iter()
+            .flatten()
+            .fold(cst_start, u32::min)
+    }
+
+    pub(crate) fn clear_tag(&mut self, cst: &Node) {
         let Some(property) = self.get(cst).map(|node| node.property) else {
             return;
         };
@@ -132,7 +154,7 @@ impl SemanticStore {
         }
     }
 
-    pub(crate) fn property_document(&self, cst: NodeId) -> Option<NodeId> {
+    pub(crate) fn property_document(&self, cst: &Node) -> Option<NodeId> {
         let node = self.get(cst)?;
         (node.property != NO_PROPERTIES).then(|| self.properties[node.property as usize].document)
     }
@@ -157,27 +179,29 @@ impl SemanticStore {
 pub(crate) struct SemanticBuilder {
     store: SemanticStore,
     open: Vec<OpenNode>,
+    current_document: Option<NodeId>,
     error: Option<YamlError>,
 }
 
 impl SemanticBuilder {
-    pub(crate) fn with_capacity(cst_capacity: usize, semantic_capacity: usize) -> Self {
+    pub(crate) fn with_capacity(_cst_capacity: usize, _semantic_capacity: usize) -> Self {
         Self {
             store: SemanticStore {
-                slots: Vec::with_capacity(cst_capacity),
-                nodes: Vec::with_capacity(semantic_capacity),
+                metadata: Vec::new(),
                 properties: Vec::new(),
                 anchors: Vec::new(),
                 tag_directives: Vec::new(),
-                documents: Vec::with_capacity(1),
+                documents: InlineVec::new(),
             },
             open: Vec::with_capacity(8),
+            current_document: None,
             error: None,
         }
     }
 
     pub(crate) fn push(
         &mut self,
+        nodes: &mut [Node],
         kind: YamlEventKind,
         span: Span,
         cst: Option<NodeId>,
@@ -186,39 +210,54 @@ impl SemanticBuilder {
         if self.error.is_some() {
             return;
         }
-        let result = self.try_push(&kind, span, cst, properties);
+        let result = self.try_push(nodes, &kind, span, cst, properties);
         drop(kind);
         if let Err(error) = result {
             self.error = Some(error);
         }
     }
 
-    pub(crate) fn register_cst_node(&mut self) {
-        self.store.slots.push(NO_SEMANTIC_NODE);
-    }
-
-    pub(crate) fn push_property_free_plain_scalar(&mut self, cst: NodeId, span: Span) {
+    pub(crate) fn push_property_free_scalar(
+        &mut self,
+        nodes: &mut [Node],
+        cst: NodeId,
+        span: Span,
+        style: YamlScalarStyle,
+    ) {
         if self.error.is_some() {
             return;
         }
-        self.store.insert(
+        self.write_node(
+            nodes,
             cst,
-            SemanticNode::new(
-                SemanticKind::Scalar {
-                    style: YamlScalarStyle::Plain,
-                },
-                span,
-                false,
-                NO_PROPERTIES,
-            ),
+            SemanticKind::Scalar { style },
+            span,
+            false,
+            NO_PROPERTIES,
         );
         if let Err(error) = self.attach_child(cst, span) {
             self.error = Some(error);
         }
     }
 
-    pub(crate) fn push_collection_start(
+    pub(crate) fn register_flow_scalar(
         &mut self,
+        nodes: &mut [Node],
+        cst: NodeId,
+        span: Span,
+        kind: SemanticKind,
+        properties: SemanticProperties,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let property = self.insert_properties(cst, properties);
+        self.write_node(nodes, cst, kind, span, false, property);
+    }
+
+    pub(crate) fn register_flow_collection(
+        &mut self,
+        nodes: &mut [Node],
         cst: NodeId,
         span: Span,
         style: CollectionStyle,
@@ -234,49 +273,20 @@ impl SemanticBuilder {
         } else {
             SemanticKind::Sequence { style }
         };
-        self.store
-            .insert(cst, SemanticNode::new(kind, span, false, property));
-        if mapping {
-            self.open.push(OpenNode::Mapping {
-                cst,
-                waiting_for_value: false,
-            });
-        } else {
-            self.open.push(OpenNode::Sequence { cst });
+        self.write_node(nodes, cst, kind, span, false, property);
+    }
+
+    pub(crate) fn finish_flow_collection(&mut self, nodes: &mut [Node], cst: NodeId, span: Span) {
+        if self.error.is_none() {
+            self.close(nodes, cst, span, None);
         }
     }
 
-    pub(crate) fn push_collection_end(&mut self, span: Span, mapping: bool) {
+    pub(crate) fn attach_flow_root(&mut self, cst: NodeId, span: Span) {
         if self.error.is_some() {
             return;
         }
-        let result = if mapping {
-            let Some(OpenNode::Mapping {
-                cst,
-                waiting_for_value,
-            }) = self.open.pop()
-            else {
-                self.error = Some(structure_error("mismatched mapping end event", span));
-                return;
-            };
-            if waiting_for_value {
-                self.error = Some(structure_error(
-                    "mapping entry does not contain a value",
-                    span,
-                ));
-                return;
-            }
-            self.store.close(cst, span, None);
-            self.attach_child(cst, span)
-        } else {
-            let Some(OpenNode::Sequence { cst }) = self.open.pop() else {
-                self.error = Some(structure_error("mismatched sequence end event", span));
-                return;
-            };
-            self.store.close(cst, span, None);
-            self.attach_child(cst, span)
-        };
-        if let Err(error) = result {
+        if let Err(error) = self.attach_child(cst, span) {
             self.error = Some(error);
         }
     }
@@ -287,6 +297,7 @@ impl SemanticBuilder {
     )]
     fn try_push(
         &mut self,
+        nodes: &mut [Node],
         kind: &YamlEventKind,
         span: Span,
         cst: Option<NodeId>,
@@ -305,11 +316,16 @@ impl SemanticBuilder {
                 {
                     directive.document = cst;
                 }
+                self.current_document = Some(cst);
                 self.store.documents.push(cst);
                 let property = self.insert_properties(cst, properties);
-                self.store.insert(
+                self.write_node(
+                    nodes,
                     cst,
-                    SemanticNode::new(SemanticKind::Document, span, *explicit, property),
+                    SemanticKind::Document,
+                    span,
+                    *explicit,
+                    property,
                 );
                 self.open.push(OpenNode::Document { cst, children: 0 });
                 Ok(())
@@ -317,14 +333,13 @@ impl SemanticBuilder {
             YamlEventKind::MappingStart { style, .. } => {
                 let cst = required_cst(cst, span)?;
                 let property = self.insert_properties(cst, properties);
-                self.store.insert(
+                self.write_node(
+                    nodes,
                     cst,
-                    SemanticNode::new(
-                        SemanticKind::Mapping { style: *style },
-                        span,
-                        false,
-                        property,
-                    ),
+                    SemanticKind::Mapping { style: *style },
+                    span,
+                    false,
+                    property,
                 );
                 self.open.push(OpenNode::Mapping {
                     cst,
@@ -335,14 +350,13 @@ impl SemanticBuilder {
             YamlEventKind::SequenceStart { style, .. } => {
                 let cst = required_cst(cst, span)?;
                 let property = self.insert_properties(cst, properties);
-                self.store.insert(
+                self.write_node(
+                    nodes,
                     cst,
-                    SemanticNode::new(
-                        SemanticKind::Sequence { style: *style },
-                        span,
-                        false,
-                        property,
-                    ),
+                    SemanticKind::Sequence { style: *style },
+                    span,
+                    false,
+                    property,
                 );
                 self.open.push(OpenNode::Sequence { cst });
                 Ok(())
@@ -350,24 +364,20 @@ impl SemanticBuilder {
             YamlEventKind::Scalar { style, .. } => {
                 let cst = required_cst(cst, span)?;
                 let property = self.insert_properties(cst, properties);
-                self.store.insert(
+                self.write_node(
+                    nodes,
                     cst,
-                    SemanticNode::new(
-                        SemanticKind::Scalar { style: *style },
-                        span,
-                        false,
-                        property,
-                    ),
+                    SemanticKind::Scalar { style: *style },
+                    span,
+                    false,
+                    property,
                 );
                 self.attach_child(cst, span)
             }
             YamlEventKind::Alias { .. } => {
                 let cst = required_cst(cst, span)?;
                 let property = self.insert_properties(cst, properties);
-                self.store.insert(
-                    cst,
-                    SemanticNode::new(SemanticKind::Alias, span, false, property),
-                );
+                self.write_node(nodes, cst, SemanticKind::Alias, span, false, property);
                 self.attach_child(cst, span)
             }
             YamlEventKind::MappingEnd => {
@@ -384,21 +394,22 @@ impl SemanticBuilder {
                         span,
                     ));
                 }
-                self.store.close(cst, span, None);
+                self.close(nodes, cst, span, None);
                 self.attach_child(cst, span)
             }
             YamlEventKind::SequenceEnd => {
                 let Some(OpenNode::Sequence { cst }) = self.open.pop() else {
                     return Err(structure_error("mismatched sequence end event", span));
                 };
-                self.store.close(cst, span, None);
+                self.close(nodes, cst, span, None);
                 self.attach_child(cst, span)
             }
             YamlEventKind::DocumentEnd { explicit } => {
                 let Some(OpenNode::Document { cst, .. }) = self.open.pop() else {
                     return Err(structure_error("mismatched document end event", span));
                 };
-                self.store.close(cst, span, Some(*explicit));
+                self.close(nodes, cst, span, Some(*explicit));
+                self.current_document = None;
                 Ok(())
             }
         }
@@ -412,18 +423,80 @@ impl SemanticBuilder {
         });
     }
 
+    fn write_node(
+        &mut self,
+        nodes: &mut [Node],
+        cst: NodeId,
+        kind: SemanticKind,
+        span: Span,
+        explicit_start: bool,
+        property: u32,
+    ) {
+        let node = &mut nodes[cst.as_usize()];
+        node.syntax_flags &= !(NODE_SEMANTIC_ALIAS
+            | NODE_EXPLICIT_START
+            | NODE_EXPLICIT_END
+            | NODE_SCALAR_STYLE_MASK);
+        match kind {
+            SemanticKind::Scalar { style } => {
+                node.syntax_flags |= match style {
+                    YamlScalarStyle::Plain => NODE_SCALAR_PLAIN,
+                    YamlScalarStyle::SingleQuoted => NODE_SCALAR_SINGLE_QUOTED,
+                    YamlScalarStyle::DoubleQuoted => NODE_SCALAR_DOUBLE_QUOTED,
+                    YamlScalarStyle::Literal | YamlScalarStyle::Folded => 0,
+                };
+            }
+            SemanticKind::Alias => node.syntax_flags |= NODE_SEMANTIC_ALIAS,
+            SemanticKind::Document
+            | SemanticKind::Mapping { .. }
+            | SemanticKind::Sequence { .. } => {}
+        }
+        if explicit_start {
+            node.syntax_flags |= NODE_EXPLICIT_START;
+        }
+        node.semantic = if property == NO_PROPERTIES {
+            COMMON_SEMANTIC_NODE
+        } else {
+            self.push_metadata(SemanticMetadata {
+                end_offset: span.end,
+                property,
+            })
+        };
+    }
+
+    fn close(&mut self, nodes: &mut [Node], cst: NodeId, span: Span, explicit: Option<bool>) {
+        let node = &mut nodes[cst.as_usize()];
+        if node.semantic == COMMON_SEMANTIC_NODE {
+            if span.end != node.span.end {
+                node.semantic = self.push_metadata(SemanticMetadata {
+                    end_offset: span.end,
+                    property: NO_PROPERTIES,
+                });
+            }
+        } else {
+            self.store.metadata[node.semantic as usize].end_offset = span.end;
+        }
+        if let Some(explicit) = explicit {
+            if explicit {
+                node.syntax_flags |= NODE_EXPLICIT_END;
+            } else {
+                node.syntax_flags &= !NODE_EXPLICIT_END;
+            }
+        }
+    }
+
+    fn push_metadata(&mut self, metadata: SemanticMetadata) -> u32 {
+        let index = u32::try_from(self.store.metadata.len())
+            .expect("semantic metadata arena exceeds u32 capacity");
+        self.store.metadata.push(metadata);
+        index
+    }
+
     fn insert_properties(&mut self, target: NodeId, properties: SemanticProperties) -> u32 {
         if properties.is_empty() {
             return NO_PROPERTIES;
         }
-        let document = self
-            .open
-            .iter()
-            .find_map(|node| match node {
-                OpenNode::Document { cst, .. } => Some(*cst),
-                _ => None,
-            })
-            .unwrap_or(target);
+        let document = self.current_document.unwrap_or(target);
         let index = u32::try_from(self.store.properties.len())
             .expect("semantic property arena exceeds u32 capacity");
         self.store.properties.push(PropertyRecord {
@@ -464,30 +537,18 @@ impl SemanticBuilder {
         Ok(())
     }
 
-    pub(crate) fn finish(mut self, cst_len: usize) -> Result<SemanticStore, YamlError> {
+    pub(crate) fn finish(self) -> Result<SemanticStore, YamlError> {
         if let Some(error) = self.error {
             return Err(error);
         }
         if !self.open.is_empty() {
             return Err(structure_error("unclosed semantic node", Span::empty(0)));
         }
-        self.store.slots.resize(cst_len, NO_SEMANTIC_NODE);
         Ok(self.store)
     }
 }
 
 impl SemanticNode {
-    fn new(kind: SemanticKind, span: Span, explicit_start: bool, property: u32) -> Self {
-        Self {
-            kind,
-            flags: u8::from(explicit_start) * EXPLICIT_START,
-            padding: 0,
-            span_start: span.start,
-            end_offset: span.end,
-            property,
-        }
-    }
-
     pub(crate) const fn explicit_start(self) -> bool {
         self.flags & EXPLICIT_START != 0
     }
@@ -495,13 +556,38 @@ impl SemanticNode {
     pub(crate) const fn explicit_end(self) -> bool {
         self.flags & EXPLICIT_END != 0
     }
+}
 
-    fn set_flag(&mut self, flag: u8, value: bool) {
-        if value {
-            self.flags |= flag;
-        } else {
-            self.flags &= !flag;
-        }
+fn semantic_kind_from_node(node: &Node) -> SemanticKind {
+    match node.kind {
+        NodeKind::Document => SemanticKind::Document,
+        NodeKind::BlockMapping => SemanticKind::Mapping {
+            style: CollectionStyle::Block,
+        },
+        NodeKind::FlowMapping => SemanticKind::Mapping {
+            style: CollectionStyle::Flow,
+        },
+        NodeKind::BlockSequence => SemanticKind::Sequence {
+            style: CollectionStyle::Block,
+        },
+        NodeKind::FlowSequence => SemanticKind::Sequence {
+            style: CollectionStyle::Flow,
+        },
+        NodeKind::Scalar if node.syntax_flags & NODE_SEMANTIC_ALIAS != 0 => SemanticKind::Alias,
+        NodeKind::Scalar => SemanticKind::Scalar {
+            style: match node.syntax_flags & NODE_SCALAR_STYLE_MASK {
+                NODE_SCALAR_SINGLE_QUOTED => YamlScalarStyle::SingleQuoted,
+                NODE_SCALAR_DOUBLE_QUOTED => YamlScalarStyle::DoubleQuoted,
+                _ => YamlScalarStyle::Plain,
+            },
+        },
+        NodeKind::LiteralScalar => SemanticKind::Scalar {
+            style: YamlScalarStyle::Literal,
+        },
+        NodeKind::FoldedScalar => SemanticKind::Scalar {
+            style: YamlScalarStyle::Folded,
+        },
+        _ => unreachable!("only semantic CST nodes carry semantic metadata"),
     }
 }
 
@@ -530,19 +616,38 @@ fn structure_error(message: &str, span: Span) -> YamlError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticBuilder, SemanticNode, SemanticProperties};
-    use crate::{CollectionStyle, NodeId, Span, YamlEventKind, YamlScalarStyle};
+    use super::{SemanticBuilder, SemanticMetadata, SemanticNode, SemanticProperties};
+    use crate::syntax::{NO_NODE, NO_SEMANTIC_NODE};
+    use crate::{CollectionStyle, Node, NodeId, NodeKind, Span, YamlEventKind, YamlScalarStyle};
+
+    fn cst_nodes(len: usize) -> Vec<Node> {
+        (0..len)
+            .map(|_| Node {
+                kind: NodeKind::Scalar,
+                syntax_flags: 0,
+                span: Span::empty(0),
+                parent: NO_NODE,
+                first_child: NO_NODE,
+                last_child: NO_NODE,
+                next_sibling: NO_NODE,
+                semantic: NO_SEMANTIC_NODE,
+            })
+            .collect()
+    }
 
     #[test]
     fn direct_builder_rejects_dangling_mapping_value() {
         let mut builder = SemanticBuilder::with_capacity(4, 4);
+        let mut nodes = cst_nodes(3);
         builder.push(
+            &mut nodes,
             YamlEventKind::DocumentStart { explicit: false },
             Span::empty(0),
             Some(NodeId(0)),
             SemanticProperties::NONE,
         );
         builder.push(
+            &mut nodes,
             YamlEventKind::MappingStart {
                 style: CollectionStyle::Block,
                 tag: None,
@@ -553,6 +658,7 @@ mod tests {
             SemanticProperties::NONE,
         );
         builder.push(
+            &mut nodes,
             YamlEventKind::Scalar {
                 style: YamlScalarStyle::Plain,
                 value: String::new(),
@@ -564,20 +670,23 @@ mod tests {
             SemanticProperties::NONE,
         );
         builder.push(
+            &mut nodes,
             YamlEventKind::MappingEnd,
             Span::empty(0),
             None,
             SemanticProperties::NONE,
         );
 
-        let error = builder.finish(3).expect_err("mapping value is required");
+        let error = builder.finish().expect_err("mapping value is required");
         assert!(error.to_string().contains("does not contain a value"));
     }
 
     #[test]
     fn direct_builder_rejects_mismatched_collection_end() {
         let mut builder = SemanticBuilder::with_capacity(2, 2);
+        let mut nodes = cst_nodes(1);
         builder.push(
+            &mut nodes,
             YamlEventKind::SequenceStart {
                 style: CollectionStyle::Flow,
                 tag: None,
@@ -588,20 +697,23 @@ mod tests {
             SemanticProperties::NONE,
         );
         builder.push(
+            &mut nodes,
             YamlEventKind::MappingEnd,
             Span::empty(1),
             None,
             SemanticProperties::NONE,
         );
 
-        let error = builder.finish(1).expect_err("collection ends must match");
+        let error = builder.finish().expect_err("collection ends must match");
         assert!(error.to_string().contains("mismatched mapping end"));
     }
 
     #[test]
     fn direct_builder_rejects_multiple_document_roots() {
         let mut builder = SemanticBuilder::with_capacity(3, 3);
+        let mut nodes = cst_nodes(3);
         builder.push(
+            &mut nodes,
             YamlEventKind::DocumentStart { explicit: false },
             Span::empty(0),
             Some(NodeId(0)),
@@ -609,6 +721,7 @@ mod tests {
         );
         for cst in [NodeId(1), NodeId(2)] {
             builder.push(
+                &mut nodes,
                 YamlEventKind::Scalar {
                     style: YamlScalarStyle::Plain,
                     value: String::new(),
@@ -621,25 +734,29 @@ mod tests {
             );
         }
 
-        let error = builder.finish(3).expect_err("documents have one root");
+        let error = builder.finish().expect_err("documents have one root");
         assert!(error.to_string().contains("multiple root nodes"));
     }
 
     #[test]
-    fn semantic_record_is_at_most_sixteen_bytes() {
-        assert!(std::mem::size_of::<SemanticNode>() <= 16);
+    fn semantic_records_have_compact_layouts() {
+        assert_eq!(std::mem::size_of::<SemanticNode>(), 12);
+        assert_eq!(std::mem::size_of::<SemanticMetadata>(), 8);
     }
 
     #[test]
     fn undecorated_nodes_do_not_populate_sparse_arenas() {
         let mut builder = SemanticBuilder::with_capacity(2, 2);
+        let mut nodes = cst_nodes(2);
         builder.push(
+            &mut nodes,
             YamlEventKind::DocumentStart { explicit: false },
             Span::empty(0),
             Some(NodeId(0)),
             SemanticProperties::NONE,
         );
         builder.push(
+            &mut nodes,
             YamlEventKind::Scalar {
                 style: YamlScalarStyle::Plain,
                 value: String::new(),
@@ -651,13 +768,15 @@ mod tests {
             SemanticProperties::NONE,
         );
         builder.push(
+            &mut nodes,
             YamlEventKind::DocumentEnd { explicit: false },
             Span::empty(0),
             None,
             SemanticProperties::NONE,
         );
 
-        let store = builder.finish(2).expect("semantic structure closes");
+        let store = builder.finish().expect("semantic structure closes");
+        assert!(store.metadata.is_empty());
         assert!(store.properties.is_empty());
         assert!(store.anchors.is_empty());
         assert!(store.tag_directives.is_empty());

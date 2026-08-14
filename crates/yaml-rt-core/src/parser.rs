@@ -1,19 +1,36 @@
 use std::collections::BTreeMap;
 
-use crate::source::LineFacts;
-use crate::syntax::{Children, NO_NODE, node_link};
+use crate::inline_vec::InlineVec;
+use crate::source::{CachedScalarStyle, LineFacts};
+use crate::syntax::{
+    Children, NO_NODE, NO_SEMANTIC_NODE, NODE_SCALAR_DOUBLE_QUOTED as SCALAR_STYLE_DOUBLE_QUOTED,
+    NODE_SCALAR_PLAIN as SCALAR_STYLE_PLAIN,
+    NODE_SCALAR_SINGLE_QUOTED as SCALAR_STYLE_SINGLE_QUOTED,
+    NODE_SCALAR_STYLE_MASK as SCALAR_STYLE_MASK,
+    NODE_SCALAR_SYNTAX_VALIDATED as SCALAR_SYNTAX_VALIDATED, node_link,
+};
 use crate::{
     CollectionStyle, Diagnostic, DiagnosticKind, Node, NodeId, NodeKind, ParsedYaml,
-    SemanticBuilder, SemanticProperties, Source, Span, YamlError, YamlEvent, YamlEventKind,
-    YamlScalarStyle, validate_yaml_chars,
+    SemanticBuilder, SemanticKind, SemanticProperties, Source, Span, YamlError, YamlEvent,
+    YamlEventKind, YamlScalarStyle, validate_yaml_chars,
 };
 
 const MAX_FLOW_COLLECTION_DEPTH: usize = 1024;
+fn scalar_style_from_first_char(character: char) -> YamlScalarStyle {
+    match character {
+        '"' => YamlScalarStyle::DoubleQuoted,
+        '\'' => YamlScalarStyle::SingleQuoted,
+        _ => YamlScalarStyle::Plain,
+    }
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlowCollectionKind {
-    Sequence,
-    Mapping,
+fn scalar_style_from_flags(flags: u8) -> Option<YamlScalarStyle> {
+    match flags & SCALAR_STYLE_MASK {
+        SCALAR_STYLE_PLAIN => Some(YamlScalarStyle::Plain),
+        SCALAR_STYLE_SINGLE_QUOTED => Some(YamlScalarStyle::SingleQuoted),
+        SCALAR_STYLE_DOUBLE_QUOTED => Some(YamlScalarStyle::DoubleQuoted),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -21,7 +38,7 @@ enum FlowFrameState {
     SequenceExpectItem,
     SequenceAwaitItem {
         entry: NodeId,
-        entry_start: usize,
+        entry_start: u32,
         explicit: bool,
     },
     SequenceAwaitValue {
@@ -33,19 +50,18 @@ enum FlowFrameState {
     MappingExpectKey,
     MappingAwaitKey {
         entry: NodeId,
-        entry_start: usize,
+        entry_start: u32,
         explicit: bool,
     },
     MappingAwaitValue {
         entry: NodeId,
-        entry_start: usize,
+        entry_start: u32,
     },
     MappingAfterPair,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct FlowFrame {
-    kind: FlowCollectionKind,
     node: NodeId,
     close: char,
     state: FlowFrameState,
@@ -67,8 +83,14 @@ struct FlowParseState<'text> {
 }
 
 impl<'text> FlowParseState<'text> {
-    fn new(text: &'text str, absolute_start: usize, root: NodeId, open: char) -> Self {
-        let mut frames = Vec::with_capacity(16);
+    fn new(
+        text: &'text str,
+        absolute_start: usize,
+        root: NodeId,
+        open: char,
+        mut frames: Vec<FlowFrame>,
+    ) -> Self {
+        frames.clear();
         frames.push(flow_frame(root, open));
         Self {
             text,
@@ -81,14 +103,6 @@ impl<'text> FlowParseState<'text> {
     }
 }
 
-enum PendingFlowEvent {
-    Node(NodeId),
-    Entries(u32),
-    Children(u32),
-    SequenceEnd(Span),
-    MappingEnd(Span),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenEventCollection {
     Mapping,
@@ -97,30 +111,71 @@ enum OpenEventCollection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingNodeProperties {
-    indent: usize,
-    span_start: usize,
+    indent: u32,
+    span_start: u32,
     properties: NodeProperties,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ContextFrame {
-    Mapping {
-        indent: usize,
-        node: NodeId,
-    },
-    Sequence {
-        indent: usize,
-        node: NodeId,
-    },
-    EventCollection {
-        indent: usize,
-        collection: OpenEventCollection,
-    },
-    PendingProperties(PendingNodeProperties),
-    BlockScalarIndent {
-        node: NodeId,
-        indent: usize,
-    },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockFrame {
+    indent: u32,
+    node: NodeId,
+    collection: OpenEventCollection,
+    previous_same_kind: u32,
+}
+
+const NO_BLOCK_FRAME: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockScalarIndent {
+    node: NodeId,
+    indent: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockTransition {
+    Consume(usize),
+    Reprocess,
+    Push(usize),
+    Pop(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockEntryKind {
+    Mapping,
+    Sequence,
+    ExplicitMapping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockEntryPhase {
+    Key,
+    Separator,
+    Value,
+    NestedChild,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockValueFrame {
+    kind: BlockEntryKind,
+    indent: u32,
+    owner: NodeId,
+    collection: NodeId,
+    phase: BlockEntryPhase,
+    semantic_open: bool,
+    pending_properties: bool,
+    last_content_end: u32,
+    empty_offset: u32,
+    allow_indentless_sequence: bool,
+    allow_same_indent_content: bool,
+}
+
+struct BlockMachine<'source> {
+    parser: Parser<'source>,
+    lines: LineTable<'source>,
+    cursor: LineCursor<'source>,
+    frames: InlineVec<BlockValueFrame, 4>,
 }
 
 pub(crate) struct Parser<'source> {
@@ -133,7 +188,13 @@ pub(crate) struct Parser<'source> {
     document_was_explicitly_opened: bool,
     document_yaml_directive_seen: bool,
     tag_handles: BTreeMap<String, String>,
-    contexts: Vec<ContextFrame>,
+    block_frames: Vec<BlockFrame>,
+    last_mapping_frame: u32,
+    last_sequence_frame: u32,
+    pending_properties: Vec<PendingNodeProperties>,
+    block_scalar_indents: Vec<BlockScalarIndent>,
+    flow_frames: Vec<FlowFrame>,
+    pending_block_values: InlineVec<BlockValueFrame, 2>,
 }
 
 impl<'source> Parser<'source> {
@@ -151,7 +212,13 @@ impl<'source> Parser<'source> {
             document_was_explicitly_opened: false,
             document_yaml_directive_seen: false,
             tag_handles: BTreeMap::new(),
-            contexts: Vec::with_capacity(16),
+            block_frames: Vec::with_capacity(16),
+            last_mapping_frame: NO_BLOCK_FRAME,
+            last_sequence_frame: NO_BLOCK_FRAME,
+            pending_properties: Vec::new(),
+            block_scalar_indents: Vec::new(),
+            flow_frames: Vec::new(),
+            pending_block_values: InlineVec::new(),
         }
     }
 
@@ -164,10 +231,7 @@ impl<'source> Parser<'source> {
         );
 
         let lines = LineTable::new(self.source);
-        let mut index = 0;
-        while index < lines.len() {
-            index += self.parse_line(lines, index)?;
-        }
+        self = BlockMachine::new(self, lines).run()?;
         if self.document.is_some() {
             self.close_document(false, Span::empty_from_usize(self.source.len()))?;
         } else if self.nodes[stream.0 as usize].first_child == NO_NODE {
@@ -188,7 +252,7 @@ impl<'source> Parser<'source> {
             Span::from_usize(self.source.len(), self.source.len()),
         );
 
-        let semantics = self.semantics.finish(self.nodes.len())?;
+        let semantics = self.semantics.finish()?;
         Ok(ParsedYaml {
             nodes: self.nodes,
             semantics,
@@ -199,8 +263,12 @@ impl<'source> Parser<'source> {
         clippy::too_many_lines,
         reason = "top-level YAML line dispatch must preserve grammar precedence"
     )]
-    fn parse_line(&mut self, lines: LineTable<'_>, index: usize) -> Result<usize, YamlError> {
-        let line = lines.line(index);
+    fn parse_line(
+        &mut self,
+        lines: LineTable<'_>,
+        index: usize,
+        line: SourceLine<'_>,
+    ) -> Result<usize, YamlError> {
         let content = line.content_without_break;
         if let Some(indent) = line.facts.indent()
             && let Some((colon, value_start)) = line.facts.simple_mapping()
@@ -211,16 +279,16 @@ impl<'source> Parser<'source> {
                 mapping,
                 lines,
                 index,
+                line,
                 indent,
                 body,
                 line.content_start + indent,
-                SimpleMappingFacts { colon, value_start },
+                SimpleMappingFacts::new(colon, value_start),
             );
         }
         if line.facts.is_blank() {
             return Ok(1);
         }
-        let cached_mapping_colon = line.facts.mapping_colon();
         let trimmed = content.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             return Ok(1);
@@ -237,12 +305,11 @@ impl<'source> Parser<'source> {
             count_indent(content, line.content_start)?
         };
         let body = &content[indent..];
+        let prepared = PreparedBlockLine::new(line, indent)?;
         if body.as_bytes().first() == Some(&b'\t')
             && (is_explicit_mapping_key(body)
                 || is_explicit_mapping_value(body)
-                || cached_mapping_colon.is_some()
-                || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
-                || find_mapping_colon(body).is_some())
+                || prepared.mapping_colon().is_some())
         {
             return Err(tab_indentation_error(line.content_start + indent));
         }
@@ -267,7 +334,8 @@ impl<'source> Parser<'source> {
             }
             reject_compact_decorated_document(rest, line.content_end - rest.len())?;
             let rest_start = line.content_end - rest.len();
-            return self.parse_content_body(document, lines, index, 0, rest, rest_start);
+            let prepared = PreparedBlockLine::from_body(line, 0, rest, rest_start)?;
+            return self.parse_content_body(document, lines, index, prepared);
         }
 
         if let Some(rest) = document_marker_rest(body, "...") {
@@ -303,44 +371,33 @@ impl<'source> Parser<'source> {
 
         self.validate_indent(indent, line, body)?;
         self.close_collections_deeper_than(indent);
-        self.reject_invalid_block_sibling(indent, line, body, cached_mapping_colon.is_some())?;
-        if self.has_sequence_at(indent)
-            && self.has_mapping_at(indent)
+        self.reject_invalid_block_sibling(indent, line, body, prepared.mapping_colon().is_some())?;
+        if self.sequence_is_open_at(indent)
+            && self.mapping_is_open_at(indent)
             && !is_sequence_entry(body)
             && (is_explicit_mapping_key(body)
                 || is_explicit_mapping_value(body)
-                || cached_mapping_colon.is_some()
-                || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
-                || find_mapping_colon(body).is_some())
+                || prepared.mapping_colon().is_some())
         {
             self.close_sequence_at_indent(indent);
         }
         reject_unexpected_line_start(body, line.content_start + indent)?;
 
         let document = self.ensure_current_document(false, line);
-        self.parse_content_body(
-            document,
-            lines,
-            index,
-            indent,
-            body,
-            line.content_start + indent,
-        )
+        self.parse_content_body(document, lines, index, prepared)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "block-content dispatch keeps context-sensitive cases in precedence order"
-    )]
     fn parse_content_body(
         &mut self,
         document: NodeId,
         lines: LineTable<'_>,
         index: usize,
-        indent: usize,
-        body: &str,
-        absolute_start: usize,
+        prepared: PreparedBlockLine<'_>,
     ) -> Result<usize, YamlError> {
+        let line = prepared.line;
+        let indent = prepared.indent();
+        let body = prepared.body;
+        let absolute_start = prepared.absolute_start();
         if self.nodes[document.as_usize()].kind == NodeKind::Document
             && self.document_has_content
             && indent == 0
@@ -349,91 +406,64 @@ impl<'source> Parser<'source> {
             return Err(invalid_orphaned_block_content(absolute_start));
         }
         self.document_has_content = true;
-        if let Some(facts) = lines
-            .simple_mapping_facts(index, absolute_start)
+        if let Some(facts) = prepared
+            .simple_mapping_facts()
             .or_else(|| simple_plain_mapping_facts(body))
         {
             return self.parse_simple_plain_mapping_entry(
                 document,
                 lines,
                 index,
+                line,
                 indent,
                 body,
                 absolute_start,
                 facts,
             );
         }
-        if let Some(next_indent) = property_only_node_indent(body, lines, index, absolute_start)? {
-            self.push_pending_node_properties(body, absolute_start, next_indent)?;
+        let uncommented = prepared.uncommented().trim_end();
+        if body_may_start_with_node_properties(uncommented)
+            && let Some(next_indent) =
+                property_only_node_indent(uncommented, lines, index, absolute_start)?
+        {
+            self.push_pending_node_properties(uncommented, absolute_start, next_indent)?;
             return Ok(1);
         }
 
         if is_sequence_entry(body) {
-            self.parse_sequence_entry(document, lines, index, indent, body)
+            self.parse_sequence_entry(document, lines, index, line, indent, body)
         } else if is_explicit_mapping_key(body) {
-            self.parse_explicit_mapping_entry(document, lines, index, indent, body, absolute_start)
+            self.parse_explicit_mapping_entry(document, lines, index, prepared)
         } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, absolute_start, indent, body, true)?;
             self.attach_child_at(document.0 as usize, node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
-        } else if let Some(colon_byte) = lines.mapping_colon(index, absolute_start) {
+        } else if let Some(colon_byte) = prepared.mapping_colon() {
             self.parse_mapping_entry(
                 document,
                 lines,
                 index,
+                line,
                 indent,
                 body,
                 colon_byte,
                 absolute_start,
             )
-        } else if let Some(colon_byte) = flow_collection_mapping_key_colon(body, absolute_start)? {
-            self.parse_mapping_entry(
-                document,
-                lines,
-                index,
-                indent,
-                body,
-                colon_byte,
-                absolute_start,
-            )
-        } else if body_starts_flow_value(body, absolute_start)? {
+        } else if prepared.starts_flow {
             let (node, _end, consumed) =
                 self.parse_flow_value_lines(lines, index, absolute_start)?;
             self.attach_child_at(document.0 as usize, node);
-            self.emit_node_event(node)?;
             Ok(consumed)
         } else if body.starts_with('"') {
-            if let Some(colon_byte) = find_mapping_colon(body) {
-                self.parse_mapping_entry(
-                    document,
-                    lines,
-                    index,
-                    indent,
-                    body,
-                    colon_byte,
-                    absolute_start,
-                )
-            } else {
-                let (node, consumed) =
-                    self.parse_quoted_scalar_lines(lines, index, absolute_start, '"')?;
-                self.attach_child_at(document.0 as usize, node);
-                self.emit_scalar_event(node)?;
-                Ok(consumed)
-            }
-        } else if let Some(colon_byte) = find_mapping_colon(body) {
-            self.parse_mapping_entry(
-                document,
-                lines,
-                index,
-                indent,
-                body,
-                colon_byte,
-                absolute_start,
-            )
+            let (node, consumed) =
+                self.parse_quoted_scalar_lines(lines, index, absolute_start, '"', false)?;
+            self.attach_child_at(document.0 as usize, node);
+            self.emit_scalar_event(node)?;
+            Ok(consumed)
         } else {
-            let allow_same_indent_continuation = !self.has_parent_collection_below(indent);
+            let allow_same_indent_continuation = !self.parent_collection_below(indent);
             let (scalar, consumed) = self.parse_block_plain_scalar(
                 lines,
                 index,
@@ -458,13 +488,13 @@ impl<'source> Parser<'source> {
         document: NodeId,
         lines: LineTable<'_>,
         index: usize,
+        line: SourceLine<'_>,
         indent: usize,
         body: &str,
         absolute_start: usize,
         facts: SimpleMappingFacts,
     ) -> Result<usize, YamlError> {
-        let line = lines.line(index);
-        let mapping = self.ensure_mapping(
+        let mapping = self.mapping_for_line(
             document,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
@@ -473,6 +503,7 @@ impl<'source> Parser<'source> {
             mapping,
             lines,
             index,
+            line,
             indent,
             body,
             absolute_start,
@@ -489,12 +520,12 @@ impl<'source> Parser<'source> {
         mapping: NodeId,
         lines: LineTable<'_>,
         index: usize,
+        line: SourceLine<'_>,
         indent: usize,
         body: &str,
         absolute_start: usize,
         facts: SimpleMappingFacts,
     ) -> Result<usize, YamlError> {
-        let line = lines.line(index);
         let entry = self.push_node(
             NodeKind::MappingEntry,
             Span::from_usize(line.content_start, line.content_end),
@@ -504,14 +535,14 @@ impl<'source> Parser<'source> {
 
         let key = self.push_node(
             NodeKind::Scalar,
-            Span::from_usize(absolute_start, absolute_start + facts.colon),
+            Span::from_usize(absolute_start, absolute_start + facts.colon()),
         );
         self.attach_child_at(entry.as_usize(), key);
         self.emit_property_free_plain_scalar(key);
 
-        let value_start = absolute_start + facts.value_start;
+        let value_start = absolute_start + facts.value_start();
         debug_assert_eq!(
-            &body[facts.value_start..],
+            &body[facts.value_start()..],
             &self.source.as_str()[value_start..line.content_end]
         );
         let (value, consumed) = if lines.next_line_starts_simple_mapping(index, indent) {
@@ -528,7 +559,7 @@ impl<'source> Parser<'source> {
         self.attach_child_at(entry.as_usize(), value);
         self.emit_property_free_plain_scalar(value);
         if consumed > 1 {
-            let end = lines.line(index + consumed - 1).content_end;
+            let end = lines.content_end(index + consumed - 1);
             self.extend_node_span(entry, end);
             self.extend_node_span(mapping, end);
         }
@@ -536,22 +567,10 @@ impl<'source> Parser<'source> {
     }
 
     fn active_simple_mapping(&self, indent: usize) -> Option<NodeId> {
-        let [.., mapping, event] = self.contexts.as_slice() else {
-            return None;
-        };
-        match (mapping, event) {
-            (
-                ContextFrame::Mapping {
-                    indent: mapping_indent,
-                    node,
-                },
-                ContextFrame::EventCollection {
-                    indent: event_indent,
-                    collection: OpenEventCollection::Mapping,
-                },
-            ) if *mapping_indent == indent && *event_indent == indent => Some(*node),
-            _ => None,
-        }
+        self.block_frames.last().and_then(|frame| {
+            (frame.collection == OpenEventCollection::Mapping && frame.indent as usize == indent)
+                .then_some(frame.node)
+        })
     }
 
     fn parse_quoted_scalar_lines(
@@ -560,12 +579,13 @@ impl<'source> Parser<'source> {
         index: usize,
         absolute_start: usize,
         quote: char,
+        reject_tab_indentation: bool,
     ) -> Result<(NodeId, usize), YamlError> {
         let source_tail = &self.source.as_str()[absolute_start..];
         let end = match quote {
-            '"' => double_quoted_scalar_end(source_tail),
+            '"' => scan_double_quoted_scalar(source_tail, 0)?,
             '\'' => single_quoted_scalar_end(source_tail),
-            _ => None,
+            _ => unreachable!("quoted scalar parser requires a quote"),
         }
         .ok_or_else(|| {
             let scalar_name = if quote == '"' {
@@ -586,6 +606,17 @@ impl<'source> Parser<'source> {
         let mut consumed = 1;
         for line in lines.iter_from(index + 1) {
             if line.content_start < absolute_end {
+                if reject_tab_indentation && line.content_without_break.starts_with('\t') {
+                    return Err(tab_indentation_error(line.content_start));
+                }
+                if reject_tab_indentation
+                    && !line.content_without_break.trim().is_empty()
+                    && content_line_indent(line.content_without_break) == 0
+                {
+                    return Err(invalid_quoted_scalar_continuation_indent(
+                        line.content_start,
+                    ));
+                }
                 if quote == '"' {
                     validate_double_quoted_continuation_line(&line)?;
                 }
@@ -595,13 +626,17 @@ impl<'source> Parser<'source> {
             }
         }
 
-        Ok((
-            self.push_node(
-                NodeKind::Scalar,
-                Span::from_usize(absolute_start, absolute_end),
-            ),
-            consumed,
-        ))
+        let node = self.push_node(
+            NodeKind::Scalar,
+            Span::from_usize(absolute_start, absolute_end),
+        );
+        let style = if quote == '"' {
+            YamlScalarStyle::DoubleQuoted
+        } else {
+            YamlScalarStyle::SingleQuoted
+        };
+        self.mark_scalar_syntax(node, style, true);
+        Ok((node, consumed))
     }
 
     fn parse_flow_value_lines(
@@ -616,25 +651,25 @@ impl<'source> Parser<'source> {
             Span::from_usize(absolute_start, self.source.len()),
         )?;
         reject_invalid_node_property_placement(source_tail, absolute_start, &properties)?;
-        let marker_offset = properties.value_start
-            + leading_flow_whitespace(&source_tail[properties.value_start..]);
+        let marker_offset = properties.value_start()
+            + leading_flow_whitespace(&source_tail[properties.value_start()..]);
         let marker_start = absolute_start + marker_offset;
         let (node, end) = self.parse_flow_value(source_tail, absolute_start)?;
         let validate_sequence_indent = source_tail[marker_offset..]
             .chars()
             .find(|character| !character.is_whitespace())
             == Some('[')
-            && marker_start > lines.line(index).content_start + self.source_indent_at(marker_start);
+            && marker_start > lines.content_start(index) + self.source_indent_at(marker_start);
         let absolute_end = absolute_start + end;
         let mut consumed = 1;
         // Include the line break in the validation window. The one-pass cursor may
         // stop immediately after separation at the end of a line, while trailing
         // content is still bounded by the last source line the value consumed.
-        let mut validation_end = lines.line(index).line_end;
+        let mut validation_end = lines.line_end(index);
         let flow_indent = self.source_indent_at(marker_start);
-        let current_line = lines.line(index);
-        let marker_prefix = &current_line.content_without_break
-            [..marker_start.saturating_sub(current_line.content_start)];
+        let line_start = lines.content_start(index);
+        let marker_prefix =
+            &self.source.as_str()[line_start..marker_start.min(lines.content_end(index))];
         let allow_tab_continuation = marker_prefix.as_bytes().contains(&b'\t');
         for line in lines.iter_from(index + 1) {
             if line.content_start < absolute_end {
@@ -674,13 +709,13 @@ impl<'source> Parser<'source> {
         document: NodeId,
         lines: LineTable<'_>,
         index: usize,
+        line: SourceLine<'_>,
         indent: usize,
         body: &str,
         colon_byte: usize,
         absolute_start: usize,
     ) -> Result<usize, YamlError> {
-        let line = lines.line(index);
-        let mapping = self.ensure_mapping(
+        let mapping = self.mapping_for_line(
             document,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
@@ -703,7 +738,6 @@ impl<'source> Parser<'source> {
             let (key, end) = self.parse_flow_value(key_text, key_start)?;
             reject_trailing_flow_content(key_text, end, key_start)?;
             self.attach_child_at(entry.0 as usize, key);
-            self.emit_node_event(key)?;
         } else {
             let key_properties =
                 parse_node_properties(key_text, Span::from_usize(key_start, key_end))?;
@@ -718,6 +752,28 @@ impl<'source> Parser<'source> {
         }
 
         let raw_value = &body[colon_byte + 1..];
+        let scalar_facts = match source_line_scalar_mapping_facts(line, absolute_start) {
+            Some((cached_colon, facts)) if cached_colon == colon_byte => Some(facts),
+            _ if lines.source.has_line_facts() => single_line_scalar_facts(raw_value)?,
+            _ => None,
+        };
+        if is_simple_plain_atom(key_text)
+            && let Some(facts) = scalar_facts
+            && (facts.style != YamlScalarStyle::Plain
+                || lines.plain_scalar_cannot_continue(index, indent))
+        {
+            let raw_start = absolute_start + colon_byte + 1;
+            let value = self.push_node(
+                NodeKind::Scalar,
+                Span::from_usize(raw_start + facts.start(), raw_start + facts.end()),
+            );
+            self.attach_child_at(entry.as_usize(), value);
+            if facts.style != YamlScalarStyle::Plain {
+                self.mark_scalar_syntax(value, facts.style, true);
+            }
+            self.emit_property_free_scalar(value, facts.style);
+            return Ok(1);
+        }
         let raw_value_trimmed = raw_value.trim_start();
         let value = strip_inline_comment(raw_value);
         let value_trimmed = value.trim_start();
@@ -748,8 +804,9 @@ impl<'source> Parser<'source> {
                 self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
-            } else if let Some(header_offset) =
-                block_scalar_after_node_properties(value_trimmed, value_start)?
+            } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
+                && let Some(header_offset) =
+                    block_scalar_after_node_properties(value_trimmed, value_start)?
             {
                 self.push_pending_node_properties(
                     &value_trimmed[..header_offset],
@@ -767,60 +824,53 @@ impl<'source> Parser<'source> {
                 self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
-            } else if let Some(next_indent) = property_only_mapping_value_collection_indent(
-                value_trimmed,
-                lines,
-                index,
-                value_start,
-                indent,
-            )? {
+            } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
+                && let Some(next_indent) = property_only_mapping_value_collection_indent(
+                    value_trimmed,
+                    lines,
+                    index,
+                    value_start,
+                    indent,
+                )?
+            {
                 self.push_pending_node_properties(value_trimmed, value_start, next_indent)?;
-                let consumed =
-                    self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-                let end = lines.line(index + consumed - 1).content_end;
-                self.extend_node_span(entry, end);
-                self.extend_node_span(mapping, end);
-                return Ok(consumed);
+                self.defer_block_value(
+                    BlockEntryKind::Mapping,
+                    entry,
+                    mapping,
+                    indent,
+                    line.content_end,
+                    true,
+                    true,
+                );
+                return Ok(1);
             } else if body_starts_flow_value(raw_value_trimmed, value_start)? {
                 let (node, _end, consumed) =
                     self.parse_flow_value_lines(lines, index, value_start)?;
                 self.attach_child_at(entry.0 as usize, node);
-                self.emit_node_event(node)?;
                 return Ok(consumed);
             }
             validate_quoted_scalar_trailing_content(value_trimmed, value_start)?;
             reject_nested_plain_mapping_colon(value_trimmed, value_start)?;
-            let (node, consumed) =
-                self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
+            let (node, consumed) = match value_trimmed.chars().next() {
+                Some(quote @ ('"' | '\'')) if value_properties.value_start() == 0 => {
+                    self.parse_quoted_scalar_lines(lines, index, value_start, quote, true)?
+                }
+                _ => self.parse_block_plain_scalar(lines, index, indent, value_start, false)?,
+            };
             self.attach_child_at(entry.0 as usize, node);
             self.emit_scalar_event(node)?;
             return Ok(consumed);
         }
-        let next_significant = next_significant_body_with_index(lines, index);
-        if next_significant.is_some_and(|(_, next_indent, next_body)| {
-            next_indent == indent && is_sequence_entry(next_body)
-        }) {
-            let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-            let end = lines.line(index + consumed - 1).content_end;
-            self.extend_node_span(entry, end);
-            self.extend_node_span(mapping, end);
-            return Ok(consumed);
-        }
-        let next_significant_indent = next_significant.map(|(_, next_indent, _)| next_indent);
-        if next_significant_indent.is_none_or(|next| next <= indent) {
-            let empty = self.push_empty_scalar(line.content_end);
-            self.attach_child_at(entry.0 as usize, empty);
-            self.emit_scalar_event(empty)?;
-            return Ok(1);
-        }
-        if next_significant_indent.is_some_and(|next| next > indent) {
-            let consumed = self.parse_nested_mapping_entry_value(entry, lines, index, indent)?;
-            let end = lines.line(index + consumed - 1).content_end;
-            self.extend_node_span(entry, end);
-            self.extend_node_span(mapping, end);
-            return Ok(consumed);
-        }
-
+        self.defer_block_value(
+            BlockEntryKind::Mapping,
+            entry,
+            mapping,
+            indent,
+            line.content_end,
+            true,
+            false,
+        );
         Ok(1)
     }
 
@@ -829,12 +879,13 @@ impl<'source> Parser<'source> {
         document: NodeId,
         lines: LineTable<'_>,
         index: usize,
-        indent: usize,
-        body: &str,
-        absolute_start: usize,
+        prepared: PreparedBlockLine<'_>,
     ) -> Result<usize, YamlError> {
-        let line = lines.line(index);
-        let mapping = self.ensure_mapping(
+        let line = prepared.line;
+        let indent = prepared.indent();
+        let body = prepared.body;
+        let absolute_start = prepared.absolute_start();
+        let mapping = self.mapping_for_line(
             document,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
@@ -849,103 +900,33 @@ impl<'source> Parser<'source> {
         let after_question = if body == "?" { "" } else { &body[1..] };
         reject_invalid_indicator_tab(body, absolute_start)?;
         let key_text = strip_inline_comment(after_question).trim_start();
-        let key_consumed = if key_text.is_empty() {
-            if next_significant_body_with_index(lines, index).is_some_and(
-                |(_, next_indent, next_body)| {
-                    next_indent >= indent && !is_explicit_mapping_value(next_body)
-                },
-            ) {
-                self.parse_following_explicit_key_block(entry, lines, index, indent)?
-            } else {
-                let key = self.push_empty_scalar(absolute_start + 1);
-                self.attach_child_at(entry.0 as usize, key);
-                self.emit_scalar_event(key)?;
-                1
-            }
-        } else {
-            let leading = after_question.len() - after_question.trim_start().len();
-            let key_start = absolute_start + 1 + leading;
-            let key_properties = parse_node_properties(
-                key_text,
-                Span::from_usize(key_start, key_start + key_text.len()),
-            )?;
-            reject_invalid_node_property_placement(key_text, key_start, &key_properties)?;
-            self.parse_explicit_mapping_key_node(entry, lines, index, indent, key_text, key_start)?
-        };
-
-        let Some((value_index, value_indent, value_body)) =
-            next_significant_body_with_index(lines, index + key_consumed - 1)
-        else {
-            self.close_sequence_at_indent(indent);
-            self.close_collections_deeper_than(indent);
-            let empty = self.push_empty_scalar(line.content_end);
-            self.attach_child_at(entry.0 as usize, empty);
-            self.emit_scalar_event(empty)?;
-            return Ok(key_consumed);
-        };
-
-        if value_indent != indent || !is_explicit_mapping_value(value_body) {
-            self.close_sequence_at_indent(indent);
-            self.close_collections_deeper_than(indent);
-            let empty = self.push_empty_scalar(line.content_end);
-            self.attach_child_at(entry.0 as usize, empty);
-            self.emit_scalar_event(empty)?;
-            return Ok(key_consumed);
-        }
-
-        self.close_sequence_at_indent(indent);
-        self.close_collections_deeper_than(indent);
-        let value_consumed =
-            self.parse_explicit_mapping_value(entry, lines, value_index, indent, value_body)?;
-        let end = lines.line(value_index + value_consumed - 1).content_end;
-        self.extend_node_span(entry, end);
-        self.extend_node_span(mapping, end);
-        Ok(value_index - index + value_consumed)
-    }
-
-    fn parse_following_explicit_key_block(
-        &mut self,
-        entry: NodeId,
-        lines: LineTable<'_>,
-        index: usize,
-        parent_indent: usize,
-    ) -> Result<usize, YamlError> {
-        let mut consumed = 1;
-        let mut nested_index = index + 1;
-
-        while nested_index < lines.len() {
-            let line = lines.line(nested_index);
-            let trimmed = line.content_without_break.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                consumed += 1;
-                nested_index += 1;
-                continue;
-            }
-
-            let indent = content_line_indent(line.content_without_break);
-            let body = &line.content_without_break[indent..];
-            if indent == parent_indent && is_explicit_mapping_value(body) {
-                break;
-            }
-            if indent < parent_indent {
-                break;
-            }
-
-            self.close_collections_deeper_than(indent);
-            reject_unexpected_line_start(body, line.content_start + indent)?;
-            let nested_consumed = self.parse_content_body(
+        if key_text.is_empty() {
+            self.defer_explicit_mapping(
                 entry,
-                lines,
-                nested_index,
+                mapping,
                 indent,
-                body,
-                line.content_start + indent,
-            )?;
-            consumed += nested_consumed;
-            nested_index += nested_consumed;
+                BlockEntryPhase::Key,
+                line.content_end,
+            );
+            return Ok(1);
         }
-
-        Ok(consumed)
+        let leading = after_question.len() - after_question.trim_start().len();
+        let key_start = absolute_start + 1 + leading;
+        let key_properties = parse_node_properties(
+            key_text,
+            Span::from_usize(key_start, key_start + key_text.len()),
+        )?;
+        reject_invalid_node_property_placement(key_text, key_start, &key_properties)?;
+        let key_consumed =
+            self.parse_explicit_mapping_key_node(entry, lines, index, indent, key_text, key_start)?;
+        self.defer_explicit_mapping(
+            entry,
+            mapping,
+            indent,
+            BlockEntryPhase::Separator,
+            line.content_end,
+        );
+        Ok(key_consumed)
     }
 
     fn parse_explicit_mapping_key_node(
@@ -964,12 +945,19 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(node)?;
             Ok(consumed)
         } else if is_sequence_entry(key_text) {
-            let key_indent = key_start - lines.line(index).content_start;
+            let current_line = lines
+                .cursor_from(index)
+                .next()
+                .expect("current line index is in bounds");
+            let key_indent = key_start - current_line.content_start;
             let mut consumed =
-                self.parse_sequence_entry(entry, lines, index, key_indent, key_text)?;
+                self.parse_sequence_entry(entry, lines, index, current_line, key_indent, key_text)?;
             let mut nested_index = index + consumed;
             while nested_index < lines.len() {
-                let line = lines.line(nested_index);
+                let line = lines
+                    .cursor_from(nested_index)
+                    .next()
+                    .expect("nested line index is in bounds");
                 let trimmed = line.content_without_break.trim();
                 if trimmed.is_empty() || trimmed.starts_with('#') {
                     consumed += 1;
@@ -981,14 +969,9 @@ impl<'source> Parser<'source> {
                 if indent != key_indent || !is_sequence_entry(body) {
                     break;
                 }
-                let nested_consumed = self.parse_content_body(
-                    entry,
-                    lines,
-                    nested_index,
-                    indent,
-                    body,
-                    line.content_start + indent,
-                )?;
+                let prepared = PreparedBlockLine::new(line, indent)?;
+                let nested_consumed =
+                    self.parse_content_body(entry, lines, nested_index, prepared)?;
                 consumed += nested_consumed;
                 nested_index += nested_consumed;
             }
@@ -998,7 +981,6 @@ impl<'source> Parser<'source> {
         } else if body_starts_flow_value(key_text, key_start)? {
             let (key, _end, consumed) = self.parse_flow_value_lines(lines, index, key_start)?;
             self.attach_child_at(entry.0 as usize, key);
-            self.emit_node_event(key)?;
             Ok(consumed)
         } else if let Some(colon_byte) = find_mapping_colon(key_text) {
             self.parse_compact_block_mapping_node(entry, key_text, key_start, colon_byte)
@@ -1016,12 +998,16 @@ impl<'source> Parser<'source> {
     fn parse_explicit_mapping_value(
         &mut self,
         entry: NodeId,
+        mapping: NodeId,
         lines: LineTable<'_>,
         index: usize,
         indent: usize,
         body: &str,
     ) -> Result<usize, YamlError> {
-        let line = lines.line(index);
+        let line = lines
+            .cursor_from(index)
+            .next()
+            .expect("current line index is in bounds");
         let raw_value = &body[1..];
         reject_invalid_indicator_tab(body, line.content_start + indent)?;
         let raw_value_trimmed = raw_value.trim_start();
@@ -1029,18 +1015,7 @@ impl<'source> Parser<'source> {
         let value_trimmed = value.trim_start();
 
         if value_trimmed.is_empty() {
-            if next_significant_body_with_index(lines, index).is_some_and(
-                |(_, next_indent, next_body)| {
-                    next_indent >= indent
-                        && !is_explicit_mapping_key(next_body)
-                        && !is_explicit_mapping_value(next_body)
-                },
-            ) {
-                return self.parse_following_explicit_value_block(entry, lines, index, indent);
-            }
-            let empty = self.push_empty_scalar(line.content_end);
-            self.attach_child_at(entry.0 as usize, empty);
-            self.emit_scalar_event(empty)?;
+            self.defer_explicit_mapping_value(entry, mapping, indent, line.content_end);
             return Ok(1);
         }
 
@@ -1089,12 +1064,14 @@ impl<'source> Parser<'source> {
             indent,
         )? {
             self.push_pending_node_properties(value_trimmed, value_start, next_indent)?;
-            self.parse_nested_mapping_entry_value(entry, lines, index, indent)
+            self.defer_explicit_mapping_value(entry, mapping, indent, line.content_end);
+            Ok(1)
         } else if is_sequence_entry(value_trimmed) {
             self.parse_sequence_entry(
                 entry,
                 lines,
                 index,
+                line,
                 value_start - line.content_start,
                 value_trimmed,
             )
@@ -1105,7 +1082,6 @@ impl<'source> Parser<'source> {
             let (value_node, _end, consumed) =
                 self.parse_flow_value_lines(lines, index, value_start)?;
             self.attach_child_at(entry.0 as usize, value_node);
-            self.emit_node_event(value_node)?;
             Ok(consumed)
         } else {
             validate_quoted_scalar_trailing_content(value_trimmed, value_start)?;
@@ -1116,129 +1092,6 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(node)?;
             Ok(consumed)
         }
-    }
-
-    fn parse_following_explicit_value_block(
-        &mut self,
-        entry: NodeId,
-        lines: LineTable<'_>,
-        index: usize,
-        parent_indent: usize,
-    ) -> Result<usize, YamlError> {
-        let mut consumed = 1;
-        let mut nested_index = index + 1;
-
-        while nested_index < lines.len() {
-            let line = lines.line(nested_index);
-            let trimmed = line.content_without_break.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                consumed += 1;
-                nested_index += 1;
-                continue;
-            }
-
-            let indent = content_line_indent(line.content_without_break);
-            let body = &line.content_without_break[indent..];
-            if indent < parent_indent
-                || (indent == parent_indent
-                    && (is_explicit_mapping_key(body) || is_explicit_mapping_value(body)))
-            {
-                break;
-            }
-
-            self.close_collections_deeper_than(indent);
-            reject_unexpected_line_start(body, line.content_start + indent)?;
-            let nested_consumed = self.parse_content_body(
-                entry,
-                lines,
-                nested_index,
-                indent,
-                body,
-                line.content_start + indent,
-            )?;
-            consumed += nested_consumed;
-            nested_index += nested_consumed;
-        }
-
-        self.close_sequence_at_indent(parent_indent);
-        Ok(consumed)
-    }
-
-    fn parse_nested_mapping_entry_value(
-        &mut self,
-        entry: NodeId,
-        lines: LineTable<'_>,
-        index: usize,
-        parent_indent: usize,
-    ) -> Result<usize, YamlError> {
-        let mut nested_index = index + 1;
-        while nested_index < lines.len() {
-            let line = lines.line(nested_index);
-            let trimmed = line.content_without_break.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                nested_index += 1;
-                continue;
-            }
-
-            let nested_indent = content_line_indent(line.content_without_break);
-            if nested_indent < parent_indent {
-                break;
-            }
-
-            let body = &line.content_without_break[nested_indent..];
-            if nested_indent == parent_indent
-                && body.as_bytes().first() == Some(&b'\t')
-                && flow_collection_mapping_key_colon(body, line.content_start + nested_indent)?
-                    .is_some()
-            {
-                return Err(tab_indentation_error(line.content_start + nested_indent));
-            }
-            if nested_indent == parent_indent && !is_sequence_entry(body) {
-                break;
-            }
-            if nested_indent == parent_indent {
-                self.close_sequence_at_indent(parent_indent);
-            }
-            if property_only_block_collection_indent(
-                body,
-                lines,
-                nested_index,
-                line.content_start + nested_indent,
-            )?
-            .is_some()
-            {
-                return self.parse_nested_block_value(entry, lines, index, parent_indent, true);
-            }
-            if property_only_node_indent(
-                body,
-                lines,
-                nested_index,
-                line.content_start + nested_indent,
-            )?
-            .is_some()
-            {
-                return self.parse_nested_block_value(entry, lines, index, parent_indent, true);
-            }
-            if is_sequence_entry(body)
-                || is_explicit_mapping_key(body)
-                || find_mapping_colon(body).is_some()
-            {
-                return self.parse_nested_block_value(entry, lines, index, parent_indent, true);
-            }
-
-            let (scalar, consumed) = self.parse_block_plain_scalar(
-                lines,
-                nested_index,
-                parent_indent,
-                line.content_start + nested_indent,
-                false,
-            )?;
-            self.attach_child_at(entry.0 as usize, scalar);
-            self.emit_scalar_event(scalar)?;
-            return Ok(nested_index - index + consumed);
-        }
-
-        Ok(1)
     }
 
     fn push_pending_node_properties(
@@ -1256,24 +1109,32 @@ impl<'source> Parser<'source> {
             &properties,
             Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
-        if let Some(pending) = self.contexts.iter_mut().find_map(|frame| match frame {
-            ContextFrame::PendingProperties(pending) if pending.indent == indent => Some(pending),
-            _ => None,
-        }) {
-            pending.span_start = pending.span_start.min(absolute_start);
-            if pending.properties.anchor.is_none() {
-                pending.properties.anchor = properties.anchor;
+        let pending = if self
+            .pending_properties
+            .last()
+            .is_some_and(|pending| pending.indent as usize == indent)
+        {
+            self.pending_properties.last_mut()
+        } else {
+            self.pending_properties
+                .iter_mut()
+                .rev()
+                .find(|pending| pending.indent as usize == indent)
+        };
+        if let Some(pending) = pending {
+            pending.span_start = pending.span_start.min(Span::usize_to_u32(absolute_start));
+            if pending.properties.anchor().is_none() {
+                pending.properties.set_anchor(properties.anchor());
             }
-            if pending.properties.tag.is_none() {
-                pending.properties.tag = properties.tag;
+            if pending.properties.tag().is_none() {
+                pending.properties.set_tag(properties.tag());
             }
         } else {
-            self.contexts
-                .push(ContextFrame::PendingProperties(PendingNodeProperties {
-                    indent,
-                    span_start: absolute_start,
-                    properties,
-                }));
+            self.pending_properties.push(PendingNodeProperties {
+                indent: Span::usize_to_u32(indent),
+                span_start: Span::usize_to_u32(absolute_start),
+                properties,
+            });
         }
         Ok(())
     }
@@ -1294,7 +1155,9 @@ impl<'source> Parser<'source> {
         self.document = Some(document);
         self.document_has_content = false;
         self.document_was_explicitly_opened = explicit;
-        self.contexts.clear();
+        self.clear_block_frames();
+        self.pending_properties.clear();
+        self.block_scalar_indents.clear();
         self.push_node_event(YamlEventKind::DocumentStart { explicit }, span, document);
         document
     }
@@ -1316,7 +1179,9 @@ impl<'source> Parser<'source> {
         self.document_was_explicitly_opened = false;
         self.document_yaml_directive_seen = false;
         self.tag_handles.clear();
-        self.contexts.clear();
+        self.clear_block_frames();
+        self.pending_properties.clear();
+        self.block_scalar_indents.clear();
         Ok(())
     }
 
@@ -1407,11 +1272,11 @@ impl<'source> Parser<'source> {
         document: NodeId,
         lines: LineTable<'_>,
         index: usize,
+        line: SourceLine<'_>,
         indent: usize,
         body: &str,
     ) -> Result<usize, YamlError> {
-        let line = lines.line(index);
-        let sequence = self.ensure_sequence(
+        let sequence = self.sequence_for_line(
             document,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
@@ -1427,19 +1292,17 @@ impl<'source> Parser<'source> {
         reject_invalid_indicator_tab(body, line.content_start + indent)?;
         reject_invalid_sequence_tab_separated_nested_indicator(body, line.content_start + indent)?;
         let value = after_dash.trim_start();
-        let value_without_comment = strip_inline_comment(after_dash).trim_start();
-        if value.is_empty() || value_without_comment.is_empty() {
-            if next_significant_indent(lines, index)?.is_some_and(|next| next > indent) {
-                let consumed =
-                    self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
-                let end = lines.line(index + consumed - 1).content_end;
-                self.extend_node_span(entry, end);
-                self.extend_node_span(sequence, end);
-                return Ok(consumed);
-            }
-            let empty = self.push_empty_scalar(line.content_start + indent + 1);
-            self.attach_child_at(entry.0 as usize, empty);
-            self.emit_scalar_event(empty)?;
+        if value.is_empty() || value.starts_with('#') {
+            self.defer_block_value(
+                BlockEntryKind::Sequence,
+                entry,
+                sequence,
+                indent,
+                line.content_start + indent + 1,
+                false,
+                false,
+            );
+            Ok(1)
         } else {
             let leading = after_dash.len() - value.len();
             let value_start = line.content_start + indent + 1 + leading;
@@ -1449,6 +1312,18 @@ impl<'source> Parser<'source> {
                 self.attach_child_at(entry.as_usize(), value_node);
                 self.emit_property_free_plain_scalar(value_node);
                 return Ok(consumed);
+            }
+            if let Some(colon_byte) = simple_plain_key_mapping_colon(value) {
+                return self.parse_mapping_entry(
+                    entry,
+                    lines,
+                    index,
+                    line,
+                    value_start - line.content_start,
+                    value,
+                    colon_byte,
+                    value_start,
+                );
             }
             let value_properties = parse_node_properties(
                 value,
@@ -1462,8 +1337,8 @@ impl<'source> Parser<'source> {
                 self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
-            } else if let Some(header_offset) =
-                block_scalar_after_node_properties(value, value_start)?
+            } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
+                && let Some(header_offset) = block_scalar_after_node_properties(value, value_start)?
             {
                 self.push_pending_node_properties(
                     &value[..header_offset],
@@ -1481,22 +1356,28 @@ impl<'source> Parser<'source> {
                 self.attach_child_at(entry.0 as usize, node);
                 self.emit_scalar_event(node)?;
                 return Ok(consumed);
-            } else if let Some(next_indent) =
-                property_only_block_collection_indent(value, lines, index, value_start)?
-                    .filter(|next_indent| *next_indent > indent)
+            } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
+                && let Some(next_indent) =
+                    property_only_block_collection_indent(value, lines, index, value_start)?
+                        .filter(|next_indent| *next_indent > indent)
             {
                 self.push_pending_node_properties(value, value_start, next_indent)?;
-                let consumed =
-                    self.parse_nested_sequence_entry_value(entry, lines, index, indent)?;
-                let end = lines.line(index + consumed - 1).content_end;
-                self.extend_node_span(entry, end);
-                self.extend_node_span(sequence, end);
-                return Ok(consumed);
+                self.defer_block_value(
+                    BlockEntryKind::Sequence,
+                    entry,
+                    sequence,
+                    indent,
+                    line.content_end,
+                    false,
+                    true,
+                );
+                return Ok(1);
             } else if is_sequence_entry(value) {
                 return self.parse_sequence_entry(
                     entry,
                     lines,
                     index,
+                    line,
                     value_start - line.content_start,
                     value,
                 );
@@ -1504,17 +1385,15 @@ impl<'source> Parser<'source> {
                 let (value_node, _end, consumed) =
                     self.parse_flow_value_lines(lines, index, value_start)?;
                 self.attach_child_at(entry.0 as usize, value_node);
-                self.emit_node_event(value_node)?;
                 return Ok(consumed);
             } else if is_explicit_mapping_key(value) {
-                return self.parse_explicit_mapping_entry(
-                    entry,
-                    lines,
-                    index,
+                let prepared = PreparedBlockLine::from_body(
+                    line,
                     value_start - line.content_start,
                     value,
                     value_start,
-                );
+                )?;
+                return self.parse_explicit_mapping_entry(entry, lines, index, prepared);
             } else if is_compact_explicit_empty_key_mapping(value) {
                 self.parse_compact_explicit_empty_key_mapping(
                     entry,
@@ -1529,6 +1408,7 @@ impl<'source> Parser<'source> {
                     entry,
                     lines,
                     index,
+                    line,
                     value_start - line.content_start,
                     value,
                     colon_byte,
@@ -1541,10 +1421,8 @@ impl<'source> Parser<'source> {
                 self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
             self.attach_child_at(entry.0 as usize, value_node);
             self.emit_scalar_event(value_node)?;
-            return Ok(consumed);
+            Ok(consumed)
         }
-
-        Ok(1)
     }
 
     fn parse_compact_explicit_empty_key_mapping(
@@ -1555,7 +1433,7 @@ impl<'source> Parser<'source> {
         body: &str,
         absolute_start: usize,
     ) -> Result<(), YamlError> {
-        let mapping = self.ensure_mapping(
+        let mapping = self.mapping_for_line(
             parent,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
@@ -1651,18 +1529,23 @@ impl<'source> Parser<'source> {
         self.attach_child_at(mapping.0 as usize, entry);
 
         let key_text = body[..colon_byte].trim_end();
-        let key = if key_text.is_empty() {
-            self.push_empty_scalar(absolute_start)
+        let (key, flow_key) = if key_text.is_empty() {
+            (self.push_empty_scalar(absolute_start), false)
         } else if body_starts_flow_value(key_text, absolute_start)? {
             let (key, end) = self.parse_flow_value(key_text, absolute_start)?;
             reject_trailing_flow_content(key_text, end, absolute_start)?;
-            key
+            (key, true)
         } else {
             let key_end = absolute_start + key_text.len();
-            self.push_node(NodeKind::Scalar, Span::from_usize(absolute_start, key_end))
+            (
+                self.push_node(NodeKind::Scalar, Span::from_usize(absolute_start, key_end)),
+                false,
+            )
         };
         self.attach_child_at(entry.0 as usize, key);
-        self.emit_node_event(key)?;
+        if !flow_key {
+            self.emit_scalar_event(key)?;
+        }
 
         let raw_value = &body[colon_byte + 1..];
         let value_trimmed = raw_value.trim_start();
@@ -1688,114 +1571,106 @@ impl<'source> Parser<'source> {
         Ok(1)
     }
 
-    fn parse_nested_sequence_entry_value(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a deferred entry frame retains the complete attachment and indentation state"
+    )]
+    fn defer_block_value(
         &mut self,
-        entry: NodeId,
-        lines: LineTable<'_>,
-        index: usize,
-        parent_indent: usize,
-    ) -> Result<usize, YamlError> {
-        self.parse_nested_block_value(entry, lines, index, parent_indent, false)
+        kind: BlockEntryKind,
+        owner: NodeId,
+        collection: NodeId,
+        indent: usize,
+        empty_offset: usize,
+        allow_indentless_sequence: bool,
+        pending_properties: bool,
+    ) {
+        self.pending_block_values.push(BlockValueFrame {
+            kind,
+            indent: Span::usize_to_u32(indent),
+            owner,
+            collection,
+            phase: BlockEntryPhase::Value,
+            semantic_open: true,
+            pending_properties,
+            last_content_end: Span::usize_to_u32(empty_offset),
+            empty_offset: Span::usize_to_u32(empty_offset),
+            allow_indentless_sequence,
+            allow_same_indent_content: false,
+        });
     }
 
-    fn parse_nested_block_value(
+    fn defer_explicit_mapping(
         &mut self,
-        parent: NodeId,
-        lines: LineTable<'_>,
-        index: usize,
-        parent_indent: usize,
-        allow_same_indent_sequence: bool,
-    ) -> Result<usize, YamlError> {
-        let mut consumed = 1;
-        let mut nested_index = index + 1;
+        entry: NodeId,
+        mapping: NodeId,
+        indent: usize,
+        phase: BlockEntryPhase,
+        offset: usize,
+    ) {
+        debug_assert!(matches!(
+            phase,
+            BlockEntryPhase::Key | BlockEntryPhase::Separator
+        ));
+        self.pending_block_values.push(BlockValueFrame {
+            kind: BlockEntryKind::ExplicitMapping,
+            indent: Span::usize_to_u32(indent),
+            owner: entry,
+            collection: mapping,
+            phase,
+            semantic_open: true,
+            pending_properties: false,
+            last_content_end: Span::usize_to_u32(offset),
+            empty_offset: Span::usize_to_u32(offset),
+            allow_indentless_sequence: false,
+            allow_same_indent_content: true,
+        });
+    }
 
-        while nested_index < lines.len() {
-            let line = lines.line(nested_index);
-            let trimmed = line.content_without_break.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                consumed += 1;
-                nested_index += 1;
-                continue;
-            }
+    fn defer_explicit_mapping_value(
+        &mut self,
+        entry: NodeId,
+        mapping: NodeId,
+        indent: usize,
+        offset: usize,
+    ) {
+        self.defer_block_value(
+            BlockEntryKind::Mapping,
+            entry,
+            mapping,
+            indent,
+            offset,
+            false,
+            false,
+        );
+        let index = self.pending_block_values.len() - 1;
+        self.pending_block_values[index].allow_same_indent_content = true;
+    }
 
-            let nested_indent = content_line_indent(line.content_without_break);
-            if nested_indent < parent_indent {
-                break;
+    fn finish_block_value(&mut self, mut frame: BlockValueFrame) -> Result<(), YamlError> {
+        debug_assert!(frame.semantic_open);
+        if frame.kind == BlockEntryKind::ExplicitMapping {
+            self.close_sequence_at_indent(frame.indent as usize);
+            self.close_collections_deeper_than(frame.indent as usize);
+            if self.nodes[frame.owner.as_usize()].first_child == NO_NODE {
+                let key = self.push_empty_scalar(frame.empty_offset as usize);
+                self.attach_child_at(frame.owner.as_usize(), key);
+                self.emit_scalar_event(key)?;
             }
-
-            let body = &line.content_without_break[nested_indent..];
-            if nested_indent == parent_indent
-                && (!allow_same_indent_sequence || !is_sequence_entry(body))
-            {
-                break;
-            }
-            if property_only_node_indent(
-                body,
-                lines,
-                nested_index,
-                line.content_start + nested_indent,
-            )?
-            .is_some()
-                && let Some((header_index, header_indent, header_body)) =
-                    first_non_property_node_after_with_index(
-                        lines,
-                        nested_index,
-                        line.content_start + nested_indent,
-                    )?
-                && (header_body.starts_with('|') || header_body.starts_with('>'))
-            {
-                for property_line in lines
-                    .iter_from(nested_index)
-                    .take(header_index - nested_index)
-                {
-                    let property_trimmed = property_line.content_without_break.trim();
-                    if property_trimmed.is_empty() || property_trimmed.starts_with('#') {
-                        continue;
-                    }
-                    let property_indent = content_line_indent(property_line.content_without_break);
-                    let property_body = &property_line.content_without_break[property_indent..];
-                    self.push_pending_node_properties(
-                        property_body,
-                        property_line.content_start + property_indent,
-                        header_indent,
-                    )?;
-                }
-                let header_start = lines.line(header_index).content_start + header_indent;
-                let (node, scalar_consumed) = self.parse_block_scalar(
-                    lines,
-                    header_index,
-                    header_start,
-                    parent_indent,
-                    header_body,
-                    true,
-                )?;
-                self.attach_child_at(parent.0 as usize, node);
-                self.emit_scalar_event(node)?;
-                consumed += header_index - nested_index + scalar_consumed;
-                nested_index = header_index + scalar_consumed;
-                continue;
-            }
-
-            self.close_collections_deeper_than(nested_indent);
-            reject_unexpected_line_start(body, line.content_start + nested_indent)?;
-            if self.has_sequence_at(nested_indent) && !is_sequence_entry(body) {
-                return Err(invalid_nested_block_sequence_sibling(
-                    line.content_start + nested_indent,
-                ));
-            }
-            let nested_consumed = self.parse_content_body(
-                parent,
-                lines,
-                nested_index,
-                nested_indent,
-                body,
-                line.content_start + nested_indent,
-            )?;
-            consumed += nested_consumed;
-            nested_index += nested_consumed;
         }
-
-        Ok(consumed)
+        let needs_empty_value = frame.phase == BlockEntryPhase::Value
+            || matches!(
+                frame.phase,
+                BlockEntryPhase::Key | BlockEntryPhase::Separator
+            );
+        frame.phase = BlockEntryPhase::Complete;
+        frame.semantic_open = false;
+        if needs_empty_value {
+            let empty = self.push_empty_scalar(frame.empty_offset as usize);
+            self.attach_child_at(frame.owner.as_usize(), empty);
+            self.emit_scalar_event(empty)?;
+        }
+        Ok(())
     }
 
     fn parse_block_plain_scalar(
@@ -1807,7 +1682,10 @@ impl<'source> Parser<'source> {
         allow_same_indent_continuation: bool,
     ) -> Result<(NodeId, usize), YamlError> {
         let mut consumed = 1;
-        let initial_line = lines.line(index);
+        let initial_line = lines
+            .cursor_from(index)
+            .next()
+            .expect("current line index is in bounds");
         let mut end = initial_line.content_end;
         let mut pending_blank_lines = 0usize;
         let mut scalar_has_inline_comment = plain_scalar_line_has_inline_comment(
@@ -1819,10 +1697,20 @@ impl<'source> Parser<'source> {
                 initial_text,
                 Span::from_usize(value_start, initial_line.content_end),
             )?;
-            properties.anchor.is_some() || properties.tag.is_some()
+            properties.anchor().is_some() || properties.tag().is_some()
         } else {
             false
         };
+        let initial_properties = parse_node_properties(
+            initial_text,
+            Span::from_usize(value_start, initial_line.content_end),
+        )?;
+        let scalar_style = scalar_style_from_first_char(
+            initial_text[initial_properties.value_start()..]
+                .chars()
+                .next()
+                .unwrap_or(' '),
+        );
 
         for line in lines.iter_from(index + 1) {
             let trimmed = line.content_without_break.trim();
@@ -1852,7 +1740,7 @@ impl<'source> Parser<'source> {
             }
             let indent = content_line_indent(line.content_without_break);
             let body = &line.content_without_break[indent..];
-            if scalar_has_inline_comment || find_mapping_colon(body).is_some() {
+            if scalar_has_inline_comment || plain_continuation_has_mapping_colon(body) {
                 return Err(invalid_plain_scalar_continuation(
                     line.content_start + indent,
                 ));
@@ -1864,10 +1752,11 @@ impl<'source> Parser<'source> {
             scalar_has_inline_comment |= plain_scalar_line_has_inline_comment(body);
         }
 
-        Ok((
-            self.push_node(NodeKind::Scalar, Span::from_usize(value_start, end)),
-            consumed,
-        ))
+        let node = self.push_node(NodeKind::Scalar, Span::from_usize(value_start, end));
+        if consumed > 1 {
+            self.mark_scalar_syntax(node, scalar_style, scalar_style == YamlScalarStyle::Plain);
+        }
+        Ok((node, consumed))
     }
 
     fn parse_flow_value(
@@ -1880,14 +1769,18 @@ impl<'source> Parser<'source> {
             Span::from_usize(absolute_start, absolute_start + text.len()),
         )?;
         reject_invalid_node_property_placement(text, absolute_start, &properties)?;
+        let pending_properties = self.take_pending_node_properties_at(absolute_start);
         let value_start =
-            properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
+            properties.value_start() + leading_flow_whitespace(&text[properties.value_start()..]);
         let value_text = &text[value_start..];
         if value_text.starts_with(['[', '{']) {
             let collection_start = absolute_start + value_start;
             let (node, consumed) =
                 self.parse_flow_collection_iterative(value_text, collection_start)?;
             self.nodes[node.as_usize()].span.start = Span::usize_to_u32(absolute_start);
+            self.register_flow_collection_semantics(node, properties, pending_properties)?;
+            let span = self.nodes[node.as_usize()].span;
+            self.semantics.attach_flow_root(node, span);
             Ok((node, value_start + consumed))
         } else {
             let end = flow_scalar_end(text, value_start, absolute_start, &[',', ']', '}'])?;
@@ -1896,13 +1789,24 @@ impl<'source> Parser<'source> {
             if scalar_start >= scalar_end {
                 return Err(empty_flow_value(absolute_start));
             }
-            Ok((
-                self.push_node(
-                    NodeKind::Scalar,
-                    Span::from_usize(absolute_start, absolute_start + scalar_end),
+            let node = self.push_node(
+                NodeKind::Scalar,
+                Span::from_usize(absolute_start, absolute_start + scalar_end),
+            );
+            self.mark_scalar_syntax(
+                node,
+                scalar_style_from_first_char(
+                    text[scalar_start..]
+                        .chars()
+                        .next()
+                        .expect("scalar start is inside text"),
                 ),
-                end,
-            ))
+                matches!(text.as_bytes()[scalar_start], b'"' | b'\''),
+            );
+            self.register_flow_scalar_semantics(node, properties, pending_properties)?;
+            let span = self.nodes[node.as_usize()].span;
+            self.semantics.attach_flow_root(node, span);
+            Ok((node, end))
         }
     }
 
@@ -1922,17 +1826,23 @@ impl<'source> Parser<'source> {
             },
             Span::from_usize(absolute_start, absolute_start + open.len_utf8()),
         );
-        let mut flow = FlowParseState::new(text, absolute_start, root, open);
-
-        loop {
+        let frames = std::mem::take(&mut self.flow_frames);
+        let mut flow = FlowParseState::new(text, absolute_start, root, open, frames);
+        let result = loop {
             if let Some((child, child_end)) = flow.completed.take() {
-                if let Some(end) = self.resume_completed_flow_node(&mut flow, child, child_end)? {
-                    return Ok((flow.root, end));
+                match self.resume_completed_flow_node(&mut flow, child, child_end) {
+                    Ok(Some(end)) => break Ok((flow.root, end)),
+                    Ok(None) => {}
+                    Err(error) => break Err(error),
                 }
                 continue;
             }
-            self.advance_flow_frame(&mut flow)?;
-        }
+            if let Err(error) = self.advance_flow_frame(&mut flow) {
+                break Err(error);
+            }
+        };
+        self.flow_frames = flow.frames;
+        result
     }
 
     fn resume_completed_flow_node(
@@ -1978,7 +1888,7 @@ impl<'source> Parser<'source> {
                 self.finish_flow_mapping_entry(
                     frame.node,
                     entry,
-                    entry_start,
+                    entry_start as usize,
                     flow.position,
                     flow.absolute_start,
                 );
@@ -2010,6 +1920,7 @@ impl<'source> Parser<'source> {
                 flow.absolute_start + flow.position,
             ));
         };
+        let entry_start = entry_start as usize;
         flow.position = skip_flow_whitespace(flow.text, flow.position);
         if flow.text[flow.position..].starts_with(':') {
             if !explicit {
@@ -2027,6 +1938,7 @@ impl<'source> Parser<'source> {
                     flow.absolute_start + flow.position,
                 ),
             );
+            self.register_implicit_flow_mapping(mapping);
             let mapping_entry = self.push_node(
                 NodeKind::MappingEntry,
                 Span::from_usize(
@@ -2038,7 +1950,7 @@ impl<'source> Parser<'source> {
             self.attach_child_at(mapping_entry.as_usize(), child);
             flow.position = skip_flow_whitespace(flow.text, flow.position + 1);
             if flow.text[flow.position..].starts_with([',', ']']) {
-                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
                 self.attach_child_at(mapping_entry.as_usize(), value);
                 self.finish_flow_mapping_sequence_item(
                     frame.node,
@@ -2065,6 +1977,7 @@ impl<'source> Parser<'source> {
                     flow.absolute_start + flow.position,
                 ),
             );
+            self.register_implicit_flow_mapping(mapping);
             let mapping_entry = self.push_node(
                 NodeKind::MappingEntry,
                 Span::from_usize(
@@ -2072,7 +1985,7 @@ impl<'source> Parser<'source> {
                     flow.absolute_start + flow.position,
                 ),
             );
-            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
             self.attach_child_at(mapping.as_usize(), mapping_entry);
             self.attach_child_at(mapping_entry.as_usize(), child);
             self.attach_child_at(mapping_entry.as_usize(), value);
@@ -2112,6 +2025,7 @@ impl<'source> Parser<'source> {
                 flow.absolute_start + flow.position,
             ));
         };
+        let entry_start = entry_start as usize;
         self.attach_child_at(entry.as_usize(), child);
         flow.position = skip_flow_whitespace(flow.text, flow.position);
         if flow.text[flow.position..].starts_with(':') {
@@ -2125,7 +2039,7 @@ impl<'source> Parser<'source> {
                 self.source_indent_at(flow.absolute_start),
             )?;
             if flow.text[flow.position..].starts_with([',', '}']) {
-                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
                 self.attach_child_at(entry.as_usize(), value);
                 self.finish_flow_mapping_entry(
                     frame.node,
@@ -2136,12 +2050,14 @@ impl<'source> Parser<'source> {
                 );
                 flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
             } else {
-                flow.frames[frame_index].state =
-                    FlowFrameState::MappingAwaitValue { entry, entry_start };
+                flow.frames[frame_index].state = FlowFrameState::MappingAwaitValue {
+                    entry,
+                    entry_start: Span::usize_to_u32(entry_start),
+                };
                 self.start_flow_node(flow, frame.close)?;
             }
         } else if explicit || flow.text[flow.position..].starts_with(',') {
-            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
             self.attach_child_at(entry.as_usize(), value);
             self.finish_flow_mapping_entry(
                 frame.node,
@@ -2169,7 +2085,7 @@ impl<'source> Parser<'source> {
         let frame = flow.frames[frame_index];
         flow.position = skip_flow_whitespace(flow.text, flow.position);
         let Some(character) = flow.text[flow.position..].chars().next() else {
-            return Err(if frame.kind == FlowCollectionKind::Sequence {
+            return Err(if frame.close == ']' {
                 missing_flow_sequence_end(flow.absolute_start, flow.text.len())
             } else {
                 missing_flow_mapping_end(flow.absolute_start, flow.text.len())
@@ -2231,16 +2147,17 @@ impl<'source> Parser<'source> {
                 NodeKind::FlowMapping,
                 Span::empty_from_usize(flow.absolute_start + entry_start),
             );
+            self.register_implicit_flow_mapping(mapping);
             let mapping_entry = self.push_node(
                 NodeKind::MappingEntry,
                 Span::empty_from_usize(flow.absolute_start + entry_start),
             );
-            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let key = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
             self.attach_child_at(mapping.as_usize(), mapping_entry);
             self.attach_child_at(mapping_entry.as_usize(), key);
             flow.position = skip_flow_whitespace(flow.text, flow.position + 1);
             if flow.text[flow.position..].starts_with([',', ']']) {
-                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
                 self.attach_child_at(mapping_entry.as_usize(), value);
                 self.finish_flow_mapping_sequence_item(
                     frame.node,
@@ -2264,12 +2181,13 @@ impl<'source> Parser<'source> {
                 NodeKind::FlowMapping,
                 Span::empty_from_usize(flow.absolute_start + entry_start),
             );
+            self.register_implicit_flow_mapping(mapping);
             let mapping_entry = self.push_node(
                 NodeKind::MappingEntry,
                 Span::empty_from_usize(flow.absolute_start + entry_start),
             );
-            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
-            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let key = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
             self.attach_child_at(mapping.as_usize(), mapping_entry);
             self.attach_child_at(mapping_entry.as_usize(), key);
             self.attach_child_at(mapping_entry.as_usize(), value);
@@ -2285,7 +2203,7 @@ impl<'source> Parser<'source> {
         } else {
             flow.frames[frame_index].state = FlowFrameState::SequenceAwaitItem {
                 entry,
-                entry_start,
+                entry_start: Span::usize_to_u32(entry_start),
                 explicit,
             };
             self.start_flow_node(flow, frame.close)?;
@@ -2328,7 +2246,7 @@ impl<'source> Parser<'source> {
         if flow.text[flow.position..].starts_with(':')
             && is_flow_mapping_separator_colon(flow.text, flow.position)
         {
-            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let key = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
             self.attach_child_at(entry.as_usize(), key);
             let value_start = flow.position + 1;
             flow.position = skip_flow_whitespace(flow.text, value_start);
@@ -2340,7 +2258,7 @@ impl<'source> Parser<'source> {
                 self.source_indent_at(flow.absolute_start),
             )?;
             if flow.text[flow.position..].starts_with([',', '}']) {
-                let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
                 self.attach_child_at(entry.as_usize(), value);
                 self.finish_flow_mapping_entry(
                     frame.node,
@@ -2351,13 +2269,15 @@ impl<'source> Parser<'source> {
                 );
                 flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
             } else {
-                flow.frames[frame_index].state =
-                    FlowFrameState::MappingAwaitValue { entry, entry_start };
+                flow.frames[frame_index].state = FlowFrameState::MappingAwaitValue {
+                    entry,
+                    entry_start: Span::usize_to_u32(entry_start),
+                };
                 self.start_flow_node(flow, frame.close)?;
             }
         } else if explicit && flow.text[flow.position..].starts_with([',', '}']) {
-            let key = self.push_empty_scalar(flow.absolute_start + flow.position);
-            let value = self.push_empty_scalar(flow.absolute_start + flow.position);
+            let key = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
             self.attach_child_at(entry.as_usize(), key);
             self.attach_child_at(entry.as_usize(), value);
             self.finish_flow_mapping_entry(
@@ -2371,7 +2291,7 @@ impl<'source> Parser<'source> {
         } else {
             flow.frames[frame_index].state = FlowFrameState::MappingAwaitKey {
                 entry,
-                entry_start,
+                entry_start: Span::usize_to_u32(entry_start),
                 explicit,
             };
             self.start_flow_node(flow, frame.close)?;
@@ -2436,6 +2356,11 @@ impl<'source> Parser<'source> {
         flow.position += character.len_utf8();
         self.nodes[frame.node.as_usize()].span.end =
             Span::usize_to_u32(flow.absolute_start + flow.position);
+        if frame.node != flow.root {
+            let span = self.nodes[frame.node.as_usize()].span;
+            self.semantics
+                .finish_flow_collection(&mut self.nodes, frame.node, span);
+        }
         flow.frames.pop();
         flow.completed = Some((frame.node, flow.position));
     }
@@ -2479,24 +2404,23 @@ impl<'source> Parser<'source> {
             &properties,
         )?;
         let marker = start
-            + properties.value_start
-            + leading_flow_whitespace(&text[start + properties.value_start..]);
+            + properties.value_start()
+            + leading_flow_whitespace(&text[start + properties.value_start()..]);
         let Some(character) = text[marker..].chars().next() else {
             return Err(empty_flow_value(absolute_start + start));
         };
-        if (properties.anchor.is_some() || properties.tag.is_some())
+        if (properties.anchor().is_some() || properties.tag().is_some())
             && (character == ','
                 || character == close
                 || character == ':' && is_flow_mapping_separator_colon(text, marker))
         {
             let property_end = marker - trailing_flow_whitespace(&text[start..marker]);
-            return Ok(FlowNode::Scalar(
-                self.push_node(
-                    NodeKind::Scalar,
-                    Span::from_usize(absolute_start + start, absolute_start + property_end),
-                ),
-                marker,
-            ));
+            let node = self.push_node(
+                NodeKind::Scalar,
+                Span::from_usize(absolute_start + start, absolute_start + property_end),
+            );
+            self.register_flow_scalar_semantics(node, properties, None)?;
+            return Ok(FlowNode::Scalar(node, marker));
         }
         if matches!(character, '[' | '{') {
             let node = self.push_node(
@@ -2510,6 +2434,7 @@ impl<'source> Parser<'source> {
                     absolute_start + marker + character.len_utf8(),
                 ),
             );
+            self.register_flow_collection_semantics(node, properties, None)?;
             return Ok(FlowNode::Collection(
                 flow_frame(node, character),
                 marker + character.len_utf8(),
@@ -2521,13 +2446,17 @@ impl<'source> Parser<'source> {
         if marker >= trimmed_end {
             return Err(empty_flow_value(absolute_start + start));
         }
-        Ok(FlowNode::Scalar(
-            self.push_node(
-                NodeKind::Scalar,
-                Span::from_usize(absolute_start + start, absolute_start + trimmed_end),
-            ),
-            end,
-        ))
+        let node = self.push_node(
+            NodeKind::Scalar,
+            Span::from_usize(absolute_start + start, absolute_start + trimmed_end),
+        );
+        self.mark_scalar_syntax(
+            node,
+            scalar_style_from_first_char(character),
+            matches!(character, '"' | '\''),
+        );
+        self.register_flow_scalar_semantics(node, properties, None)?;
+        Ok(FlowNode::Scalar(node, end))
     }
 
     fn finish_flow_mapping_sequence_item(
@@ -2542,6 +2471,9 @@ impl<'source> Parser<'source> {
         let absolute_end = Span::usize_to_u32(absolute_start + end);
         self.nodes[mapping_entry.as_usize()].span.end = absolute_end;
         self.nodes[mapping.as_usize()].span.end = absolute_end;
+        let mapping_span = self.nodes[mapping.as_usize()].span;
+        self.semantics
+            .finish_flow_collection(&mut self.nodes, mapping, mapping_span);
         self.attach_child_at(entry.as_usize(), mapping);
         self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + end);
         self.attach_child_at(sequence.as_usize(), entry);
@@ -2561,6 +2493,18 @@ impl<'source> Parser<'source> {
         self.nodes[mapping.as_usize()].span.end = Span::usize_to_u32(absolute_start + end);
     }
 
+    fn register_implicit_flow_mapping(&mut self, mapping: NodeId) {
+        let span = self.nodes[mapping.as_usize()].span;
+        self.semantics.register_flow_collection(
+            &mut self.nodes,
+            mapping,
+            span,
+            CollectionStyle::Flow,
+            true,
+            SemanticProperties::NONE,
+        );
+    }
+
     fn parse_block_scalar(
         &mut self,
         lines: LineTable<'_>,
@@ -2575,7 +2519,10 @@ impl<'source> Parser<'source> {
         let mut content_indent = header
             .indent
             .map_or(usize::MAX, |indent| parent_indent + indent);
-        let initial_line = lines.line(index);
+        let initial_line = lines
+            .cursor_from(index)
+            .next()
+            .expect("current line index is in bounds");
         let mut end = initial_line.line_end;
         let inline_header =
             header_start > initial_line.content_start + parent_indent && !allow_same_indent_content;
@@ -2655,29 +2602,25 @@ impl<'source> Parser<'source> {
         } else {
             content_indent
         };
-        self.contexts.push(ContextFrame::BlockScalarIndent {
+        self.block_scalar_indents.push(BlockScalarIndent {
             node: scalar,
-            indent: content_indent,
+            indent: Span::usize_to_u32(content_indent),
         });
         Ok((scalar, consumed))
     }
 
-    fn ensure_mapping(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
-        if let Some(node) = self.contexts.iter().find_map(|frame| match frame {
-            ContextFrame::Mapping {
-                indent: level,
-                node,
-            } if *level == indent => Some(*node),
-            _ => None,
-        }) {
+    fn mapping_for_line(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
+        if let Some(node) = self.collection_at(self.last_mapping_frame, indent) {
             node
         } else {
             let (span, properties) = self.collection_properties(indent, span);
             let mapping = self.push_node(NodeKind::BlockMapping, span);
             self.attach_child_at(parent.0 as usize, mapping);
-            self.contexts.push(ContextFrame::Mapping {
-                indent,
+            self.push_block_frame(BlockFrame {
+                indent: Span::usize_to_u32(indent),
                 node: mapping,
+                collection: OpenEventCollection::Mapping,
+                previous_same_kind: NO_BLOCK_FRAME,
             });
             self.open_event_collection(
                 indent,
@@ -2704,22 +2647,18 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn ensure_sequence(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
-        if let Some(node) = self.contexts.iter().find_map(|frame| match frame {
-            ContextFrame::Sequence {
-                indent: level,
-                node,
-            } if *level == indent => Some(*node),
-            _ => None,
-        }) {
+    fn sequence_for_line(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
+        if let Some(node) = self.collection_at(self.last_sequence_frame, indent) {
             node
         } else {
             let (span, properties) = self.collection_properties(indent, span);
             let sequence = self.push_node(NodeKind::BlockSequence, span);
             self.attach_child_at(parent.0 as usize, sequence);
-            self.contexts.push(ContextFrame::Sequence {
-                indent,
+            self.push_block_frame(BlockFrame {
+                indent: Span::usize_to_u32(indent),
                 node: sequence,
+                collection: OpenEventCollection::Sequence,
+                previous_same_kind: NO_BLOCK_FRAME,
             });
             self.open_event_collection(
                 indent,
@@ -2737,35 +2676,53 @@ impl<'source> Parser<'source> {
         }
     }
 
+    fn collection_at(&self, frame: u32, indent: usize) -> Option<NodeId> {
+        let frame = self.block_frames.get(frame as usize)?;
+        (frame.indent as usize == indent).then_some(frame.node)
+    }
+
+    fn push_block_frame(&mut self, mut frame: BlockFrame) {
+        let index = u32::try_from(self.block_frames.len())
+            .expect("block collection stack exceeds u32 capacity");
+        let last = match frame.collection {
+            OpenEventCollection::Mapping => &mut self.last_mapping_frame,
+            OpenEventCollection::Sequence => &mut self.last_sequence_frame,
+        };
+        frame.previous_same_kind = *last;
+        *last = index;
+        self.block_frames.push(frame);
+    }
+
+    fn clear_block_frames(&mut self) {
+        self.block_frames.clear();
+        self.last_mapping_frame = NO_BLOCK_FRAME;
+        self.last_sequence_frame = NO_BLOCK_FRAME;
+    }
+
     fn collection_properties(&mut self, indent: usize, span: Span) -> (Span, NodeProperties) {
         let Some(pending) = self.take_pending_node_properties(indent) else {
             return (span, NodeProperties::default());
         };
-        (
-            Span::new(Span::usize_to_u32(pending.span_start), span.end),
-            pending.properties,
-        )
+        (Span::new(pending.span_start, span.end), pending.properties)
     }
 
     fn take_pending_node_properties(&mut self, indent: usize) -> Option<PendingNodeProperties> {
-        let index = self.contexts.iter().rposition(|frame| {
-            matches!(
-                frame,
-                ContextFrame::PendingProperties(pending) if pending.indent == indent
-            )
-        })?;
-        match self.contexts.remove(index) {
-            ContextFrame::PendingProperties(pending) => Some(pending),
-            _ => unreachable!("matched pending properties frame"),
+        if self
+            .pending_properties
+            .last()
+            .is_some_and(|pending| pending.indent as usize == indent)
+        {
+            return self.pending_properties.pop();
         }
+        let index = self
+            .pending_properties
+            .iter()
+            .rposition(|pending| pending.indent as usize == indent)?;
+        Some(self.pending_properties.remove(index))
     }
 
     fn take_pending_node_properties_at(&mut self, offset: usize) -> Option<PendingNodeProperties> {
-        if !self
-            .contexts
-            .iter()
-            .any(|frame| matches!(frame, ContextFrame::PendingProperties(_)))
-        {
+        if self.pending_properties.is_empty() {
             return None;
         }
         self.take_pending_node_properties(self.source_indent_at(offset))
@@ -2787,7 +2744,7 @@ impl<'source> Parser<'source> {
             return Ok(());
         }
 
-        let has_parent_collection = self.has_parent_collection_below(indent);
+        let has_parent_collection = self.parent_collection_below(indent);
 
         let is_indented_root_collection = !has_parent_collection
             && (is_sequence_entry(body) || body_starts_flow_value_start(body));
@@ -2806,24 +2763,20 @@ impl<'source> Parser<'source> {
         }
     }
 
-    fn has_parent_collection_below(&self, indent: usize) -> bool {
-        self.contexts.iter().any(|frame| match frame {
-            ContextFrame::Mapping { indent: level, .. }
-            | ContextFrame::Sequence { indent: level, .. } => *level < indent,
-            _ => false,
-        })
+    fn parent_collection_below(&self, indent: usize) -> bool {
+        self.block_frames
+            .first()
+            .is_some_and(|frame| (frame.indent as usize) < indent)
     }
 
-    fn has_mapping_at(&self, indent: usize) -> bool {
-        self.contexts.iter().any(|frame| {
-            matches!(frame, ContextFrame::Mapping { indent: level, .. } if *level == indent)
-        })
+    fn mapping_is_open_at(&self, indent: usize) -> bool {
+        self.collection_at(self.last_mapping_frame, indent)
+            .is_some()
     }
 
-    fn has_sequence_at(&self, indent: usize) -> bool {
-        self.contexts.iter().any(|frame| {
-            matches!(frame, ContextFrame::Sequence { indent: level, .. } if *level == indent)
-        })
+    fn sequence_is_open_at(&self, indent: usize) -> bool {
+        self.collection_at(self.last_sequence_frame, indent)
+            .is_some()
     }
 
     fn reject_invalid_block_sibling(
@@ -2833,28 +2786,29 @@ impl<'source> Parser<'source> {
         body: &str,
         known_mapping: bool,
     ) -> Result<(), YamlError> {
-        if self.has_sequence_at(indent) && !is_sequence_entry(body) {
-            let has_mapping_at_indent = self.has_mapping_at(indent);
+        if self.sequence_is_open_at(indent) && !is_sequence_entry(body) {
+            let mapping_is_open_at_indent = self.mapping_is_open_at(indent);
             let is_mapping_sibling = is_explicit_mapping_key(body)
                 || is_explicit_mapping_value(body)
                 || known_mapping
                 || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
                 || find_mapping_colon(body).is_some();
-            if !has_mapping_at_indent || !is_mapping_sibling {
+            if !mapping_is_open_at_indent || !is_mapping_sibling {
                 return Err(invalid_nested_block_sequence_sibling(
                     line.content_start + indent,
                 ));
             }
         }
-        if self.has_mapping_at(indent) && comment_text_contains_mapping_colon(body) {
+        if self.mapping_is_open_at(indent) && comment_text_contains_mapping_colon(body) {
             return Err(invalid_orphaned_block_content(
                 line.content_start + indent + separated_comment_offset(body).unwrap_or(0),
             ));
         }
 
-        let has_collection_at_indent = self.has_mapping_at(indent) || self.has_sequence_at(indent);
+        let has_collection_at_indent =
+            self.mapping_is_open_at(indent) || self.sequence_is_open_at(indent);
         let is_indented_root_collection = indent > 0
-            && !self.has_parent_collection_below(indent)
+            && !self.parent_collection_below(indent)
             && (is_sequence_entry(body) || body_starts_flow_value_start(body));
         if indent > 0
             && !has_collection_at_indent
@@ -2872,44 +2826,47 @@ impl<'source> Parser<'source> {
     }
 
     fn close_collections_deeper_than(&mut self, indent: usize) {
-        self.contexts.retain(|frame| match frame {
-            ContextFrame::Mapping { indent: level, .. }
-            | ContextFrame::Sequence { indent: level, .. } => *level <= indent,
-            _ => true,
-        });
-        self.close_event_collections_deeper_than(indent);
+        while self
+            .block_frames
+            .last()
+            .is_some_and(|frame| frame.indent as usize > indent)
+        {
+            self.close_last_event_collection();
+        }
     }
 
     fn close_sequence_at_indent(&mut self, indent: usize) {
-        let Some(index) = self.contexts.iter().rposition(|frame| {
-            matches!(frame, ContextFrame::Sequence { indent: level, .. } if *level == indent)
-        })
-        else {
-            return;
-        };
-        if self
-            .last_event_collection()
-            .is_some_and(|(level, collection)| {
-                level == indent && collection == OpenEventCollection::Sequence
-            })
-        {
-            self.contexts.remove(index);
+        if self.block_frames.last().is_some_and(|frame| {
+            frame.indent as usize == indent && frame.collection == OpenEventCollection::Sequence
+        }) {
             self.close_last_event_collection();
         }
     }
 
     fn push_node(&mut self, kind: NodeKind, span: Span) -> NodeId {
         let id = NodeId::from_usize(self.nodes.len());
-        self.semantics.register_cst_node();
         self.nodes.push(Node {
             kind,
+            syntax_flags: 0,
             span,
             parent: NO_NODE,
             first_child: NO_NODE,
             last_child: NO_NODE,
             next_sibling: NO_NODE,
+            semantic: NO_SEMANTIC_NODE,
         });
         id
+    }
+
+    fn mark_scalar_syntax(&mut self, node: NodeId, style: YamlScalarStyle, validated: bool) {
+        let style = match style {
+            YamlScalarStyle::Plain => SCALAR_STYLE_PLAIN,
+            YamlScalarStyle::SingleQuoted => SCALAR_STYLE_SINGLE_QUOTED,
+            YamlScalarStyle::DoubleQuoted => SCALAR_STYLE_DOUBLE_QUOTED,
+            YamlScalarStyle::Literal | YamlScalarStyle::Folded => 0,
+        };
+        self.nodes[node.as_usize()].syntax_flags =
+            style | (u8::from(validated) * SCALAR_SYNTAX_VALIDATED);
     }
 
     fn attach_child_at(&mut self, parent_index: usize, child: NodeId) {
@@ -2929,6 +2886,20 @@ impl<'source> Parser<'source> {
         self.push_node(NodeKind::Scalar, Span::empty_from_usize(offset))
     }
 
+    fn push_empty_flow_scalar(&mut self, offset: usize) -> NodeId {
+        let node = self.push_empty_scalar(offset);
+        self.semantics.register_flow_scalar(
+            &mut self.nodes,
+            node,
+            Span::empty_from_usize(offset),
+            SemanticKind::Scalar {
+                style: YamlScalarStyle::Plain,
+            },
+            SemanticProperties::NONE,
+        );
+        node
+    }
+
     fn extend_node_span(&mut self, node: NodeId, end: usize) {
         let node = &mut self.nodes[node.as_usize()];
         node.span.end = node.span.end.max(Span::usize_to_u32(end));
@@ -2936,12 +2907,17 @@ impl<'source> Parser<'source> {
 
     fn push_event(&mut self, kind: YamlEventKind, span: Span) {
         self.semantics
-            .push(kind, span, None, SemanticProperties::NONE);
+            .push(&mut self.nodes, kind, span, None, SemanticProperties::NONE);
     }
 
     fn push_node_event(&mut self, kind: YamlEventKind, span: Span, cst: NodeId) {
-        self.semantics
-            .push(kind, span, Some(cst), SemanticProperties::NONE);
+        self.semantics.push(
+            &mut self.nodes,
+            kind,
+            span,
+            Some(cst),
+            SemanticProperties::NONE,
+        );
     }
 
     fn push_node_event_with_properties(
@@ -2951,20 +2927,19 @@ impl<'source> Parser<'source> {
         cst: NodeId,
         properties: SemanticProperties,
     ) {
-        self.semantics.push(kind, span, Some(cst), properties);
+        self.semantics
+            .push(&mut self.nodes, kind, span, Some(cst), properties);
     }
 
     fn open_event_collection(
         &mut self,
-        indent: usize,
-        collection: OpenEventCollection,
+        _indent: usize,
+        _collection: OpenEventCollection,
         kind: YamlEventKind,
         span: Span,
         cst: NodeId,
         properties: SemanticProperties,
     ) {
-        self.contexts
-            .push(ContextFrame::EventCollection { indent, collection });
         self.push_node_event_with_properties(kind, span, cst, properties);
     }
 
@@ -2984,18 +2959,21 @@ impl<'source> Parser<'source> {
     }
 
     fn close_last_event_collection(&mut self) {
-        let Some(index) = self
-            .contexts
-            .iter()
-            .rposition(|frame| matches!(frame, ContextFrame::EventCollection { .. }))
-        else {
+        let Some(frame) = self.block_frames.pop() else {
             return;
         };
-        let ContextFrame::EventCollection { collection, .. } = self.contexts.remove(index) else {
-            unreachable!("matched event collection frame");
-        };
+        match frame.collection {
+            OpenEventCollection::Mapping => {
+                debug_assert_eq!(self.last_mapping_frame as usize, self.block_frames.len());
+                self.last_mapping_frame = frame.previous_same_kind;
+            }
+            OpenEventCollection::Sequence => {
+                debug_assert_eq!(self.last_sequence_frame as usize, self.block_frames.len());
+                self.last_sequence_frame = frame.previous_same_kind;
+            }
+        }
         let offset = Span::usize_to_u32(self.source.len());
-        let kind = match collection {
+        let kind = match frame.collection {
             OpenEventCollection::Mapping => YamlEventKind::MappingEnd,
             OpenEventCollection::Sequence => YamlEventKind::SequenceEnd,
         };
@@ -3003,132 +2981,81 @@ impl<'source> Parser<'source> {
     }
 
     fn last_event_collection(&self) -> Option<(usize, OpenEventCollection)> {
-        self.contexts.iter().rev().find_map(|frame| match frame {
-            ContextFrame::EventCollection { indent, collection } => Some((*indent, *collection)),
-            _ => None,
-        })
+        self.block_frames
+            .last()
+            .map(|frame| (frame.indent as usize, frame.collection))
     }
 
-    fn emit_node_event(&mut self, node: NodeId) -> Result<(), YamlError> {
-        let mut pending = vec![PendingFlowEvent::Node(node)];
-        while let Some(event) = pending.pop() {
-            match event {
-                PendingFlowEvent::Node(node) => match self.nodes[node.as_usize()].kind {
-                    NodeKind::FlowSequence => {
-                        let span = self.emit_flow_sequence_start(node)?;
-                        pending.push(PendingFlowEvent::SequenceEnd(span));
-                        pending.push(PendingFlowEvent::Entries(
-                            self.nodes[node.as_usize()].first_child,
-                        ));
-                    }
-                    NodeKind::FlowMapping => {
-                        let span = self.emit_flow_mapping_start(node)?;
-                        pending.push(PendingFlowEvent::MappingEnd(span));
-                        pending.push(PendingFlowEvent::Entries(
-                            self.nodes[node.as_usize()].first_child,
-                        ));
-                    }
-                    NodeKind::Scalar => {
-                        let text = self.source.slice(self.nodes[node.as_usize()].span);
-                        if is_simple_plain_atom(text) {
-                            self.emit_property_free_plain_scalar(node);
-                        } else {
-                            self.emit_scalar_event(node)?;
-                        }
-                    }
-                    NodeKind::LiteralScalar | NodeKind::FoldedScalar => {
-                        self.emit_scalar_event(node)?;
-                    }
-                    _ => {}
-                },
-                PendingFlowEvent::Entries(next) => {
-                    let Some(entry) = node_link(next) else {
-                        continue;
-                    };
-                    pending.push(PendingFlowEvent::Entries(
-                        self.nodes[entry.as_usize()].next_sibling,
-                    ));
-                    pending.push(PendingFlowEvent::Children(
-                        self.nodes[entry.as_usize()].first_child,
-                    ));
-                }
-                PendingFlowEvent::Children(next) => {
-                    let Some(child) = node_link(next) else {
-                        continue;
-                    };
-                    pending.push(PendingFlowEvent::Children(
-                        self.nodes[child.as_usize()].next_sibling,
-                    ));
-                    pending.push(PendingFlowEvent::Node(child));
-                }
-                PendingFlowEvent::SequenceEnd(span) => {
-                    self.semantics.push_collection_end(span, false);
-                }
-                PendingFlowEvent::MappingEnd(span) => {
-                    self.semantics.push_collection_end(span, true);
-                }
-            }
-        }
+    fn register_flow_collection_semantics(
+        &mut self,
+        node: NodeId,
+        mut properties: NodeProperties,
+        pending: Option<PendingNodeProperties>,
+    ) -> Result<(), YamlError> {
+        let span = self.nodes[node.as_usize()].span;
+        merge_pending_properties(&mut properties, pending);
+        self.resolve_node_properties(&properties, span)?;
+        let semantic_properties = semantic_properties(&properties, None);
+        let mapping = self.nodes[node.as_usize()].kind == NodeKind::FlowMapping;
+        self.semantics.register_flow_collection(
+            &mut self.nodes,
+            node,
+            span,
+            CollectionStyle::Flow,
+            mapping,
+            semantic_properties,
+        );
         Ok(())
     }
 
-    fn emit_flow_sequence_start(&mut self, node: NodeId) -> Result<Span, YamlError> {
-        let sequence_span = self.nodes[node.0 as usize].span;
-        let mut properties = self.flow_event_properties(sequence_span)?;
-        self.resolve_node_properties(&properties, sequence_span)?;
-        let span = self.apply_pending_event_properties(&mut properties, sequence_span);
-        let semantic_properties = semantic_properties(&properties, None);
-        self.semantics.push_collection_start(
-            node,
-            span,
-            CollectionStyle::Flow,
-            false,
-            semantic_properties,
-        );
-        Ok(span)
-    }
-
-    fn emit_flow_mapping_start(&mut self, node: NodeId) -> Result<Span, YamlError> {
-        let mapping_span = self.nodes[node.0 as usize].span;
-        let mut properties = self.flow_event_properties(mapping_span)?;
-        self.resolve_node_properties(&properties, mapping_span)?;
-        let span = self.apply_pending_event_properties(&mut properties, mapping_span);
-        let semantic_properties = semantic_properties(&properties, None);
-        self.semantics.push_collection_start(
-            node,
-            span,
-            CollectionStyle::Flow,
-            true,
-            semantic_properties,
-        );
-        Ok(span)
-    }
-
-    fn apply_pending_event_properties(
+    fn register_flow_scalar_semantics(
         &mut self,
-        properties: &mut NodeProperties,
-        span: Span,
-    ) -> Span {
-        if let Some(pending) = self.take_pending_node_properties_at(span.start as usize) {
-            if properties.anchor.is_none() {
-                properties.anchor = pending.properties.anchor;
-            }
-            if properties.tag.is_none() {
-                properties.tag = pending.properties.tag;
-            }
-            Span::new(Span::usize_to_u32(pending.span_start), span.end)
-        } else {
-            span
+        node: NodeId,
+        mut properties: NodeProperties,
+        pending: Option<PendingNodeProperties>,
+    ) -> Result<(), YamlError> {
+        let node_span = self.nodes[node.as_usize()].span;
+        let syntax_flags = self.nodes[node.as_usize()].syntax_flags;
+        let text = self.source.slice(node_span);
+        merge_pending_properties(&mut properties, pending);
+        self.resolve_node_properties(&properties, node_span)?;
+        let value_start = properties.value_start().min(text.len());
+        let value_text = &text[value_start..];
+        let style = scalar_style_from_flags(syntax_flags).unwrap_or_else(|| {
+            scalar_style_from_first_char(value_text.chars().next().unwrap_or(' '))
+        });
+        let trimmed = strip_inline_comment(value_text).trim();
+        if style == YamlScalarStyle::Plain
+            && let Some(alias) = trimmed.strip_prefix('*')
+            && !alias.is_empty()
+            && !alias.chars().any(char::is_whitespace)
+        {
+            let alias_start = node_span.start as usize
+                + value_start
+                + value_text
+                    .len()
+                    .saturating_sub(value_text.trim_start().len())
+                + 1;
+            self.semantics.register_flow_scalar(
+                &mut self.nodes,
+                node,
+                node_span,
+                SemanticKind::Alias,
+                SemanticProperties {
+                    alias: Some(Span::from_usize(alias_start, alias_start + alias.len())),
+                    ..semantic_properties(&properties, None)
+                },
+            );
+            return Ok(());
         }
-    }
-
-    fn flow_event_properties(&self, span: Span) -> Result<NodeProperties, YamlError> {
-        let text = self.source.slice(span);
-        if body_starts_flow_value(text, span.start as usize)? {
-            parse_node_properties(text, span)
-        } else {
-            Ok(NodeProperties::default())
-        }
+        self.semantics.register_flow_scalar(
+            &mut self.nodes,
+            node,
+            node_span,
+            SemanticKind::Scalar { style },
+            semantic_properties(&properties, None),
+        );
+        Ok(())
     }
 
     fn emit_scalar_event(&mut self, node: NodeId) -> Result<(), YamlError> {
@@ -3136,56 +3063,66 @@ impl<'source> Parser<'source> {
         let block_scalar_content_indent = self.take_block_scalar_indent(node_id);
         let node_kind = self.nodes[node.0 as usize].kind;
         let node_span = self.nodes[node.0 as usize].span;
+        let syntax_flags = self.nodes[node.0 as usize].syntax_flags;
         let text = self.source.slice(node_span);
         let mut properties = parse_node_properties(text, node_span)?;
         self.resolve_node_properties(&properties, node_span)?;
         let span =
             if let Some(pending) = self.take_pending_node_properties_at(node_span.start as usize) {
-                if properties.anchor.is_none() {
-                    properties.anchor = pending.properties.anchor;
+                if properties.anchor().is_none() {
+                    properties.set_anchor(pending.properties.anchor());
                 }
-                if properties.tag.is_none() {
-                    properties.tag = pending.properties.tag;
+                if properties.tag().is_none() {
+                    properties.set_tag(pending.properties.tag());
                 }
-                Span::new(Span::usize_to_u32(pending.span_start), node_span.end)
+                Span::new(pending.span_start, node_span.end)
             } else {
                 node_span
             };
-        let value_text = &text[properties.value_start..];
+        let value_text = &text[properties.value_start()..];
         let style = match node_kind {
             NodeKind::LiteralScalar => YamlScalarStyle::Literal,
             NodeKind::FoldedScalar => YamlScalarStyle::Folded,
-            NodeKind::Scalar if value_text.starts_with('"') => YamlScalarStyle::DoubleQuoted,
-            NodeKind::Scalar if value_text.starts_with('\'') => YamlScalarStyle::SingleQuoted,
-            NodeKind::Scalar => YamlScalarStyle::Plain,
+            NodeKind::Scalar => scalar_style_from_flags(syntax_flags).unwrap_or_else(|| {
+                scalar_style_from_first_char(value_text.chars().next().unwrap_or(' '))
+            }),
             _ => unreachable!("emit_scalar_event only receives scalar nodes"),
         };
-        if (style == YamlScalarStyle::DoubleQuoted
-            && double_quoted_scalar_end(value_text).is_none())
-            || (style == YamlScalarStyle::SingleQuoted
-                && single_quoted_scalar_end(value_text).is_none())
-        {
-            let quote = if style == YamlScalarStyle::DoubleQuoted {
-                '"'
-            } else {
-                '\''
-            };
-            return Err(unterminated_quoted_scalar_error(
-                quote,
-                Span::from_usize(
-                    node_span.start as usize + properties.value_start,
-                    node_span.end as usize,
-                ),
-            ));
-        }
-        if style == YamlScalarStyle::Plain {
+        let syntax_validated = syntax_flags & SCALAR_SYNTAX_VALIDATED != 0;
+        let quoted_end = if syntax_validated {
+            None
+        } else if style == YamlScalarStyle::DoubleQuoted {
+            Some(double_quoted_scalar_end(value_text).ok_or_else(|| {
+                unterminated_quoted_scalar_error(
+                    '"',
+                    Span::from_usize(
+                        node_span.start as usize + properties.value_start(),
+                        node_span.end as usize,
+                    ),
+                )
+            })?)
+        } else if style == YamlScalarStyle::SingleQuoted {
+            let _ = single_quoted_scalar_end(value_text).ok_or_else(|| {
+                unterminated_quoted_scalar_error(
+                    '\'',
+                    Span::from_usize(
+                        node_span.start as usize + properties.value_start(),
+                        node_span.end as usize,
+                    ),
+                )
+            })?;
+            None
+        } else {
+            None
+        };
+        if style == YamlScalarStyle::Plain && !syntax_validated {
             let trimmed = strip_inline_comment(value_text).trim();
             if let Some(alias) = trimmed.strip_prefix('*')
                 && !alias.is_empty()
                 && !alias.chars().any(char::is_whitespace)
             {
                 let alias_start = node_span.start as usize
-                    + properties.value_start
+                    + properties.value_start()
                     + value_text
                         .len()
                         .saturating_sub(value_text.trim_start().len())
@@ -3205,11 +3142,9 @@ impl<'source> Parser<'source> {
                 return Ok(());
             }
         }
-        if matches!(node_kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar) {
-            let _ =
-                decode_scalar_value_with_content_indent(value_text, block_scalar_content_indent)?;
-        } else if style != YamlScalarStyle::Plain {
-            let _ = decode_scalar_value(value_text)?;
+        if let Some(end) = quoted_end {
+            validate_double_quoted_scalar_content(&value_text[1..end - 1])?;
+            validate_double_quoted_scalar_escapes(&value_text[1..end - 1])?;
         }
         let content_indent = block_scalar_content_indent.map(Span::usize_to_u32);
         let semantic_properties = semantic_properties(&properties, content_indent);
@@ -3228,18 +3163,31 @@ impl<'source> Parser<'source> {
     }
 
     fn emit_property_free_plain_scalar(&mut self, node: NodeId) {
+        self.emit_property_free_scalar(node, YamlScalarStyle::Plain);
+    }
+
+    fn emit_property_free_scalar(&mut self, node: NodeId, style: YamlScalarStyle) {
         let span = self.nodes[node.as_usize()].span;
-        self.semantics.push_property_free_plain_scalar(node, span);
+        self.semantics
+            .push_property_free_scalar(&mut self.nodes, node, span, style);
     }
 
     fn take_block_scalar_indent(&mut self, node: NodeId) -> Option<usize> {
-        let index = self.contexts.iter().rposition(|frame| {
-            matches!(frame, ContextFrame::BlockScalarIndent { node: candidate, .. } if *candidate == node)
-        })?;
-        match self.contexts.remove(index) {
-            ContextFrame::BlockScalarIndent { indent, .. } => Some(indent),
-            _ => unreachable!("matched block scalar indent frame"),
+        if self
+            .block_scalar_indents
+            .last()
+            .is_some_and(|record| record.node == node)
+        {
+            return self
+                .block_scalar_indents
+                .pop()
+                .map(|record| record.indent as usize);
         }
+        let index = self
+            .block_scalar_indents
+            .iter()
+            .rposition(|record| record.node == node)?;
+        Some(self.block_scalar_indents.remove(index).indent as usize)
     }
 
     fn resolve_node_properties(
@@ -3247,7 +3195,7 @@ impl<'source> Parser<'source> {
         properties: &NodeProperties,
         span: Span,
     ) -> Result<(), YamlError> {
-        if let Some(tag) = properties.tag {
+        if let Some(tag) = properties.tag() {
             let _ = resolve_tag(self.source.slice(tag), &self.tag_handles, span)?;
         }
         Ok(())
@@ -3270,11 +3218,37 @@ fn unterminated_quoted_scalar_error(quote: char, span: Span) -> YamlError {
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct NodeProperties {
-    pub(crate) tag: Option<Span>,
-    pub(crate) anchor: Option<Span>,
-    pub(crate) value_start: usize,
+    tag: Option<Span>,
+    anchor: Option<Span>,
+    value_start: usize,
+}
+
+impl NodeProperties {
+    pub(crate) fn tag(self) -> Option<Span> {
+        self.tag
+    }
+
+    pub(crate) fn anchor(self) -> Option<Span> {
+        self.anchor
+    }
+
+    pub(crate) const fn value_start(self) -> usize {
+        self.value_start
+    }
+
+    fn set_tag(&mut self, tag: Option<Span>) {
+        self.tag = tag;
+    }
+
+    fn set_anchor(&mut self, anchor: Option<Span>) {
+        self.anchor = anchor;
+    }
+
+    fn set_value_start(&mut self, value_start: usize) {
+        self.value_start = value_start;
+    }
 }
 
 fn semantic_properties(
@@ -3282,10 +3256,25 @@ fn semantic_properties(
     content_indent: Option<u32>,
 ) -> SemanticProperties {
     SemanticProperties {
-        tag: properties.tag,
-        anchor: properties.anchor,
+        tag: properties.tag(),
+        anchor: properties.anchor(),
         alias: None,
         content_indent,
+    }
+}
+
+fn merge_pending_properties(
+    properties: &mut NodeProperties,
+    pending: Option<PendingNodeProperties>,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    if properties.anchor().is_none() {
+        properties.set_anchor(pending.properties.anchor());
+    }
+    if properties.tag().is_none() {
+        properties.set_tag(pending.properties.tag());
     }
 }
 
@@ -3294,12 +3283,12 @@ fn reject_invalid_node_property_placement(
     absolute_start: usize,
     properties: &NodeProperties,
 ) -> Result<(), YamlError> {
-    if properties.anchor.is_none() && properties.tag.is_none() {
+    if properties.anchor().is_none() && properties.tag().is_none() {
         return Ok(());
     }
 
     let value_start =
-        properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
+        properties.value_start() + leading_flow_whitespace(&text[properties.value_start()..]);
     let value_text = &text[value_start..];
     let Some(first) = value_text.chars().next() else {
         return Ok(());
@@ -3320,11 +3309,11 @@ fn reject_invalid_block_node_property_punctuation(
     absolute_start: usize,
     properties: &NodeProperties,
 ) -> Result<(), YamlError> {
-    if properties.anchor.is_none() && properties.tag.is_none() {
+    if properties.anchor().is_none() && properties.tag().is_none() {
         return Ok(());
     }
     let value_start =
-        properties.value_start + leading_flow_whitespace(&text[properties.value_start..]);
+        properties.value_start() + leading_flow_whitespace(&text[properties.value_start()..]);
     if text[value_start..].starts_with(',') {
         return Err(invalid_node_property_placement(
             absolute_start + value_start,
@@ -3346,17 +3335,34 @@ fn invalid_node_property_placement(offset: usize, found: char) -> YamlError {
 }
 
 fn body_starts_flow_value(body: &str, absolute_start: usize) -> Result<bool, YamlError> {
+    if !body_may_start_flow_value(body) {
+        return Ok(false);
+    }
     let properties = parse_node_properties(
         body,
         Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
     reject_invalid_node_property_placement(body, absolute_start, &properties)?;
     let value_start =
-        properties.value_start + leading_flow_whitespace(&body[properties.value_start..]);
+        properties.value_start() + leading_flow_whitespace(&body[properties.value_start()..]);
     Ok(matches!(
         body[value_start..].chars().next(),
         Some('[' | '{')
     ))
+}
+
+fn body_may_start_flow_value(body: &str) -> bool {
+    matches!(
+        body.trim_start_matches([' ', '\t']).as_bytes().first(),
+        Some(b'[' | b'{' | b'&' | b'!')
+    )
+}
+
+fn body_may_start_with_node_properties(body: &str) -> bool {
+    matches!(
+        body.trim_start_matches([' ', '\t']).as_bytes().first(),
+        Some(b'&' | b'!')
+    )
 }
 
 fn flow_collection_mapping_key_colon(
@@ -3371,7 +3377,7 @@ fn flow_collection_mapping_key_colon(
         Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
     let marker_offset =
-        properties.value_start + leading_flow_whitespace(&body[properties.value_start..]);
+        properties.value_start() + leading_flow_whitespace(&body[properties.value_start()..]);
     let Ok(flow_end) =
         flow_collection_source_end(&body[marker_offset..], absolute_start + marker_offset)
     else {
@@ -3394,11 +3400,11 @@ fn block_scalar_after_node_properties(
         body,
         Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
-    if properties.anchor.is_none() && properties.tag.is_none() {
+    if properties.anchor().is_none() && properties.tag().is_none() {
         return Ok(None);
     }
     let header_offset =
-        properties.value_start + leading_flow_whitespace(&body[properties.value_start..]);
+        properties.value_start() + leading_flow_whitespace(&body[properties.value_start()..]);
     if matches!(body[header_offset..].chars().next(), Some('|' | '>')) {
         Ok(Some(header_offset))
     } else {
@@ -3468,9 +3474,9 @@ fn reject_invalid_anchor_only_nested_property_mapping(
         body,
         Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
-    if properties.anchor.is_none()
-        || properties.tag.is_some()
-        || properties.value_start < body.len()
+    if properties.anchor().is_none()
+        || properties.tag().is_some()
+        || properties.value_start() < body.len()
     {
         return Ok(());
     }
@@ -3485,13 +3491,13 @@ fn reject_invalid_anchor_only_nested_property_mapping(
         nested_body,
         Span::from_usize(absolute_start, absolute_start + nested_body.len()),
     )?;
-    if (nested_properties.anchor.is_some() || nested_properties.tag.is_some())
-        && nested_properties.value_start < nested_body.len()
+    if (nested_properties.anchor().is_some() || nested_properties.tag().is_some())
+        && nested_properties.value_start() < nested_body.len()
         && find_mapping_colon(nested_body).is_none()
     {
         return Err(invalid_node_property_placement(
-            absolute_start + nested_properties.value_start,
-            nested_body[nested_properties.value_start..]
+            absolute_start + nested_properties.value_start(),
+            nested_body[nested_properties.value_start()..]
                 .chars()
                 .next()
                 .unwrap_or(':'),
@@ -3526,8 +3532,8 @@ fn first_non_property_node_after_with_index(
             nested_body,
             Span::from_usize(absolute_start, absolute_start + nested_body.len()),
         )?;
-        if (nested_properties.anchor.is_some() || nested_properties.tag.is_some())
-            && nested_properties.value_start == nested_body.len()
+        if (nested_properties.anchor().is_some() || nested_properties.tag().is_some())
+            && nested_properties.value_start() == nested_body.len()
         {
             scan_index = next_index;
             continue;
@@ -3543,15 +3549,18 @@ fn property_only_node_indent(
     index: usize,
     absolute_start: usize,
 ) -> Result<Option<usize>, YamlError> {
+    if !body_may_start_with_node_properties(body) {
+        return Ok(None);
+    }
     let body = strip_inline_comment(body).trim_end();
     let properties = parse_node_properties(
         body,
         Span::from_usize(absolute_start, absolute_start + body.len()),
     )?;
-    if properties.anchor.is_none() && properties.tag.is_none() {
+    if properties.anchor().is_none() && properties.tag().is_none() {
         return Ok(None);
     }
-    if properties.value_start < body.len() {
+    if properties.value_start() < body.len() {
         return Ok(None);
     }
 
@@ -3562,6 +3571,20 @@ fn next_significant_body_with_index(
     lines: LineTable<'_>,
     current_index: usize,
 ) -> Option<(usize, usize, &str)> {
+    if let Some(next_index) = lines.source.cached_next_significant_line(current_index) {
+        return next_index.map(|index| {
+            let line = lines
+                .cursor_from(index)
+                .next()
+                .expect("line index from source table is in bounds");
+            let indent = line
+                .facts
+                .indent()
+                .unwrap_or_else(|| content_line_indent(line.content_without_break));
+            (index, indent, &line.content_without_break[indent..])
+        });
+    }
+
     for (relative_index, line) in lines.iter_from(current_index + 1).enumerate() {
         let index = current_index + 1 + relative_index;
         let trimmed = line.content_without_break.trim();
@@ -3630,13 +3653,13 @@ pub(crate) fn parse_node_properties(text: &str, span: Span) -> Result<NodeProper
     loop {
         position = skip_property_whitespace(text, position);
         let Some(character) = text[position..].chars().next() else {
-            properties.value_start = position;
+            properties.set_value_start(position);
             return Ok(properties);
         };
 
         match character {
             '&' => {
-                if properties.anchor.is_some() {
+                if properties.anchor().is_some() {
                     return Err(node_property_error(
                         "duplicate anchor property",
                         span,
@@ -3644,14 +3667,14 @@ pub(crate) fn parse_node_properties(text: &str, span: Span) -> Result<NodeProper
                     ));
                 }
                 let next = parse_anchor_property(text, position, span)?;
-                properties.anchor = Some(Span::new(
+                properties.set_anchor(Some(Span::new(
                     Span::offset_from_usize(span.start, position + 1),
                     Span::offset_from_usize(span.start, next),
-                ));
+                )));
                 position = next;
             }
             '!' => {
-                if properties.tag.is_some() {
+                if properties.tag().is_some() {
                     return Err(node_property_error(
                         "duplicate tag property",
                         span,
@@ -3659,20 +3682,20 @@ pub(crate) fn parse_node_properties(text: &str, span: Span) -> Result<NodeProper
                     ));
                 }
                 let next = parse_tag_property(text, position, span)?;
-                properties.tag = Some(Span::new(
+                properties.set_tag(Some(Span::new(
                     Span::offset_from_usize(span.start, position),
                     Span::offset_from_usize(span.start, next),
-                ));
+                )));
                 position = next;
             }
             _ => {
-                properties.value_start = position;
+                properties.set_value_start(position);
                 return Ok(properties);
             }
         }
 
         if next_property_character_is_not_whitespace(text, position) {
-            properties.value_start = position;
+            properties.set_value_start(position);
             return Ok(properties);
         }
     }
@@ -3979,8 +4002,132 @@ struct SourceLine<'source> {
 }
 
 #[derive(Clone, Copy)]
+struct PreparedBlockLine<'source> {
+    line: SourceLine<'source>,
+    indent: u32,
+    body: &'source str,
+    absolute_start: u32,
+    comment_end: u32,
+    mapping_colon: Option<u32>,
+    starts_flow: bool,
+}
+
+impl<'source> PreparedBlockLine<'source> {
+    fn new(line: SourceLine<'source>, indent: usize) -> Result<Self, YamlError> {
+        Self::from_body(
+            line,
+            indent,
+            &line.content_without_break[indent..],
+            line.content_start + indent,
+        )
+    }
+
+    fn from_body(
+        line: SourceLine<'source>,
+        indent: usize,
+        body: &'source str,
+        absolute_start: usize,
+    ) -> Result<Self, YamlError> {
+        let cached_mapping_colon = line
+            .facts
+            .mapping_colon()
+            .filter(|_| absolute_start == line.content_start + indent);
+        let (starts_flow, mapping_colon) = if let Some(colon) = cached_mapping_colon {
+            (false, Some(colon))
+        } else {
+            let starts_flow = body_starts_flow_value(body, absolute_start)?;
+            let mapping_colon = if starts_flow {
+                flow_collection_mapping_key_colon(body, absolute_start)?
+            } else {
+                find_mapping_colon(body)
+            };
+            (starts_flow, mapping_colon)
+        };
+        let comment_end = if body_may_start_with_node_properties(body) {
+            strip_inline_comment(body).len()
+        } else {
+            body.len()
+        };
+        Ok(Self {
+            line,
+            indent: Span::usize_to_u32(indent),
+            body,
+            absolute_start: Span::usize_to_u32(absolute_start),
+            comment_end: Span::usize_to_u32(comment_end),
+            mapping_colon: mapping_colon.map(Span::usize_to_u32),
+            starts_flow,
+        })
+    }
+
+    const fn indent(self) -> usize {
+        self.indent as usize
+    }
+
+    const fn absolute_start(self) -> usize {
+        self.absolute_start as usize
+    }
+
+    fn uncommented(self) -> &'source str {
+        &self.body[..self.comment_end as usize]
+    }
+
+    const fn mapping_colon(self) -> Option<usize> {
+        match self.mapping_colon {
+            Some(colon) => Some(colon as usize),
+            None => None,
+        }
+    }
+
+    fn simple_mapping_facts(self) -> Option<SimpleMappingFacts> {
+        source_line_simple_mapping_facts(self.line, self.absolute_start())
+    }
+}
+
+fn source_line_simple_mapping_facts(
+    line: SourceLine<'_>,
+    absolute_start: usize,
+) -> Option<SimpleMappingFacts> {
+    let indent = line.facts.indent()?;
+    if absolute_start != line.content_start + indent {
+        return None;
+    }
+    let (colon, value_start) = line.facts.simple_mapping()?;
+    Some(SimpleMappingFacts::new(colon, value_start))
+}
+
+fn source_line_scalar_mapping_facts(
+    line: SourceLine<'_>,
+    absolute_start: usize,
+) -> Option<(usize, SingleLineScalarFacts)> {
+    let indent = line.facts.indent()?;
+    if absolute_start != line.content_start + indent {
+        return None;
+    }
+    let (colon, start, end, style) = line.facts.scalar_mapping()?;
+    Some((
+        colon,
+        SingleLineScalarFacts {
+            start: Span::usize_to_u32(start - colon - 1),
+            end: Span::usize_to_u32(end - colon - 1),
+            style: match style {
+                CachedScalarStyle::Plain => YamlScalarStyle::Plain,
+                CachedScalarStyle::SingleQuoted => YamlScalarStyle::SingleQuoted,
+                CachedScalarStyle::DoubleQuoted => YamlScalarStyle::DoubleQuoted,
+            },
+        },
+    ))
+}
+
+#[derive(Clone, Copy)]
 struct LineTable<'source> {
     source: &'source Source,
+}
+
+#[derive(Clone)]
+struct LineCursor<'source> {
+    lines: LineTable<'source>,
+    next_index: usize,
+    next_start: usize,
 }
 
 impl<'source> LineTable<'source> {
@@ -3994,54 +4141,31 @@ impl<'source> LineTable<'source> {
             - usize::from(starts.last().copied() == Some(Span::usize_to_u32(self.source.len())))
     }
 
-    fn line(self, index: usize) -> SourceLine<'source> {
-        assert!(index < self.len(), "line index must be in bounds");
-        let starts = self.source.line_starts();
-        let start = starts[index] as usize;
-        let next_start = starts
+    fn content_start(self, index: usize) -> usize {
+        self.source.line_starts()[index] as usize
+    }
+
+    fn line_end(self, index: usize) -> usize {
+        self.source
+            .line_starts()
             .get(index + 1)
-            .map_or(self.source.len(), |start| *start as usize);
+            .copied()
+            .map_or(self.source.len(), |start| start as usize)
+    }
 
-        let mut content_end = next_start;
-        let text = self.source.as_str();
-        if content_end > start && text.as_bytes()[content_end - 1] == b'\n' {
-            content_end -= 1;
-            if content_end > start && text.as_bytes()[content_end - 1] == b'\r' {
-                content_end -= 1;
+    fn content_end(self, index: usize) -> usize {
+        let start = self.content_start(index);
+        let mut end = self.line_end(index);
+        let bytes = self.source.as_str().as_bytes();
+        if end > start && bytes[end - 1] == b'\n' {
+            end -= 1;
+            if end > start && bytes[end - 1] == b'\r' {
+                end -= 1;
             }
-        } else if content_end > start && text.as_bytes()[content_end - 1] == b'\r' {
-            content_end -= 1;
+        } else if end > start && bytes[end - 1] == b'\r' {
+            end -= 1;
         }
-
-        SourceLine {
-            content_start: start,
-            content_end,
-            line_end: next_start,
-            content_without_break: self.source.slice(Span::from_usize(start, content_end)),
-            facts: self.source.line_facts(index),
-        }
-    }
-
-    fn simple_mapping_facts(
-        self,
-        index: usize,
-        absolute_start: usize,
-    ) -> Option<SimpleMappingFacts> {
-        let line = self.line(index);
-        let indent = line.facts.indent()?;
-        if absolute_start != line.content_start + indent {
-            return None;
-        }
-        let (colon, value_start) = line.facts.simple_mapping()?;
-        Some(SimpleMappingFacts { colon, value_start })
-    }
-
-    fn mapping_colon(self, index: usize, absolute_start: usize) -> Option<usize> {
-        let line = self.line(index);
-        let indent = line.facts.indent()?;
-        (absolute_start == line.content_start + indent)
-            .then(|| line.facts.mapping_colon())
-            .flatten()
+        end
     }
 
     fn next_line_starts_simple_mapping(self, index: usize, parent_indent: usize) -> bool {
@@ -4055,24 +4179,392 @@ impl<'source> LineTable<'source> {
             .is_some_and(|_| facts.indent().is_some_and(|indent| indent <= parent_indent))
     }
 
+    fn plain_scalar_cannot_continue(self, index: usize, parent_indent: usize) -> bool {
+        next_significant_body_with_index(self, index)
+            .is_none_or(|(_, indent, _)| indent <= parent_indent)
+    }
+
     fn iter_from(self, start: usize) -> impl Iterator<Item = SourceLine<'source>> {
-        (start..self.len()).map(move |index| self.line(index))
+        self.cursor_from(start)
+    }
+
+    fn cursor_from(self, start: usize) -> LineCursor<'source> {
+        let next_start = self
+            .source
+            .line_starts()
+            .get(start)
+            .copied()
+            .map_or(self.source.len(), |offset| offset as usize);
+        LineCursor {
+            lines: self,
+            next_index: start,
+            next_start,
+        }
     }
 }
 
-fn next_significant_indent(
-    lines: LineTable<'_>,
-    current_index: usize,
-) -> Result<Option<usize>, YamlError> {
-    for line in lines.iter_from(current_index + 1) {
-        let trimmed = line.content_without_break.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        return count_indent(line.content_without_break, line.content_start).map(Some);
+impl<'source> LineCursor<'source> {
+    fn next_indexed(&mut self) -> Option<(usize, SourceLine<'source>)> {
+        let index = self.next_index;
+        self.next().map(|line| (index, line))
     }
 
-    Ok(None)
+    fn advance_by(&mut self, count: usize) {
+        for _ in 0..count {
+            if self.next().is_none() {
+                break;
+            }
+        }
+    }
+}
+
+impl<'source> Iterator for LineCursor<'source> {
+    type Item = SourceLine<'source>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_index >= self.lines.len() {
+            return None;
+        }
+
+        let index = self.next_index;
+        let start = self.next_start;
+        let line_end = self
+            .lines
+            .source
+            .line_starts()
+            .get(index + 1)
+            .copied()
+            .map_or(self.lines.source.len(), |offset| offset as usize);
+        self.next_index += 1;
+        self.next_start = line_end;
+
+        let text = self.lines.source.as_str();
+        let mut content_end = line_end;
+        if content_end > start && text.as_bytes()[content_end - 1] == b'\n' {
+            content_end -= 1;
+            if content_end > start && text.as_bytes()[content_end - 1] == b'\r' {
+                content_end -= 1;
+            }
+        } else if content_end > start && text.as_bytes()[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+
+        Some(SourceLine {
+            content_start: start,
+            content_end,
+            line_end,
+            content_without_break: self.lines.source.validated_line_slice(start, content_end),
+            facts: self.lines.source.line_facts(index),
+        })
+    }
+}
+
+impl<'source> BlockMachine<'source> {
+    fn new(parser: Parser<'source>, lines: LineTable<'source>) -> Self {
+        Self {
+            parser,
+            lines,
+            cursor: lines.cursor_from(0),
+            frames: InlineVec::new(),
+        }
+    }
+
+    fn run(mut self) -> Result<Parser<'source>, YamlError> {
+        while let Some((index, line)) = self.cursor.next_indexed() {
+            let transition = if self.frames.is_empty() {
+                self.transition_line(index, line)?
+            } else {
+                loop {
+                    let transition = if line_is_blank_or_comment(line) {
+                        let transition = self.transition_line(index, line)?;
+                        if let Some(frame) = self
+                            .frames
+                            .last_mut()
+                            .filter(|frame| frame.allow_same_indent_content)
+                        {
+                            frame.last_content_end = Span::usize_to_u32(line.content_end);
+                        }
+                        transition
+                    } else if self
+                        .frames
+                        .last()
+                        .is_some_and(|frame| frame.kind == BlockEntryKind::ExplicitMapping)
+                    {
+                        self.transition_explicit_mapping(index, line)?
+                    } else if self.frame_rejects_line(line)? {
+                        let frame = self.frames.pop().expect("a rejected entry frame exists");
+                        self.finish_frame(frame)?;
+                        BlockTransition::Reprocess
+                    } else if self.frames.is_empty() {
+                        self.transition_line(index, line)?
+                    } else {
+                        self.transition_nested_line(index, line)?
+                    };
+
+                    if transition != BlockTransition::Reprocess {
+                        break transition;
+                    }
+                }
+            };
+            let consumed = match transition {
+                BlockTransition::Consume(consumed)
+                | BlockTransition::Push(consumed)
+                | BlockTransition::Pop(consumed) => consumed,
+                BlockTransition::Reprocess => unreachable!("reprocessing completes in the loop"),
+            };
+            self.cursor.advance_by(consumed.saturating_sub(1));
+        }
+        while let Some(frame) = self.frames.pop() {
+            self.finish_frame(frame)?;
+        }
+        Ok(self.parser)
+    }
+
+    fn frame_rejects_line(&self, line: SourceLine<'source>) -> Result<bool, YamlError> {
+        let Some(frame) = self.frames.last() else {
+            return Ok(false);
+        };
+        let indent = content_line_indent(line.content_without_break);
+        let body = &line.content_without_break[indent..];
+        Ok(indent < frame.indent as usize
+            || indent == frame.indent as usize
+                && frame.allow_same_indent_content
+                && (is_explicit_mapping_key(body) || is_explicit_mapping_value(body))
+            || indent == frame.indent as usize
+                && !(frame.allow_same_indent_content
+                    || frame.allow_indentless_sequence && is_sequence_entry(body)))
+    }
+
+    fn transition_explicit_mapping(
+        &mut self,
+        index: usize,
+        line: SourceLine<'source>,
+    ) -> Result<BlockTransition, YamlError> {
+        let frame_index = self.frames.len() - 1;
+        let frame = self.frames[frame_index];
+        let indent = content_line_indent(line.content_without_break);
+        let body = &line.content_without_break[indent..];
+        if frame.phase == BlockEntryPhase::Key
+            && !(indent == frame.indent as usize && is_explicit_mapping_value(body))
+        {
+            if indent < frame.indent as usize {
+                let frame = self.frames.pop().expect("explicit mapping frame exists");
+                self.finish_frame(frame)?;
+                return Ok(BlockTransition::Reprocess);
+            }
+            self.parser.close_collections_deeper_than(indent);
+            reject_unexpected_line_start(body, line.content_start + indent)?;
+            let previous_depth = self.parser.block_frames.len();
+            let prepared = PreparedBlockLine::new(line, indent)?;
+            let consumed =
+                self.parser
+                    .parse_content_body(frame.owner, self.lines, index, prepared)?;
+            let end = self.lines.content_end(index + consumed - 1);
+            let active = &mut self.frames[frame_index];
+            active.last_content_end = Span::usize_to_u32(end);
+            self.capture_deferred_frame();
+            return Ok(self.depth_transition(previous_depth, consumed));
+        }
+
+        if indent != frame.indent as usize || !is_explicit_mapping_value(body) {
+            let frame = self.frames.pop().expect("explicit mapping frame exists");
+            self.finish_frame(frame)?;
+            return Ok(BlockTransition::Reprocess);
+        }
+        if self.parser.nodes[frame.owner.as_usize()].first_child == NO_NODE {
+            let key = self.parser.push_empty_scalar(frame.empty_offset as usize);
+            self.parser.attach_child_at(frame.owner.as_usize(), key);
+            self.parser.emit_scalar_event(key)?;
+        }
+        self.parser.close_sequence_at_indent(frame.indent as usize);
+        self.parser
+            .close_collections_deeper_than(frame.indent as usize);
+        let consumed = self.parser.parse_explicit_mapping_value(
+            frame.owner,
+            frame.collection,
+            self.lines,
+            index,
+            frame.indent as usize,
+            body,
+        )?;
+        let end = self.lines.content_end(index + consumed - 1);
+        self.parser.extend_node_span(frame.owner, end);
+        self.parser.extend_node_span(frame.collection, end);
+        self.frames.pop();
+        if let Some(parent) = self.frames.last_mut() {
+            parent.last_content_end = parent.last_content_end.max(Span::usize_to_u32(end));
+        }
+        let pushed = !self.parser.pending_block_values.is_empty();
+        self.capture_deferred_frame();
+        Ok(if pushed {
+            BlockTransition::Push(consumed)
+        } else {
+            BlockTransition::Consume(consumed)
+        })
+    }
+
+    fn transition_nested_line(
+        &mut self,
+        index: usize,
+        line: SourceLine<'source>,
+    ) -> Result<BlockTransition, YamlError> {
+        let frame_index = self.frames.len() - 1;
+        let owner = self.frames[frame_index].owner;
+        let indent = content_line_indent(line.content_without_break);
+        let body = &line.content_without_break[indent..];
+        let absolute_start = line.content_start + indent;
+        self.parser.close_collections_deeper_than(indent);
+        reject_unexpected_line_start(body, line.content_start + indent)?;
+        if self.parser.sequence_is_open_at(indent) && !is_sequence_entry(body) {
+            return Err(invalid_nested_block_sequence_sibling(
+                line.content_start + indent,
+            ));
+        }
+        let previous_depth = self.parser.block_frames.len();
+        if let Some(facts) = source_line_simple_mapping_facts(line, absolute_start) {
+            let consumed = if let Some(mapping) = self.parser.active_simple_mapping(indent) {
+                self.parser.append_simple_plain_mapping_entry(
+                    mapping,
+                    self.lines,
+                    index,
+                    line,
+                    indent,
+                    body,
+                    absolute_start,
+                    facts,
+                )?
+            } else {
+                self.parser.parse_simple_plain_mapping_entry(
+                    owner,
+                    self.lines,
+                    index,
+                    line,
+                    indent,
+                    body,
+                    absolute_start,
+                    facts,
+                )?
+            };
+            self.finish_nested_transition(frame_index, index, consumed, false);
+            self.capture_deferred_frame();
+            return Ok(self.depth_transition(previous_depth, consumed));
+        }
+        let prepared = PreparedBlockLine::new(line, indent)?;
+        let structural = is_sequence_entry(body)
+            || is_explicit_mapping_key(body)
+            || prepared.mapping_colon().is_some();
+        let property_only = !structural
+            && body_may_start_with_node_properties(body)
+            && (property_only_block_collection_indent(body, self.lines, index, absolute_start)?
+                .is_some()
+                || property_only_node_indent(body, self.lines, index, absolute_start)?.is_some());
+        let mapping_scalar = self.frames[frame_index].kind == BlockEntryKind::Mapping
+            && self.frames[frame_index].phase == BlockEntryPhase::Value
+            && !property_only
+            && !structural;
+        let split_block_scalar = self.frames[frame_index].kind == BlockEntryKind::Mapping
+            && self.frames[frame_index].pending_properties
+            && (body.starts_with('|') || body.starts_with('>'));
+        let consumed = if split_block_scalar {
+            let parent_indent = self.frames[frame_index].indent as usize;
+            let (scalar, consumed) = self.parser.parse_block_scalar(
+                self.lines,
+                index,
+                absolute_start,
+                parent_indent,
+                body,
+                true,
+            )?;
+            self.parser.attach_child_at(owner.as_usize(), scalar);
+            self.parser.emit_scalar_event(scalar)?;
+            consumed
+        } else if mapping_scalar {
+            let parent_indent = self.frames[frame_index].indent as usize;
+            let (scalar, consumed) = self.parser.parse_block_plain_scalar(
+                self.lines,
+                index,
+                parent_indent,
+                absolute_start,
+                false,
+            )?;
+            self.parser.attach_child_at(owner.as_usize(), scalar);
+            self.parser.emit_scalar_event(scalar)?;
+            consumed
+        } else {
+            self.parser
+                .parse_content_body(owner, self.lines, index, prepared)?
+        };
+        self.finish_nested_transition(frame_index, index, consumed, property_only);
+        self.capture_deferred_frame();
+        Ok(self.depth_transition(previous_depth, consumed))
+    }
+
+    fn finish_nested_transition(
+        &mut self,
+        frame_index: usize,
+        index: usize,
+        consumed: usize,
+        pending_properties: bool,
+    ) {
+        let end = self.lines.content_end(index + consumed - 1);
+        let frame = &mut self.frames[frame_index];
+        frame.last_content_end = Span::usize_to_u32(end);
+        frame.phase = BlockEntryPhase::NestedChild;
+        frame.pending_properties = pending_properties;
+    }
+
+    fn transition_line(
+        &mut self,
+        index: usize,
+        line: SourceLine<'source>,
+    ) -> Result<BlockTransition, YamlError> {
+        let consumed = self.parser.parse_line(self.lines, index, line)?;
+        if consumed == 0 {
+            return Ok(BlockTransition::Reprocess);
+        }
+        let pushed = !self.parser.pending_block_values.is_empty();
+        self.capture_deferred_frame();
+        Ok(if pushed {
+            BlockTransition::Push(consumed)
+        } else {
+            BlockTransition::Consume(consumed)
+        })
+    }
+
+    fn capture_deferred_frame(&mut self) {
+        while let Some(frame) = self.parser.pending_block_values.pop() {
+            self.frames.push(frame);
+        }
+    }
+
+    fn finish_frame(&mut self, frame: BlockValueFrame) -> Result<(), YamlError> {
+        let end = frame.last_content_end as usize;
+        if frame.kind != BlockEntryKind::ExplicitMapping {
+            self.parser.extend_node_span(frame.owner, end);
+            self.parser.extend_node_span(frame.collection, end);
+        }
+        self.parser.finish_block_value(frame)?;
+        if let Some(parent) = self.frames.last_mut() {
+            parent.last_content_end = parent.last_content_end.max(Span::usize_to_u32(end));
+        }
+        Ok(())
+    }
+
+    fn depth_transition(&self, previous_depth: usize, consumed: usize) -> BlockTransition {
+        match self.parser.block_frames.len().cmp(&previous_depth) {
+            std::cmp::Ordering::Greater => BlockTransition::Push(consumed),
+            std::cmp::Ordering::Less => BlockTransition::Pop(consumed),
+            std::cmp::Ordering::Equal => BlockTransition::Consume(consumed),
+        }
+    }
+}
+
+fn line_is_blank_or_comment(line: SourceLine<'_>) -> bool {
+    if line.facts.is_blank() {
+        return true;
+    }
+    let trimmed = line.content_without_break.trim_start();
+    trimmed.is_empty() || trimmed.starts_with('#')
 }
 
 fn invalid_document_marker(line: SourceLine<'_>) -> YamlError {
@@ -4260,6 +4752,17 @@ fn tab_indentation_error(offset: usize) -> YamlError {
             Span::from_usize(offset, offset + 1),
         )
         .with_expected("spaces for indentation"),
+    )
+}
+
+fn invalid_quoted_scalar_continuation_indent(offset: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "quoted scalar continuation is not indented",
+            Span::empty_from_usize(offset),
+        )
+        .with_expected("quoted scalar content indented deeper than its parent mapping"),
     )
 }
 
@@ -4635,10 +5138,10 @@ fn reject_compact_decorated_document(rest: &str, absolute_start: usize) -> Resul
         rest,
         Span::from_usize(absolute_start, absolute_start + rest.len()),
     )?;
-    if properties.anchor.is_none() && properties.tag.is_none() {
+    if properties.anchor().is_none() && properties.tag().is_none() {
         return Ok(());
     }
-    let value = rest[properties.value_start..].trim_start();
+    let value = rest[properties.value_start()..].trim_start();
     if find_mapping_colon(value).is_some() {
         return Err(YamlError::new(
             Diagnostic::new(
@@ -4846,14 +5349,12 @@ fn flow_scalar_end(
 fn flow_frame(node: NodeId, open: char) -> FlowFrame {
     if open == '[' {
         FlowFrame {
-            kind: FlowCollectionKind::Sequence,
             node,
             close: ']',
             state: FlowFrameState::SequenceExpectItem,
         }
     } else {
         FlowFrame {
-            kind: FlowCollectionKind::Mapping,
             node,
             close: '}',
             state: FlowFrameState::MappingExpectKey,
@@ -4975,32 +5476,82 @@ fn double_quoted_flow_end(
     start: usize,
     absolute_start: usize,
 ) -> Result<usize, YamlError> {
-    let mut position = start + 1;
-    let mut escaped = false;
+    scan_double_quoted_scalar(text, start)?.ok_or_else(|| {
+        YamlError::new(
+            Diagnostic::new(
+                DiagnosticKind::Parser,
+                "unterminated double-quoted scalar in flow sequence",
+                Span::from_usize(absolute_start + start, absolute_start + text.len()),
+            )
+            .with_expected("closing \""),
+        )
+    })
+}
 
-    while position < text.len() {
-        let character = text[position..]
-            .chars()
-            .next()
-            .expect("position is inside text");
-        position += character.len_utf8();
-        if escaped {
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '"' {
-            return Ok(position);
+fn scan_double_quoted_scalar(text: &str, start: usize) -> Result<Option<usize>, YamlError> {
+    let bytes = text.as_bytes();
+    let mut position = start + 1;
+    while position < bytes.len() {
+        let byte = bytes[position];
+        if byte == b'"' {
+            return Ok(Some(position + 1));
+        }
+        if byte != b'\\' {
+            if byte == b'\r' && bytes.get(position + 1) == Some(&b'\n') {
+                position += 2;
+                reject_double_quoted_document_marker(&text[position..])?;
+            } else {
+                position += 1;
+                if byte == b'\n' || byte == b'\r' {
+                    reject_double_quoted_document_marker(&text[position..])?;
+                }
+            }
+            continue;
+        }
+
+        position += 1;
+        let whitespace_end = position
+            + bytes[position..]
+                .iter()
+                .take_while(|byte| matches!(**byte, b' ' | b'\t'))
+                .count();
+        if matches!(bytes.get(whitespace_end), Some(b'\n' | b'\r')) {
+            position = skip_escaped_line_break(text, whitespace_end);
+            reject_double_quoted_document_marker(&text[position..])?;
+            continue;
+        }
+
+        let Some(&escaped) = bytes.get(position) else {
+            return Ok(None);
+        };
+        position += 1;
+        match escaped {
+            b'"' | b'\\' | b'/' | b' ' | b'0' | b'a' | b'b' | b't' | b'\t' | b'n' | b'v' | b'f'
+            | b'r' | b'e' => {}
+            b'x' => position = decode_hex_escape(text, position, 2)?.1,
+            b'u' => position = decode_hex_escape(text, position, 4)?.1,
+            b'U' => position = decode_hex_escape(text, position, 8)?.1,
+            b'\n' | b'\r' => {
+                position = skip_escaped_line_break(text, position - 1);
+                reject_double_quoted_document_marker(&text[position..])?;
+            }
+            _ => return Err(invalid_double_quoted_escape("invalid double-quoted escape")),
         }
     }
 
-    Err(YamlError::new(
-        Diagnostic::new(
-            DiagnosticKind::Parser,
-            "unterminated double-quoted scalar in flow sequence",
-            Span::from_usize(absolute_start + start, absolute_start + text.len()),
-        )
-        .with_expected("closing \""),
-    ))
+    Ok(None)
+}
+
+fn reject_double_quoted_document_marker(line: &str) -> Result<(), YamlError> {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    if document_marker_rest(trimmed, "---").is_some()
+        || document_marker_rest(trimmed, "...").is_some()
+    {
+        return Err(invalid_double_quoted_escape(
+            "document marker is not allowed inside a double-quoted scalar",
+        ));
+    }
+    Ok(())
 }
 
 fn single_quoted_flow_end(
@@ -5152,8 +5703,144 @@ fn expected_flow_mapping_separator(offset: usize, found: char) -> YamlError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SimpleMappingFacts {
-    colon: usize,
-    value_start: usize,
+    colon: u32,
+    value_start: u32,
+}
+
+impl SimpleMappingFacts {
+    fn new(colon: usize, value_start: usize) -> Self {
+        Self {
+            colon: Span::usize_to_u32(colon),
+            value_start: Span::usize_to_u32(value_start),
+        }
+    }
+
+    const fn colon(self) -> usize {
+        self.colon as usize
+    }
+
+    const fn value_start(self) -> usize {
+        self.value_start as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SingleLineScalarFacts {
+    start: u32,
+    end: u32,
+    style: YamlScalarStyle,
+}
+
+impl SingleLineScalarFacts {
+    fn new(start: usize, end: usize, style: YamlScalarStyle) -> Self {
+        Self {
+            start: Span::usize_to_u32(start),
+            end: Span::usize_to_u32(end),
+            style,
+        }
+    }
+
+    const fn start(self) -> usize {
+        self.start as usize
+    }
+
+    const fn end(self) -> usize {
+        self.end as usize
+    }
+}
+
+fn single_line_scalar_facts(raw: &str) -> Result<Option<SingleLineScalarFacts>, YamlError> {
+    let start = raw.bytes().take_while(|byte| *byte == b' ').count();
+    let text = &raw[start..];
+    let Some(first) = text.as_bytes().first().copied() else {
+        return Ok(None);
+    };
+
+    if first == b'"' {
+        let Some(end) = scan_double_quoted_scalar(text, 0)? else {
+            return Ok(None);
+        };
+        if !valid_quoted_scalar_trailing_text(&text[end..]) {
+            return Ok(None);
+        }
+        return Ok(Some(SingleLineScalarFacts::new(
+            start,
+            start + end,
+            YamlScalarStyle::DoubleQuoted,
+        )));
+    }
+    if first == b'\'' {
+        let Some(end) = single_quoted_scalar_end(text) else {
+            return Ok(None);
+        };
+        if !valid_quoted_scalar_trailing_text(&text[end..]) {
+            return Ok(None);
+        }
+        return Ok(Some(SingleLineScalarFacts::new(
+            start,
+            start + end,
+            YamlScalarStyle::SingleQuoted,
+        )));
+    }
+    if matches!(
+        first,
+        b'-' | b'?'
+            | b':'
+            | b','
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'#'
+            | b'&'
+            | b'*'
+            | b'!'
+            | b'|'
+            | b'>'
+            | b'%'
+            | b'@'
+            | b'`'
+    ) {
+        return Ok(None);
+    }
+
+    let bytes = text.as_bytes();
+    let mut end = bytes.len();
+    let mut previous_was_whitespace = false;
+    for (offset, &byte) in bytes.iter().enumerate() {
+        if byte == b'#' && previous_was_whitespace {
+            end = offset;
+            break;
+        }
+        if byte == b':'
+            && bytes
+                .get(offset + 1)
+                .is_none_or(|next| matches!(*next, b' ' | b'\t'))
+        {
+            return Ok(None);
+        }
+        if matches!(byte, b'\t' | b'[' | b']' | b'{' | b'}' | b',') {
+            return Ok(None);
+        }
+        previous_was_whitespace = byte == b' ';
+    }
+    end = text[..end].trim_end_matches(' ').len();
+    if end == 0 {
+        return Ok(None);
+    }
+    Ok(Some(SingleLineScalarFacts::new(
+        start,
+        start + end,
+        YamlScalarStyle::Plain,
+    )))
+}
+
+fn valid_quoted_scalar_trailing_text(trailing: &str) -> bool {
+    if trailing.is_empty() || trailing.bytes().all(|byte| byte == b' ') {
+        return true;
+    }
+    let whitespace = trailing.bytes().take_while(|byte| *byte == b' ').count();
+    whitespace > 0 && trailing[whitespace..].starts_with('#')
 }
 
 fn simple_plain_mapping_facts(body: &str) -> Option<SimpleMappingFacts> {
@@ -5177,7 +5864,15 @@ fn simple_plain_mapping_facts(body: &str) -> Option<SimpleMappingFacts> {
         return None;
     }
 
-    Some(SimpleMappingFacts { colon, value_start })
+    Some(SimpleMappingFacts::new(colon, value_start))
+}
+
+fn simple_plain_key_mapping_colon(body: &str) -> Option<usize> {
+    let colon = body.as_bytes().iter().position(|byte| *byte == b':')?;
+    if !is_simple_plain_atom(&body[..colon]) || !is_block_mapping_separator_colon(body, colon) {
+        return None;
+    }
+    Some(colon)
 }
 
 fn is_simple_plain_atom(text: &str) -> bool {
@@ -5188,15 +5883,39 @@ fn is_simple_plain_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/')
 }
 
+#[cfg(test)]
+mod layout_tests {
+    use std::mem::size_of;
+
+    use super::{
+        BlockFrame, FlowFrame, NodeProperties, PendingNodeProperties, SimpleMappingFacts,
+        SingleLineScalarFacts,
+    };
+
+    #[test]
+    fn transient_parser_records_stay_compact() {
+        assert_eq!(size_of::<FlowFrame>(), 24);
+        assert_eq!(size_of::<NodeProperties>(), 32);
+        assert_eq!(size_of::<PendingNodeProperties>(), 40);
+        assert_eq!(size_of::<BlockFrame>(), 16);
+        assert_eq!(size_of::<SimpleMappingFacts>(), 8);
+        assert_eq!(size_of::<SingleLineScalarFacts>(), 12);
+    }
+}
+
 pub(crate) fn find_mapping_colon(body: &str) -> Option<usize> {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
     let mut previous_was_whitespace = false;
-    let start = parse_node_properties(body, Span::empty(0))
-        .ok()
-        .filter(|properties| properties.anchor.is_some() || properties.tag.is_some())
-        .map_or(0, |properties| properties.value_start);
+    let start = if body.starts_with(['!', '&']) {
+        parse_node_properties(body, Span::empty(0))
+            .ok()
+            .filter(|properties| properties.anchor().is_some() || properties.tag().is_some())
+            .map_or(0, NodeProperties::value_start)
+    } else {
+        0
+    };
 
     for (offset, character) in body[start..].char_indices() {
         let offset = start + offset;
@@ -5228,6 +5947,48 @@ pub(crate) fn find_mapping_colon(body: &str) -> Option<usize> {
     }
 
     None
+}
+
+fn plain_continuation_has_mapping_colon(body: &str) -> bool {
+    if body.starts_with(['!', '&']) {
+        return find_mapping_colon(body).is_some();
+    }
+
+    let bytes = body.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut previous_was_whitespace = false;
+    for (offset, &byte) in bytes.iter().enumerate() {
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_double = false;
+            }
+        } else if in_single {
+            if byte == b'\'' {
+                in_single = false;
+            }
+        } else if byte == b'"' && offset == 0 {
+            in_double = true;
+        } else if byte == b'\'' && offset == 0 {
+            in_single = true;
+        } else if byte == b'#' && previous_was_whitespace {
+            return false;
+        } else if byte == b':'
+            && bytes
+                .get(offset + 1)
+                .is_none_or(|next| matches!(*next, b' ' | b'\t'))
+            && !colon_is_inside_leading_alias(body, offset)
+        {
+            return true;
+        }
+        previous_was_whitespace = matches!(byte, b' ' | b'\t');
+    }
+    false
 }
 
 fn is_block_mapping_separator_colon(text: &str, position: usize) -> bool {
@@ -5417,10 +6178,6 @@ fn format_double_quoted_scalar_value(value: &str) -> String {
     output
 }
 
-pub(crate) fn decode_scalar_value(text: &str) -> Result<String, YamlError> {
-    decode_scalar_value_with_content_indent(text, None)
-}
-
 pub(crate) fn decode_scalar_value_with_content_indent(
     text: &str,
     content_indent: Option<usize>,
@@ -5534,6 +6291,57 @@ fn validate_double_quoted_scalar_content(text: &str) -> Result<(), YamlError> {
         }
         first_line = false;
         position = next_position;
+    }
+    Ok(())
+}
+
+fn validate_double_quoted_scalar_escapes(text: &str) -> Result<(), YamlError> {
+    let mut position = 0;
+    while position < text.len() {
+        let character = text[position..]
+            .chars()
+            .next()
+            .expect("position is inside text");
+        if character != '\\' {
+            position += character.len_utf8();
+            continue;
+        }
+
+        position += '\\'.len_utf8();
+        let whitespace_end = position
+            + text[position..]
+                .bytes()
+                .take_while(|byte| matches!(*byte, b' ' | b'\t'))
+                .count();
+        if text[whitespace_end..]
+            .chars()
+            .next()
+            .is_some_and(|next| matches!(next, '\n' | '\r'))
+        {
+            position = skip_escaped_line_break(text, whitespace_end);
+            continue;
+        }
+
+        let Some(escaped) = text[position..].chars().next() else {
+            return Err(YamlError::new(
+                Diagnostic::new(
+                    DiagnosticKind::Typed,
+                    "unterminated double-quoted escape",
+                    Span::empty(0),
+                )
+                .with_expected("an escaped character"),
+            ));
+        };
+        position += escaped.len_utf8();
+        match escaped {
+            '"' | '\\' | '/' | ' ' | '0' | 'a' | 'b' | 't' | '\t' | 'n' | 'v' | 'f' | 'r' | 'e' => {
+            }
+            'x' => position = decode_hex_escape(text, position, 2)?.1,
+            'u' => position = decode_hex_escape(text, position, 4)?.1,
+            'U' => position = decode_hex_escape(text, position, 8)?.1,
+            '\n' | '\r' => position = skip_escaped_line_break(text, position - escaped.len_utf8()),
+            _ => return Err(invalid_double_quoted_escape("invalid double-quoted escape")),
+        }
     }
     Ok(())
 }

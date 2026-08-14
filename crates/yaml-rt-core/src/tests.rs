@@ -1101,6 +1101,22 @@ fn parser_events_carry_source_spans() {
 }
 
 #[test]
+fn semantic_span_reconstructs_split_property_indicator_start() {
+    let doc = YamlDoc::parse("&root\n!local\nvalue\n").expect("valid split scalar properties");
+    let scalar = doc
+        .events()
+        .find(|event| matches!(event.kind, YamlEventKind::Scalar { .. }))
+        .expect("scalar event exists");
+
+    assert_eq!(scalar.span, Span::new(0, 18));
+    assert_eq!(scalar.cst.and_then(|node| doc.anchor(node)), Some("root"));
+    assert_eq!(
+        scalar.cst.and_then(|node| doc.raw_tag(node)),
+        Some("!local")
+    );
+}
+
+#[test]
 fn semantic_events_link_directly_to_originating_cst_nodes() {
     let doc = YamlDoc::parse("---\nroot:\n  - {key: &anchor value}\n  - *anchor\n")
         .expect("valid nested block and flow collections");
@@ -2670,6 +2686,18 @@ fn parser_accepts_property_prefixed_root_flow_sequence() {
     assert_eq!(
         doc.events_to_test_string(),
         "+STR\n+DOC\n+SEQ [] &flowseq\n+MAP {}\n=VAL :a\n=VAL :b\n-MAP\n+MAP {}\n=VAL &c :c\n=VAL :d\n-MAP\n-SEQ\n-DOC\n-STR\n"
+    );
+}
+
+#[test]
+fn parser_registers_property_only_flow_scalars_without_reparsing_the_node_span() {
+    let input = "[&empty , tail]\n";
+    let doc = YamlDoc::parse(input).expect("parser should accept a property-only flow node");
+
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+SEQ []\n=VAL &empty :\n=VAL :tail\n-SEQ\n-DOC\n-STR\n"
     );
 }
 

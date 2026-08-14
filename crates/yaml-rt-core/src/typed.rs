@@ -519,9 +519,9 @@ pub fn __typed_node_error(
 
 fn preserve_fragment_root_anchor(yaml: &mut String, anchor: &str) -> Result<(), YamlError> {
     let properties = parse_node_properties(yaml, Span::from_usize(0, yaml.len()))?;
-    if let Some(existing) = properties.anchor {
+    if let Some(existing) = properties.anchor() {
         yaml.replace_range(existing.start as usize..existing.end as usize, anchor);
-    } else if let Some(tag) = properties.tag {
+    } else if let Some(tag) = properties.tag() {
         yaml.insert_str(tag.end as usize, &format!(" &{anchor}"));
     } else {
         yaml.insert_str(0, &format!("&{anchor} "));
@@ -682,10 +682,10 @@ fn block_scalar_header_line(text: &str, span: Span) -> Result<(usize, usize, usi
                 span.start as usize + line_end,
             ),
         )?;
-        let value = line[properties.value_start..].trim_start();
+        let value = line[properties.value_start()..].trim_start();
         if value.starts_with('|') || value.starts_with('>') {
-            let leading = line[properties.value_start..].len() - value.len();
-            return Ok((line_start, line_end, properties.value_start + leading));
+            let leading = line[properties.value_start()..].len() - value.len();
+            return Ok((line_start, line_end, properties.value_start() + leading));
         }
 
         line_start = line_end;

@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [[bench]]
 name = "parse"
 harness = false
@@ -23,10 +26,10 @@ harness = false
 
 [dev-dependencies]
 criterion = "0.8.2"
-yaml-rt-core.workspace = true
 
 [dependencies]
 saphyr = { version = "0.0.6", optional = true }
+yaml-rt-core.workspace = true
 
 [build-dependencies]
 cc = "1.2.65"

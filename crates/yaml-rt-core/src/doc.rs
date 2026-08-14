@@ -5,8 +5,8 @@ use std::fmt;
 use crate::syntax::node_link;
 use crate::{
     Children, CollectionStyle, Diagnostic, DiagnosticKind, FromYamlDoc, Node, NodeId, NodeKind,
-    Parser, ScalarStyle, SemanticKind, SemanticStore, Source, Span, ToYamlDoc, ToYamlFragment,
-    Token, YamlEditError, YamlError, YamlEvent, YamlFragment,
+    Parser, ScalarStyle, SemanticKind, SemanticProperties, SemanticStore, Source, Span, ToYamlDoc,
+    ToYamlFragment, Token, YamlEditError, YamlError, YamlEvent, YamlFragment,
     decode_scalar_value_with_content_indent, directive_emit_error, double_quoted_scalar_end,
     edits_conflict, events_to_test_string, format_scalar_value, lex, parse_node_properties,
     plain_scalar_end, resolve_tag, single_quoted_scalar_end, strip_inline_comment,
@@ -45,7 +45,7 @@ impl Iterator for YamlEvents<'_> {
                 }
                 EventTask::Documents(index) => self.schedule_document(index),
                 EventTask::DocumentStart(document) => {
-                    let Some(metadata) = self.doc.semantics.get(document) else {
+                    let Some(metadata) = self.doc.semantic_metadata(document) else {
                         continue;
                     };
                     return Some(YamlEvent {
@@ -59,7 +59,7 @@ impl Iterator for YamlEvents<'_> {
                 }
                 EventTask::DocumentChildren(next) => self.schedule_document_child(next),
                 EventTask::DocumentEnd(document) => {
-                    let Some(metadata) = self.doc.semantics.get(document) else {
+                    let Some(metadata) = self.doc.semantic_metadata(document) else {
                         continue;
                     };
                     return Some(YamlEvent {
@@ -79,7 +79,7 @@ impl Iterator for YamlEvents<'_> {
                 EventTask::MappingEntries(next) => self.schedule_mapping_entry(next),
                 EventTask::SequenceEntries(next) => self.schedule_sequence_entry(next),
                 EventTask::CollectionEnd { node, mapping } => {
-                    let Some(metadata) = self.doc.semantics.get(node) else {
+                    let Some(metadata) = self.doc.semantic_metadata(node) else {
                         continue;
                     };
                     return Some(YamlEvent {
@@ -144,13 +144,13 @@ impl YamlEvents<'_> {
         self.tasks.push(EventTask::DocumentChildren(
             self.doc.nodes[child.as_usize()].next_sibling,
         ));
-        if self.doc.semantics.get(child).is_some() {
+        if self.doc.semantic_metadata(child).is_some() {
             self.tasks.push(EventTask::Node(child));
         }
     }
 
     fn schedule_node(&mut self, node: NodeId) -> Option<YamlEvent> {
-        let metadata = self.doc.semantics.get(node)?;
+        let metadata = self.doc.semantic_metadata(node)?;
         let span = self.doc.semantic_span(node, metadata);
         match metadata.kind {
             SemanticKind::Document => None,
@@ -222,8 +222,7 @@ impl YamlEvents<'_> {
                 cst: Some(node),
                 content_indent: self
                     .doc
-                    .semantics
-                    .properties(node)
+                    .semantic_properties(node)
                     .and_then(|properties| properties.content_indent),
             }),
             SemanticKind::Alias => Some(YamlEvent {
@@ -284,7 +283,7 @@ impl YamlEvents<'_> {
 
     fn next_semantic(&self, mut next: u32) -> Option<NodeId> {
         while let Some(node) = node_link(next) {
-            if self.doc.semantics.get(node).is_some() {
+            if self.doc.semantic_metadata(node).is_some() {
                 return Some(node);
             }
             next = self.doc.nodes[node.as_usize()].next_sibling;
@@ -612,19 +611,27 @@ impl YamlDoc {
 
     fn semantic_children(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         self.children(node)
-            .filter(|child| self.semantics.get(*child).is_some())
+            .filter(|child| self.semantic_metadata(*child).is_some())
     }
 
     /// Returns a node's semantic interpretation.
     #[must_use]
     pub fn semantic_kind(&self, node: NodeId) -> Option<SemanticKind> {
-        self.semantics.get(node).map(|node| node.kind)
+        self.semantic_metadata(node).map(|node| node.kind)
+    }
+
+    pub(crate) fn semantic_metadata(&self, node: NodeId) -> Option<crate::semantic::SemanticNode> {
+        self.semantics.get(self.node(node)?)
+    }
+
+    pub(crate) fn semantic_properties(&self, node: NodeId) -> Option<SemanticProperties> {
+        self.semantics.properties(self.node(node)?)
     }
 
     /// Returns the explicit tag spelling, including its leading `!`.
     #[must_use]
     pub fn raw_tag(&self, node: NodeId) -> Option<&str> {
-        let span = self.semantics.properties(node)?.tag?;
+        let span = self.semantic_properties(node)?.tag?;
         Some(self.source.slice(span))
     }
 
@@ -637,7 +644,10 @@ impl YamlDoc {
         let Some(raw) = self.raw_tag(node) else {
             return Ok(None);
         };
-        let document = self.semantics.property_document(node).unwrap_or(node);
+        let document = self
+            .node(node)
+            .and_then(|cst| self.semantics.property_document(cst))
+            .unwrap_or(node);
         let handles = self
             .semantics
             .tag_directives(document)
@@ -649,8 +659,7 @@ impl YamlDoc {
             })
             .collect::<BTreeMap<_, _>>();
         let span = self
-            .semantics
-            .properties(node)
+            .semantic_properties(node)
             .and_then(|properties| properties.tag)
             .unwrap_or_else(|| self.node(node).map_or(Span::empty(0), Node::span));
         resolve_tag(raw, &handles, span).map(|tag| Some(Cow::Owned(tag)))
@@ -659,14 +668,14 @@ impl YamlDoc {
     /// Returns an anchor name without its leading `&`.
     #[must_use]
     pub fn anchor(&self, node: NodeId) -> Option<&str> {
-        let span = self.semantics.properties(node)?.anchor?;
+        let span = self.semantic_properties(node)?.anchor?;
         Some(self.source.slice(span))
     }
 
     /// Returns an alias name without its leading `*`.
     #[must_use]
     pub fn alias_name(&self, node: NodeId) -> Option<&str> {
-        let span = self.semantics.properties(node)?.alias?;
+        let span = self.semantic_properties(node)?.alias?;
         Some(self.source.slice(span))
     }
 
@@ -674,7 +683,7 @@ impl YamlDoc {
     #[must_use]
     pub fn resolve_alias(&self, node: NodeId) -> Option<NodeId> {
         let name = self.alias_name(node)?;
-        let document = self.semantics.property_document(node)?;
+        let document = self.semantics.property_document(self.node(node)?)?;
         let alias_start = self.node(node)?.span.start;
         self.semantics
             .anchors()
@@ -689,15 +698,19 @@ impl YamlDoc {
             .map(|(_, target, _)| target)
     }
 
-    fn semantic_span(&self, node: NodeId, metadata: &crate::semantic::SemanticNode) -> Span {
+    fn semantic_span(&self, node: NodeId, metadata: crate::semantic::SemanticNode) -> Span {
+        let cst_start = self
+            .node(node)
+            .map_or(metadata.end_offset, |node| node.span.start);
         Span::new(
-            metadata.span_start,
+            self.semantics
+                .span_start(self.node(node).expect("semantic node has CST"), cst_start),
             self.node(node)
                 .map_or(metadata.end_offset, |node| node.span.end),
         )
     }
 
-    fn semantic_end_span(&self, node: NodeId, metadata: &crate::semantic::SemanticNode) -> Span {
+    fn semantic_end_span(&self, node: NodeId, metadata: crate::semantic::SemanticNode) -> Span {
         if metadata.explicit_end()
             && let Some(marker) = self.children(node).find_map(|child| {
                 let child = self.node(child)?;
@@ -990,7 +1003,7 @@ impl YamlDoc {
 
     pub(crate) fn rerooted_without_tag(&self, root: NodeId) -> Result<Self, YamlError> {
         let mut doc = self.rerooted_at(root)?;
-        doc.semantics.clear_tag(root);
+        doc.semantics.clear_tag(&doc.nodes[root.as_usize()]);
         Ok(doc)
     }
 
@@ -1073,7 +1086,7 @@ impl YamlDoc {
         }
         let text = self.source.slice(node_ref.span);
         let properties = parse_node_properties(text, node_ref.span)?;
-        let value_text = &text[properties.value_start..];
+        let value_text = &text[properties.value_start()..];
         if matches!(
             self.semantic_kind(node),
             Some(SemanticKind::Scalar {
@@ -1086,8 +1099,7 @@ impl YamlDoc {
         }
         decode_scalar_value_with_content_indent(
             value_text,
-            self.semantics
-                .properties(node)
+            self.semantic_properties(node)
                 .and_then(|properties| properties.content_indent)
                 .map(|indent| indent as usize),
         )
@@ -1135,9 +1147,9 @@ impl YamlDoc {
             return Ok(None);
         }
         let properties = parse_node_properties(text, node_ref.span)?;
-        let value_text = &text[properties.value_start..];
+        let value_text = &text[properties.value_start()..];
         let value_len = plain_scalar_end(value_text);
-        let start = Span::offset_from_usize(node_ref.span.start, properties.value_start);
+        let start = Span::offset_from_usize(node_ref.span.start, properties.value_start());
         Ok(Some(Span::new(
             start,
             Span::offset_from_usize(start, value_len),
@@ -1643,8 +1655,8 @@ impl YamlDoc {
         let node = self.expect_node_kind(node, NodeKind::Scalar)?;
         let text = self.source.slice(node.span);
         let properties = parse_node_properties(text, node.span)?;
-        let value_text = &text[properties.value_start..];
-        let value_start = Span::offset_from_usize(node.span.start, properties.value_start);
+        let value_text = &text[properties.value_start()..];
+        let value_start = Span::offset_from_usize(node.span.start, properties.value_start());
 
         if value_text.starts_with('"') {
             let end = double_quoted_scalar_end(value_text).ok_or_else(|| {

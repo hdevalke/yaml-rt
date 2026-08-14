@@ -416,9 +416,13 @@ follow Conventional Commits.
 The lossless CST remains the source of truth. Semantic information and typed
 Rust values are overlays that read from it and queue source patches. See
 [`docs/architecture.md`](docs/architecture.md) for the component boundaries and
-data flow. Flow collections are parsed left-to-right with a bounded explicit
-frame stack, so deeply nested input does not rely on call-stack recursion and
-each CST node is attached in its grammatical context exactly once.
+data flow. Block parsing advances a sequential line cursor over compact entry
+and collection frames in one iterative state machine. Flow collections are
+parsed left-to-right with a bounded explicit frame stack. Both machines
+register semantic metadata directly in CST nodes during recognition, so deeply
+nested input does not rely on call-stack recursion, no completed-CST semantic
+pass is required, and each CST node is attached in its grammatical context
+exactly once.
 
 ## Roadmap
 

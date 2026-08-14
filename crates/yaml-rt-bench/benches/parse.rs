@@ -9,6 +9,8 @@ use criterion::BatchSize;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 #[cfg(feature = "saphyr-baseline")]
 use saphyr::{LoadableYamlNode, Yaml};
+#[cfg(feature = "rapidyaml-baseline")]
+use yaml_rt_bench as _;
 use yaml_rt_core::{Source, YamlDoc, parse_cst};
 
 struct Fixture {
@@ -169,6 +171,19 @@ fn bench_parse(c: &mut Criterion) {
         );
     }
     flow.finish();
+
+    let hotpath_inputs = [
+        ("quoted_scalars_256", quoted_scalars(256)),
+        ("block_scalars_128", block_scalars(128)),
+        ("nested_configuration_128", nested_configuration(128)),
+        ("json_objects_256", json_objects(256)),
+        ("mixed_flow_256", mixed_flow(256)),
+    ];
+    let mut hotpaths = c.benchmark_group("parse_hotpaths");
+    for (name, input) in &hotpath_inputs {
+        bench_input(&mut hotpaths, name, input);
+    }
+    hotpaths.finish();
 }
 
 fn bench_input(
@@ -284,6 +299,74 @@ fn nested_flow_sequence(depth: usize) -> String {
     input.extend(std::iter::repeat_n('[', depth));
     input.push('0');
     input.extend(std::iter::repeat_n(']', depth));
+    input
+}
+
+fn quoted_scalars(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(72));
+    for index in 0..entries {
+        writeln!(
+            input,
+            "double_{index}: \"Unicode café value {index}\" # comment"
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(input, "single_{index}: 'presentation # value {index}'")
+            .expect("writing to a String cannot fail");
+    }
+    input
+}
+
+fn block_scalars(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(96));
+    for index in 0..entries {
+        writeln!(input, "literal_{index}: |-").expect("writing to a String cannot fail");
+        writeln!(input, "  first line {index}").expect("writing to a String cannot fail");
+        input.push_str("  second line\n");
+        writeln!(input, "folded_{index}: >").expect("writing to a String cannot fail");
+        input.push_str("  folded text\n  continues here\n\n");
+    }
+    input
+}
+
+fn nested_configuration(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(128));
+    input.push_str("services:\n");
+    for index in 0..entries {
+        writeln!(input, "  service_{index}:").expect("writing to a String cannot fail");
+        writeln!(input, "    endpoint: \"https://example.test/{index}\"")
+            .expect("writing to a String cannot fail");
+        input.push_str("    enabled: true\n    retry:\n      count: 3\n      delay_ms: 250\n");
+    }
+    input
+}
+
+fn json_objects(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(72));
+    input.push('[');
+    for index in 0..entries {
+        if index > 0 {
+            input.push(',');
+        }
+        write!(
+            input,
+            "{{\"id\":{index},\"name\":\"item {index}\",\"enabled\":true}}"
+        )
+        .expect("writing to a String cannot fail");
+    }
+    input.push(']');
+    input
+}
+
+fn mixed_flow(entries: usize) -> String {
+    let mut input = String::with_capacity(entries.saturating_mul(80));
+    input.push_str("items:\n");
+    for index in 0..entries {
+        writeln!(
+            input,
+            "  - {{name: \"item {index}\", flags: [http, runtime], retries: 3}}"
+        )
+        .expect("writing to a String cannot fail");
+    }
     input
 }
 

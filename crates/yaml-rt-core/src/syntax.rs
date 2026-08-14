@@ -6,15 +6,27 @@ use crate::{NodeId, Parser, Source, Span, YamlError};
 pub struct Node {
     /// Node classification.
     pub(crate) kind: NodeKind,
+    pub(crate) syntax_flags: u8,
     /// Original source span for this node.
     pub(crate) span: Span,
     pub(crate) parent: u32,
     pub(crate) first_child: u32,
     pub(crate) last_child: u32,
     pub(crate) next_sibling: u32,
+    pub(crate) semantic: u32,
 }
 
 pub(crate) const NO_NODE: u32 = u32::MAX;
+pub(crate) const NO_SEMANTIC_NODE: u32 = u32::MAX;
+pub(crate) const COMMON_SEMANTIC_NODE: u32 = u32::MAX - 1;
+pub(crate) const NODE_SEMANTIC_ALIAS: u8 = 1 << 3;
+pub(crate) const NODE_EXPLICIT_START: u8 = 1 << 4;
+pub(crate) const NODE_EXPLICIT_END: u8 = 1 << 5;
+pub(crate) const NODE_SCALAR_STYLE_MASK: u8 = 0b11;
+pub(crate) const NODE_SCALAR_PLAIN: u8 = 1;
+pub(crate) const NODE_SCALAR_SINGLE_QUOTED: u8 = 2;
+pub(crate) const NODE_SCALAR_DOUBLE_QUOTED: u8 = 3;
+pub(crate) const NODE_SCALAR_SYNTAX_VALIDATED: u8 = 1 << 2;
 
 impl Node {
     /// Returns this node's syntax classification.

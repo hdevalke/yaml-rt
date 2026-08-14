@@ -10,6 +10,7 @@ mod diagnostic;
 mod doc;
 mod edit;
 mod fragment;
+mod inline_vec;
 mod lexer;
 mod parser;
 mod pointer;

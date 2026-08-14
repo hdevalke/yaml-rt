@@ -41,8 +41,12 @@ edit request ------------+---> ordered source patches
 
 ### Source and spans
 
-`Source` owns UTF-8 text and its line-start index. The document editor derives
-the preferred line-ending style from that source when it needs to insert new
+`Source` owns UTF-8 text, its line-start index, and compact facts for ordinary
+block lines. Parsing advances a sequential `LineCursor` whose current view
+already contains byte boundaries, indentation facts, and the next significant
+line. Multiline lookahead clones this cheap cursor and commits the advanced
+copy only when the grammar consumes those lines. The document editor derives
+the preferred line-ending style from the source when it needs to insert new
 lines. Syntax nodes and diagnostics use byte `Span`s and stable `NodeId`s
 instead of borrowing substrings. This keeps the public model lifetime-light and
 makes diagnostics and edits refer to exact user-visible syntax.
@@ -54,19 +58,36 @@ punctuation, and document markers. The parser builds a CST whose node spans
 cover source regions without normalizing them. Rendering an unedited
 `YamlDoc` therefore returns the original bytes.
 
-Flow collections use a one-pass frame machine. Sequence and mapping frames
-record the next grammatical state while a single source cursor advances;
+Block syntax is driven by one iterative `BlockMachine`. Its entry frames retain
+the indentation, CST owner and collection, grammatical phase, pending-property
+state, semantic-open state, last content end, and indentless-sequence policy.
+The machine consumes a sequential `LineCursor` and uses explicit consume,
+reprocess, push, and pop transitions. A `PreparedBlockLine` owns the quote-aware
+mapping-separator and comment results for the recognizing transition. Compact
+syntax reprocesses the current view; dedentation pops entry and compact
+collection frames exactly once. Collection lookup uses cached same-kind links
+instead of searching a heterogeneous context stack.
+
+Flow collections use a separate one-pass frame machine. Sequence and mapping
+frames record the next grammatical state while a single source cursor advances;
 nested collections push frames and completed collections resume their parent.
-This keeps nesting off the call stack, enforces the documented depth limit,
-and prevents speculative nodes from being attached outside their source
-context.
+Both machines keep nesting off the call stack, enforce the documented depth
+limit, and attach nodes only in the transition that recognizes them.
 
 ### Semantic metadata
 
 Composition records document roots, mapping entries, sequence items, tags,
-anchors, aliases, and resolved scalar kinds alongside the CST. It does not
-replace the syntax tree. Schema resolution and JSON Pointer lookup use this
-metadata while emission continues to use source spans.
+anchors, aliases, and resolved scalar kinds alongside the CST. Flow parsing
+registers these semantics as each scalar or collection transition is
+recognized, including implicit mappings and empty nodes, so it does not walk
+the completed flow CST a second time. The semantic builder writes common kind,
+scalar style, alias, and document-marker state directly into CST node flags as
+the grammar transition occurs. A node-local reference addresses sparse
+metadata only when properties or a semantic end offset differ from the CST
+span. Finishing validates that semantic frames are closed and returns that
+sparse store; it does not convert or scan a transient semantic-node arena.
+Schema resolution and JSON Pointer lookup use a derived semantic view while
+emission continues to use source spans.
 
 ### Editing and emission
 

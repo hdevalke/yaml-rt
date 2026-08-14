@@ -126,7 +126,7 @@ impl YamlFragment {
         let mut doc = self.doc.clone();
         let nodes = self.subtree_nodes().collect::<Vec<_>>();
         for node in nodes {
-            let Some(properties) = doc.semantics.properties(node) else {
+            let Some(properties) = doc.semantic_properties(node) else {
                 continue;
             };
             if let Some(span) = properties.anchor {

@@ -4,9 +4,9 @@ use std::{
     time::Duration,
 };
 
-use yaml_rt::{FromYamlDoc, ToYamlDoc, ToYamlFragment, YamlDoc, YamlRoundTrip};
+use yaml_rt::{FromYamlDoc, ToYamlDoc, ToYamlFragment, YamlDoc, YamlRt};
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(rename_all = "lowercase")]
 enum Letter {
     A,
@@ -14,14 +14,14 @@ enum Letter {
     C,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 enum Status {
     Pending,
     #[yaml(rename = "ready", alias = "legacy-ready")]
     Ready,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct UnitEnumConfig {
     letter: Letter,
     status: Status,
@@ -113,7 +113,7 @@ mod positive_i16 {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(rename_all = "lowercase")]
 enum Mode {
     A,
@@ -128,21 +128,21 @@ enum Mode {
     Delayed(#[yaml(with = "duration_seconds")] Duration),
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(rename_all = "lowercase")]
 enum AdaptedPayload {
     Network(#[yaml(with = "ipv4_octets")] Ipv4Addr),
     Positive(#[yaml(with = "positive_i16")] i16),
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(rename_all = "lowercase")]
 enum EmptyPayload {
     Tuple(),
     Struct {},
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(rename_all = "lowercase")]
 enum ExtensibleMode {
     Config {
@@ -152,7 +152,7 @@ enum ExtensibleMode {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 enum GenericMode<T, const N: usize>
 where
     T: Copy,
@@ -161,7 +161,7 @@ where
     Batch([T; N]),
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct EnumShapes {
     optional: Option<Mode>,
     sequence: Vec<Mode>,
@@ -218,7 +218,7 @@ fn unit_enums_work_as_named_struct_fields() {
 
 #[test]
 fn unit_enum_fragments_quote_schema_ambiguous_variant_names() {
-    #[derive(YamlRoundTrip)]
+    #[derive(YamlRt)]
     enum Ambiguous {
         #[yaml(rename = "true")]
         Enabled,
@@ -366,7 +366,7 @@ fn tagged_payload_adapters_support_collections_and_propagate_errors() {
 
 #[test]
 fn variant_switch_replaces_payload_but_preserves_anchor_and_entry_comment() {
-    #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+    #[derive(Debug, PartialEq, Eq, YamlRt)]
     struct Config {
         mode: Mode,
     }
@@ -617,32 +617,32 @@ fn empty_tuple_and_struct_variant_payloads_use_explicit_empty_collections() {
 
 #[test]
 fn enum_rename_rules_follow_serde_variant_transformations() {
-    #[derive(YamlRoundTrip)]
+    #[derive(YamlRt)]
     #[yaml(rename_all = "lowercase")]
     enum Lower {
         VeryTasty(u8),
     }
-    #[derive(YamlRoundTrip)]
+    #[derive(YamlRt)]
     #[yaml(rename_all = "snake_case")]
     enum Snake {
         VeryTasty(u8),
     }
-    #[derive(YamlRoundTrip)]
+    #[derive(YamlRt)]
     #[yaml(rename_all = "kebab-case")]
     enum Kebab {
         VeryTasty(u8),
     }
-    #[derive(YamlRoundTrip)]
+    #[derive(YamlRt)]
     #[yaml(rename_all = "SCREAMING_SNAKE_CASE")]
     enum Screaming {
         VeryTasty(u8),
     }
-    #[derive(YamlRoundTrip)]
+    #[derive(YamlRt)]
     #[yaml(rename_all = "camelCase")]
     enum Camel {
         VeryTasty(u8),
     }
-    #[derive(YamlRoundTrip)]
+    #[derive(YamlRt)]
     #[yaml(rename_all = "PascalCase")]
     enum Pascal {
         VeryTasty(u8),
@@ -676,7 +676,7 @@ fn enum_rename_rules_follow_serde_variant_transformations() {
 
 #[test]
 fn optional_enums_distinguish_missing_null_and_tagged_values() {
-    #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+    #[derive(Debug, PartialEq, Eq, YamlRt)]
     struct OptionalMode {
         mode: Option<Mode>,
     }
@@ -715,7 +715,7 @@ fn optional_enums_distinguish_missing_null_and_tagged_values() {
 
 #[test]
 fn enum_sequence_growth_renders_tags_in_flow_context_and_preserves_crlf() {
-    #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+    #[derive(Debug, PartialEq, Eq, YamlRt)]
     struct Modes {
         modes: Vec<Mode>,
     }

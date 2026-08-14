@@ -87,11 +87,11 @@ use syn::{
 /// comment. Enum data variants intentionally support only the local-tag
 /// representation; internally tagged, adjacently tagged, externally mapped,
 /// and untagged representations are outside this derive's current contract.
-#[proc_macro_derive(YamlRoundTrip, attributes(yaml))]
-pub fn derive_yaml_round_trip(input: TokenStream) -> TokenStream {
+#[proc_macro_derive(YamlRt, attributes(yaml))]
+pub fn derive_yaml_rt(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    expand_yaml_round_trip(input)
+    expand_yaml_rt(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -168,7 +168,7 @@ enum FieldAccess {
     Bindings,
 }
 
-fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
+fn expand_yaml_rt(input: DeriveInput) -> syn::Result<TokenStream2> {
     let DeriveInput {
         attrs,
         ident: name,
@@ -189,17 +189,17 @@ fn expand_yaml_round_trip(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
             Fields::Unnamed(fields) => Err(syn::Error::new_spanned(
                 fields,
-                "YamlRoundTrip supports tuple structs only when they contain exactly one field",
+                "YamlRt supports tuple structs only when they contain exactly one field",
             )),
             Fields::Unit => Err(syn::Error::new_spanned(
                 name,
-                "YamlRoundTrip does not support unit structs",
+                "YamlRt does not support unit structs",
             )),
         },
         Data::Enum(data) => expand_enum(&attrs, &name, generics, data.variants),
         Data::Union(data) => Err(syn::Error::new_spanned(
             data.union_token,
-            "YamlRoundTrip cannot be derived for unions",
+            "YamlRt cannot be derived for unions",
         )),
     }
 }
@@ -1641,7 +1641,7 @@ fn expand_fields(
         let Some(field_name) = field.ident else {
             return Err(syn::Error::new_spanned(
                 field,
-                "YamlRoundTrip supports only named fields",
+                "YamlRt supports only named fields",
             ));
         };
         let field_type = field.ty;
@@ -2157,7 +2157,7 @@ mod tests {
             }
         };
 
-        let error = expand_yaml_round_trip(input).expect_err("with plus skip must fail");
+        let error = expand_yaml_rt(input).expect_err("with plus skip must fail");
 
         assert!(
             error
@@ -2175,7 +2175,7 @@ mod tests {
             }
         };
 
-        let error = expand_yaml_round_trip(input).expect_err("with plus flatten must fail");
+        let error = expand_yaml_rt(input).expect_err("with plus flatten must fail");
 
         assert!(
             error
@@ -2194,7 +2194,7 @@ mod tests {
             }
         };
 
-        let error = expand_yaml_round_trip(input).expect_err("duplicate names must fail");
+        let error = expand_yaml_rt(input).expect_err("duplicate names must fail");
         let message = error.to_string();
 
         assert!(message.contains("yaml enum variant name `First`"));
@@ -2210,7 +2210,7 @@ mod tests {
             }
         };
 
-        let error = expand_yaml_round_trip(input).expect_err("invalid tag must fail");
+        let error = expand_yaml_rt(input).expect_err("invalid tag must fail");
 
         assert!(
             error
@@ -2228,7 +2228,7 @@ mod tests {
             }
         };
 
-        let error = expand_yaml_round_trip(input).expect_err("unsupported rename rule must fail");
+        let error = expand_yaml_rt(input).expect_err("unsupported rename rule must fail");
 
         assert!(error.to_string().contains(
             "rename_all must be lowercase, snake_case, kebab-case, SCREAMING_SNAKE_CASE, camelCase, or PascalCase"
@@ -2250,9 +2250,9 @@ mod tests {
         };
 
         let variant_error =
-            expand_yaml_round_trip(variant_input).expect_err("invalid variant attr must fail");
+            expand_yaml_rt(variant_input).expect_err("invalid variant attr must fail");
         let payload_error =
-            expand_yaml_round_trip(payload_input).expect_err("invalid payload attr must fail");
+            expand_yaml_rt(payload_input).expect_err("invalid payload attr must fail");
 
         assert!(
             variant_error

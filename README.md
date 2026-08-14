@@ -88,14 +88,14 @@ patch-oriented editing primitives.
 
 ## Typed round-trip overlays
 
-`YamlRoundTrip` maps Rust configuration models onto YAML without turning the
+`YamlRt` maps Rust configuration models onto YAML without turning the
 Rust value into the source of truth. Reading does not discard syntax, and
 writing patches only modeled values unless configured otherwise.
 
 ```rust
-use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRoundTrip};
+use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRt};
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Config {
     host: String,
 
@@ -165,8 +165,8 @@ Enums use the same YAML representation as `yaml-rt-serde`: unit variants are
 strings, and variants with data use local tags.
 
 ```rust
-# use yaml_rt::YamlRoundTrip;
-#[derive(YamlRoundTrip)]
+# use yaml_rt::YamlRt;
+#[derive(YamlRt)]
 #[yaml(rename_all = "lowercase")]
 enum Mode {
     A,                          // a
@@ -232,8 +232,8 @@ mod duration_seconds {
     }
 }
 
-# use yaml_rt::YamlRoundTrip;
-#[derive(YamlRoundTrip)]
+# use yaml_rt::YamlRt;
+#[derive(YamlRt)]
 struct Service {
     #[yaml(with = "duration_seconds", rename = "timeout-seconds")]
     timeout: Duration,
@@ -250,7 +250,7 @@ duration adapter together, and the
 [`enum_overlays` example](crates/yaml-rt/examples/enum_overlays.rs) for
 transparent newtypes and tagged enums.
 
-`YamlRoundTrip` is a lossless overlay, not a general-purpose Serde data-model
+`YamlRt` is a lossless overlay, not a general-purpose Serde data-model
 implementation: it reads from an existing `YamlDoc` and applies localized
 patches back to that same source. Serde conversion creates ordinary Rust
 values and deterministic YAML when retaining the original presentation is not
@@ -359,7 +359,7 @@ Run `yaml-rt help <operation>` for operation-specific arguments.
 | --- | --- | --- |
 | `yaml-rt-core` | Dependency-free source model, parser, CST, semantic graph, diagnostics, editor, and emitter | Yes |
 | `yaml-rt-rfc9535` | Native RFC 9535 JSONPath parsing and evaluation over `YamlDoc` | Yes |
-| `yaml-rt-derive` | `YamlRoundTrip` procedural derive | Yes |
+| `yaml-rt-derive` | `YamlRt` procedural derive | Yes |
 | `yaml-rt-serde` | Serde serializer and deserializer | Yes |
 | `yaml-rt` | Facade re-exporting the public APIs | Yes |
 | `yaml-rt-cli` | `yaml-rt` command-line editor | Yes |
@@ -370,7 +370,7 @@ The facade features are:
 
 | Feature | Default | Effect |
 | --- | --- | --- |
-| `derive` | Yes | Re-exports `yaml_rt_derive::YamlRoundTrip` |
+| `derive` | Yes | Re-exports `yaml_rt_derive::YamlRt` |
 | `serde` | No | Re-exports the `yaml-rt-serde` conversion API |
 
 `yaml-rt-core` has no third-party dependencies and retains the foundational RFC

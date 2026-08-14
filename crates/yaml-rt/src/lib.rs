@@ -16,7 +16,7 @@
 //! # }
 //! ```
 //!
-//! The default `derive` feature re-exports [`YamlRoundTrip`] for named mapping
+//! The default `derive` feature re-exports [`YamlRt`] for named mapping
 //! structs, transparent newtypes, and locally tagged enums. The optional
 //! `serde` feature re-exports serialization and deserialization APIs for
 //! conversions where presentation preservation is not required.
@@ -24,7 +24,7 @@
 pub use yaml_rt_core::*;
 
 #[cfg(feature = "derive")]
-pub use yaml_rt_derive::YamlRoundTrip;
+pub use yaml_rt_derive::YamlRt;
 
 #[cfg(feature = "serde")]
 pub use yaml_rt_serde::{

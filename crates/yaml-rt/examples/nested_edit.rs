@@ -1,6 +1,6 @@
-use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRoundTrip};
+use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRt};
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Server {
     host: String,
 
@@ -8,7 +8,7 @@ struct Server {
     port: u16,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Config {
     name: String,
     server: Server,

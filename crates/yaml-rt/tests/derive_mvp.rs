@@ -1,18 +1,18 @@
-use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
+use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRt};
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Config {
     host: String,
     port: u16,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct MatrixConfig {
     host: String,
     matrix: Vec<Vec<u16>>,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct PortsConfig {
     host: String,
     ports: Vec<u16>,

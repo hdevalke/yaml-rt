@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRoundTrip};
+use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRt};
 
 mod duration_seconds {
     use std::time::Duration;
@@ -26,19 +26,19 @@ mod duration_seconds {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Server {
     host: String,
     port: u16,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Group<T, const N: usize> {
     name: String,
     values: [T; N],
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Config {
     #[yaml(with = "duration_seconds", rename = "timeout-seconds")]
     timeout: Duration,

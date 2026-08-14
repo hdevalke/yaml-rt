@@ -21,9 +21,9 @@ parser. Keep every change aligned with the roadmap in `README.md`.
   stream, lossless CST, semantic YAML graph, diagnostics, editor APIs, and the
   patch-based emitter.
 - `crates/yaml-rt-derive`: may use `syn`, `quote`, and `proc-macro2`. Owns the
-  `YamlRoundTrip` derive macro and YAML field/struct attributes.
+  `YamlRt` derive macro and YAML field/struct attributes.
 - `crates/yaml-rt`: facade crate. Re-exports public core APIs and
-  `yaml_rt_derive::YamlRoundTrip`.
+  `yaml_rt_derive::YamlRt`.
 - `tests/`: integration tests, including the typed overlay usefulness target and
   YAML Test Suite harness tests.
 

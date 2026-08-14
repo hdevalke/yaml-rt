@@ -1,7 +1,7 @@
 //! Serde serialization and deserialization for yaml-rt's YAML 1.2.2 model.
 //!
 //! This crate converts typed values. It intentionally does not preserve YAML
-//! presentation details; use `yaml-rt`'s `YamlRoundTrip` overlay for lossless
+//! presentation details; use `yaml-rt`'s `YamlRt` overlay for lossless
 //! document editing.
 //!
 //! [`from_str`] and [`from_slice`] deserialize one YAML document. [`from_reader`]

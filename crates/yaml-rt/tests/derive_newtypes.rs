@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
+use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRt};
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Port(u16);
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Identifier<T>(T)
 where
     T: Copy;
@@ -34,10 +34,10 @@ mod duration_seconds {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Timeout(#[yaml(with = "duration_seconds")] Duration);
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Service {
     port: Port,
     identifiers: Vec<Identifier<u16>>,

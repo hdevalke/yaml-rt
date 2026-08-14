@@ -3,7 +3,7 @@ use std::{
     marker::PhantomData,
     time::Duration,
 };
-use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRoundTrip};
+use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRt};
 
 mod duration_seconds {
     use std::time::Duration;
@@ -86,7 +86,7 @@ mod positive_port {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct AdapterConfig {
     #[yaml(
         with = "duration_seconds",
@@ -180,7 +180,7 @@ fn with_adapters_propagate_read_and_write_conversion_errors() {
     assert_eq!(error.diagnostic.message, "port must be positive");
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Config {
     host: String,
     #[yaml(rename = "log-level")]
@@ -224,7 +224,7 @@ fn derive_inserts_defaults_with_doc_comments() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Commented {
     name: String,
     /// Doc comment should lose to yaml comment.
@@ -247,7 +247,7 @@ fn yaml_comment_attribute_overrides_doc_comment_for_inserted_fields() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct Aliased {
     name: String,
     #[yaml(alias = "legacy-port")]
@@ -290,7 +290,7 @@ fn alias_attribute_inserts_canonical_key_when_missing() {
     assert_eq!(doc.to_string(), "name: app\nport: 8080\n");
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct SkippedField {
     name: String,
     #[yaml(skip)]
@@ -325,7 +325,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct SkipsSerializingIf {
     name: String,
     #[yaml(
@@ -379,7 +379,7 @@ fn skip_serializing_if_omits_missing_field_and_inserts_when_false() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct AliasSkippedSerialization {
     name: String,
     #[yaml(
@@ -403,7 +403,7 @@ fn skip_serializing_if_removes_existing_alias_field() {
     assert_eq!(doc.to_string(), "name: app\n");
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct OptionalFields {
     name: String,
     optional: Option<String>,
@@ -440,14 +440,14 @@ fn option_fields_distinguish_missing_defaults_and_explicit_null() {
     assert_eq!(config.omitted.as_deref(), Some("present"));
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct ServerFields {
     host: String,
     #[yaml(default = 8080)]
     port: u16,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct FlattenedConfig {
     name: String,
     #[yaml(flatten)]
@@ -492,7 +492,7 @@ fn flatten_attribute_writes_nested_overlay_to_root_mapping() {
 
 type ExtraValues = BTreeMap<String, String>;
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct CatchAllConfig {
     #[yaml(alias = "legacy-name")]
     name: String,
@@ -539,7 +539,7 @@ fn flattened_btree_map_owns_only_unclaimed_block_entries() {
 
 #[test]
 fn flattened_btree_map_patches_flow_mappings_and_reparses() {
-    #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+    #[derive(Debug, PartialEq, Eq, YamlRt)]
     struct FlowConfig {
         name: String,
         #[yaml(flatten)]
@@ -572,7 +572,7 @@ fn flattened_btree_map_patches_flow_mappings_and_reparses() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct FlattenedServerAndExtras {
     name: String,
     #[yaml(flatten)]
@@ -601,14 +601,14 @@ fn catch_all_map_composes_with_flattened_structs_and_rejects_collisions() {
     assert_eq!(doc.to_string(), input);
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct ServerWithExtras {
     host: String,
     #[yaml(flatten)]
     extra: BTreeMap<String, String>,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct OuterFlattenedExtras {
     name: String,
     #[yaml(flatten)]
@@ -646,7 +646,7 @@ fn generic_flatten_supports_hash_map_aliases_with_sorted_insertions() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct AmbiguousCatchAll {
     #[yaml(flatten)]
     ordered: BTreeMap<String, String>,
@@ -674,24 +674,24 @@ fn multiple_catch_all_maps_fail_before_reading_or_writing() {
     assert_eq!(doc.to_string(), input);
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct NestedConfig {
     name: String,
     server: ServerFields,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct NestedCollectionsConfig {
     servers: Vec<ServerFields>,
     groups: BTreeMap<String, ServerFields>,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct FlowNestedConfig {
     servers: Vec<ServerFields>,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct StandardShapeConfig {
     primary: Box<ServerFields>,
     fixed: [ServerFields; 2],
@@ -699,12 +699,12 @@ struct StandardShapeConfig {
     by_name: HashMap<String, ServerFields>,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct GenericLeaf<T> {
     value: T,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct GenericConfig<'a, T, const N: usize>
 where
     T: Copy,
@@ -717,7 +717,7 @@ where
     marker: PhantomData<&'a T>,
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct GenericFlatten<T> {
     #[yaml(flatten)]
     values: T,
@@ -951,7 +951,7 @@ fn nested_struct_field_inserts_missing_mapping() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(insert_order = "struct")]
 struct OrderedNestedConfig {
     name: String,
@@ -982,7 +982,7 @@ fn nested_struct_field_inserts_with_comment_and_struct_order() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 struct CollectionConfig {
     name: String,
     #[yaml(default)]
@@ -1036,7 +1036,7 @@ fn repeated_apply_can_commit_between_passes() {
     assert_eq!(doc.to_string(), "name: app\nports:\n  - 9090\nlimits: {}\n");
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(prune_unknown_fields)]
 struct PrunedConfig {
     name: String,
@@ -1058,7 +1058,7 @@ fn prune_unknown_fields_removes_unmodeled_root_entries_after_write() {
     assert_eq!(doc.to_string(), "name: app\nlegacy-port: 9090\n");
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(preserve_unknown_fields)]
 struct ExplicitlyPreservedConfig {
     name: String,
@@ -1076,7 +1076,7 @@ fn preserve_unknown_fields_struct_attribute_keeps_default_behavior() {
     assert_eq!(doc.to_string(), "name: app\nextra: keep-me\n");
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(insert_order = "struct")]
 struct StructOrderedConfig {
     host: String,
@@ -1100,7 +1100,7 @@ fn insert_order_struct_inserts_missing_fields_before_next_declared_entry() {
     );
 }
 
-#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(insert_order = "append")]
 struct AppendOrderedConfig {
     host: String,

@@ -4,7 +4,7 @@ use std::fmt;
 use yaml_rt_core::{
     NodeId, ResolvedScalar, SemanticKind, YamlDoc, YamlScalarStyle, resolve_scalar,
 };
-use yaml_rt_rfc9535::JsonPath;
+use yaml_rt_rfc9535::{JsonPath, QueryMatches};
 
 const MAX_VALUE_DEPTH: usize = 1024;
 const MAP_TAG: &str = "tag:yaml.org,2002:map";
@@ -15,10 +15,7 @@ pub(crate) fn run_query(
     document: usize,
     source: &str,
 ) -> Result<String, QueryCommandError> {
-    let query = JsonPath::parse(source).map_err(QueryCommandError::display)?;
-    let matches = query
-        .query(doc, document)
-        .map_err(QueryCommandError::display)?;
+    let matches = query_matches(doc, document, source)?;
     let budget = doc.as_source().len().saturating_mul(100).max(10_000);
     let mut output = String::new();
     for matched in matches {
@@ -29,6 +26,17 @@ pub(crate) fn run_query(
         output.push('\n');
     }
     Ok(output)
+}
+
+pub(crate) fn query_matches(
+    doc: &YamlDoc,
+    document: usize,
+    source: &str,
+) -> Result<QueryMatches, QueryCommandError> {
+    JsonPath::parse(source)
+        .map_err(QueryCommandError::display)?
+        .query(doc, document)
+        .map_err(QueryCommandError::display)
 }
 
 #[derive(Debug)]

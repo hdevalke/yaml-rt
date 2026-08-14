@@ -34,6 +34,24 @@ fn help_and_version_report_distribution_metadata() {
     assert!(help.status.success(), "{:?}", help.stderr);
     assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: yaml-rt"));
     assert!(help.stderr.is_empty());
+
+    for operation in ["get", "add", "remove", "replace", "test"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .args([operation, "--help"])
+            .output()
+            .unwrap();
+        assert!(help.status.success(), "{:?}", help.stderr);
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--query <QUERY>"));
+    }
+
+    for operation in ["move", "copy", "patch"] {
+        let help = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .args([operation, "--help"])
+            .output()
+            .unwrap();
+        assert!(help.status.success(), "{:?}", help.stderr);
+        assert!(!String::from_utf8_lossy(&help.stdout).contains("--query"));
+    }
 }
 
 #[test]
@@ -117,6 +135,78 @@ fn query_supports_document_selection_and_output_files() {
     assert_eq!(
         fs::read(&result).unwrap(),
         b"\"/users/0/name\": \"second\"\n"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn query_targeted_commands_support_positional_files_and_outputs() {
+    let directory = temp_dir();
+    let input = directory.join("document.yaml");
+    let result = directory.join("result.yaml");
+    fs::write(
+        &input,
+        "---\nusers: [{name: first, active: false}]\n---\nusers: [{name: second, active: false}]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "get",
+            "--query",
+            "$.users[*].name",
+            "--doc",
+            "1",
+            "--output",
+            result.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read(&result).unwrap(), b"---\nsecond\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "replace",
+            "--query",
+            "$.missing",
+            "--doc",
+            "1",
+            "--value",
+            "true",
+            "--in-place",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fs::read(&input).unwrap(),
+        b"---\nusers: [{name: first, active: false}]\n---\nusers: [{name: second, active: false}]\n"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "replace",
+            "--query",
+            "$.users[*].active",
+            "--doc",
+            "1",
+            "--value",
+            "true",
+            "--in-place",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fs::read(&input).unwrap(),
+        b"---\nusers: [{name: first, active: false}]\n---\nusers: [{name: second, active: true}]\n"
     );
     fs::remove_dir_all(directory).unwrap();
 }

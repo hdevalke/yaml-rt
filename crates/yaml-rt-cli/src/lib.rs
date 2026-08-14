@@ -5,18 +5,21 @@
 //! retaining unrelated presentation. [`run`] is public so integrations can
 //! supply their own argument and I/O streams.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap::{Args, Parser, Subcommand, error::ErrorKind};
+use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment, YamlPatch};
+use yaml_rt_rfc9535::QueryMatches;
 
 mod query;
 
-use query::run_query;
+use query::{query_matches, run_query};
 
 const FAILURE: i32 = 1;
 const USAGE: i32 = 2;
@@ -51,6 +54,13 @@ where
             return if display_only { 0 } else { USAGE };
         }
     };
+    if let Err(message) = cli.operation.validate() {
+        let error = Cli::command().error(ErrorKind::ArgumentConflict, message);
+        if write!(stderr, "{error}").is_err() {
+            return FAILURE;
+        }
+        return USAGE;
+    }
     match execute(&cli.operation, stdin, stdout) {
         Ok(()) | Err(RunError::BrokenPipe) => 0,
         Err(RunError::Message(message)) => {
@@ -107,8 +117,16 @@ struct TargetArgs {
 
 #[derive(Args)]
 struct PathArgs {
-    #[arg(value_name = "PATH", allow_hyphen_values = true)]
-    path: String,
+    /// JSON Pointer, or the input file when `--query` is used.
+    #[arg(
+        value_name = "PATH_OR_FILE",
+        allow_hyphen_values = true,
+        required_unless_present = "query"
+    )]
+    path_or_file: Option<String>,
+    /// Select operation targets with an RFC 9535 `JSONPath` query.
+    #[arg(long, value_name = "QUERY")]
+    query: Option<String>,
     #[command(flatten)]
     target: TargetArgs,
 }
@@ -228,7 +246,7 @@ fn execute(
     stdout: &mut dyn Write,
 ) -> Result<(), RunError> {
     let target = operation.target();
-    let input_path = target.file.as_deref();
+    let input_path = operation.input_path();
     let target_uses_stdin = input_path.is_none_or(|path| path == Path::new("-"));
     if matches!(operation, Operation::Patch(arguments) if arguments.source.patch_file.as_deref() == Some(Path::new("-")))
         && target_uses_stdin
@@ -258,14 +276,26 @@ fn execute(
         return write_mutation(&doc, &arguments.output, input_path, stdout);
     }
 
+    let value = read_value(operation.value(), target_uses_stdin, stdin)?;
+    if let Some(source) = operation.selection_query() {
+        let matches = query_matches(&doc, document, source).map_err(RunError::display)?;
+        return execute_query_targeted(
+            operation,
+            &mut doc,
+            document,
+            &matches,
+            value.as_ref(),
+            input_path,
+            stdout,
+        );
+    }
+
     let path = JsonPointer::parse(operation.path()).map_err(RunError::display)?;
     let from = operation
         .from()
         .map(JsonPointer::parse)
         .transpose()
         .map_err(RunError::display)?;
-    let value = read_value(operation.value(), target_uses_stdin, stdin)?;
-
     match operation {
         Operation::Query(_) => unreachable!("query returned before pointer operations"),
         Operation::Get(arguments) => {
@@ -334,6 +364,20 @@ fn execute(
 }
 
 impl Operation {
+    fn validate(&self) -> Result<(), String> {
+        let path = match self {
+            Self::Get(args) => Some(&args.path),
+            Self::Add(args) | Self::Replace(args) => Some(&args.value.path),
+            Self::Remove(args) => Some(&args.path),
+            Self::Test(args) => Some(&args.path),
+            _ => None,
+        };
+        if let Some(path) = path {
+            path.validate()?;
+        }
+        Ok(())
+    }
+
     fn target(&self) -> &TargetArgs {
         match self {
             Self::Query(args) => &args.target,
@@ -351,11 +395,31 @@ impl Operation {
             Self::Query(_) | Self::Patch(_) => {
                 unreachable!("operation does not use a JSON Pointer argument")
             }
-            Self::Get(args) => &args.path.path,
-            Self::Add(args) | Self::Replace(args) => &args.value.path.path,
-            Self::Remove(args) => &args.path.path,
+            Self::Get(args) => args.path.pointer(),
+            Self::Add(args) | Self::Replace(args) => args.value.path.pointer(),
+            Self::Remove(args) => args.path.pointer(),
             Self::Move(args) | Self::Copy(args) => &args.path.path,
-            Self::Test(args) => &args.path.path,
+            Self::Test(args) => args.path.pointer(),
+        }
+    }
+
+    fn selection_query(&self) -> Option<&str> {
+        match self {
+            Self::Get(args) => args.path.query.as_deref(),
+            Self::Add(args) | Self::Replace(args) => args.value.path.query.as_deref(),
+            Self::Remove(args) => args.path.query.as_deref(),
+            Self::Test(args) => args.path.query.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn input_path(&self) -> Option<&Path> {
+        match self {
+            Self::Get(args) => args.path.input_path(),
+            Self::Add(args) | Self::Replace(args) => args.value.path.input_path(),
+            Self::Remove(args) => args.path.input_path(),
+            Self::Test(args) => args.path.input_path(),
+            _ => self.target().file.as_deref(),
         }
     }
 
@@ -373,6 +437,197 @@ impl Operation {
             _ => None,
         }
     }
+}
+
+impl PathArgs {
+    fn validate(&self) -> Result<(), String> {
+        if self.query.is_some() && self.target.file.is_some() {
+            return Err(
+                "a JSONPath-targeted command accepts at most one positional FILE argument"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    fn pointer(&self) -> &str {
+        self.path_or_file
+            .as_deref()
+            .expect("Clap requires a pointer when --query is absent")
+    }
+
+    fn input_path(&self) -> Option<&Path> {
+        if self.query.is_some() {
+            self.path_or_file.as_deref().map(Path::new)
+        } else {
+            self.target.file.as_deref()
+        }
+    }
+}
+
+fn execute_query_targeted(
+    operation: &Operation,
+    doc: &mut YamlDoc,
+    document: usize,
+    matches: &QueryMatches,
+    value: Option<&YamlFragment>,
+    input_path: Option<&Path>,
+    stdout: &mut dyn Write,
+) -> Result<(), RunError> {
+    match operation {
+        Operation::Get(arguments) => {
+            let output = render_yaml_stream(doc, matches)?;
+            write_result(
+                output.as_bytes(),
+                arguments.output.output.as_deref(),
+                input_path,
+                stdout,
+            )
+        }
+        Operation::Test(_) => test_query_matches(
+            doc,
+            document,
+            matches,
+            value.expect("Clap requires a value"),
+        ),
+        Operation::Add(arguments) => {
+            apply_query_mutation(
+                doc,
+                document,
+                matches,
+                QueryMutation::Add(value.expect("Clap requires a value")),
+            )?;
+            write_mutation(doc, &arguments.output, input_path, stdout)
+        }
+        Operation::Remove(arguments) => {
+            apply_query_mutation(doc, document, matches, QueryMutation::Remove)?;
+            write_mutation(doc, &arguments.output, input_path, stdout)
+        }
+        Operation::Replace(arguments) => {
+            apply_query_mutation(
+                doc,
+                document,
+                matches,
+                QueryMutation::Replace(value.expect("Clap requires a value")),
+            )?;
+            write_mutation(doc, &arguments.output, input_path, stdout)
+        }
+        _ => unreachable!("only single-path commands accept --query"),
+    }
+}
+
+fn render_yaml_stream(doc: &YamlDoc, matches: &QueryMatches) -> Result<String, RunError> {
+    let mut output = String::new();
+    for matched in matches {
+        output.push_str("---\n");
+        if let Some(node) = matched.node() {
+            let fragment = doc.extract_node(node).map_err(RunError::display)?;
+            output.push_str(&fragment);
+            if !fragment.ends_with(['\n', '\r']) {
+                output.push('\n');
+            }
+        }
+    }
+    Ok(output)
+}
+
+enum QueryMutation<'a> {
+    Add(&'a YamlFragment),
+    Remove,
+    Replace(&'a YamlFragment),
+}
+
+fn apply_query_mutation(
+    doc: &mut YamlDoc,
+    document: usize,
+    matches: &QueryMatches,
+    mutation: QueryMutation<'_>,
+) -> Result<(), RunError> {
+    if matches.is_empty() {
+        return Err(RunError::message("query matched no nodes"));
+    }
+    let mut targets = normalized_mutation_targets(matches);
+    if matches!(mutation, QueryMutation::Remove) {
+        targets.sort_by(removal_order);
+    }
+    let mut work = doc.clone();
+    for pointer in &targets {
+        match mutation {
+            QueryMutation::Add(value) => work.add_at(document, pointer, value),
+            QueryMutation::Remove => work.remove_at(document, pointer),
+            QueryMutation::Replace(value) => work.replace_at(document, pointer, value),
+        }
+        .map_err(RunError::display)?;
+    }
+    *doc = work;
+    Ok(())
+}
+
+fn normalized_mutation_targets(matches: &QueryMatches) -> Vec<JsonPointer> {
+    let mut seen = HashSet::new();
+    let unique = matches
+        .iter()
+        .filter_map(|matched| {
+            let pointer = matched.pointer();
+            seen.insert(pointer.as_str().to_owned())
+                .then(|| pointer.clone())
+        })
+        .collect::<Vec<_>>();
+    unique
+        .iter()
+        .filter(|pointer| {
+            !unique
+                .iter()
+                .any(|candidate| candidate.is_proper_prefix_of(pointer))
+        })
+        .cloned()
+        .collect()
+}
+
+fn removal_order(left: &JsonPointer, right: &JsonPointer) -> CmpOrdering {
+    right
+        .tokens()
+        .len()
+        .cmp(&left.tokens().len())
+        .then_with(|| {
+            for (left, right) in left.tokens().iter().zip(right.tokens()) {
+                let order = match (
+                    left.as_str().parse::<usize>(),
+                    right.as_str().parse::<usize>(),
+                ) {
+                    (Ok(left), Ok(right)) => right.cmp(&left),
+                    _ => right.as_str().cmp(left.as_str()),
+                };
+                if order != CmpOrdering::Equal {
+                    return order;
+                }
+            }
+            CmpOrdering::Equal
+        })
+}
+
+fn test_query_matches(
+    doc: &YamlDoc,
+    document: usize,
+    matches: &QueryMatches,
+    value: &YamlFragment,
+) -> Result<(), RunError> {
+    if matches.is_empty() {
+        return Err(RunError::message("query matched no nodes"));
+    }
+    for matched in matches {
+        let pointer = matched.pointer();
+        let equal = doc
+            .test_at(document, pointer, value)
+            .map_err(RunError::display)?;
+        if !equal {
+            return Err(RunError::message(format!(
+                "test failed at {:?}: values are not semantically equal",
+                pointer.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_patch(arguments: &PatchSourceArgs, stdin: &mut dyn Read) -> Result<YamlPatch, RunError> {
@@ -669,6 +924,137 @@ mod tests {
         let (status, stdout, stderr) = invoke(&["yaml-rt", "query", "$.missing"], input);
         assert_eq!(status, 0, "{stderr}");
         assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn get_query_emits_a_yaml_document_stream() {
+        let input = "users:\n  - {name: Ada}\n  - {name: Linus}\n";
+        let (status, stdout, stderr) =
+            invoke(&["yaml-rt", "get", "--query", "$.users[*].name"], input);
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "---\nAda\n---\nLinus\n");
+
+        let (status, stdout, stderr) = invoke(&["yaml-rt", "get", "--query", "$.missing"], input);
+        assert_eq!(status, 0, "{stderr}");
+        assert!(stdout.is_empty());
+
+        let (status, stdout, stderr) = invoke(&["yaml-rt", "get", "--query", "$"], "---\n");
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "---\n");
+    }
+
+    #[test]
+    fn query_targeted_value_mutations_are_atomic() {
+        let input = "items: [{enabled: false}, {enabled: false}]\n";
+        for operation in ["add", "replace"] {
+            let (status, stdout, stderr) = invoke(
+                &[
+                    "yaml-rt",
+                    operation,
+                    "--query",
+                    "$.items[*].enabled",
+                    "--value",
+                    "true",
+                ],
+                input,
+            );
+            assert_eq!(status, 0, "{stderr}");
+            assert_eq!(stdout, "items: [{enabled: true}, {enabled: true}]\n");
+        }
+
+        let (status, stdout, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "replace",
+                "--query",
+                "$.missing",
+                "--value",
+                "true",
+            ],
+            input,
+        );
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("query matched no nodes"));
+    }
+
+    #[test]
+    fn query_targeted_remove_normalizes_and_orders_matches() {
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "remove", "--query", "$.items[0,2,0]"],
+            "items: [a, b, c, d]\n",
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "items: [b, d]\n");
+
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "remove", "--query", "$..*"],
+            "root: {child: x}\nuntouched: y\n",
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn query_targeted_test_requires_matches_and_tests_every_node() {
+        let input = "values: [1, 1, 2]\n";
+        let (status, stdout, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "test",
+                "--query",
+                "$.values[0,1]",
+                "--value",
+                "1",
+            ],
+            input,
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert!(stdout.is_empty());
+
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "test", "--query", "$.values[*]", "--value", "1"],
+            input,
+        );
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("/values/2"));
+
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "test", "--query", "$.missing", "--value", "1"],
+            input,
+        );
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("query matched no nodes"));
+    }
+
+    #[test]
+    fn query_targeted_commands_reject_extra_positionals_as_usage_errors() {
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "get", "--query", "$.value", "first", "second"],
+            "value: 1\n",
+        );
+        assert_eq!(status, USAGE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("at most one positional FILE"));
+    }
+
+    #[test]
+    fn query_targeted_commands_report_query_errors_before_output() {
+        let (status, stdout, stderr) =
+            invoke(&["yaml-rt", "get", "--query", "not-jsonpath"], "value: 1\n");
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("JSONPath"));
+
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "remove", "--query", "$.*"],
+            "? [complex, key]\n: value\n",
+        );
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("non-string key"));
     }
 
     #[test]

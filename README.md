@@ -295,8 +295,14 @@ yaml-rt query '$.services[*].port' config.yaml
 # Read a node.
 yaml-rt get /server/port config.yaml
 
+# Read every matching node as a YAML document stream.
+yaml-rt get --query '$.services[*].port' config.yaml
+
 # Replace a value and print the edited document.
 yaml-rt replace /server/port --value 9090 config.yaml
+
+# Replace every node selected by JSONPath.
+yaml-rt replace --query '$.services[*].port' --value 9090 config.yaml
 
 # Edit a file atomically in place.
 yaml-rt add /server/debug --value true --in-place config.yaml
@@ -316,6 +322,13 @@ Available operations are `query`, `get`, `add`, `remove`, `replace`, `move`,
 compact JSON Pointer/value pair per line. JSONPath evaluation uses the YAML 1.2
 core schema and rejects YAML values that are not JSON-compatible, including
 non-string or duplicate mapping keys and non-finite numbers.
+
+`get`, `add`, `remove`, `replace`, and `test` also accept `--query QUERY` in
+place of their positional JSON Pointer. `get --query` emits each match as a
+separate `---` YAML document in nodelist order. Query-targeted mutations apply
+to all matched nodes transactionally; duplicate targets are edited once, and a
+selected ancestor supersedes its selected descendants. A mutation or `test`
+fails when the query matches nothing, while `get` succeeds with empty output.
 
 `patch` accepts an RFC 6902-style operation sequence through either
 `--patch YAML` or `--patch-file FILE`. JSON patch documents are valid because

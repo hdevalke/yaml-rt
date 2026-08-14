@@ -143,6 +143,16 @@ enum EmptyPayload {
 }
 
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+#[yaml(rename_all = "lowercase")]
+enum ExtensibleMode {
+    Config {
+        name: String,
+        #[yaml(flatten)]
+        extra: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
 enum GenericMode<T, const N: usize>
 where
     T: Copy,
@@ -420,6 +430,38 @@ fn tagged_variant_fragments_use_serde_compatible_local_tags() {
         .to_yaml_fragment(0, "\n")
         .expect("struct variant formats"),
         "!server\nhost: api\nport: 8080"
+    );
+}
+
+#[test]
+fn struct_variants_support_catch_all_maps_in_edits_and_fragments() {
+    let mut doc = YamlDoc::parse("!config {name: app, custom: \"old\", remove: gone}\n")
+        .expect("valid extensible enum variant");
+    let mut value = ExtensibleMode::from_yaml_doc(&doc).expect("enum catch-all reads");
+    let ExtensibleMode::Config { name, extra } = &mut value;
+    assert_eq!(name, "app");
+    extra.insert("custom".to_owned(), "new".to_owned());
+    extra.remove("remove");
+    extra.insert("alpha".to_owned(), "first".to_owned());
+
+    value
+        .apply_to_yaml_doc(&mut doc)
+        .expect("enum catch-all writes");
+    assert_eq!(
+        doc.to_string(),
+        "!config {name: app, custom: \"new\", alpha: first}\n"
+    );
+    doc.commit_edits().expect("enum catch-all output reparses");
+    assert_eq!(
+        ExtensibleMode::from_yaml_doc(&doc).expect("enum catch-all rereads"),
+        value
+    );
+
+    assert_eq!(
+        value
+            .to_yaml_fragment(0, "\n")
+            .expect("enum catch-all fragment formats"),
+        "!config\nname: app\nalpha: first\ncustom: new"
     );
 }
 

@@ -46,7 +46,8 @@ use syn::{
 /// - `#[yaml(skip_serializing_if = "path::to::predicate")]` to remove or omit
 ///   the field when the predicate returns `true`
 /// - `#[yaml(flatten)]` to overlay a nested round-trip struct on the same root
-///   mapping
+///   mapping or capture unmodeled entries in a string-keyed `BTreeMap` or
+///   `HashMap`
 /// - `#[yaml(with = "module::path")]` to convert through the module's `Repr`
 ///   type and `from_yaml`/`to_yaml` functions
 /// - Rust doc comments as insertion comments when `yaml(comment = ...)` is not
@@ -64,6 +65,11 @@ use syn::{
 /// `Repr` must implement `YamlValue` and `ToYamlFragment`. The usual field
 /// attributes are applied outside the conversion. `with` cannot be combined
 /// with `skip` or `flatten`.
+///
+/// A recursively flattened mapping graph may contain one catch-all map. Its
+/// entries exclude canonical field names, aliases, skipped fields, and keys
+/// modeled by nested flattened structs. Applying the overlay synchronizes the
+/// catch-all entries exactly; inserting a modeled key into the map is an error.
 ///
 /// Supported struct attributes:
 ///
@@ -149,6 +155,8 @@ struct FieldExpansion {
     reads: Vec<TokenStream2>,
     writes: Vec<TokenStream2>,
     known_keys: Vec<String>,
+    flatten_types: Vec<syn::Type>,
+    flatten_values: Vec<TokenStream2>,
     has_flatten: bool,
     read_bounds: Vec<WherePredicate>,
     write_bounds: Vec<WherePredicate>,
@@ -219,15 +227,20 @@ fn expand_named_struct(
     let prune_unknown_fields = match struct_options.unknown_field_policy {
         UnknownFieldPolicy::Preserve => quote! {},
         UnknownFieldPolicy::Prune => {
-            let known_keys = &fields.known_keys;
             quote! {
-                doc.retain_mapping_entries(root, &[#(#known_keys),*])?;
+                doc.retain_mapping_entries(root, &__yaml_rt_claimed_keys)?;
             }
         }
     };
 
-    let field_reads = fields.reads;
-    let field_writes = fields.writes;
+    let field_reads = &fields.reads;
+    let field_writes = &fields.writes;
+    let catch_all_count = flatten_catch_all_count(&fields);
+    let direct_claimed_keys = flatten_claimed_keys_binding(&fields, quote! { &[] });
+    let outer_claimed_keys =
+        flatten_claimed_keys_binding(&fields, quote! { __yaml_rt_outer_claimed_keys });
+    let flatten_validations = flatten_validation_tokens(&fields);
+    let flatten_key_metadata = flatten_key_metadata(&fields);
     let mut read_generics = generics.clone();
     read_generics
         .make_where_clause()
@@ -242,11 +255,11 @@ fn expand_named_struct(
     combined_generics
         .make_where_clause()
         .predicates
-        .extend(fields.read_bounds);
+        .extend(fields.read_bounds.iter().cloned());
     combined_generics
         .make_where_clause()
         .predicates
-        .extend(fields.write_bounds);
+        .extend(fields.write_bounds.iter().cloned());
     let (read_impl_generics, read_type_generics, read_where_clause) =
         read_generics.split_for_impl();
     let (write_impl_generics, write_type_generics, write_where_clause) =
@@ -257,6 +270,8 @@ fn expand_named_struct(
     Ok(quote! {
         impl #read_impl_generics ::yaml_rt::FromYamlDoc for #name #read_type_generics #read_where_clause {
             fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
+                ::yaml_rt::__validate_yaml_flatten_layout(doc, #catch_all_count)?;
+                #direct_claimed_keys
                 Ok(Self {
                     #(#field_reads,)*
                 })
@@ -265,6 +280,59 @@ fn expand_named_struct(
 
         impl #write_impl_generics ::yaml_rt::ToYamlDoc for #name #write_type_generics #write_where_clause {
             fn apply_to_yaml_doc(&self, doc: &mut ::yaml_rt::YamlDoc) -> Result<(), ::yaml_rt::YamlError> {
+                ::yaml_rt::__validate_yaml_flatten_layout(doc, #catch_all_count)?;
+                #direct_claimed_keys
+                #(#flatten_validations)*
+                let root = doc.root_mapping()?;
+                #ordered_keys_binding
+                #(#field_writes)*
+                #prune_unknown_fields
+                Ok(())
+            }
+        }
+
+        impl #combined_impl_generics ::yaml_rt::YamlFlatten for #name #combined_type_generics #combined_where_clause {
+            fn yaml_flatten_keys() -> ::std::vec::Vec<&'static str> {
+                #flatten_key_metadata
+            }
+
+            fn yaml_flatten_catch_all_count() -> usize {
+                #catch_all_count
+            }
+
+            fn from_yaml_flattened(
+                doc: &::yaml_rt::YamlDoc,
+                __yaml_rt_outer_claimed_keys: &[&str],
+            ) -> Result<Self, ::yaml_rt::YamlError> {
+                ::yaml_rt::__validate_yaml_flatten_layout(doc, #catch_all_count)?;
+                #outer_claimed_keys
+                Ok(Self {
+                    #(#field_reads,)*
+                })
+            }
+
+            fn validate_yaml_flattened(
+                &self,
+                doc: &::yaml_rt::YamlDoc,
+                __yaml_rt_outer_claimed_keys: &[&str],
+            ) -> Result<(), ::yaml_rt::YamlError> {
+                ::yaml_rt::__validate_yaml_flatten_layout(doc, #catch_all_count)?;
+                #outer_claimed_keys
+                #(#flatten_validations)*
+                Ok(())
+            }
+
+            fn apply_to_yaml_flattened(
+                &self,
+                doc: &mut ::yaml_rt::YamlDoc,
+                __yaml_rt_outer_claimed_keys: &[&str],
+            ) -> Result<(), ::yaml_rt::YamlError> {
+                <Self as ::yaml_rt::YamlFlatten>::validate_yaml_flattened(
+                    self,
+                    doc,
+                    __yaml_rt_outer_claimed_keys,
+                )?;
+                #outer_claimed_keys
                 let root = doc.root_mapping()?;
                 #ordered_keys_binding
                 #(#field_writes)*
@@ -300,6 +368,83 @@ fn expand_named_struct(
             }
         }
     })
+}
+
+fn flatten_catch_all_count(fields: &FieldExpansion) -> TokenStream2 {
+    let counts = fields.flatten_types.iter().map(|field_type| {
+        quote! { <#field_type as ::yaml_rt::YamlFlatten>::yaml_flatten_catch_all_count() }
+    });
+    quote! { 0usize #(+ #counts)* }
+}
+
+fn flatten_claimed_keys_binding(
+    fields: &FieldExpansion,
+    outer_claimed_keys: TokenStream2,
+) -> TokenStream2 {
+    let known_keys = &fields.known_keys;
+    let nested_keys = fields.flatten_types.iter().map(|field_type| {
+        quote! {
+            for __yaml_rt_key in
+                <#field_type as ::yaml_rt::YamlFlatten>::yaml_flatten_keys()
+            {
+                if !__yaml_rt_claimed_keys.contains(&__yaml_rt_key) {
+                    __yaml_rt_claimed_keys.push(__yaml_rt_key);
+                }
+            }
+        }
+    });
+    quote! {
+        let mut __yaml_rt_claimed_keys: ::std::vec::Vec<&str> =
+            (#outer_claimed_keys).to_vec();
+        #(
+            if !__yaml_rt_claimed_keys.contains(&#known_keys) {
+                __yaml_rt_claimed_keys.push(#known_keys);
+            }
+        )*
+        #(#nested_keys)*
+    }
+}
+
+fn flatten_key_metadata(fields: &FieldExpansion) -> TokenStream2 {
+    let known_keys = &fields.known_keys;
+    let nested_keys = fields.flatten_types.iter().map(|field_type| {
+        quote! {
+            for __yaml_rt_key in
+                <#field_type as ::yaml_rt::YamlFlatten>::yaml_flatten_keys()
+            {
+                if !__yaml_rt_keys.contains(&__yaml_rt_key) {
+                    __yaml_rt_keys.push(__yaml_rt_key);
+                }
+            }
+        }
+    });
+    quote! {
+        let mut __yaml_rt_keys = ::std::vec::Vec::new();
+        #(
+            if !__yaml_rt_keys.contains(&#known_keys) {
+                __yaml_rt_keys.push(#known_keys);
+            }
+        )*
+        #(#nested_keys)*
+        __yaml_rt_keys
+    }
+}
+
+fn flatten_validation_tokens(fields: &FieldExpansion) -> Vec<TokenStream2> {
+    fields
+        .flatten_types
+        .iter()
+        .zip(&fields.flatten_values)
+        .map(|(field_type, field_value)| {
+            quote! {
+                <#field_type as ::yaml_rt::YamlFlatten>::validate_yaml_flattened(
+                    #field_value,
+                    doc,
+                    &__yaml_rt_claimed_keys,
+                )?;
+            }
+        })
+        .collect()
 }
 
 #[expect(
@@ -1160,8 +1305,12 @@ fn tagged_variant_read_arm(variant: &EnumVariant) -> TokenStream2 {
         }
         EnumVariantKind::Struct { expansion, .. } => {
             let reads = &expansion.reads;
+            let catch_all_count = flatten_catch_all_count(expansion);
+            let claimed_keys = flatten_claimed_keys_binding(expansion, quote! { &[] });
             quote! {
                 ::yaml_rt::__read_mapping_fields(doc, node, |doc| {
+                    ::yaml_rt::__validate_yaml_flatten_layout(doc, #catch_all_count)?;
+                    #claimed_keys
                     Ok(Self::#ident {
                         #(#reads,)*
                     })
@@ -1303,12 +1452,18 @@ fn enum_variant_write_arm(variant: &EnumVariant) -> TokenStream2 {
         }
         EnumVariantKind::Struct { fields, expansion } => {
             let writes = &expansion.writes;
+            let catch_all_count = flatten_catch_all_count(expansion);
+            let claimed_keys = flatten_claimed_keys_binding(expansion, quote! { &[] });
+            let validations = flatten_validation_tokens(expansion);
             quote! {
                 Self::#ident { #(#fields),* } => {
                     if !(#same_tag) {
                         return ::yaml_rt::__replace_yaml_value(self, doc, node);
                     }
                     ::yaml_rt::__write_mapping_fields(doc, node, |doc| {
+                        ::yaml_rt::__validate_yaml_flatten_layout(doc, #catch_all_count)?;
+                        #claimed_keys
+                        #(#validations)*
                         let root = doc.root_mapping()?;
                         #(#writes)*
                         Ok(())
@@ -1412,6 +1567,9 @@ fn enum_variant_fragment_arm(variant: &EnumVariant) -> TokenStream2 {
         }
         EnumVariantKind::Struct { fields, expansion } => {
             let writes = &expansion.writes;
+            let catch_all_count = flatten_catch_all_count(expansion);
+            let claimed_keys = flatten_claimed_keys_binding(expansion, quote! { &[] });
+            let validations = flatten_validation_tokens(expansion);
             quote! {
                 Self::#ident { #(#fields),* } => {
                     let __yaml_rt_payload =
@@ -1419,6 +1577,12 @@ fn enum_variant_fragment_arm(variant: &EnumVariant) -> TokenStream2 {
                             indent,
                             line_ending,
                             |doc| {
+                                ::yaml_rt::__validate_yaml_flatten_layout(
+                                    doc,
+                                    #catch_all_count,
+                                )?;
+                                #claimed_keys
+                                #(#validations)*
                                 let root = doc.root_mapping()?;
                                 #(#writes)*
                                 Ok(())
@@ -1532,18 +1696,27 @@ fn push_flatten_field(
     }
 
     expansion.read_bounds.push(syn::parse_quote! {
-        #field_type: ::yaml_rt::FromYamlDoc
+        #field_type: ::yaml_rt::YamlFlatten
     });
     expansion.write_bounds.push(syn::parse_quote! {
-        #field_type: ::yaml_rt::ToYamlDoc
+        #field_type: ::yaml_rt::YamlFlatten
     });
     expansion.reads.push(quote! {
-        #field_name: <#field_type as ::yaml_rt::FromYamlDoc>::from_yaml_doc(doc)?
+        #field_name: <#field_type as ::yaml_rt::YamlFlatten>::from_yaml_flattened(
+            doc,
+            &__yaml_rt_claimed_keys,
+        )?
     });
     let field_value = field_reference(field_name, access);
     expansion.writes.push(quote! {
-        ::yaml_rt::ToYamlDoc::apply_to_yaml_doc(#field_value, doc)?;
+        <#field_type as ::yaml_rt::YamlFlatten>::apply_to_yaml_flattened(
+            #field_value,
+            doc,
+            &__yaml_rt_claimed_keys,
+        )?;
     });
+    expansion.flatten_types.push(field_type.clone());
+    expansion.flatten_values.push(field_value);
     Ok(())
 }
 

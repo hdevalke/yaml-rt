@@ -148,6 +148,15 @@ Rust doc comments become comments for newly inserted entries when no explicit
 with `preserve_unknown_fields` or `prune_unknown_fields`, and insertion order
 with `insert_order = "append"` or `insert_order = "struct"`.
 
+`flatten` accepts both nested derived structs and one catch-all
+`BTreeMap<String, T>` or `HashMap<String, T>` across the recursively flattened
+field graph. The catch-all map reads every entry not claimed by a canonical
+field name, alias, skipped field, or nested flattened struct. Applying the
+overlay synchronizes those entries exactly: existing entries are patched in
+place, missing map keys are removed from YAML, and new keys are inserted
+deterministically. A catch-all entry that collides with a modeled key is
+rejected before edits are queued.
+
 Single-field tuple structs are transparent automatically. Their inner value is
 represented directly, so `struct Port(u16)` reads and writes `8080`, not a
 mapping or tag. The unnamed field may use `yaml(with = "module")`.
@@ -418,9 +427,9 @@ cargo test -p yaml-rt-core --test yaml_test_suite
   or presentation metadata.
 - Typed-overlay `flatten` has intentionally conservative combinations with
   field and struct policies; unsupported combinations produce derive errors.
-- Typed mappings use string keys. Borrowed overlay fields, catch-all map
-  flattening, standalone unit structs, standalone multi-field tuple structs,
-  and full Serde attribute compatibility remain future work.
+- Typed mappings use string keys. Borrowed overlay fields, standalone unit
+  structs, standalone multi-field tuple structs, and full Serde attribute
+  compatibility remain future work.
 - Enum data variants use local tags only. Internally tagged, adjacently tagged,
   externally mapped, and untagged enum representations are not implemented.
 - Collection identity is positional for sequences. Mapping insertion accepts

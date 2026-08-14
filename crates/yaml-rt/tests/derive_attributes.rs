@@ -490,6 +490,190 @@ fn flatten_attribute_writes_nested_overlay_to_root_mapping() {
     );
 }
 
+type ExtraValues = BTreeMap<String, String>;
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct CatchAllConfig {
+    #[yaml(alias = "legacy-name")]
+    name: String,
+    #[yaml(skip)]
+    cached: u16,
+    #[yaml(default = false, skip_serializing_if = "is_false")]
+    debug: bool,
+    #[yaml(flatten)]
+    extra: ExtraValues,
+}
+
+#[test]
+fn flattened_btree_map_owns_only_unclaimed_block_entries() {
+    let input = "legacy-name: app\ncached: 7\ndebug: true\nquoted: \"old\" # keep\nremove: gone\n";
+    let mut doc = YamlDoc::parse(input).expect("valid catch-all mapping");
+    let mut config = CatchAllConfig::from_yaml_doc(&doc).expect("catch-all map reads");
+
+    assert_eq!(
+        config.extra,
+        BTreeMap::from([
+            ("quoted".to_owned(), "old".to_owned()),
+            ("remove".to_owned(), "gone".to_owned()),
+        ])
+    );
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("unchanged catch-all map writes");
+    assert_eq!(doc.to_string(), input);
+
+    config.debug = false;
+    config.extra.insert("quoted".to_owned(), "new".to_owned());
+    config.extra.remove("remove");
+    config.extra.insert("zeta".to_owned(), "last".to_owned());
+    config.extra.insert("alpha".to_owned(), "first".to_owned());
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("catch-all map synchronizes");
+
+    assert_eq!(
+        doc.to_string(),
+        "legacy-name: app\ncached: 7\nquoted: \"new\" # keep\nalpha: first\nzeta: last\n"
+    );
+}
+
+#[test]
+fn flattened_btree_map_patches_flow_mappings_and_reparses() {
+    #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+    struct FlowConfig {
+        name: String,
+        #[yaml(flatten)]
+        extra: BTreeMap<String, String>,
+    }
+
+    let mut doc = YamlDoc::parse("{name: app, beta: \"old\", remove: gone}\n")
+        .expect("valid flow catch-all mapping");
+    let mut config = FlowConfig::from_yaml_doc(&doc).expect("flow catch-all reads");
+    config.extra.insert("beta".to_owned(), "new".to_owned());
+    config.extra.remove("remove");
+    config.extra.insert("alpha".to_owned(), "first".to_owned());
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("flow catch-all writes");
+
+    assert_eq!(
+        doc.to_string(),
+        "{name: app, beta: \"new\", alpha: first}\n"
+    );
+    doc.commit_edits().expect("flow catch-all output reparses");
+    assert_eq!(
+        FlowConfig::from_yaml_doc(&doc)
+            .expect("flow catch-all rereads")
+            .extra,
+        BTreeMap::from([
+            ("alpha".to_owned(), "first".to_owned()),
+            ("beta".to_owned(), "new".to_owned()),
+        ])
+    );
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct FlattenedServerAndExtras {
+    name: String,
+    #[yaml(flatten)]
+    server: ServerFields,
+    #[yaml(flatten)]
+    extra: BTreeMap<String, String>,
+}
+
+#[test]
+fn catch_all_map_composes_with_flattened_structs_and_rejects_collisions() {
+    let input = "name: app\nhost: localhost\ncustom: keep\n";
+    let mut doc = YamlDoc::parse(input).expect("valid composed flatten mapping");
+    let mut config = FlattenedServerAndExtras::from_yaml_doc(&doc).expect("composed flatten reads");
+
+    assert_eq!(config.extra.get("custom").map(String::as_str), Some("keep"));
+    assert!(!config.extra.contains_key("name"));
+    assert!(!config.extra.contains_key("host"));
+
+    config
+        .extra
+        .insert("host".to_owned(), "collision".to_owned());
+    let error = config
+        .apply_to_yaml_doc(&mut doc)
+        .expect_err("modeled-key collision fails");
+    assert!(error.diagnostic.message.contains("modeled key `host`"));
+    assert_eq!(doc.to_string(), input);
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct ServerWithExtras {
+    host: String,
+    #[yaml(flatten)]
+    extra: BTreeMap<String, String>,
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct OuterFlattenedExtras {
+    name: String,
+    #[yaml(flatten)]
+    server: ServerWithExtras,
+}
+
+#[test]
+fn nested_catch_all_excludes_outer_modeled_keys() {
+    let doc = YamlDoc::parse("name: app\nhost: localhost\ncustom: keep\n")
+        .expect("valid recursively flattened mapping");
+    let config = OuterFlattenedExtras::from_yaml_doc(&doc).expect("nested catch-all reads");
+
+    assert_eq!(
+        config.server.extra,
+        BTreeMap::from([("custom".to_owned(), "keep".to_owned())])
+    );
+}
+
+type HashedExtras = HashMap<String, String>;
+
+#[test]
+fn generic_flatten_supports_hash_map_aliases_with_sorted_insertions() {
+    let mut doc = YamlDoc::parse("existing: keep\n").expect("valid generic catch-all mapping");
+    let mut config =
+        GenericFlatten::<HashedExtras>::from_yaml_doc(&doc).expect("generic catch-all reads");
+    config.values.insert("zeta".to_owned(), "last".to_owned());
+    config.values.insert("alpha".to_owned(), "first".to_owned());
+    config
+        .apply_to_yaml_doc(&mut doc)
+        .expect("generic catch-all writes");
+
+    assert_eq!(
+        doc.to_string(),
+        "existing: keep\nalpha: first\nzeta: last\n"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
+struct AmbiguousCatchAll {
+    #[yaml(flatten)]
+    ordered: BTreeMap<String, String>,
+    #[yaml(flatten)]
+    hashed: HashMap<String, String>,
+}
+
+#[test]
+fn multiple_catch_all_maps_fail_before_reading_or_writing() {
+    let input = "extra: keep\n";
+    let doc = YamlDoc::parse(input).expect("valid ambiguous catch-all mapping");
+    let read_error =
+        AmbiguousCatchAll::from_yaml_doc(&doc).expect_err("multiple catch-all maps reject read");
+    assert!(read_error.diagnostic.message.contains("at most one"));
+
+    let mut doc = YamlDoc::parse(input).expect("valid ambiguous catch-all mapping");
+    let value = AmbiguousCatchAll {
+        ordered: BTreeMap::new(),
+        hashed: HashMap::new(),
+    };
+    let write_error = value
+        .apply_to_yaml_doc(&mut doc)
+        .expect_err("multiple catch-all maps reject write");
+    assert!(write_error.diagnostic.message.contains("at most one"));
+    assert_eq!(doc.to_string(), input);
+}
+
 #[derive(Debug, PartialEq, Eq, YamlRoundTrip)]
 struct NestedConfig {
     name: String,

@@ -35,6 +35,57 @@ pub trait ToYamlDoc {
     fn apply_to_yaml_doc(&self, doc: &mut YamlDoc) -> Result<(), YamlError>;
 }
 
+/// Reads and writes a field flattened into its containing YAML mapping.
+///
+/// Derived named structs implement this trait by reporting the mapping keys
+/// they model. String-keyed [`std::collections::BTreeMap`] and [`HashMap`]
+/// implementations instead act as catch-all fields: they capture every entry
+/// not claimed by a modeled field in the surrounding flattened struct graph.
+///
+/// At most one catch-all map may appear in a recursively flattened graph.
+pub trait YamlFlatten: Sized {
+    /// Returns the canonical mapping keys and aliases modeled by this value.
+    fn yaml_flatten_keys() -> Vec<&'static str>;
+
+    /// Returns the number of catch-all maps in this recursively flattened value.
+    fn yaml_flatten_catch_all_count() -> usize;
+
+    /// Reads this value from the current document root mapping.
+    ///
+    /// `claimed_keys` contains every key modeled by the surrounding flattened
+    /// graph. Catch-all implementations must omit those keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document root is not a mapping or a captured
+    /// value cannot be decoded.
+    fn from_yaml_flattened(doc: &YamlDoc, claimed_keys: &[&str]) -> Result<Self, YamlError>;
+
+    /// Validates flattened key ownership before edits are queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this value would write a key already owned by a
+    /// regular or recursively flattened modeled field.
+    fn validate_yaml_flattened(
+        &self,
+        doc: &YamlDoc,
+        claimed_keys: &[&str],
+    ) -> Result<(), YamlError>;
+
+    /// Applies this value to the current document root mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when key ownership is ambiguous, a value cannot be
+    /// emitted, or a localized edit cannot be queued.
+    fn apply_to_yaml_flattened(
+        &self,
+        doc: &mut YamlDoc,
+        claimed_keys: &[&str],
+    ) -> Result<(), YamlError>;
+}
+
 /// Reads and writes individual YAML node values.
 pub trait YamlValue: Sized {
     /// Reads a mapping field that may be absent.
@@ -305,6 +356,25 @@ where
         output.push_str("{}");
     }
     Ok(output)
+}
+
+#[doc(hidden)]
+pub fn __validate_yaml_flatten_layout(
+    doc: &YamlDoc,
+    catch_all_count: usize,
+) -> Result<(), YamlError> {
+    if catch_all_count <= 1 {
+        return Ok(());
+    }
+    let root = doc.root_mapping()?;
+    Err(__typed_node_error(
+        doc,
+        root,
+        format!(
+            "a flattened mapping graph may contain at most one catch-all map, found {catch_all_count}"
+        ),
+        &["zero or one flattened catch-all map"],
+    ))
 }
 
 #[doc(hidden)]
@@ -1403,5 +1473,144 @@ where
         let allowed_keys = self.keys().map(String::as_str).collect::<Vec<_>>();
         doc.retain_mapping_entries(node, &allowed_keys)?;
         Ok(node)
+    }
+}
+
+fn validate_catch_all_keys<'a>(
+    doc: &YamlDoc,
+    claimed_keys: &[&str],
+    keys: impl Iterator<Item = &'a String>,
+) -> Result<(), YamlError> {
+    if let Some(key) = keys
+        .into_iter()
+        .find(|key| claimed_keys.contains(&key.as_str()))
+    {
+        let root = doc.root_mapping()?;
+        return Err(__typed_node_error(
+            doc,
+            root,
+            format!("flattened catch-all map contains modeled key `{key}`"),
+            &["a key not modeled by another flattened field"],
+        ));
+    }
+    Ok(())
+}
+
+impl<T> YamlFlatten for std::collections::BTreeMap<String, T>
+where
+    T: YamlValue + ToYamlFragment,
+{
+    fn yaml_flatten_keys() -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    fn yaml_flatten_catch_all_count() -> usize {
+        1
+    }
+
+    fn from_yaml_flattened(doc: &YamlDoc, claimed_keys: &[&str]) -> Result<Self, YamlError> {
+        let root = doc.root_mapping()?;
+        let mut values = Self::new();
+        for (key_node, value_node) in doc.mapping_entries(root) {
+            let key = doc.scalar_value(key_node)?.into_owned();
+            if !claimed_keys.contains(&key.as_str()) {
+                values.insert(key, T::read_yaml(doc, value_node)?);
+            }
+        }
+        Ok(values)
+    }
+
+    fn validate_yaml_flattened(
+        &self,
+        doc: &YamlDoc,
+        claimed_keys: &[&str],
+    ) -> Result<(), YamlError> {
+        validate_catch_all_keys(doc, claimed_keys, self.keys())
+    }
+
+    fn apply_to_yaml_flattened(
+        &self,
+        doc: &mut YamlDoc,
+        claimed_keys: &[&str],
+    ) -> Result<(), YamlError> {
+        self.validate_yaml_flattened(doc, claimed_keys)?;
+        let root = doc.root_mapping()?;
+        for (key, value) in self {
+            if let Some(value_node) = doc.get_mapping_value(root, key)? {
+                value.write_yaml(doc, Some(value_node))?;
+            } else {
+                doc.insert_mapping_value_with_comment(
+                    root,
+                    key,
+                    value,
+                    MappingEntryStyle::Inherit,
+                    None,
+                )?;
+            }
+        }
+        let mut allowed_keys = claimed_keys.to_vec();
+        allowed_keys.extend(self.keys().map(String::as_str));
+        doc.retain_mapping_entries(root, &allowed_keys)
+    }
+}
+
+impl<T, S> YamlFlatten for HashMap<String, T, S>
+where
+    T: YamlValue + ToYamlFragment,
+    S: BuildHasher + Default,
+{
+    fn yaml_flatten_keys() -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    fn yaml_flatten_catch_all_count() -> usize {
+        1
+    }
+
+    fn from_yaml_flattened(doc: &YamlDoc, claimed_keys: &[&str]) -> Result<Self, YamlError> {
+        let root = doc.root_mapping()?;
+        let mut values = Self::with_hasher(S::default());
+        for (key_node, value_node) in doc.mapping_entries(root) {
+            let key = doc.scalar_value(key_node)?.into_owned();
+            if !claimed_keys.contains(&key.as_str()) {
+                values.insert(key, T::read_yaml(doc, value_node)?);
+            }
+        }
+        Ok(values)
+    }
+
+    fn validate_yaml_flattened(
+        &self,
+        doc: &YamlDoc,
+        claimed_keys: &[&str],
+    ) -> Result<(), YamlError> {
+        validate_catch_all_keys(doc, claimed_keys, self.keys())
+    }
+
+    fn apply_to_yaml_flattened(
+        &self,
+        doc: &mut YamlDoc,
+        claimed_keys: &[&str],
+    ) -> Result<(), YamlError> {
+        self.validate_yaml_flattened(doc, claimed_keys)?;
+        let root = doc.root_mapping()?;
+        let mut entries = self.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        for (key, value) in entries {
+            if let Some(value_node) = doc.get_mapping_value(root, key)? {
+                value.write_yaml(doc, Some(value_node))?;
+            } else {
+                doc.insert_mapping_value_with_comment(
+                    root,
+                    key,
+                    value,
+                    MappingEntryStyle::Inherit,
+                    None,
+                )?;
+            }
+        }
+        let mut allowed_keys = claimed_keys.to_vec();
+        allowed_keys.extend(self.keys().map(String::as_str));
+        doc.retain_mapping_entries(root, &allowed_keys)
     }
 }

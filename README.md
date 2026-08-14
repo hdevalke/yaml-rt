@@ -306,17 +306,28 @@ yaml-rt add /server/tls --value-file tls.yaml config.yaml
 
 # Select the second document in a YAML stream.
 yaml-rt get /name --doc 1 stream.yaml
+
+# Apply several changes transactionally from YAML or JSON.
+yaml-rt patch --patch-file changes.yaml --in-place config.yaml
 ```
 
 Available operations are `query`, `get`, `add`, `remove`, `replace`, `move`,
-`copy`, and `test`. Query results are emitted in nodelist order as one compact
-JSON Pointer/value pair per line. JSONPath evaluation uses the YAML 1.2 core
-schema and rejects YAML values that are not JSON-compatible, including
+`copy`, `test`, and `patch`. Query results are emitted in nodelist order as one
+compact JSON Pointer/value pair per line. JSONPath evaluation uses the YAML 1.2
+core schema and rejects YAML values that are not JSON-compatible, including
 non-string or duplicate mapping keys and non-finite numbers.
+
+`patch` accepts an RFC 6902-style operation sequence through either
+`--patch YAML` or `--patch-file FILE`. JSON patch documents are valid because
+JSON is a subset of YAML; YAML syntax additionally permits complete YAML nodes
+as operation values. Operations run in order against the selected document,
+and the entire patch is rolled back if any operation or `test` fails.
 
 An omitted input file, or `-`, reads YAML from standard input. Mutations write
 to standard output unless `--output` or `--in-place` is used. Values passed with
-`--value` or `--value-file` must be complete YAML nodes.
+`--value` or `--value-file` must be complete YAML nodes. `--patch-file -` reads
+the patch from standard input only when the target YAML is a real file; both
+inputs cannot use standard input at once.
 
 Run `yaml-rt help <operation>` for operation-specific arguments.
 
@@ -341,12 +352,14 @@ The facade features are:
 | `serde` | No | Re-exports the `yaml-rt-serde` conversion API |
 
 `yaml-rt-core` has no third-party dependencies and retains the foundational RFC
-6901 `JsonPointer` API. The independently usable `yaml-rt-rfc9535` crate depends
-on `regex` for the standard `match()` and `search()` functions. Its JSONPath
-parser, semantic evaluator, compatibility validator, and pointer construction
-operate directly on `YamlDoc` without a generic JSON value dependency. Compact
-JSON rendering remains private to `yaml-rt-cli`; the RFC 9535 crate is not
-re-exported by the `yaml-rt` facade.
+6901 `JsonPointer` API. Its `YamlPatch` and `YamlPatchOperation` APIs parse and
+transactionally apply RFC 6902-style operation sequences with full YAML values.
+The independently usable `yaml-rt-rfc9535` crate depends on `regex` for the
+standard `match()` and `search()` functions. Its JSONPath parser, semantic
+evaluator, compatibility validator, and pointer construction operate directly
+on `YamlDoc` without a generic JSON value dependency. Compact JSON rendering
+remains private to `yaml-rt-cli`; the RFC 9535 crate is not re-exported by the
+`yaml-rt` facade.
 
 ## YAML 1.2.2 conformance
 
@@ -368,6 +381,8 @@ cargo test -p yaml-rt-core --test yaml_test_suite
 - Parsing and emitting an untouched valid document is byte-identical.
 - Local edits retain unrelated source bytes and aim for the smallest practical
   diff.
+- Batch patches are transactional; a failing operation leaves the target
+  document unchanged.
 - User-visible syntax and diagnostics carry source spans.
 - YAML streams, directives, tags, anchors, aliases, explicit document markers,
   collection styles, scalar styles, comments, whitespace, and line endings are
@@ -383,8 +398,9 @@ cargo test -p yaml-rt-core --test yaml_test_suite
   ambiguous or invalid.
 - JSON Pointer lookup reports duplicate mapping keys and cannot address
   non-string mapping keys.
-- CLI `test` compares YAML values using the supported YAML 1.2 core scalar and
-  collection model; it is not a general tag-aware application schema.
+- CLI and patch `test` operations compare YAML values using the supported YAML
+  1.2 core scalar and collection model; they are not a general tag-aware
+  application schema.
 - Serde conversion does not expose a generic YAML `Value`, merge-key expansion,
   or presentation metadata.
 - Typed-overlay `flatten` has intentionally conservative combinations with

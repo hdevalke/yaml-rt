@@ -2,7 +2,8 @@
 //! Serde conversion.
 //!
 //! `YamlDoc` keeps the original source as its source of truth. Unedited YAML is
-//! returned byte-for-byte, while editor operations queue localized patches.
+//! returned byte-for-byte, while editor operations queue localized changes and
+//! [`YamlPatch`] applies multi-operation YAML or JSON patches transactionally.
 //!
 //! ```
 //! use yaml_rt::{YamlDoc, YamlError};

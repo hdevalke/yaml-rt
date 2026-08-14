@@ -189,3 +189,127 @@ fn in_place_replaces_only_after_success() {
     assert_eq!(fs::read(&input).unwrap(), b"port: 9090\n");
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn patch_file_supports_json_document_selection_and_output() {
+    let directory = temp_dir();
+    let input = directory.join("document.yaml");
+    let patch = directory.join("changes.json");
+    let result = directory.join("result.yaml");
+    fs::write(&input, "---\nname: first\n---\nname: second # keep\n").unwrap();
+    fs::write(
+        &patch,
+        r#"[{"op":"replace","path":"/name","value":"updated"}]"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "patch",
+            "--patch-file",
+            patch.to_str().unwrap(),
+            "--doc",
+            "1",
+            "--output",
+            result.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fs::read(&result).unwrap(),
+        b"---\nname: first\n---\nname: updated # keep\n"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn patch_and_target_stdin_combinations_are_checked() {
+    let directory = temp_dir();
+    let input = directory.join("document.yaml");
+    let patch = directory.join("changes.yaml");
+    fs::write(&input, "value: 1\n").unwrap();
+    fs::write(&patch, "- {op: replace, path: /value, value: 2}\n").unwrap();
+
+    let mut patch_from_stdin = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["patch", "--patch-file", "-", input.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    patch_from_stdin
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"- {op: replace, path: /value, value: 3}\n")
+        .unwrap();
+    let output = patch_from_stdin.wait_with_output().unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"value: 3\n");
+
+    let mut target_from_stdin = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["patch", "--patch-file", patch.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    target_from_stdin
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"value: 1\n")
+        .unwrap();
+    let output = target_from_stdin.wait_with_output().unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(output.stdout, b"value: 2\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["patch", "--patch-file", "-"])
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("both read stdin"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn patch_in_place_is_atomic_across_all_operations() {
+    let directory = temp_dir();
+    let input = directory.join("document.yaml");
+    fs::write(&input, "value: 1 # keep\n").unwrap();
+
+    let failing = "- {op: replace, path: /value, value: 2}\n- {op: test, path: /value, value: 3}\n";
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "patch",
+            "--patch",
+            failing,
+            "--in-place",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&input).unwrap(), b"value: 1 # keep\n");
+
+    let successful = "- {op: replace, path: /value, value: 2}\n";
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "patch",
+            "--patch",
+            successful,
+            "--in-place",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read(&input).unwrap(), b"value: 2 # keep\n");
+    fs::remove_dir_all(directory).unwrap();
+}

@@ -1,8 +1,9 @@
 //! Command-line querying and editing operations for the `yaml-rt` binary.
 //!
-//! The binary searches YAML documents with `JSONPath` and applies JSON Pointer
-//! operations while retaining unrelated presentation. [`run`] is public so
-//! integrations can supply their own argument and I/O streams.
+//! The binary searches YAML documents with `JSONPath`, applies JSON Pointer
+//! operations, and executes transactional YAML or JSON patch documents while
+//! retaining unrelated presentation. [`run`] is public so integrations can
+//! supply their own argument and I/O streams.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -11,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
-use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment};
+use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment, YamlPatch};
 
 mod query;
 
@@ -90,6 +91,8 @@ enum Operation {
     Copy(FromMutationArgs),
     /// Test semantic equality at a path.
     Test(ValueArgs),
+    /// Apply a transactional YAML or JSON patch document.
+    Patch(PatchArgs),
 }
 
 #[derive(Args)]
@@ -148,6 +151,17 @@ struct ValueSourceArgs {
 }
 
 #[derive(Args)]
+#[group(required = true, multiple = false)]
+struct PatchSourceArgs {
+    /// YAML or JSON patch document.
+    #[arg(long, value_name = "YAML", allow_hyphen_values = true)]
+    patch: Option<String>,
+    /// Read the YAML or JSON patch document from a file.
+    #[arg(long, value_name = "FILE")]
+    patch_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct ReadArgs {
     #[command(flatten)]
     path: PathArgs,
@@ -198,6 +212,16 @@ struct ValueMutationArgs {
     output: MutationOutputArgs,
 }
 
+#[derive(Args)]
+struct PatchArgs {
+    #[command(flatten)]
+    target: TargetArgs,
+    #[command(flatten)]
+    source: PatchSourceArgs,
+    #[command(flatten)]
+    output: MutationOutputArgs,
+}
+
 fn execute(
     operation: &Operation,
     stdin: &mut dyn Read,
@@ -206,6 +230,13 @@ fn execute(
     let target = operation.target();
     let input_path = target.file.as_deref();
     let target_uses_stdin = input_path.is_none_or(|path| path == Path::new("-"));
+    if matches!(operation, Operation::Patch(arguments) if arguments.source.patch_file.as_deref() == Some(Path::new("-")))
+        && target_uses_stdin
+    {
+        return Err(RunError::message(
+            "target YAML and --patch-file cannot both read stdin",
+        ));
+    }
     let input = read_target(input_path, stdin)?;
     let mut doc = YamlDoc::parse_owned(input).map_err(RunError::display)?;
     let document = select_document(&doc, target.doc)?;
@@ -218,6 +249,13 @@ fn execute(
             input_path,
             stdout,
         );
+    }
+
+    if let Operation::Patch(arguments) = operation {
+        let patch = read_patch(&arguments.source, stdin)?;
+        doc.apply_patch(document, &patch)
+            .map_err(RunError::display)?;
+        return write_mutation(&doc, &arguments.output, input_path, stdout);
     }
 
     let path = JsonPointer::parse(operation.path()).map_err(RunError::display)?;
@@ -291,6 +329,7 @@ fn execute(
                 .map_err(RunError::display)?;
             write_mutation(&doc, &arguments.output, input_path, stdout)
         }
+        Operation::Patch(_) => unreachable!("patch returned before pointer operations"),
     }
 }
 
@@ -303,12 +342,15 @@ impl Operation {
             Self::Remove(args) => &args.path.target,
             Self::Move(args) | Self::Copy(args) => &args.path.target,
             Self::Test(args) => &args.path.target,
+            Self::Patch(args) => &args.target,
         }
     }
 
     fn path(&self) -> &str {
         match self {
-            Self::Query(_) => unreachable!("query does not use a JSON Pointer argument"),
+            Self::Query(_) | Self::Patch(_) => {
+                unreachable!("operation does not use a JSON Pointer argument")
+            }
             Self::Get(args) => &args.path.path,
             Self::Add(args) | Self::Replace(args) => &args.value.path.path,
             Self::Remove(args) => &args.path.path,
@@ -331,6 +373,26 @@ impl Operation {
             _ => None,
         }
     }
+}
+
+fn read_patch(arguments: &PatchSourceArgs, stdin: &mut dyn Read) -> Result<YamlPatch, RunError> {
+    let input = if let Some(patch) = &arguments.patch {
+        patch.clone()
+    } else if let Some(path) = arguments.patch_file.as_deref() {
+        if path == Path::new("-") {
+            read_stream(stdin, "patch stdin")?
+        } else {
+            fs::read_to_string(path).map_err(|error| {
+                RunError::message(format!(
+                    "cannot read patch file {}: {error}",
+                    path.display()
+                ))
+            })?
+        }
+    } else {
+        unreachable!("Clap requires a patch source")
+    };
+    YamlPatch::parse_owned(input).map_err(RunError::display)
 }
 
 fn read_target(path: Option<&Path>, stdin: &mut dyn Read) -> Result<String, RunError> {
@@ -616,6 +678,47 @@ mod tests {
         assert_eq!(status, FAILURE);
         assert!(stdout.is_empty());
         assert!(stderr.contains("test failed"));
+    }
+
+    #[test]
+    fn inline_patch_is_transactional() {
+        let patch =
+            "- {op: replace, path: /port, value: 9090}\n- {op: add, path: /debug, value: true}\n";
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "patch", "--patch", patch],
+            "port: 8080 # keep\n",
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "port: 9090 # keep\ndebug: true\n");
+
+        let failing =
+            "- {op: replace, path: /port, value: 9090}\n- {op: test, path: /port, value: 8080}\n";
+        let (status, stdout, stderr) =
+            invoke(&["yaml-rt", "patch", "--patch", failing], "port: 8080\n");
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("patch operation[1]"));
+    }
+
+    #[test]
+    fn patch_source_is_required_and_exclusive() {
+        let (status, _, stderr) = invoke(&["yaml-rt", "patch"], "{}\n");
+        assert_eq!(status, USAGE);
+        assert!(stderr.contains("required"));
+
+        let (status, _, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "patch",
+                "--patch",
+                "[]",
+                "--patch-file",
+                "changes.yaml",
+            ],
+            "{}\n",
+        );
+        assert_eq!(status, USAGE);
+        assert!(stderr.contains("cannot be used with"));
     }
 
     #[test]

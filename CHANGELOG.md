@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.0 (2026-08-14)
+
+### Features
+
+* **derive:** support catch-all map flattening (730ad31)
+* **cli:** add JSONPath targeting to single-path commands (869d374)
+* add transactional YAML and JSON patch support (17bcf9c)
+
 ### v0.1.2 (2026-08-10)
 
 #### Features

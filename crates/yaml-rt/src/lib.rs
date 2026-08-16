@@ -19,7 +19,8 @@
 //! The default `derive` feature re-exports [`YamlRt`] for named mapping
 //! structs, transparent newtypes, and locally tagged enums. The optional
 //! `serde` feature re-exports serialization and deserialization APIs for
-//! conversions where presentation preservation is not required.
+//! conversions where presentation preservation is not required, including a
+//! generic `Value` model.
 
 pub use yaml_rt_core::*;
 
@@ -28,6 +29,6 @@ pub use yaml_rt_derive::YamlRt;
 
 #[cfg(feature = "serde")]
 pub use yaml_rt_serde::{
-    Deserializer, Error, Location, Result, Serializer, from_reader, from_slice, from_str,
-    to_string, to_writer,
+    Deserializer, Error, Index, Location, Mapping, Number, Result, Sequence, Serializer, Value,
+    from_reader, from_slice, from_str, from_value, to_string, to_value, to_writer,
 };

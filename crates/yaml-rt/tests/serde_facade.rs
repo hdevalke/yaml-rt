@@ -1,10 +1,21 @@
 use serde::{Deserialize, Serialize};
-use yaml_rt::{Deserializer, Serializer, from_str, to_string};
+use yaml_rt::{Deserializer, Serializer, Value, from_str, from_value, to_string, to_value};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Config {
     host: String,
     port: u16,
+}
+
+#[test]
+fn serde_feature_reexports_value_conversion_api() {
+    let mut value: Value = from_str("service: {name: api}\n").unwrap();
+    assert_eq!(value["service"]["name"], "api");
+    value["service"]["name"] = Value::from("worker");
+
+    let converted = to_value(vec![1_u16, 2]).unwrap();
+    assert_eq!(from_value::<Vec<u16>>(converted).unwrap(), vec![1, 2]);
+    assert_eq!(to_string(&value).unwrap(), "service:\n  name: worker\n");
 }
 
 #[test]

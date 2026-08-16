@@ -2,6 +2,7 @@ use std::io::Write;
 
 use serde::{Serialize, ser};
 
+use crate::value::{Mapping, Number, Tag, TaggedValue, Value};
 use crate::{Error, Result};
 
 /// Serializes a value to a UTF-8 YAML string.
@@ -69,7 +70,7 @@ where
         Ok(self.writer)
     }
 
-    fn write_document(&mut self, value: &SerValue) -> Result<()> {
+    fn write_document(&mut self, value: &Value) -> Result<()> {
         if self.documents > 0 {
             self.writer.write_all(b"---\n").map_err(Error::io)?;
         }
@@ -89,180 +90,13 @@ where
     where
         T: ?Sized + Serialize,
     {
-        let value = value.serialize(ValueSerializer)?;
+        let value = crate::to_value(value)?;
         self.write_document(&value)
     }
 }
 
-#[derive(Debug)]
-pub enum SerValue {
-    Null,
-    Bool(bool),
-    Signed(i128),
-    Unsigned(u128),
-    Float(f64),
-    String(String),
-    Sequence(Vec<SerValue>),
-    Mapping(Vec<(SerValue, SerValue)>),
-    Tagged(String, Box<SerValue>),
-}
-
-struct ValueSerializer;
-
-impl ser::Serializer for ValueSerializer {
-    type Ok = SerValue;
-    type Error = Error;
-    type SerializeSeq = ValueSequence;
-    type SerializeTuple = ValueSequence;
-    type SerializeTupleStruct = ValueSequence;
-    type SerializeTupleVariant = ValueSequence;
-    type SerializeMap = ValueMapping;
-    type SerializeStruct = ValueMapping;
-    type SerializeStructVariant = ValueMapping;
-
-    fn serialize_bool(self, value: bool) -> Result<SerValue> {
-        Ok(SerValue::Bool(value))
-    }
-    fn serialize_i8(self, value: i8) -> Result<SerValue> {
-        self.serialize_i128(value.into())
-    }
-    fn serialize_i16(self, value: i16) -> Result<SerValue> {
-        self.serialize_i128(value.into())
-    }
-    fn serialize_i32(self, value: i32) -> Result<SerValue> {
-        self.serialize_i128(value.into())
-    }
-    fn serialize_i64(self, value: i64) -> Result<SerValue> {
-        self.serialize_i128(value.into())
-    }
-    fn serialize_i128(self, value: i128) -> Result<SerValue> {
-        Ok(SerValue::Signed(value))
-    }
-    fn serialize_u8(self, value: u8) -> Result<SerValue> {
-        self.serialize_u128(value.into())
-    }
-    fn serialize_u16(self, value: u16) -> Result<SerValue> {
-        self.serialize_u128(value.into())
-    }
-    fn serialize_u32(self, value: u32) -> Result<SerValue> {
-        self.serialize_u128(value.into())
-    }
-    fn serialize_u64(self, value: u64) -> Result<SerValue> {
-        self.serialize_u128(value.into())
-    }
-    fn serialize_u128(self, value: u128) -> Result<SerValue> {
-        Ok(SerValue::Unsigned(value))
-    }
-    fn serialize_f32(self, value: f32) -> Result<SerValue> {
-        Ok(SerValue::Float(value.into()))
-    }
-    fn serialize_f64(self, value: f64) -> Result<SerValue> {
-        Ok(SerValue::Float(value))
-    }
-    fn serialize_char(self, value: char) -> Result<SerValue> {
-        Ok(SerValue::String(value.to_string()))
-    }
-    fn serialize_str(self, value: &str) -> Result<SerValue> {
-        Ok(SerValue::String(value.to_owned()))
-    }
-    fn serialize_bytes(self, _value: &[u8]) -> Result<SerValue> {
-        Err(Error::message(
-            "serialization and deserialization of bytes in YAML is not implemented",
-        ))
-    }
-    fn serialize_none(self) -> Result<SerValue> {
-        Ok(SerValue::Null)
-    }
-    fn serialize_some<T>(self, value: &T) -> Result<SerValue>
-    where
-        T: ?Sized + Serialize,
-    {
-        value.serialize(self)
-    }
-    fn serialize_unit(self) -> Result<SerValue> {
-        Ok(SerValue::Null)
-    }
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<SerValue> {
-        Ok(SerValue::Null)
-    }
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        _index: u32,
-        variant: &'static str,
-    ) -> Result<SerValue> {
-        Ok(SerValue::String(variant.to_owned()))
-    }
-    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<SerValue>
-    where
-        T: ?Sized + Serialize,
-    {
-        value.serialize(self)
-    }
-    fn serialize_newtype_variant<T>(
-        self,
-        _name: &'static str,
-        _index: u32,
-        variant: &'static str,
-        value: &T,
-    ) -> Result<SerValue>
-    where
-        T: ?Sized + Serialize,
-    {
-        let value = value.serialize(self)?;
-        if matches!(value, SerValue::Tagged(..)) {
-            return Err(Error::message(
-                "serializing nested enums in YAML is not supported",
-            ));
-        }
-        Ok(SerValue::Tagged(variant.to_owned(), Box::new(value)))
-    }
-    fn serialize_seq(self, len: Option<usize>) -> Result<ValueSequence> {
-        Ok(ValueSequence::new(len, None))
-    }
-    fn serialize_tuple(self, len: usize) -> Result<ValueSequence> {
-        Ok(ValueSequence::new(Some(len), None))
-    }
-    fn serialize_tuple_struct(self, _name: &'static str, len: usize) -> Result<ValueSequence> {
-        Ok(ValueSequence::new(Some(len), None))
-    }
-    fn serialize_tuple_variant(
-        self,
-        _name: &'static str,
-        _index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> Result<ValueSequence> {
-        Ok(ValueSequence::new(Some(len), Some(variant.to_owned())))
-    }
-    fn serialize_map(self, len: Option<usize>) -> Result<ValueMapping> {
-        Ok(ValueMapping::new(len, None))
-    }
-    fn serialize_struct(self, _name: &'static str, len: usize) -> Result<ValueMapping> {
-        Ok(ValueMapping::new(Some(len), None))
-    }
-    fn serialize_struct_variant(
-        self,
-        _name: &'static str,
-        _index: u32,
-        variant: &'static str,
-        len: usize,
-    ) -> Result<ValueMapping> {
-        Ok(ValueMapping::new(Some(len), Some(variant.to_owned())))
-    }
-    fn collect_str<T>(self, value: &T) -> Result<SerValue>
-    where
-        T: ?Sized + std::fmt::Display,
-    {
-        Ok(SerValue::String(value.to_string()))
-    }
-    fn is_human_readable(&self) -> bool {
-        true
-    }
-}
-
 pub struct ValueSequence {
-    values: Vec<SerValue>,
+    values: Vec<Value>,
     tag: Option<String>,
 }
 
@@ -278,21 +112,24 @@ impl ValueSequence {
     where
         T: ?Sized + Serialize,
     {
-        self.values.push(value.serialize(ValueSerializer)?);
+        self.values.push(crate::to_value(value)?);
         Ok(())
     }
 
-    fn finish(self) -> SerValue {
-        let value = SerValue::Sequence(self.values);
+    fn finish(self) -> Value {
+        let value = Value::Sequence(self.values);
         match self.tag {
-            Some(tag) => SerValue::Tagged(tag, Box::new(value)),
+            Some(tag) => Value::Tagged(Box::new(TaggedValue {
+                tag: Tag::new(tag),
+                value,
+            })),
             None => value,
         }
     }
 }
 
 impl ser::SerializeSeq for ValueSequence {
-    type Ok = SerValue;
+    type Ok = Value;
     type Error = Error;
     fn serialize_element<T>(&mut self, value: &T) -> Result<()>
     where
@@ -300,12 +137,12 @@ impl ser::SerializeSeq for ValueSequence {
     {
         self.push(value)
     }
-    fn end(self) -> Result<SerValue> {
+    fn end(self) -> Result<Value> {
         Ok(self.finish())
     }
 }
 impl ser::SerializeTuple for ValueSequence {
-    type Ok = SerValue;
+    type Ok = Value;
     type Error = Error;
     fn serialize_element<T>(&mut self, value: &T) -> Result<()>
     where
@@ -313,12 +150,12 @@ impl ser::SerializeTuple for ValueSequence {
     {
         self.push(value)
     }
-    fn end(self) -> Result<SerValue> {
+    fn end(self) -> Result<Value> {
         Ok(self.finish())
     }
 }
 impl ser::SerializeTupleStruct for ValueSequence {
-    type Ok = SerValue;
+    type Ok = Value;
     type Error = Error;
     fn serialize_field<T>(&mut self, value: &T) -> Result<()>
     where
@@ -326,12 +163,12 @@ impl ser::SerializeTupleStruct for ValueSequence {
     {
         self.push(value)
     }
-    fn end(self) -> Result<SerValue> {
+    fn end(self) -> Result<Value> {
         Ok(self.finish())
     }
 }
 impl ser::SerializeTupleVariant for ValueSequence {
-    type Ok = SerValue;
+    type Ok = Value;
     type Error = Error;
     fn serialize_field<T>(&mut self, value: &T) -> Result<()>
     where
@@ -339,40 +176,43 @@ impl ser::SerializeTupleVariant for ValueSequence {
     {
         self.push(value)
     }
-    fn end(self) -> Result<SerValue> {
+    fn end(self) -> Result<Value> {
         Ok(self.finish())
     }
 }
 
 pub struct ValueMapping {
-    entries: Vec<(SerValue, SerValue)>,
-    pending: Option<SerValue>,
+    entries: Mapping,
+    pending: Option<Value>,
     tag: Option<String>,
 }
 
 impl ValueMapping {
     fn new(len: Option<usize>, tag: Option<String>) -> Self {
         Self {
-            entries: Vec::with_capacity(len.unwrap_or(0)),
+            entries: Mapping::with_capacity(len.unwrap_or(0)),
             pending: None,
             tag,
         }
     }
 
-    fn finish(self) -> Result<SerValue> {
+    fn finish(self) -> Result<Value> {
         if self.pending.is_some() {
             return Err(Error::message("map ended before serializing a value"));
         }
-        let value = SerValue::Mapping(self.entries);
+        let value = Value::Mapping(self.entries);
         Ok(match self.tag {
-            Some(tag) => SerValue::Tagged(tag, Box::new(value)),
+            Some(tag) => Value::Tagged(Box::new(TaggedValue {
+                tag: Tag::new(tag),
+                value,
+            })),
             None => value,
         })
     }
 }
 
 impl ser::SerializeMap for ValueMapping {
-    type Ok = SerValue;
+    type Ok = Value;
     type Error = Error;
     fn serialize_key<T>(&mut self, key: &T) -> Result<()>
     where
@@ -381,7 +221,7 @@ impl ser::SerializeMap for ValueMapping {
         if self.pending.is_some() {
             return Err(Error::message("map key serialized before its value"));
         }
-        self.pending = Some(key.serialize(ValueSerializer)?);
+        self.pending = Some(crate::to_value(key)?);
         Ok(())
     }
     fn serialize_value<T>(&mut self, value: &T) -> Result<()>
@@ -392,7 +232,7 @@ impl ser::SerializeMap for ValueMapping {
             .pending
             .take()
             .ok_or_else(|| Error::message("map value serialized before its key"))?;
-        self.entries.push((key, value.serialize(ValueSerializer)?));
+        self.entries.insert(key, crate::to_value(value)?);
         Ok(())
     }
     fn serialize_entry<K, V>(&mut self, key: &K, value: &V) -> Result<()>
@@ -400,49 +240,43 @@ impl ser::SerializeMap for ValueMapping {
         K: ?Sized + Serialize,
         V: ?Sized + Serialize,
     {
-        self.entries.push((
-            key.serialize(ValueSerializer)?,
-            value.serialize(ValueSerializer)?,
-        ));
+        self.entries
+            .insert(crate::to_value(key)?, crate::to_value(value)?);
         Ok(())
     }
-    fn end(self) -> Result<SerValue> {
+    fn end(self) -> Result<Value> {
         self.finish()
     }
 }
 
 impl ser::SerializeStruct for ValueMapping {
-    type Ok = SerValue;
+    type Ok = Value;
     type Error = Error;
     fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<()>
     where
         T: ?Sized + Serialize,
     {
-        self.entries.push((
-            SerValue::String(key.to_owned()),
-            value.serialize(ValueSerializer)?,
-        ));
+        self.entries
+            .insert(Value::String(key.to_owned()), crate::to_value(value)?);
         Ok(())
     }
-    fn end(self) -> Result<SerValue> {
+    fn end(self) -> Result<Value> {
         self.finish()
     }
 }
 
 impl ser::SerializeStructVariant for ValueMapping {
-    type Ok = SerValue;
+    type Ok = Value;
     type Error = Error;
     fn serialize_field<T>(&mut self, key: &'static str, value: &T) -> Result<()>
     where
         T: ?Sized + Serialize,
     {
-        self.entries.push((
-            SerValue::String(key.to_owned()),
-            value.serialize(ValueSerializer)?,
-        ));
+        self.entries
+            .insert(Value::String(key.to_owned()), crate::to_value(value)?);
         Ok(())
     }
-    fn end(self) -> Result<SerValue> {
+    fn end(self) -> Result<Value> {
         self.finish()
     }
 }
@@ -625,7 +459,7 @@ where
     type SerializeStructVariant = DocumentSequence<'a, W>;
 
     fn serialize_bool(self, value: bool) -> Result<()> {
-        self.write_document(&SerValue::Bool(value))
+        self.write_document(&Value::Bool(value))
     }
     fn serialize_i8(self, value: i8) -> Result<()> {
         self.serialize_i128(value.into())
@@ -640,7 +474,7 @@ where
         self.serialize_i128(value.into())
     }
     fn serialize_i128(self, value: i128) -> Result<()> {
-        self.write_document(&SerValue::Signed(value))
+        self.write_document(&Value::Number(Number::from(value)))
     }
     fn serialize_u8(self, value: u8) -> Result<()> {
         self.serialize_u128(value.into())
@@ -655,19 +489,19 @@ where
         self.serialize_u128(value.into())
     }
     fn serialize_u128(self, value: u128) -> Result<()> {
-        self.write_document(&SerValue::Unsigned(value))
+        self.write_document(&Value::Number(Number::from(value)))
     }
     fn serialize_f32(self, value: f32) -> Result<()> {
-        self.write_document(&SerValue::Float(value.into()))
+        self.write_document(&Value::Number(Number::from(value)))
     }
     fn serialize_f64(self, value: f64) -> Result<()> {
-        self.write_document(&SerValue::Float(value))
+        self.write_document(&Value::Number(Number::from(value)))
     }
     fn serialize_char(self, value: char) -> Result<()> {
-        self.write_document(&SerValue::String(value.to_string()))
+        self.write_document(&Value::String(value.to_string()))
     }
     fn serialize_str(self, value: &str) -> Result<()> {
-        self.write_document(&SerValue::String(value.to_owned()))
+        self.write_document(&Value::String(value.to_owned()))
     }
     fn serialize_bytes(self, _value: &[u8]) -> Result<()> {
         Err(Error::message(
@@ -675,7 +509,7 @@ where
         ))
     }
     fn serialize_none(self) -> Result<()> {
-        self.write_document(&SerValue::Null)
+        self.write_document(&Value::Null)
     }
     fn serialize_some<T>(self, value: &T) -> Result<()>
     where
@@ -684,7 +518,7 @@ where
         self.collect(value)
     }
     fn serialize_unit(self) -> Result<()> {
-        self.write_document(&SerValue::Null)
+        self.write_document(&Value::Null)
     }
     fn serialize_unit_struct(self, _name: &'static str) -> Result<()> {
         self.serialize_unit()
@@ -695,13 +529,15 @@ where
         _index: u32,
         variant: &'static str,
     ) -> Result<()> {
-        self.write_document(&SerValue::String(variant.to_owned()))
+        self.write_document(&Value::String(variant.to_owned()))
     }
-    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<()>
+    fn serialize_newtype_struct<T>(self, name: &'static str, value: &T) -> Result<()>
     where
         T: ?Sized + Serialize,
     {
-        self.collect(value)
+        let value =
+            ser::Serializer::serialize_newtype_struct(crate::value::Serializer, name, value)?;
+        self.write_document(&value)
     }
     fn serialize_newtype_variant<T>(
         self,
@@ -713,13 +549,16 @@ where
     where
         T: ?Sized + Serialize,
     {
-        let value = value.serialize(ValueSerializer)?;
-        if matches!(value, SerValue::Tagged(..)) {
+        let value = crate::to_value(value)?;
+        if matches!(value, Value::Tagged(..)) {
             return Err(Error::message(
                 "serializing nested enums in YAML is not supported",
             ));
         }
-        self.write_document(&SerValue::Tagged(variant.to_owned(), Box::new(value)))
+        self.write_document(&Value::Tagged(Box::new(TaggedValue {
+            tag: Tag::new(variant),
+            value,
+        })))
     }
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
         Ok(DocumentSequence::sequence(self, len, None))
@@ -777,11 +616,11 @@ where
     }
 }
 
-fn render_value(value: &SerValue, indent: usize, output: &mut String) {
+fn render_value(value: &Value, indent: usize, output: &mut String) {
     enum RenderAction<'a> {
-        Value(&'a SerValue, usize),
-        Nested(&'a SerValue, usize),
-        Inline(&'a SerValue),
+        Value(&'a Value, usize),
+        Nested(&'a Value, usize),
+        Inline(&'a Value),
         Indent(usize),
         Text(&'static str),
     }
@@ -793,12 +632,12 @@ fn render_value(value: &SerValue, indent: usize, output: &mut String) {
             RenderAction::Indent(indent) => push_indent(output, indent),
             RenderAction::Inline(value) => render_inline(value, output),
             RenderAction::Nested(value, indent) => match value {
-                SerValue::Tagged(tag, inner) if !is_inline(inner) => {
+                Value::Tagged(tagged) if !is_inline(&tagged.value) => {
                     output.push(' ');
                     output.push('!');
-                    output.push_str(tag);
+                    output.push_str(tagged.tag.as_suffix());
                     output.push('\n');
-                    pending.push(RenderAction::Value(inner, indent));
+                    pending.push(RenderAction::Value(&tagged.value, indent));
                 }
                 _ if is_inline(value) => {
                     output.push(' ');
@@ -810,20 +649,15 @@ fn render_value(value: &SerValue, indent: usize, output: &mut String) {
                 }
             },
             RenderAction::Value(value, indent) => match value {
-                SerValue::Null
-                | SerValue::Bool(_)
-                | SerValue::Signed(_)
-                | SerValue::Unsigned(_)
-                | SerValue::Float(_)
-                | SerValue::String(_) => {
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
                     push_indent(output, indent);
                     render_scalar(value, output);
                 }
-                SerValue::Sequence(values) if values.is_empty() => {
+                Value::Sequence(values) if values.is_empty() => {
                     push_indent(output, indent);
                     output.push_str("[]");
                 }
-                SerValue::Sequence(values) => {
+                Value::Sequence(values) => {
                     for (index, value) in values.iter().enumerate().rev() {
                         pending.push(RenderAction::Nested(value, indent + 2));
                         pending.push(RenderAction::Text("-"));
@@ -833,11 +667,11 @@ fn render_value(value: &SerValue, indent: usize, output: &mut String) {
                         }
                     }
                 }
-                SerValue::Mapping(entries) if entries.is_empty() => {
+                Value::Mapping(entries) if entries.is_empty() => {
                     push_indent(output, indent);
                     output.push_str("{}");
                 }
-                SerValue::Mapping(entries) => {
+                Value::Mapping(entries) => {
                     for (index, (key, value)) in entries.iter().enumerate().rev() {
                         pending.push(RenderAction::Nested(value, indent + 2));
                         if is_inline(key) {
@@ -857,16 +691,16 @@ fn render_value(value: &SerValue, indent: usize, output: &mut String) {
                         }
                     }
                 }
-                SerValue::Tagged(tag, inner) => {
+                Value::Tagged(tagged) => {
                     push_indent(output, indent);
                     output.push('!');
-                    output.push_str(tag);
-                    if is_inline(inner) {
+                    output.push_str(tagged.tag.as_suffix());
+                    if is_inline(&tagged.value) {
                         output.push(' ');
-                        pending.push(RenderAction::Inline(inner));
+                        pending.push(RenderAction::Inline(&tagged.value));
                     } else {
                         output.push('\n');
-                        pending.push(RenderAction::Value(inner, indent));
+                        pending.push(RenderAction::Value(&tagged.value, indent));
                     }
                 }
             },
@@ -874,62 +708,39 @@ fn render_value(value: &SerValue, indent: usize, output: &mut String) {
     }
 }
 
-fn is_inline(value: &SerValue) -> bool {
+fn is_inline(value: &Value) -> bool {
     let mut value = value;
-    while let SerValue::Tagged(_, inner) = value {
-        value = inner;
+    while let Value::Tagged(tagged) = value {
+        value = &tagged.value;
     }
     matches!(
         value,
-        SerValue::Null
-            | SerValue::Bool(_)
-            | SerValue::Signed(_)
-            | SerValue::Unsigned(_)
-            | SerValue::Float(_)
-            | SerValue::String(_)
-    ) || matches!(value, SerValue::Sequence(values) if values.is_empty())
-        || matches!(value, SerValue::Mapping(entries) if entries.is_empty())
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+    ) || matches!(value, Value::Sequence(values) if values.is_empty())
+        || matches!(value, Value::Mapping(entries) if entries.is_empty())
 }
 
-fn render_inline(mut value: &SerValue, output: &mut String) {
-    while let SerValue::Tagged(tag, inner) = value {
+fn render_inline(mut value: &Value, output: &mut String) {
+    while let Value::Tagged(tagged) = value {
         output.push('!');
-        output.push_str(tag);
+        output.push_str(tagged.tag.as_suffix());
         output.push(' ');
-        value = inner;
+        value = &tagged.value;
     }
     match value {
-        SerValue::Sequence(values) if values.is_empty() => output.push_str("[]"),
-        SerValue::Mapping(entries) if entries.is_empty() => output.push_str("{}"),
+        Value::Sequence(values) if values.is_empty() => output.push_str("[]"),
+        Value::Mapping(entries) if entries.is_empty() => output.push_str("{}"),
         _ => render_scalar(value, output),
     }
 }
 
-fn render_scalar(value: &SerValue, output: &mut String) {
+fn render_scalar(value: &Value, output: &mut String) {
     match value {
-        SerValue::Null => output.push_str("null"),
-        SerValue::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        SerValue::Signed(value) => output.push_str(&value.to_string()),
-        SerValue::Unsigned(value) => output.push_str(&value.to_string()),
-        SerValue::Float(value) => render_float(*value, output),
-        SerValue::String(value) => render_string(value, output),
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => output.push_str(&value.to_string()),
+        Value::String(value) => render_string(value, output),
         _ => unreachable!("collections are not scalars"),
-    }
-}
-
-fn render_float(value: f64, output: &mut String) {
-    if value.is_nan() {
-        output.push_str(".nan");
-    } else if value == f64::INFINITY {
-        output.push_str(".inf");
-    } else if value == f64::NEG_INFINITY {
-        output.push_str("-.inf");
-    } else {
-        let text = value.to_string();
-        output.push_str(&text);
-        if !text.contains(['.', 'e', 'E']) {
-            output.push_str(".0");
-        }
     }
 }
 
@@ -1032,9 +843,9 @@ mod tests {
     #[test]
     fn renderer_handles_deep_sequences_iteratively() {
         let depth = 1024;
-        let mut value = SerValue::String("value".to_owned());
+        let mut value = Value::String("value".to_owned());
         for _ in 0..depth {
-            value = SerValue::Sequence(vec![value]);
+            value = Value::Sequence(vec![value]);
         }
 
         let mut output = String::new();
@@ -1045,9 +856,12 @@ mod tests {
 
     #[test]
     fn renderer_handles_tag_chains_iteratively() {
-        let mut value = SerValue::String("value".to_owned());
+        let mut value = Value::String("value".to_owned());
         for index in (0..1024).rev() {
-            value = SerValue::Tagged(format!("tag{index}"), Box::new(value));
+            value = Value::Tagged(Box::new(TaggedValue {
+                tag: Tag::new(format!("tag{index}")),
+                value,
+            }));
         }
 
         let mut output = String::new();

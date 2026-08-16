@@ -288,6 +288,32 @@ fn main() -> Result<(), yaml_rt::Error> {
 }
 ```
 
+For dynamic YAML, the same feature exposes a `yaml_serde`-compatible value
+model with ordered mappings, local tags, indexing, typed conversion, and
+explicit merge-key expansion:
+
+```rust
+use yaml_rt::{Value, from_str, from_value, to_value};
+
+# fn main() -> Result<(), yaml_rt::Error> {
+let mut value: Value = from_str("service: {name: api, replicas: 2}\n")?;
+value["service"]["replicas"] = Value::from(3);
+assert_eq!(value["service"]["name"], "api");
+
+let replicas: u16 = from_value(value["service"]["replicas"].clone())?;
+assert_eq!(replicas, 3);
+assert_eq!(to_value(vec![1_u8, 2])?[0], 1);
+# Ok(())
+# }
+```
+
+`Value`, `Number`, `Sequence`, `Mapping`, `Index`, `to_value`, and
+`from_value` are available from `yaml-rt-serde` directly and through the
+facade. `Number` additionally retains `i128` and `u128` values. Value
+conversion resolves aliases and intentionally discards comments, anchors,
+styles, and original scalar spelling. YAML `<<` keys remain ordinary mapping
+entries until `Value::apply_merge()` is called.
+
 Serde serialization emits deterministic block-style YAML. Use a typed
 round-trip overlay instead when comments, quoting, whitespace, or other source
 presentation must be retained.
@@ -423,8 +449,8 @@ cargo test -p yaml-rt-core --test yaml_test_suite
 - CLI and patch `test` operations compare YAML values using the supported YAML
   1.2 core scalar and collection model; they are not a general tag-aware
   application schema.
-- Serde conversion does not expose a generic YAML `Value`, merge-key expansion,
-  or presentation metadata.
+- Serde `Value` conversion does not preserve presentation metadata and only
+  expands merge keys when `Value::apply_merge()` is requested.
 - Typed-overlay `flatten` has intentionally conservative combinations with
   field and struct policies; unsupported combinations produce derive errors.
 - Typed mappings use string keys. Borrowed overlay fields, standalone unit

@@ -156,6 +156,138 @@ impl<'de> DeserializeSeed<'de> for StringSeed {
     }
 }
 
+macro_rules! deserialize_numeric_methods {
+    () => {
+        fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_signed(
+                self,
+                visitor,
+                |value| i8::try_from(value).ok(),
+                Visitor::visit_i8,
+            )
+        }
+
+        fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_signed(
+                self,
+                visitor,
+                |value| i16::try_from(value).ok(),
+                Visitor::visit_i16,
+            )
+        }
+
+        fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_signed(
+                self,
+                visitor,
+                |value| i32::try_from(value).ok(),
+                Visitor::visit_i32,
+            )
+        }
+
+        fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_signed(
+                self,
+                visitor,
+                |value| i64::try_from(value).ok(),
+                Visitor::visit_i64,
+            )
+        }
+
+        fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_signed(self, visitor, Some, Visitor::visit_i128)
+        }
+
+        fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_unsigned(
+                self,
+                visitor,
+                |value| u8::try_from(value).ok(),
+                Visitor::visit_u8,
+            )
+        }
+
+        fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_unsigned(
+                self,
+                visitor,
+                |value| u16::try_from(value).ok(),
+                Visitor::visit_u16,
+            )
+        }
+
+        fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_unsigned(
+                self,
+                visitor,
+                |value| u32::try_from(value).ok(),
+                Visitor::visit_u32,
+            )
+        }
+
+        fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_unsigned(
+                self,
+                visitor,
+                |value| u64::try_from(value).ok(),
+                Visitor::visit_u64,
+            )
+        }
+
+        fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_unsigned(self, visitor, Some, Visitor::visit_u128)
+        }
+
+        fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_float(self, visitor, |visitor, value| {
+                let value = checked_f64_to_f32(value)
+                    .ok_or_else(|| Error::message("expected an f32 in range"))?;
+                visitor.visit_f32(value)
+            })
+        }
+
+        fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
+        where
+            V: Visitor<'de>,
+        {
+            deserialize_float(self, visitor, Visitor::visit_f64)
+        }
+    };
+}
+
 impl<'de> de::Deserializer<'de> for Value {
     type Error = Error;
 
@@ -220,8 +352,10 @@ impl<'de> de::Deserializer<'de> for Value {
         visitor.visit_unit()
     }
 
+    deserialize_numeric_methods!();
+
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bool char str string
         bytes byte_buf unit unit_struct seq tuple tuple_struct map struct identifier
     }
 
@@ -296,8 +430,10 @@ impl<'de> de::Deserializer<'de> for &'de Value {
         visitor.visit_unit()
     }
 
+    deserialize_numeric_methods!();
+
     serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bool char str string
         bytes byte_buf unit unit_struct seq tuple tuple_struct map struct identifier
     }
 
@@ -323,6 +459,86 @@ where
     } else {
         Err(Error::message("invalid YAML number"))
     }
+}
+
+trait NumericValue {
+    fn into_number(self) -> Result<Number>;
+}
+
+impl NumericValue for Value {
+    fn into_number(self) -> Result<Number> {
+        match self {
+            Self::Number(number) => Ok(number),
+            _ => Err(Error::message("expected a number")),
+        }
+    }
+}
+
+impl NumericValue for &Value {
+    fn into_number(self) -> Result<Number> {
+        match self {
+            Value::Number(number) => Ok(*number),
+            _ => Err(Error::message("expected a number")),
+        }
+    }
+}
+
+fn deserialize_signed<'de, V, T>(
+    value: impl NumericValue,
+    visitor: V,
+    convert: impl FnOnce(i128) -> Option<T>,
+    visit: impl FnOnce(V, T) -> Result<V::Value>,
+) -> Result<V::Value>
+where
+    V: Visitor<'de>,
+{
+    let value = value
+        .into_number()?
+        .as_i128()
+        .and_then(convert)
+        .ok_or_else(|| Error::message("expected an integer in range"))?;
+    visit(visitor, value)
+}
+
+fn deserialize_unsigned<'de, V, T>(
+    value: impl NumericValue,
+    visitor: V,
+    convert: impl FnOnce(u128) -> Option<T>,
+    visit: impl FnOnce(V, T) -> Result<V::Value>,
+) -> Result<V::Value>
+where
+    V: Visitor<'de>,
+{
+    let value = value
+        .into_number()?
+        .as_u128()
+        .and_then(convert)
+        .ok_or_else(|| Error::message("expected an unsigned integer in range"))?;
+    visit(visitor, value)
+}
+
+fn deserialize_float<'de, V>(
+    value: impl NumericValue,
+    visitor: V,
+    visit: impl FnOnce(V, f64) -> Result<V::Value>,
+) -> Result<V::Value>
+where
+    V: Visitor<'de>,
+{
+    let value = value
+        .into_number()?
+        .as_f64()
+        .ok_or_else(|| Error::message("expected a number"))?;
+    visit(visitor, value)
+}
+
+fn checked_f64_to_f32(value: f64) -> Option<f32> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f32 deserialization applies Rust narrowing and then rejects finite overflow"
+    )]
+    let converted = value as f32;
+    (!value.is_finite() || converted.is_finite()).then_some(converted)
 }
 
 struct OwnedSeqAccess {

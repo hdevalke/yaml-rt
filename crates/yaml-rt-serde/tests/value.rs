@@ -131,6 +131,37 @@ fn typed_values_convert_without_yaml_text() {
 }
 
 #[test]
+fn value_deserializer_checks_every_numeric_width() {
+    assert_eq!(from_value::<i8>(Value::from(i8::MIN)).unwrap(), i8::MIN);
+    assert_eq!(from_value::<i16>(Value::from(i16::MIN)).unwrap(), i16::MIN);
+    assert_eq!(from_value::<i32>(Value::from(i32::MIN)).unwrap(), i32::MIN);
+    assert_eq!(from_value::<i64>(Value::from(i64::MIN)).unwrap(), i64::MIN);
+    assert_eq!(
+        from_value::<i128>(Value::from(i128::MIN)).unwrap(),
+        i128::MIN
+    );
+    assert_eq!(from_value::<u8>(Value::from(u8::MAX)).unwrap(), u8::MAX);
+    assert_eq!(from_value::<u16>(Value::from(u16::MAX)).unwrap(), u16::MAX);
+    assert_eq!(from_value::<u32>(Value::from(u32::MAX)).unwrap(), u32::MAX);
+    assert_eq!(from_value::<u64>(Value::from(u64::MAX)).unwrap(), u64::MAX);
+    assert_eq!(
+        from_value::<u128>(Value::from(u128::MAX)).unwrap(),
+        u128::MAX
+    );
+    assert_eq!(from_value::<f32>(Value::from(0.5_f64)).unwrap(), 0.5);
+    assert_eq!(from_value::<f64>(Value::from(1_u8)).unwrap(), 1.0);
+
+    let borrowed = Value::from(1_u128);
+    assert_eq!(u16::deserialize(&borrowed).unwrap(), 1);
+
+    assert!(from_value::<i8>(Value::from(128_u8)).is_err());
+    assert!(from_value::<u8>(Value::from(-1_i8)).is_err());
+    assert!(from_value::<u8>(Value::from(256_u16)).is_err());
+    assert!(from_value::<i128>(Value::from(u128::MAX)).is_err());
+    assert!(from_value::<f32>(Value::from(f64::MAX)).is_err());
+}
+
+#[test]
 fn tagged_values_and_serde_enums_share_the_same_model() {
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     enum Mode {

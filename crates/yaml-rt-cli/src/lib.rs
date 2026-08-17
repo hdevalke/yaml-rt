@@ -620,13 +620,19 @@ fn execute_batch(
     {
         return Err(RunError::message(format!(
             "--output must not name input file {}",
-            input.relative.display()
+            render_batch_path(&input.relative)
         )));
     }
 
     let mut diagnostics = discovery_failures
         .iter()
-        .map(|failure| format!("{}: {}", failure.relative.display(), failure.message))
+        .map(|failure| {
+            format!(
+                "{}: {}",
+                render_batch_path(&failure.relative),
+                failure.message
+            )
+        })
         .collect::<Vec<_>>();
     let mut succeeded = 0;
     let mut failed = 0;
@@ -635,7 +641,7 @@ fn execute_batch(
         let source = match read_target(&input.path) {
             Ok(source) => source,
             Err(RunError::Message(message)) => {
-                diagnostics.push(format!("{}: {message}", input.relative.display()));
+                diagnostics.push(format!("{}: {message}", render_batch_path(&input.relative)));
                 failed += 1;
                 continue;
             }
@@ -657,7 +663,7 @@ fn execute_batch(
                 }
             }
             Err(RunError::Message(message)) => {
-                diagnostics.push(format!("{}: {message}", input.relative.display()));
+                diagnostics.push(format!("{}: {message}", render_batch_path(&input.relative)));
                 failed += 1;
             }
             Err(error) => return Err(error),
@@ -685,11 +691,18 @@ fn append_batch_result(output: &mut Vec<u8>, path: &Path, result: &[u8]) {
     if !output.is_empty() {
         output.push(b'\n');
     }
-    writeln!(output, "==> {} <==", path.display()).expect("writing to a Vec cannot fail");
+    writeln!(output, "==> {} <==", render_batch_path(path)).expect("writing to a Vec cannot fail");
     output.extend_from_slice(result);
     if !result.is_empty() && !result.ends_with(b"\n") {
         output.push(b'\n');
     }
+}
+
+fn render_batch_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 impl Operation {

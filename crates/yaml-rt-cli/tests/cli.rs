@@ -35,7 +35,7 @@ fn help_and_version_report_distribution_metadata() {
     assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: yaml-rt"));
     assert!(help.stderr.is_empty());
 
-    for operation in ["get", "add", "remove", "replace", "test"] {
+    for operation in ["get", "add", "remove", "replace", "rename-key", "test"] {
         let help = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
             .args([operation, "--help"])
             .output()
@@ -497,6 +497,37 @@ fn in_place_replaces_only_after_success() {
     assert!(output.status.success(), "{:?}", output.stderr);
     assert!(output.stdout.is_empty());
     assert_eq!(fs::read(&input).unwrap(), b"port: 9090\n");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn rename_key_supports_in_place_recursive_directory_targets() {
+    let directory = temp_dir();
+    fs::create_dir(directory.join("nested")).unwrap();
+    fs::write(directory.join("one.yaml"), "old: one # keep\n").unwrap();
+    fs::write(directory.join("nested/two.yml"), "old: two\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "rename-key",
+            "/old",
+            "--to",
+            "new",
+            "--in-place",
+            directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fs::read(directory.join("one.yaml")).unwrap(),
+        b"new: one # keep\n"
+    );
+    assert_eq!(
+        fs::read(directory.join("nested/two.yml")).unwrap(),
+        b"new: two\n"
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 

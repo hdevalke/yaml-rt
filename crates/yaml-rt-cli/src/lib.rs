@@ -114,6 +114,8 @@ enum Operation {
     Remove(MutationArgs),
     /// Replace an existing value.
     Replace(ValueMutationArgs),
+    /// Rename one or more mapping keys.
+    RenameKey(RenameKeyArgs),
     /// Move an existing value.
     Move(FromMutationArgs),
     /// Copy an existing value.
@@ -245,6 +247,17 @@ struct ValueArgs {
 struct ValueMutationArgs {
     #[command(flatten)]
     value: ValueArgs,
+    #[command(flatten)]
+    output: MutationOutputArgs,
+}
+
+#[derive(Args)]
+struct RenameKeyArgs {
+    #[command(flatten)]
+    path: PathArgs,
+    /// Decoded destination key name.
+    #[arg(long, value_name = "KEY")]
+    to: String,
     #[command(flatten)]
     output: MutationOutputArgs,
 }
@@ -430,6 +443,11 @@ fn execute_one(
                 prepared.value.as_ref().expect("Clap requires a value"),
             )
             .map_err(RunError::display)?;
+            write_mutation(&doc, &arguments.output, input_path, stdout)
+        }
+        Operation::RenameKey(arguments) => {
+            doc.rename_key_at(document, path, &arguments.to)
+                .map_err(RunError::display)?;
             write_mutation(&doc, &arguments.output, input_path, stdout)
         }
         Operation::Move(arguments) => {
@@ -710,6 +728,7 @@ impl Operation {
         let path = match self {
             Self::Get(args) => Some(&args.path),
             Self::Add(args) | Self::Replace(args) => Some(&args.value.path),
+            Self::RenameKey(args) => Some(&args.path),
             Self::Remove(args) => Some(&args.path),
             Self::Test(args) => Some(&args.path),
             _ => None,
@@ -725,6 +744,7 @@ impl Operation {
             Self::Query(args) => &args.target,
             Self::Get(args) => &args.path.target,
             Self::Add(args) | Self::Replace(args) => &args.value.path.target,
+            Self::RenameKey(args) => &args.path.target,
             Self::Remove(args) => &args.path.target,
             Self::Move(args) | Self::Copy(args) => &args.path.target,
             Self::Test(args) => &args.path.target,
@@ -739,6 +759,7 @@ impl Operation {
             }
             Self::Get(args) => args.path.pointer(),
             Self::Add(args) | Self::Replace(args) => args.value.path.pointer(),
+            Self::RenameKey(args) => args.path.pointer(),
             Self::Remove(args) => args.path.pointer(),
             Self::Move(args) | Self::Copy(args) => &args.path.path,
             Self::Test(args) => args.path.pointer(),
@@ -749,6 +770,7 @@ impl Operation {
         match self {
             Self::Get(args) => args.path.query.as_deref(),
             Self::Add(args) | Self::Replace(args) => args.value.path.query.as_deref(),
+            Self::RenameKey(args) => args.path.query.as_deref(),
             Self::Remove(args) => args.path.query.as_deref(),
             Self::Test(args) => args.path.query.as_deref(),
             _ => None,
@@ -765,6 +787,7 @@ impl Operation {
     fn mutation_output(&self) -> Option<&MutationOutputArgs> {
         match self {
             Self::Add(args) | Self::Replace(args) => Some(&args.output),
+            Self::RenameKey(args) => Some(&args.output),
             Self::Remove(args) => Some(&args.output),
             Self::Move(args) | Self::Copy(args) => Some(&args.output),
             Self::Patch(args) => Some(&args.output),
@@ -797,6 +820,7 @@ impl Operation {
         match self {
             Self::Get(args) => args.path.input_path(),
             Self::Add(args) | Self::Replace(args) => args.value.path.input_path(),
+            Self::RenameKey(args) => args.path.input_path(),
             Self::Remove(args) => args.path.input_path(),
             Self::Test(args) => args.path.input_path(),
             _ => self.target().file.as_deref(),
@@ -899,6 +923,18 @@ fn execute_query_targeted(
                 matches,
                 QueryMutation::Replace(value.expect("Clap requires a value")),
             )?;
+            write_mutation(doc, &arguments.output, output.input_path, output.stdout)
+        }
+        Operation::RenameKey(arguments) => {
+            if matches.is_empty() {
+                return Err(RunError::message("query matched no nodes"));
+            }
+            let pointers = matches
+                .iter()
+                .map(|matched| matched.pointer().clone())
+                .collect::<Vec<_>>();
+            doc.rename_keys_at(document, &pointers, &arguments.to)
+                .map_err(RunError::display)?;
             write_mutation(doc, &arguments.output, output.input_path, output.stdout)
         }
         _ => unreachable!("only single-path commands accept --query"),
@@ -1305,6 +1341,77 @@ mod tests {
         );
         assert_eq!(status, 0, "{stderr}");
         assert_eq!(stdout, "server:\n  host: example.com\n");
+    }
+
+    #[test]
+    fn rename_key_works_with_pointer_and_document_selection() {
+        let input = "---\nold: first\n---\nold: second # keep\n";
+        let (status, stdout, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "rename-key",
+                "/old",
+                "--to",
+                "true",
+                "--doc",
+                "1",
+            ],
+            input,
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "---\nold: first\n---\n\"true\": second # keep\n");
+    }
+
+    #[test]
+    fn query_targeted_rename_is_atomic_and_requires_mapping_members() {
+        let input = "items: [{old: 1}, {old: 2}]\n";
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "rename-key", "--query", "$..old", "--to", "new"],
+            input,
+        );
+        assert_eq!(status, 0, "{stderr}");
+        assert_eq!(stdout, "items: [{new: 1}, {new: 2}]\n");
+
+        let (status, stdout, stderr) = invoke(
+            &["yaml-rt", "rename-key", "--query", "$..*", "--to", "new"],
+            input,
+        );
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("does not select a mapping member"));
+
+        let (status, stdout, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "rename-key",
+                "--query",
+                "$.missing",
+                "--to",
+                "new",
+            ],
+            input,
+        );
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("query matched no nodes"));
+    }
+
+    #[test]
+    fn query_targeted_rename_rolls_back_collisions() {
+        let (status, stdout, stderr) = invoke(
+            &[
+                "yaml-rt",
+                "rename-key",
+                "--query",
+                "$['a','b']",
+                "--to",
+                "x",
+            ],
+            "a: 1\nb: 2\n",
+        );
+        assert_eq!(status, FAILURE);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("duplicate key \"x\""));
     }
 
     #[test]

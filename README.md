@@ -82,6 +82,13 @@ server:
 `YamlDoc::commit_edits()` reparses that result and makes it the new baseline for
 subsequent edits.
 
+Mapping keys can be renamed without moving or reconstructing their entries.
+`YamlDoc::rename_key_at()` accepts a JSON Pointer to the member value, while
+`YamlDoc::rename_keys_at()` applies one decoded destination name to several
+members transactionally. Key quoting changes only when required to keep the
+new name a YAML string; entry position, values, comments, tags, anchors, and
+surrounding whitespace remain source-owned.
+
 The lower-level API exposes the lossless concrete syntax tree, semantic node
 metadata, JSON Pointer operations, fragments, diagnostics with spans, and
 patch-oriented editing primitives.
@@ -339,6 +346,12 @@ yaml-rt replace /server/port --value 9090 config.yaml
 # Replace every node selected by JSONPath.
 yaml-rt replace --query '$.services[*].port' --value 9090 config.yaml
 
+# Rename a mapping key without moving its entry.
+yaml-rt rename-key /server/old-name --to new-name config.yaml
+
+# Give every selected mapping member the same new key name.
+yaml-rt rename-key --query '$.services[*].legacy-port' --to port config.yaml
+
 # Edit a file atomically in place.
 yaml-rt add /server/debug --value true --in-place config.yaml
 
@@ -355,18 +368,27 @@ yaml-rt patch --patch-file changes.yaml --in-place config.yaml
 yaml-rt replace /server/port --value 9090 --in-place configs/
 ```
 
-Available operations are `query`, `get`, `add`, `remove`, `replace`, `move`,
-`copy`, `test`, and `patch`. Query results are emitted in nodelist order as one
-compact JSON Pointer/value pair per line. JSONPath evaluation uses the YAML 1.2
-core schema and rejects YAML values that are not JSON-compatible, including
-non-string or duplicate mapping keys and non-finite numbers.
+Available operations are `query`, `get`, `add`, `remove`, `replace`,
+`rename-key`, `move`, `copy`, `test`, and `patch`. Query results are emitted in
+nodelist order as one compact JSON Pointer/value pair per line. JSONPath
+evaluation uses the YAML 1.2 core schema and rejects YAML values that are not
+JSON-compatible, including non-string or duplicate mapping keys and non-finite
+numbers.
 
-`get`, `add`, `remove`, `replace`, and `test` also accept `--query QUERY` in
-place of their positional JSON Pointer. `get --query` emits each match as a
-separate `---` YAML document in nodelist order. Query-targeted mutations apply
-to all matched nodes transactionally; duplicate targets are edited once, and a
-selected ancestor supersedes its selected descendants. A mutation or `test`
-fails when the query matches nothing, while `get` succeeds with empty output.
+`get`, `add`, `remove`, `replace`, `rename-key`, and `test` also accept
+`--query QUERY` in place of their positional JSON Pointer. `get --query` emits
+each match as a separate `---` YAML document in nodelist order. Query-targeted
+mutations apply to all matched nodes transactionally and duplicate targets are
+edited once. Removal and value replacement normalize overlapping ancestor and
+descendant selections; key rename resolves all owning mapping entries before
+editing, so nested keys can be renamed together. A mutation or `test` fails
+when the query matches nothing, while `get` succeeds with empty output.
+
+`rename-key` takes the decoded destination name through `--to KEY`. Every
+selected node must be a mapping member, and every affected mapping must retain
+unique final string keys. Plain, single-quoted, and double-quoted keys are
+supported in both implicit and explicit-key syntax. Block-scalar, alias, and
+complex key occurrences are rejected transactionally.
 
 `patch` accepts an RFC 6902-style operation sequence through either
 `--patch YAML` or `--patch-file FILE`. JSON patch documents are valid because
@@ -466,6 +488,8 @@ cargo test -p yaml-rt-core --test yaml_test_suite
   ambiguous or invalid.
 - JSON Pointer lookup reports duplicate mapping keys and cannot address
   non-string mapping keys.
+- Mapping-key rename supports plain, single-quoted, and double-quoted string
+  key occurrences; block-scalar, alias, and complex keys are not rewritten.
 - CLI and patch `test` operations compare YAML values using the supported YAML
   1.2 core scalar and collection model; they are not a general tag-aware
   application schema.

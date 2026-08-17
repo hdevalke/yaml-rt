@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::fragment::indent_text;
@@ -72,6 +73,12 @@ enum AddLocation {
         sequence: NodeId,
         index: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+struct RenameTarget {
+    mapping: NodeId,
+    key: NodeId,
 }
 
 impl YamlDoc {
@@ -214,6 +221,67 @@ impl YamlDoc {
         semantically_equal(self, target, value.document(), value.root()).map_err(Into::into)
     }
 
+    /// Renames the mapping key that owns a pointer-selected value.
+    ///
+    /// The operation is transactional and changes only the key scalar spelling.
+    /// The pointer must select a mapping member; document roots and sequence
+    /// elements do not have a key to rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pointer does not select a supported string key,
+    /// the destination key would collide with another mapping member, or the
+    /// edited document cannot be emitted.
+    pub fn rename_key_at(
+        &mut self,
+        document: usize,
+        pointer: &JsonPointer,
+        new_key: &str,
+    ) -> Result<(), YamlEditError> {
+        self.rename_keys_at(document, std::slice::from_ref(pointer), new_key)
+    }
+
+    /// Renames the mapping keys that own several pointer-selected values.
+    ///
+    /// Targets are resolved against the original document and duplicate source
+    /// key nodes are edited once. All collision checks and edits are applied as
+    /// one transaction. An empty pointer slice succeeds without changing the
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any pointer does not select a supported string key,
+    /// any affected mapping would contain duplicate final keys, or the edited
+    /// document cannot be emitted.
+    pub fn rename_keys_at(
+        &mut self,
+        document: usize,
+        pointers: &[JsonPointer],
+        new_key: &str,
+    ) -> Result<(), YamlEditError> {
+        if pointers.is_empty() {
+            return Ok(());
+        }
+
+        let mut work = self.clone();
+        let mut seen_keys = HashSet::new();
+        let mut targets = Vec::new();
+        for pointer in pointers {
+            let target = work.resolve_rename_target(document, pointer)?;
+            if seen_keys.insert(target.key) {
+                targets.push(target);
+            }
+        }
+
+        work.validate_rename_targets(&targets, new_key)?;
+        for target in targets {
+            work.queue_key_rename(target.key, new_key)?;
+        }
+        work.commit_edits()?;
+        *self = work;
+        Ok(())
+    }
+
     fn transaction(
         &mut self,
         operation: impl FnOnce(&mut YamlDoc) -> Result<(), YamlEditError>,
@@ -222,6 +290,133 @@ impl YamlDoc {
         operation(&mut work)?;
         work.commit_edits()?;
         *self = work;
+        Ok(())
+    }
+
+    fn resolve_rename_target(
+        &self,
+        document: usize,
+        pointer: &JsonPointer,
+    ) -> Result<RenameTarget, YamlEditError> {
+        let Some((parent_pointer, token)) = pointer.parent() else {
+            return Err(YamlEditError::new(
+                "a YAML document root does not have a mapping key to rename",
+            ));
+        };
+        let token_index = pointer.tokens().len().saturating_sub(1);
+        let mut parent = self.resolve_pointer(document, &parent_pointer)?;
+        parent = self.resolve_aliases_for_pointer(parent, pointer, token_index)?;
+        if !matches!(
+            self.semantic_kind(parent),
+            Some(SemanticKind::Mapping { .. })
+        ) {
+            return Err(YamlEditError::new(format!(
+                "JSON Pointer {:?} does not select a mapping member",
+                pointer.as_str()
+            )));
+        }
+        let matched = self
+            .mapping_match(parent, token, pointer, token_index)?
+            .ok_or_else(|| {
+                YamlEditError::new(format!(
+                    "mapping has no member {:?} to rename",
+                    token.as_str()
+                ))
+            })?;
+        Ok(RenameTarget {
+            mapping: parent,
+            key: matched.key,
+        })
+    }
+
+    fn validate_rename_targets(
+        &self,
+        targets: &[RenameTarget],
+        new_key: &str,
+    ) -> Result<(), YamlEditError> {
+        crate::validate_yaml_chars(new_key)?;
+        let mut targets_by_mapping = HashMap::<NodeId, HashSet<NodeId>>::new();
+        for target in targets {
+            self.validate_rename_key_node(target.key)?;
+            targets_by_mapping
+                .entry(target.mapping)
+                .or_default()
+                .insert(target.key);
+        }
+
+        for (mapping, renamed_keys) in targets_by_mapping {
+            let mut final_keys = HashSet::new();
+            for (key, _) in self.mapping_entries(mapping) {
+                let decoded = if renamed_keys.contains(&key) {
+                    new_key.to_owned()
+                } else {
+                    self.string_mapping_key(key)?
+                };
+                if !final_keys.insert(decoded.clone()) {
+                    return Err(YamlEditError::new(format!(
+                        "renaming a mapping key to {new_key:?} would create duplicate key {decoded:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_rename_key_node(&self, key: NodeId) -> Result<(), YamlEditError> {
+        if self
+            .node(key)
+            .is_none_or(|node| node.kind() != crate::NodeKind::Scalar)
+            || !matches!(self.semantic_kind(key), Some(SemanticKind::Scalar { .. }))
+        {
+            return Err(YamlEditError::new(
+                "mapping-key rename supports only plain, single-quoted, and double-quoted string keys",
+            ));
+        }
+        if !scalar_is_string(self, key)? {
+            return Err(YamlEditError::new(
+                "mapping-key rename target is not a string scalar key",
+            ));
+        }
+        Ok(())
+    }
+
+    fn string_mapping_key(&self, key: NodeId) -> Result<String, YamlEditError> {
+        let mut resolved = key;
+        let mut seen = HashSet::new();
+        while matches!(self.semantic_kind(resolved), Some(SemanticKind::Alias)) {
+            if !seen.insert(resolved) {
+                return Err(YamlEditError::new("cyclic YAML alias key"));
+            }
+            resolved = self
+                .resolve_alias(resolved)
+                .ok_or_else(|| YamlEditError::new("unresolved YAML alias key"))?;
+        }
+        if !scalar_is_string(self, resolved)? {
+            return Err(YamlEditError::new(
+                "affected mapping contains a non-string key",
+            ));
+        }
+        self.scalar_value(resolved)
+            .map(std::borrow::Cow::into_owned)
+            .map_err(Into::into)
+    }
+
+    fn queue_key_rename(&mut self, key: NodeId, new_key: &str) -> Result<(), YamlEditError> {
+        let current = self.scalar_value(key)?;
+        if current == new_key {
+            return Ok(());
+        }
+        let (span, style) = self.scalar_replacement_target(key)?;
+        let tag = self.resolved_tag(key)?;
+        let replacement = match style {
+            crate::ScalarStyle::Plain if safe_plain_key_with_tag(new_key, tag.as_deref()) => {
+                new_key.to_owned()
+            }
+            crate::ScalarStyle::Plain => crate::fragment::quote_string(new_key),
+            style => crate::format_scalar_value(new_key, style)
+                .unwrap_or_else(|_| crate::fragment::quote_string(new_key)),
+        };
+        self.queue_edit(span, replacement)?;
         Ok(())
     }
 
@@ -687,6 +882,16 @@ pub(crate) fn emit_string_key(value: &str) -> String {
 }
 
 pub(crate) fn safe_plain_string(value: &str) -> bool {
+    if !safe_plain_string_syntax(value) {
+        return false;
+    }
+    matches!(
+        resolve_scalar(value, YamlScalarStyle::Plain, None),
+        Ok(ResolvedScalar::String)
+    )
+}
+
+fn safe_plain_string_syntax(value: &str) -> bool {
     if value.is_empty()
         || value.trim() != value
         || value.contains(['\n', '\r', '\t', ':', '#', '[', ']', '{', '}', ','])
@@ -694,10 +899,18 @@ pub(crate) fn safe_plain_string(value: &str) -> bool {
     {
         return false;
     }
-    matches!(
-        resolve_scalar(value, YamlScalarStyle::Plain, None),
-        Ok(ResolvedScalar::String)
-    )
+    true
+}
+
+fn safe_plain_key_with_tag(value: &str, tag: Option<&str>) -> bool {
+    const STRING_TAG: &str = "tag:yaml.org,2002:str";
+
+    safe_plain_string_syntax(value)
+        && (tag == Some(STRING_TAG)
+            || matches!(
+                resolve_scalar(value, YamlScalarStyle::Plain, None),
+                Ok(ResolvedScalar::String)
+            ))
 }
 
 fn scalar_is_string(doc: &YamlDoc, node: NodeId) -> Result<bool, YamlEditError> {
@@ -722,6 +935,156 @@ mod tests {
 
     fn fragment(value: &str) -> YamlFragment {
         YamlFragment::parse(value).unwrap()
+    }
+
+    #[test]
+    fn renames_block_flow_and_explicit_mapping_keys_losslessly() {
+        let input = "old: 1 # keep\nflow: {old: 2}\nexplicit:\n  ? 'old'\n  : 3\n";
+        let mut doc = YamlDoc::parse(input).unwrap();
+        doc.rename_keys_at(
+            0,
+            &[
+                pointer("/old"),
+                pointer("/flow/old"),
+                pointer("/explicit/old"),
+            ],
+            "true",
+        )
+        .unwrap();
+
+        assert_eq!(
+            doc.as_source(),
+            "\"true\": 1 # keep\nflow: {\"true\": 2}\nexplicit:\n  ? 'true'\n  : 3\n"
+        );
+    }
+
+    #[test]
+    fn rename_key_quotes_plain_names_that_are_not_safe_strings() {
+        for new_key in ["true", "", "a: b", "line\nbreak"] {
+            let mut doc = YamlDoc::parse("old: value\n").unwrap();
+            doc.rename_key_at(0, &pointer("/old"), new_key).unwrap();
+            assert_eq!(
+                doc.as_source(),
+                format!("{}: value\n", crate::fragment::quote_string(new_key))
+            );
+        }
+
+        let mut flow = YamlDoc::parse("{old: value}\n").unwrap();
+        flow.rename_key_at(0, &pointer("/old"), "a,b").unwrap();
+        assert_eq!(flow.as_source(), "{\"a,b\": value}\n");
+    }
+
+    #[test]
+    fn rename_key_preserves_quoted_styles_properties_comments_and_line_endings() {
+        let mut single = YamlDoc::parse("'old': value\n").unwrap();
+        single.rename_key_at(0, &pointer("/old"), "Bob's").unwrap();
+        assert_eq!(single.as_source(), "'Bob''s': value\n");
+
+        let mut double = YamlDoc::parse("\"old\": value\n").unwrap();
+        double
+            .rename_key_at(0, &pointer("/old"), "new \"key\"")
+            .unwrap();
+        assert_eq!(double.as_source(), "\"new \\\"key\\\"\": value\n");
+
+        let mut tagged = YamlDoc::parse("!!str &key old: value # keep\r\n").unwrap();
+        tagged.rename_key_at(0, &pointer("/old"), "true").unwrap();
+        assert_eq!(tagged.as_source(), "!!str &key true: value # keep\r\n");
+    }
+
+    #[test]
+    fn rename_keys_resolves_all_targets_before_editing_and_deduplicates_alias_routes() {
+        let mut nested = YamlDoc::parse("parent:\n  old: 1\nold: 2\n").unwrap();
+        nested
+            .rename_keys_at(0, &[pointer("/parent/old"), pointer("/parent")], "renamed")
+            .unwrap();
+        assert_eq!(nested.as_source(), "renamed:\n  renamed: 1\nold: 2\n");
+
+        let mut aliases = YamlDoc::parse("base: &base\n  name: Ada\ncopy: *base\n").unwrap();
+        aliases
+            .rename_keys_at(
+                0,
+                &[pointer("/base/name"), pointer("/copy/name")],
+                "display-name",
+            )
+            .unwrap();
+        assert_eq!(
+            aliases.as_source(),
+            "base: &base\n  display-name: Ada\ncopy: *base\n"
+        );
+    }
+
+    #[test]
+    fn rename_keys_rejects_collisions_transactionally() {
+        let input = "a: 1\nb: 2\n";
+        let mut existing = YamlDoc::parse(input).unwrap();
+        let error = existing.rename_key_at(0, &pointer("/a"), "b").unwrap_err();
+        assert!(error.to_string().contains("duplicate key \"b\""));
+        assert_eq!(existing.as_source(), input);
+
+        let mut selected = YamlDoc::parse(input).unwrap();
+        let error = selected
+            .rename_keys_at(0, &[pointer("/a"), pointer("/b")], "x")
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate key \"x\""));
+        assert_eq!(selected.as_source(), input);
+    }
+
+    #[test]
+    fn rename_keys_treats_duplicate_and_unchanged_targets_as_no_ops() {
+        let input = "\"old\": value\n";
+        let mut doc = YamlDoc::parse(input).unwrap();
+        doc.rename_keys_at(0, &[pointer("/old"), pointer("/old")], "old")
+            .unwrap();
+        doc.rename_keys_at(0, &[], "ignored").unwrap();
+        assert_eq!(doc.as_source(), input);
+    }
+
+    #[test]
+    fn rename_key_rejects_non_members_and_unsupported_key_forms() {
+        let mut root = YamlDoc::parse("key: value\n").unwrap();
+        assert!(
+            root.rename_key_at(0, &pointer(""), "new")
+                .unwrap_err()
+                .to_string()
+                .contains("document root")
+        );
+        assert_eq!(root.as_source(), "key: value\n");
+
+        let mut sequence = YamlDoc::parse("- value\n").unwrap();
+        assert!(
+            sequence
+                .rename_key_at(0, &pointer("/0"), "new")
+                .unwrap_err()
+                .to_string()
+                .contains("does not select a mapping member")
+        );
+
+        let mut block = YamlDoc::parse("? >\n  old\n: value\n").unwrap();
+        assert!(
+            block
+                .rename_key_at(0, &pointer("/old\n"), "new")
+                .unwrap_err()
+                .to_string()
+                .contains("plain, single-quoted, and double-quoted")
+        );
+
+        let mut alias = YamlDoc::parse("name: &key target\n? *key\n: value\n").unwrap();
+        let error = alias
+            .rename_key_at(0, &pointer("/target"), "new")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("plain, single-quoted, and double-quoted"),
+            "{error}"
+        );
+
+        let mut complex = YamlDoc::parse("? [a, b]\n: value\n").unwrap();
+        assert!(
+            complex
+                .rename_key_at(0, &pointer("/anything"), "new")
+                .is_err()
+        );
     }
 
     #[test]

@@ -227,6 +227,7 @@ impl std::error::Error for PointerError {}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MappingMatch {
+    pub(crate) key: NodeId,
     pub(crate) value: NodeId,
 }
 
@@ -358,11 +359,11 @@ impl YamlDoc {
     ) -> Result<Option<MappingMatch>, PointerError> {
         let mut found = None;
         for (key, value) in self.mapping_entries(mapping) {
-            let key = self.resolve_aliases_for_pointer(key, pointer, token_index)?;
-            let Some(SemanticKind::Scalar { style }) = self.semantic_kind(key) else {
+            let resolved_key = self.resolve_aliases_for_pointer(key, pointer, token_index)?;
+            let Some(SemanticKind::Scalar { style }) = self.semantic_kind(resolved_key) else {
                 return Err(non_string_key_error(pointer, token_index));
             };
-            let scalar = self.scalar_value(key).map_err(|error| {
+            let scalar = self.scalar_value(resolved_key).map_err(|error| {
                 PointerError::new(
                     pointer.as_str(),
                     Some(token_index),
@@ -370,7 +371,7 @@ impl YamlDoc {
                     error.to_string(),
                 )
             })?;
-            let tag = self.resolved_tag(key).map_err(|error| {
+            let tag = self.resolved_tag(resolved_key).map_err(|error| {
                 PointerError::new(
                     pointer.as_str(),
                     Some(token_index),
@@ -395,7 +396,7 @@ impl YamlDoc {
                         ),
                     ));
                 }
-                found = Some(MappingMatch { value });
+                found = Some(MappingMatch { key, value });
             }
         }
         Ok(found)

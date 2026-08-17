@@ -1,6 +1,20 @@
 # Changelog
 
-## v0.2.0 (2026-08-14)
+### v0.2.1 (2026-08-17)
+
+#### Features
+
+* **yaml-rt-cli:** add mapping key renaming (27122b6)
+* **yaml-rt-cli:** recurse into directory (dd842f7)
+* add yaml_serde compatible generic `Value` model (595533d)
+
+#### Fixes
+
+* **yaml-rt-cli:** normalize path output (2fc77e0)
+* range check conversion for all integer and floating points numbers
+(21b2485)
+
+## v0.2.0 (2026-08-15)
 
 ### Features
 

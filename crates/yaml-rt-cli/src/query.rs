@@ -13,9 +13,9 @@ const SEQ_TAG: &str = "tag:yaml.org,2002:seq";
 pub(crate) fn run_query(
     doc: &YamlDoc,
     document: usize,
-    source: &str,
+    query: &JsonPath,
 ) -> Result<String, QueryCommandError> {
-    let matches = query_matches(doc, document, source)?;
+    let matches = query_matches(doc, document, query)?;
     let budget = doc.as_source().len().saturating_mul(100).max(10_000);
     let mut output = String::new();
     for matched in matches {
@@ -31,10 +31,9 @@ pub(crate) fn run_query(
 pub(crate) fn query_matches(
     doc: &YamlDoc,
     document: usize,
-    source: &str,
+    query: &JsonPath,
 ) -> Result<QueryMatches, QueryCommandError> {
-    JsonPath::parse(source)
-        .map_err(QueryCommandError::display)?
+    query
         .query(doc, document)
         .map_err(QueryCommandError::display)
 }
@@ -282,8 +281,9 @@ mod tests {
     #[test]
     fn renders_pointer_value_lines() {
         let doc = YamlDoc::parse("'a/b~c': {hex: 0x10, text: \"x\\ny\"}\n").unwrap();
+        let query = JsonPath::parse("$['a/b~c']").unwrap();
         assert_eq!(
-            run_query(&doc, 0, "$['a/b~c']").unwrap(),
+            run_query(&doc, 0, &query).unwrap(),
             "\"/a~1b~0c\": {\"hex\":16,\"text\":\"x\\ny\"}\n"
         );
     }
@@ -291,6 +291,7 @@ mod tests {
     #[test]
     fn renders_empty_document_root_as_null() {
         let doc = YamlDoc::parse("---\n").unwrap();
-        assert_eq!(run_query(&doc, 0, "$").unwrap(), "\"\": null\n");
+        let query = JsonPath::parse("$").unwrap();
+        assert_eq!(run_query(&doc, 0, &query).unwrap(), "\"\": null\n");
     }
 }

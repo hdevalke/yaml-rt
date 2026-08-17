@@ -350,6 +350,9 @@ yaml-rt get /name --doc 1 stream.yaml
 
 # Apply several changes transactionally from YAML or JSON.
 yaml-rt patch --patch-file changes.yaml --in-place config.yaml
+
+# Recursively edit every .yaml or .yml file under a directory.
+yaml-rt replace /server/port --value 9090 --in-place configs/
 ```
 
 Available operations are `query`, `get`, `add`, `remove`, `replace`, `move`,
@@ -371,11 +374,28 @@ JSON is a subset of YAML; YAML syntax additionally permits complete YAML nodes
 as operation values. Operations run in order against the selected document,
 and the entire patch is rolled back if any operation or `test` fails.
 
-An omitted input file, or `-`, reads YAML from standard input. Mutations write
-to standard output unless `--output` or `--in-place` is used. Values passed with
-`--value` or `--value-file` must be complete YAML nodes. `--patch-file -` reads
-the patch from standard input only when the target YAML is a real file; both
-inputs cannot use standard input at once.
+An input may be a single file, a directory, or `-` for standard input. Omitting
+the input scans the current directory. Directory inputs are searched
+recursively for `.yaml` and `.yml` files using case-insensitive extensions;
+hidden paths are included, symbolic links are skipped, and files are processed
+in sorted relative-path order. A directory with no matching files succeeds
+without output.
+
+Batch `query` and `get --query` output identifies each input containing a match
+with an `==> relative/path.yaml <==` header and a blank line between files;
+files without matches produce no section. Pointer-based batch `get` identifies
+every successful input. The `--output` option writes the same combined stream
+to one file. Batch mutations
+require `--in-place`; each file is replaced atomically only after its operation
+succeeds. Failures are reported with relative paths, processing continues for
+the remaining files, and the command exits unsuccessfully if any file or
+directory traversal failed.
+
+Single-file mutations write to standard output unless `--output` or
+`--in-place` is used. Values passed with `--value` or `--value-file` must be
+complete YAML nodes. `--patch-file -` reads the patch from standard input only
+when the target YAML does not also use `-`; both inputs cannot use standard
+input at once.
 
 Run `yaml-rt help <operation>` for operation-specific arguments.
 

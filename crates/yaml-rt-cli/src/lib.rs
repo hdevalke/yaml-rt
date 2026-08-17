@@ -2,8 +2,10 @@
 //!
 //! The binary searches YAML documents with `JSONPath`, applies JSON Pointer
 //! operations, and executes transactional YAML or JSON patch documents while
-//! retaining unrelated presentation. [`run`] is public so integrations can
-//! supply their own argument and I/O streams.
+//! retaining unrelated presentation. File targets can also be directories,
+//! which are searched recursively for YAML files; an omitted target searches
+//! the current directory, while `-` reads standard input. [`run`] is public so
+//! integrations can supply their own argument and I/O streams.
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
@@ -15,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment, YamlPatch};
-use yaml_rt_rfc9535::QueryMatches;
+use yaml_rt_rfc9535::{JsonPath, QueryMatches};
 
 mod query;
 
@@ -63,6 +65,23 @@ where
     }
     match execute(&cli.operation, stdin, stdout) {
         Ok(()) | Err(RunError::BrokenPipe) => 0,
+        Err(RunError::Usage(message)) => {
+            let error = Cli::command().error(ErrorKind::ArgumentConflict, message);
+            if write!(stderr, "{error}").is_err() {
+                return FAILURE;
+            }
+            USAGE
+        }
+        Err(RunError::Batch {
+            diagnostics,
+            summary,
+        }) => {
+            for diagnostic in diagnostics {
+                let _ = writeln!(stderr, "yaml-rt: {diagnostic}");
+            }
+            let _ = writeln!(stderr, "yaml-rt: {summary}");
+            FAILURE
+        }
         Err(RunError::Message(message)) => {
             let _ = writeln!(stderr, "yaml-rt: {message}");
             FAILURE
@@ -107,7 +126,7 @@ enum Operation {
 
 #[derive(Args)]
 struct TargetArgs {
-    /// Input YAML file; defaults to stdin.
+    /// Input YAML file or directory; defaults to the current directory. Use - for stdin.
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
     /// Zero-based YAML document index.
@@ -245,9 +264,17 @@ fn execute(
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
 ) -> Result<(), RunError> {
-    let target = operation.target();
-    let input_path = operation.input_path();
-    let target_uses_stdin = input_path.is_none_or(|path| path == Path::new("-"));
+    let targets = resolve_targets(operation.input_path())?;
+    if matches!(targets, InputTargets::Batch { .. })
+        && operation
+            .mutation_output()
+            .is_some_and(|output| !output.in_place)
+    {
+        return Err(RunError::usage(
+            "directory targets require --in-place for mutations",
+        ));
+    }
+    let target_uses_stdin = matches!(targets, InputTargets::Stdin);
     if matches!(operation, Operation::Patch(arguments) if arguments.source.patch_file.as_deref() == Some(Path::new("-")))
         && target_uses_stdin
     {
@@ -255,57 +282,113 @@ fn execute(
             "target YAML and --patch-file cannot both read stdin",
         ));
     }
-    let input = read_target(input_path, stdin)?;
+    let prepared = prepare_operation(operation, target_uses_stdin, stdin)?;
+    match targets {
+        InputTargets::Stdin => {
+            let input = read_stream(stdin, "stdin")?;
+            execute_one(operation, &prepared, None, input, stdout, false)
+        }
+        InputTargets::File(path) => {
+            let input = read_target(&path)?;
+            execute_one(operation, &prepared, Some(&path), input, stdout, false)
+        }
+        InputTargets::Batch {
+            files,
+            discovery_failures,
+        } => execute_batch(operation, &prepared, &files, discovery_failures, stdout),
+    }
+}
+
+fn execute_one(
+    operation: &Operation,
+    prepared: &PreparedOperation,
+    input_path: Option<&Path>,
+    input: String,
+    stdout: &mut dyn Write,
+    batch_capture: bool,
+) -> Result<(), RunError> {
+    let target = operation.target();
     let mut doc = YamlDoc::parse_owned(input).map_err(RunError::display)?;
     let document = select_document(&doc, target.doc)?;
 
     if let Operation::Query(arguments) = operation {
-        let output = run_query(&doc, document, &arguments.query).map_err(RunError::display)?;
+        let output = run_query(
+            &doc,
+            document,
+            prepared
+                .query
+                .as_ref()
+                .expect("query operation is prepared"),
+        )
+        .map_err(RunError::display)?;
         return write_result(
             output.as_bytes(),
-            arguments.output.output.as_deref(),
+            if batch_capture {
+                None
+            } else {
+                arguments.output.output.as_deref()
+            },
             input_path,
             stdout,
         );
     }
 
     if let Operation::Patch(arguments) = operation {
-        let patch = read_patch(&arguments.source, stdin)?;
-        doc.apply_patch(document, &patch)
-            .map_err(RunError::display)?;
+        doc.apply_patch(
+            document,
+            prepared
+                .patch
+                .as_ref()
+                .expect("patch operation is prepared"),
+        )
+        .map_err(RunError::display)?;
         return write_mutation(&doc, &arguments.output, input_path, stdout);
     }
 
-    let value = read_value(operation.value(), target_uses_stdin, stdin)?;
-    if let Some(source) = operation.selection_query() {
-        let matches = query_matches(&doc, document, source).map_err(RunError::display)?;
+    if operation.selection_query().is_some() {
+        let matches = query_matches(
+            &doc,
+            document,
+            prepared
+                .query
+                .as_ref()
+                .expect("query-targeted operation is prepared"),
+        )
+        .map_err(RunError::display)?;
+        let mut output = CommandOutput {
+            input_path,
+            stdout,
+            batch_capture,
+        };
         return execute_query_targeted(
             operation,
             &mut doc,
             document,
             &matches,
-            value.as_ref(),
-            input_path,
-            stdout,
+            prepared.value.as_ref(),
+            &mut output,
         );
     }
 
-    let path = JsonPointer::parse(operation.path()).map_err(RunError::display)?;
-    let from = operation
-        .from()
-        .map(JsonPointer::parse)
-        .transpose()
-        .map_err(RunError::display)?;
+    let path = prepared
+        .path
+        .as_ref()
+        .expect("pointer operation is prepared");
+    let from = prepared.from.as_ref();
     match operation {
         Operation::Query(_) => unreachable!("query returned before pointer operations"),
         Operation::Get(arguments) => {
             let node = doc
-                .resolve_pointer(document, &path)
+                .resolve_pointer(document, path)
                 .map_err(RunError::display)?;
             let output = doc.extract_node(node).map_err(RunError::display)?;
             write_result(
                 output.as_bytes(),
-                arguments.output.output.as_deref(),
+                if batch_capture {
+                    None
+                } else {
+                    arguments.output.output.as_deref()
+                },
                 input_path,
                 stdout,
             )
@@ -314,8 +397,8 @@ fn execute(
             let equal = doc
                 .test_at(
                     document,
-                    &path,
-                    value.as_ref().expect("Clap requires a value"),
+                    path,
+                    prepared.value.as_ref().expect("Clap requires a value"),
                 )
                 .map_err(RunError::display)?;
             if equal {
@@ -330,36 +413,282 @@ fn execute(
         Operation::Add(arguments) => {
             doc.add_at(
                 document,
-                &path,
-                value.as_ref().expect("Clap requires a value"),
+                path,
+                prepared.value.as_ref().expect("Clap requires a value"),
             )
             .map_err(RunError::display)?;
             write_mutation(&doc, &arguments.output, input_path, stdout)
         }
         Operation::Remove(arguments) => {
-            doc.remove_at(document, &path).map_err(RunError::display)?;
+            doc.remove_at(document, path).map_err(RunError::display)?;
             write_mutation(&doc, &arguments.output, input_path, stdout)
         }
         Operation::Replace(arguments) => {
             doc.replace_at(
                 document,
-                &path,
-                value.as_ref().expect("Clap requires a value"),
+                path,
+                prepared.value.as_ref().expect("Clap requires a value"),
             )
             .map_err(RunError::display)?;
             write_mutation(&doc, &arguments.output, input_path, stdout)
         }
         Operation::Move(arguments) => {
-            doc.move_at(document, from.as_ref().expect("Clap requires from"), &path)
+            doc.move_at(document, from.expect("Clap requires from"), path)
                 .map_err(RunError::display)?;
             write_mutation(&doc, &arguments.output, input_path, stdout)
         }
         Operation::Copy(arguments) => {
-            doc.copy_at(document, from.as_ref().expect("Clap requires from"), &path)
+            doc.copy_at(document, from.expect("Clap requires from"), path)
                 .map_err(RunError::display)?;
             write_mutation(&doc, &arguments.output, input_path, stdout)
         }
         Operation::Patch(_) => unreachable!("patch returned before pointer operations"),
+    }
+}
+
+struct PreparedOperation {
+    path: Option<JsonPointer>,
+    from: Option<JsonPointer>,
+    query: Option<JsonPath>,
+    value: Option<YamlFragment>,
+    patch: Option<YamlPatch>,
+}
+
+fn prepare_operation(
+    operation: &Operation,
+    target_uses_stdin: bool,
+    stdin: &mut dyn Read,
+) -> Result<PreparedOperation, RunError> {
+    let query = operation
+        .query_source()
+        .map(JsonPath::parse)
+        .transpose()
+        .map_err(RunError::display)?;
+    let path = if query.is_none() && !matches!(operation, Operation::Patch(_)) {
+        Some(JsonPointer::parse(operation.path()).map_err(RunError::display)?)
+    } else {
+        None
+    };
+    let from = operation
+        .from()
+        .map(JsonPointer::parse)
+        .transpose()
+        .map_err(RunError::display)?;
+    let value = read_value(operation.value(), target_uses_stdin, stdin)?;
+    let patch = match operation {
+        Operation::Patch(arguments) => Some(read_patch(&arguments.source, stdin)?),
+        _ => None,
+    };
+    Ok(PreparedOperation {
+        path,
+        from,
+        query,
+        value,
+        patch,
+    })
+}
+
+enum InputTargets {
+    Stdin,
+    File(PathBuf),
+    Batch {
+        files: Vec<BatchTarget>,
+        discovery_failures: Vec<DiscoveryFailure>,
+    },
+}
+
+struct BatchTarget {
+    path: PathBuf,
+    relative: PathBuf,
+}
+
+struct DiscoveryFailure {
+    relative: PathBuf,
+    message: String,
+}
+
+fn resolve_targets(path: Option<&Path>) -> Result<InputTargets, RunError> {
+    let path = match path {
+        None => std::env::current_dir().map_err(|error| {
+            RunError::message(format!("cannot determine current directory: {error}"))
+        })?,
+        Some(path) if path == Path::new("-") => return Ok(InputTargets::Stdin),
+        Some(path) => path.to_owned(),
+    };
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+        let (files, discovery_failures) = discover_yaml_files(&path);
+        Ok(InputTargets::Batch {
+            files,
+            discovery_failures,
+        })
+    } else {
+        Ok(InputTargets::File(path))
+    }
+}
+
+fn discover_yaml_files(root: &Path) -> (Vec<BatchTarget>, Vec<DiscoveryFailure>) {
+    let mut files = Vec::new();
+    let mut failures = Vec::new();
+    discover_directory(root, root, &mut files, &mut failures);
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    failures.sort_by(|left, right| left.relative.cmp(&right.relative));
+    (files, failures)
+}
+
+fn discover_directory(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<BatchTarget>,
+    failures: &mut Vec<DiscoveryFailure>,
+) {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            failures.push(DiscoveryFailure {
+                relative: relative_to(root, directory),
+                message: format!("cannot read directory: {error}"),
+            });
+            return;
+        }
+    };
+    let mut entries = entries
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                failures.push(DiscoveryFailure {
+                    relative: relative_to(root, directory),
+                    message: format!("cannot read directory entry: {error}"),
+                });
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                failures.push(DiscoveryFailure {
+                    relative: relative_to(root, &path),
+                    message: format!("cannot inspect path: {error}"),
+                });
+                continue;
+            }
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            discover_directory(root, &path, files, failures);
+        } else if file_type.is_file() && has_yaml_extension(&path) {
+            files.push(BatchTarget {
+                relative: relative_to(root, &path),
+                path,
+            });
+        }
+    }
+}
+
+fn relative_to(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_owned()
+}
+
+fn has_yaml_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("yml")
+        })
+}
+
+fn execute_batch(
+    operation: &Operation,
+    prepared: &PreparedOperation,
+    files: &[BatchTarget],
+    discovery_failures: Vec<DiscoveryFailure>,
+    stdout: &mut dyn Write,
+) -> Result<(), RunError> {
+    if let Some(output) = operation.read_output()
+        && let Some(input) = files
+            .iter()
+            .find(|input| paths_equivalent(&input.path, output))
+    {
+        return Err(RunError::message(format!(
+            "--output must not name input file {}",
+            input.relative.display()
+        )));
+    }
+
+    let mut diagnostics = discovery_failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.relative.display(), failure.message))
+        .collect::<Vec<_>>();
+    let mut succeeded = 0;
+    let mut failed = 0;
+    let mut combined_output = Vec::new();
+    for input in files {
+        let source = match read_target(&input.path) {
+            Ok(source) => source,
+            Err(RunError::Message(message)) => {
+                diagnostics.push(format!("{}: {message}", input.relative.display()));
+                failed += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let mut result = Vec::new();
+        match execute_one(
+            operation,
+            prepared,
+            Some(&input.path),
+            source,
+            &mut result,
+            true,
+        ) {
+            Ok(()) => {
+                succeeded += 1;
+                if operation.should_emit_batch_result(&result) {
+                    append_batch_result(&mut combined_output, &input.relative, &result);
+                }
+            }
+            Err(RunError::Message(message)) => {
+                diagnostics.push(format!("{}: {message}", input.relative.display()));
+                failed += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if operation.has_read_output() {
+        write_result(&combined_output, operation.read_output(), None, stdout)?;
+    }
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(RunError::Batch {
+            diagnostics,
+            summary: format!(
+                "processed {} YAML files: {succeeded} succeeded, {failed} failed; {} traversal errors",
+                files.len(),
+                discovery_failures.len()
+            ),
+        })
+    }
+}
+
+fn append_batch_result(output: &mut Vec<u8>, path: &Path, result: &[u8]) {
+    if !output.is_empty() {
+        output.push(b'\n');
+    }
+    writeln!(output, "==> {} <==", path.display()).expect("writing to a Vec cannot fail");
+    output.extend_from_slice(result);
+    if !result.is_empty() && !result.ends_with(b"\n") {
+        output.push(b'\n');
     }
 }
 
@@ -410,6 +739,44 @@ impl Operation {
             Self::Remove(args) => args.path.query.as_deref(),
             Self::Test(args) => args.path.query.as_deref(),
             _ => None,
+        }
+    }
+
+    fn query_source(&self) -> Option<&str> {
+        match self {
+            Self::Query(args) => Some(&args.query),
+            _ => self.selection_query(),
+        }
+    }
+
+    fn mutation_output(&self) -> Option<&MutationOutputArgs> {
+        match self {
+            Self::Add(args) | Self::Replace(args) => Some(&args.output),
+            Self::Remove(args) => Some(&args.output),
+            Self::Move(args) | Self::Copy(args) => Some(&args.output),
+            Self::Patch(args) => Some(&args.output),
+            Self::Query(_) | Self::Get(_) | Self::Test(_) => None,
+        }
+    }
+
+    fn read_output(&self) -> Option<&Path> {
+        match self {
+            Self::Query(args) => args.output.output.as_deref(),
+            Self::Get(args) => args.output.output.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn has_read_output(&self) -> bool {
+        matches!(self, Self::Query(_) | Self::Get(_))
+    }
+
+    fn should_emit_batch_result(&self, result: &[u8]) -> bool {
+        match self {
+            Self::Query(_) => !result.is_empty(),
+            Self::Get(args) if args.path.query.is_some() => !result.is_empty(),
+            Self::Get(_) => true,
+            _ => false,
         }
     }
 
@@ -465,23 +832,32 @@ impl PathArgs {
     }
 }
 
+struct CommandOutput<'a> {
+    input_path: Option<&'a Path>,
+    stdout: &'a mut dyn Write,
+    batch_capture: bool,
+}
+
 fn execute_query_targeted(
     operation: &Operation,
     doc: &mut YamlDoc,
     document: usize,
     matches: &QueryMatches,
     value: Option<&YamlFragment>,
-    input_path: Option<&Path>,
-    stdout: &mut dyn Write,
+    output: &mut CommandOutput<'_>,
 ) -> Result<(), RunError> {
     match operation {
         Operation::Get(arguments) => {
-            let output = render_yaml_stream(doc, matches)?;
+            let rendered = render_yaml_stream(doc, matches)?;
             write_result(
-                output.as_bytes(),
-                arguments.output.output.as_deref(),
-                input_path,
-                stdout,
+                rendered.as_bytes(),
+                if output.batch_capture {
+                    None
+                } else {
+                    arguments.output.output.as_deref()
+                },
+                output.input_path,
+                output.stdout,
             )
         }
         Operation::Test(_) => test_query_matches(
@@ -497,11 +873,11 @@ fn execute_query_targeted(
                 matches,
                 QueryMutation::Add(value.expect("Clap requires a value")),
             )?;
-            write_mutation(doc, &arguments.output, input_path, stdout)
+            write_mutation(doc, &arguments.output, output.input_path, output.stdout)
         }
         Operation::Remove(arguments) => {
             apply_query_mutation(doc, document, matches, QueryMutation::Remove)?;
-            write_mutation(doc, &arguments.output, input_path, stdout)
+            write_mutation(doc, &arguments.output, output.input_path, output.stdout)
         }
         Operation::Replace(arguments) => {
             apply_query_mutation(
@@ -510,7 +886,7 @@ fn execute_query_targeted(
                 matches,
                 QueryMutation::Replace(value.expect("Clap requires a value")),
             )?;
-            write_mutation(doc, &arguments.output, input_path, stdout)
+            write_mutation(doc, &arguments.output, output.input_path, output.stdout)
         }
         _ => unreachable!("only single-path commands accept --query"),
     }
@@ -650,13 +1026,9 @@ fn read_patch(arguments: &PatchSourceArgs, stdin: &mut dyn Read) -> Result<YamlP
     YamlPatch::parse_owned(input).map_err(RunError::display)
 }
 
-fn read_target(path: Option<&Path>, stdin: &mut dyn Read) -> Result<String, RunError> {
-    match path {
-        None => read_stream(stdin, "stdin"),
-        Some(path) if path == Path::new("-") => read_stream(stdin, "stdin"),
-        Some(path) => fs::read_to_string(path)
-            .map_err(|error| RunError::message(format!("cannot read {}: {error}", path.display()))),
-    }
+fn read_target(path: &Path) -> Result<String, RunError> {
+    fs::read_to_string(path)
+        .map_err(|error| RunError::message(format!("cannot read {}: {error}", path.display())))
 }
 
 fn read_value(
@@ -852,11 +1224,20 @@ impl Drop for TempGuard {
 enum RunError {
     BrokenPipe,
     Message(String),
+    Usage(String),
+    Batch {
+        diagnostics: Vec<String>,
+        summary: String,
+    },
 }
 
 impl RunError {
     fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
+    }
+
+    fn usage(message: impl Into<String>) -> Self {
+        Self::Usage(message.into())
     }
 
     fn display(error: impl std::fmt::Display) -> Self {
@@ -880,6 +1261,8 @@ mod tests {
         let mut stdin = input.as_bytes();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut args = args.to_vec();
+        args.push("-");
         let status = run(args, &mut stdin, &mut stdout, &mut stderr);
         (
             status,
@@ -1032,7 +1415,7 @@ mod tests {
     #[test]
     fn query_targeted_commands_reject_extra_positionals_as_usage_errors() {
         let (status, stdout, stderr) = invoke(
-            &["yaml-rt", "get", "--query", "$.value", "first", "second"],
+            &["yaml-rt", "get", "--query", "$.value", "first"],
             "value: 1\n",
         );
         assert_eq!(status, USAGE);

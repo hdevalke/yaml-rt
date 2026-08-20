@@ -6,7 +6,7 @@ use crate::pointer::parse_sequence_index;
 use crate::{
     CollectionStyle, Diagnostic, DiagnosticKind, FragmentError, JsonPointer, NodeId, PointerError,
     ResolvedScalar, SemanticKind, SemanticValueError, Span, YamlDoc, YamlError, YamlFragment,
-    YamlScalarStyle, resolve_scalar, semantically_equal,
+    YamlScalarStyle, resolve_scalar, semantically_equal, strip_inline_comment,
 };
 
 /// Failure while applying a pointer-addressed YAML edit.
@@ -580,21 +580,26 @@ impl YamlDoc {
         );
         if !flow {
             let span = self.block_collection_entry_removal_span(collection, entry)?;
-            let removes_only_compact_mapping_entry =
-                self.node(collection).is_some_and(|node| node.span == span)
-                    && self
-                        .node(collection)
-                        .and_then(crate::Node::parent)
-                        .and_then(|parent| self.node(parent))
-                        .is_some_and(|parent| parent.kind() == crate::NodeKind::SequenceEntry);
-            self.queue_edit(
-                span,
-                if removes_only_compact_mapping_entry {
-                    "{}".to_owned()
-                } else {
-                    String::new()
-                },
-            )?;
+            let empties_collection = self
+                .children(collection)
+                .filter(|node| self.containing_entry_child(*node))
+                .count()
+                == 1;
+            let empty = empties_collection
+                .then(|| match self.semantic_kind(collection) {
+                    Some(SemanticKind::Mapping { .. }) => Some("{}"),
+                    Some(SemanticKind::Sequence { .. }) => Some("[]"),
+                    _ => None,
+                })
+                .flatten()
+                .unwrap_or_default();
+            if empty.is_empty() {
+                self.queue_edit(span, String::new())?;
+            } else {
+                let (span, replacement) =
+                    self.empty_block_collection_edit(collection, span, empty)?;
+                self.queue_edit(span, replacement)?;
+            }
             return Ok(());
         }
 
@@ -617,6 +622,89 @@ impl YamlDoc {
         };
         self.queue_edit(span, String::new())?;
         Ok(())
+    }
+
+    fn empty_block_collection_edit(
+        &self,
+        collection: NodeId,
+        removal_span: Span,
+        empty: &str,
+    ) -> Result<(Span, String), YamlEditError> {
+        let collection_node = self.expect_node(collection)?;
+        let removed = self.source().slice(removal_span);
+        let trailing_line_ending = if removed.ends_with("\r\n") {
+            "\r\n"
+        } else if removed.ends_with('\n') {
+            "\n"
+        } else if removed.ends_with('\r') {
+            "\r"
+        } else {
+            ""
+        };
+        let empty_with_break = format!("{empty}{trailing_line_ending}");
+        let value_start = self
+            .children(collection)
+            .find(|child| self.containing_entry_child(*child))
+            .map(|entry| {
+                self.expect_node(entry).map(|entry| {
+                    usize::max(
+                        entry.span.start as usize,
+                        collection_node.span.start as usize,
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(self.node_value_start(collection)?);
+        let Some(entry) = collection_node.parent() else {
+            return Ok((
+                Span::from_usize(value_start, removal_span.end as usize),
+                empty_with_break,
+            ));
+        };
+        let entry_node = self.expect_node(entry)?;
+        if !matches!(
+            entry_node.kind(),
+            crate::NodeKind::MappingEntry | crate::NodeKind::SequenceEntry
+        ) || self.line_start_offset(value_start)
+            == self.line_start_offset(entry_node.span.start as usize)
+        {
+            return Ok((
+                Span::from_usize(value_start, removal_span.end as usize),
+                empty_with_break,
+            ));
+        }
+
+        let prefix_span = Span::from_usize(entry_node.span.start as usize, value_start);
+        let prefix = self.source().slice(prefix_span);
+        let line_break = prefix.find(['\r', '\n']).ok_or_else(|| {
+            YamlEditError::new("multiline block collection has no preceding line break")
+        })?;
+        let line_break_end = if prefix.as_bytes().get(line_break) == Some(&b'\r')
+            && prefix.as_bytes().get(line_break + 1) == Some(&b'\n')
+        {
+            line_break + 2
+        } else {
+            line_break + 1
+        };
+        let head = &prefix[..line_break];
+        let uncommented = strip_inline_comment(head);
+        let content = uncommented.trim_end_matches([' ', '\t']);
+        let comment = &head[uncommented.len()..];
+        let between = prefix[line_break_end..].trim_end_matches([' ', '\t']);
+        let mut replacement = format!("{content} {empty}");
+        if !comment.is_empty() {
+            replacement.push(' ');
+            replacement.push_str(comment.trim_start());
+        }
+        if !between.is_empty() {
+            replacement.push_str(&prefix[line_break..line_break_end]);
+            replacement.push_str(between);
+        }
+        replacement.push_str(trailing_line_ending);
+        Ok((
+            Span::new(entry_node.span.start, removal_span.end),
+            replacement,
+        ))
     }
 
     fn containing_entry_child(&self, node: NodeId) -> bool {
@@ -1260,8 +1348,77 @@ mod tests {
         let mut doc = YamlDoc::parse(input).unwrap();
         doc.remove_at(0, &pointer("/items/1")).unwrap();
         doc.remove_at(0, &pointer("/items/0")).unwrap();
-        assert_eq!(doc.as_source(), "items:\ntail: keep\n");
+        assert_eq!(doc.as_source(), "items: []\ntail: keep\n");
         doc.commit_edits().unwrap();
+    }
+
+    #[test]
+    fn removals_preserve_empty_block_collection_types() {
+        let mut nested =
+            YamlDoc::parse("server:\n  host: localhost\nitems:\n  - only\ntail: keep\n").unwrap();
+        nested.remove_at(0, &pointer("/server/host")).unwrap();
+        nested.remove_at(0, &pointer("/items/0")).unwrap();
+        assert_eq!(nested.as_source(), "server: {}\nitems: []\ntail: keep\n");
+        nested.commit_edits().unwrap();
+        assert!(matches!(
+            nested.semantic_kind(nested.resolve_pointer(0, &pointer("/server")).unwrap()),
+            Some(SemanticKind::Mapping { .. })
+        ));
+        assert!(matches!(
+            nested.semantic_kind(nested.resolve_pointer(0, &pointer("/items")).unwrap()),
+            Some(SemanticKind::Sequence { .. })
+        ));
+
+        let mut root_mapping = YamlDoc::parse("only: value\n").unwrap();
+        root_mapping.remove_at(0, &pointer("/only")).unwrap();
+        assert_eq!(root_mapping.as_source(), "{}\n");
+        root_mapping.commit_edits().unwrap();
+
+        let mut root_sequence = YamlDoc::parse("- only\n").unwrap();
+        root_sequence.remove_at(0, &pointer("/0")).unwrap();
+        assert_eq!(root_sequence.as_source(), "[]\n");
+        root_sequence.commit_edits().unwrap();
+
+        let mut anchored =
+            YamlDoc::parse("defaults: &defaults\n  retries: 3\nmirror: *defaults\n").unwrap();
+        anchored
+            .remove_at(0, &pointer("/defaults/retries"))
+            .unwrap();
+        assert_eq!(
+            anchored.as_source(),
+            "defaults: &defaults {}\nmirror: *defaults\n"
+        );
+        anchored.commit_edits().unwrap();
+        let mirror = anchored.resolve_pointer(0, &pointer("/mirror")).unwrap();
+        let resolved = anchored.resolve_alias(mirror).unwrap();
+        assert!(matches!(
+            anchored.semantic_kind(resolved),
+            Some(SemanticKind::Mapping { .. })
+        ));
+
+        let mut commented =
+            YamlDoc::parse("server: # keep\r\n  host: localhost\r\ntail: keep\r\n").unwrap();
+        commented.remove_at(0, &pointer("/server/host")).unwrap();
+        assert_eq!(commented.as_source(), "server: {} # keep\r\ntail: keep\r\n");
+        commented.commit_edits().unwrap();
+    }
+
+    #[test]
+    fn moves_can_temporarily_empty_block_collections() {
+        let mut mapping = YamlDoc::parse("server:\n  host: localhost\ntail: keep\n").unwrap();
+        mapping
+            .move_at(0, &pointer("/server/host"), &pointer("/server/name"))
+            .unwrap();
+        assert_eq!(
+            mapping.as_source(),
+            "server: {name: localhost}\ntail: keep\n"
+        );
+
+        let mut sequence = YamlDoc::parse("items:\n  - only\ntail: keep\n").unwrap();
+        sequence
+            .move_at(0, &pointer("/items/0"), &pointer("/items/-"))
+            .unwrap();
+        assert_eq!(sequence.as_source(), "items: [only]\ntail: keep\n");
     }
 
     #[test]

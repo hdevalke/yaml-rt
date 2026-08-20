@@ -711,7 +711,7 @@ mod tests {
 
         assert!(result.ok, "{:?}", result.message);
         assert_eq!(result.matched_pointers, ["/services/0", "/services/1"]);
-        assert_eq!(result.output_yaml, "# services\nservices:\n");
+        assert_eq!(result.output_yaml, "# services\nservices: []\n");
         YamlDoc::parse(&result.output_yaml).unwrap();
     }
 

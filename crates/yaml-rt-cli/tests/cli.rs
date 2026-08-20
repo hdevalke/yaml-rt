@@ -496,6 +496,39 @@ fn remove_preserves_compact_sequence_mapping_items() {
 }
 
 #[test]
+fn remove_preserves_empty_block_collection_types() {
+    let directory = temp_dir();
+    let input = directory.join("collections.yaml");
+    fs::write(
+        &input,
+        "server:\n  host: localhost\nitems:\n  - only\ntail: keep\n",
+    )
+    .unwrap();
+
+    let mapping = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["remove", "/server/host", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(mapping.status.success(), "{:?}", mapping.stderr);
+    assert_eq!(
+        mapping.stdout,
+        b"server: {}\nitems:\n  - only\ntail: keep\n"
+    );
+
+    let sequence = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["remove", "/items/0", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(sequence.status.success(), "{:?}", sequence.stderr);
+    assert_eq!(
+        sequence.stdout,
+        b"server:\n  host: localhost\nitems: []\ntail: keep\n"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn in_place_replaces_only_after_success() {
     let directory = temp_dir();
     let input = directory.join("document.yaml");

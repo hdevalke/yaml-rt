@@ -1495,7 +1495,7 @@ mod tests {
             "root: {child: x}\nuntouched: y\n",
         );
         assert_eq!(status, 0, "{stderr}");
-        assert!(stdout.is_empty());
+        assert_eq!(stdout, "{}\n");
     }
 
     #[test]

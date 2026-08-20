@@ -1695,8 +1695,11 @@ impl YamlDoc {
                 .and_then(Node::parent)
                 .and_then(|parent| self.node(parent))
                 .is_some_and(|parent| parent.kind == NodeKind::SequenceEntry);
-        if compact_sequence_mapping && entries.len() == 1 {
-            return Ok(collection_node.span);
+        if entries.len() == 1 {
+            return Ok(Span::new(
+                collection_node.span.start,
+                Span::usize_to_u32(self.block_entry_extent_end(entries[0])?),
+            ));
         }
         let start = if compact_sequence_mapping && index == 0 {
             collection_node.span.start as usize
@@ -1715,7 +1718,7 @@ impl YamlDoc {
         Ok(Span::from_usize(start, end))
     }
 
-    fn collection_entry_content_start(&self, entry: NodeId) -> Result<usize, YamlError> {
+    pub(crate) fn collection_entry_content_start(&self, entry: NodeId) -> Result<usize, YamlError> {
         let entry_node = self.expect_node(entry)?;
         Ok(self
             .semantic_children(entry)
@@ -1821,6 +1824,12 @@ impl YamlDoc {
             Span::new(value_start, Span::offset_from_usize(value_start, end)),
             ScalarStyle::Plain,
         ))
+    }
+
+    pub(crate) fn node_value_start(&self, node: NodeId) -> Result<usize, YamlError> {
+        let node = self.expect_node(node)?;
+        let properties = parse_node_properties(self.source.slice(node.span), node.span)?;
+        Ok(node.span.start as usize + properties.value_start())
     }
 
     fn directive_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {

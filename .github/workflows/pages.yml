@@ -67,6 +67,8 @@ jobs:
           test -s playground/dist/pkg/yaml_rt_wasm_bg.wasm
           grep -Fq './pkg/yaml_rt_wasm.js' playground/dist/app.js
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v4
         with:
           path: playground/dist

@@ -108,12 +108,8 @@
           </div>
 
           <div id="diagnostic" class="diagnostic" role="alert" hidden></div>
-          <div id="command-output-wrap" class="command-output-wrap" hidden>
-            <div class="output-heading">
-              <span>Command output</span>
-              <span id="match-count" class="meta"></span>
-            </div>
-            <pre id="command-output" tabindex="0"></pre>
+          <div id="match-summary" class="match-summary" hidden>
+            <span id="match-count"></span>
           </div>
         </article>
 
@@ -121,10 +117,9 @@
           <div class="panel-heading">
             <div>
               <span class="step">03</span>
-              <h2>Result YAML</h2>
+              <h2 id="result-title">Result YAML</h2>
             </div>
             <div class="result-actions">
-              <span id="stale" class="stale" hidden>Last valid result</span>
               <button id="copy-result" class="quiet" type="button">Copy result</button>
             </div>
           </div>

@@ -3,6 +3,7 @@ import { EditorState, StateEffect, StateField } from "https://esm.sh/@codemirror
 import { Decoration, EditorView } from "https://esm.sh/@codemirror/view@6.43.9";
 import { yaml } from "https://esm.sh/@codemirror/lang-yaml@6.1.3?deps=@codemirror/state@6.7.1,@codemirror/view@6.43.9";
 import init, { run_command } from "./pkg/yaml_rt_wasm.js";
+import { resultPresentation } from "./state.mjs";
 
 const baseSource = `# Production services — comments and style stay put
 services:
@@ -86,7 +87,6 @@ let sourceEditor;
 let resultEditor;
 let ready = false;
 let debounce;
-let lastValid = baseSource;
 let activeExample = 0;
 
 function text(view) { return view.state.doc.toString(); }
@@ -239,19 +239,20 @@ function run() {
   };
   wasmResult.free();
   setDocuments(result.document_count);
+  const presentation = resultPresentation(result, controls.command.value, source);
+  replaceText(resultEditor, presentation.content);
+  $("result-title").textContent = presentation.title;
+  if (presentation.highlightChanges) markChanges(source, presentation.content);
+  else resultEditor.dispatch({ effects: setChangedLines.of(Decoration.none) });
+  $("match-summary").hidden = !presentation.showMatchCount;
+  if (presentation.showMatchCount) {
+    const count = result.matched_pointers.length;
+    $("match-count").textContent = `${count} match${count === 1 ? "" : "es"}`;
+  }
   if (result.ok) {
-    lastValid = result.output_yaml;
-    replaceText(resultEditor, lastValid);
-    markChanges(source, lastValid);
     $("run-state").textContent = "Ready";
     $("run-state").className = "status success";
     $("diagnostic").hidden = true;
-    $("stale").hidden = true;
-    const showOutput = Boolean(result.command_output) || ["query", "get", "test"].includes(controls.command.value);
-    $("command-output-wrap").hidden = !showOutput;
-    $("command-output").textContent = result.command_output || "No matches.";
-    const count = result.matched_pointers.length;
-    $("match-count").textContent = count ? `${count} match${count === 1 ? "" : "es"}` : "";
   } else {
     $("run-state").textContent = "Error";
     $("run-state").className = "status error";
@@ -259,7 +260,6 @@ function run() {
     const operation = result.operation_index != null ? ` (operation ${result.operation_index})` : "";
     $("diagnostic").textContent = `${result.error_source || "command"}${operation}${location}: ${result.message || "Unknown error"}`;
     $("diagnostic").hidden = false;
-    $("stale").hidden = false;
     markDiagnostic(result);
   }
 }

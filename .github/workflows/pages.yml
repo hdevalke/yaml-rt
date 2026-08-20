@@ -47,6 +47,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Test browser command engine
         run: cargo test -p yaml-rt-wasm --locked
+      - name: Test playground state
+        run: node --test playground/state.test.mjs
       - name: Build WebAssembly package
         run: >-
           wasm-pack build crates/yaml-rt-wasm
@@ -58,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p playground/dist/pkg
-          cp playground/index.html playground/styles.css playground/app.js playground/dist/
+          cp playground/index.html playground/styles.css playground/app.js playground/state.mjs playground/dist/
           cp playground/pkg/yaml_rt_wasm.js playground/pkg/yaml_rt_wasm_bg.wasm playground/dist/pkg/
           test -s playground/dist/index.html
           test -s playground/dist/pkg/yaml_rt_wasm.js

@@ -221,11 +221,8 @@ impl Source {
         let mut line_starts = Vec::with_capacity(text.len() / 32 + 1);
         line_starts.push(0);
         const SOURCE_SCAN_CHUNK: usize = 32;
-        let complete = bytes.len() / SOURCE_SCAN_CHUNK * SOURCE_SCAN_CHUNK;
-        for (chunk_index, chunk) in bytes[..complete]
-            .chunks_exact(SOURCE_SCAN_CHUNK)
-            .enumerate()
-        {
+        let (chunks, remainder) = bytes.as_chunks::<SOURCE_SCAN_CHUNK>();
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
             validate_source_chunk(
                 &text,
                 bytes,
@@ -234,7 +231,13 @@ impl Source {
                 &mut line_starts,
             )?;
         }
-        validate_source_chunk(&text, bytes, complete, &bytes[complete..], &mut line_starts)?;
+        validate_source_chunk(
+            &text,
+            bytes,
+            chunks.len() * SOURCE_SCAN_CHUNK,
+            remainder,
+            &mut line_starts,
+        )?;
         let line_facts = if text.len() >= LINE_FACTS_MIN_SOURCE_BYTES {
             build_line_facts(&text, &line_starts)
         } else {

@@ -21,6 +21,9 @@ The concrete syntax tree (CST) and original source are always authoritative.
 - `yaml-rt` is the public facade and feature switchboard.
 - `yaml-rt-cli` orchestrates JSONPath queries, renders compact JSON values, and
   exposes patch-oriented editing through JSON Pointer operations.
+- `yaml-rt-wasm` is the thin, filesystem-free browser adapter used by the
+  playground. It validates structured command requests and composes the same
+  core edit and RFC 9535 query APIs without moving parser logic into JavaScript.
 - `yaml-rt-bench` and the separate `fuzz` workspace are development-only.
 
 ## Parse and edit flow

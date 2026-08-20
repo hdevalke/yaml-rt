@@ -18,6 +18,18 @@ Version 0.1 is suitable for production use within the guarantees and
 limitations documented below. Public APIs may still evolve between 0.x
 releases.
 
+## Playground
+
+Try the [yaml-rt command playground](https://hdevalke.github.io/yaml-rt/) to
+query and edit YAML directly in a browser. It showcases every CLI operation,
+exact RFC 6901 JSON Pointer targets, multi-target RFC 9535 JSONPath selection,
+and transactional YAML or JSON patches while displaying the minimally changed
+document beside the original.
+
+The playground runs the Rust parser and editor locally through WebAssembly.
+Documents are not uploaded to a server. Its interface is plain HTML, CSS, and
+JavaScript with CodeMirror loaded from a pinned CDN release.
+
 ## When to use yaml-rt
 
 Use `yaml-rt` when you are building a configuration editor, migration tool,
@@ -435,6 +447,7 @@ Run `yaml-rt help <operation>` for operation-specific arguments.
 | `yaml-rt-serde` | Serde serializer and deserializer | Yes |
 | `yaml-rt` | Facade re-exporting the public APIs | Yes |
 | `yaml-rt-cli` | `yaml-rt` command-line editor | Yes |
+| `yaml-rt-wasm` | Filesystem-free command engine and browser bindings for the GitHub Pages playground | No |
 | `yaml-rt-bench` | Local comparison benchmarks | No |
 | `fuzz` | Separate cargo-fuzz workspace | No |
 
@@ -552,7 +565,7 @@ cargo fmt --all -- --check
 cargo test --workspace --all-features --locked
 cargo clippy \
   -p yaml-rt-core -p yaml-rt-derive -p yaml-rt-serde \
-  -p yaml-rt -p yaml-rt-cli \
+  -p yaml-rt -p yaml-rt-cli -p yaml-rt-wasm \
   --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps

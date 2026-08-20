@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Try yaml-rt lossless YAML queries and edits in your browser.">
+    <title>yaml-rt playground</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <div>
+        <a class="wordmark" href="https://github.com/hdevalke/yaml-rt">yaml-rt</a>
+        <span class="eyebrow">command playground</span>
+      </div>
+      <p>Query and edit YAML without losing the human details.</p>
+    </header>
+
+    <main>
+      <section class="toolbar" aria-label="Playground controls">
+        <label for="example">Example</label>
+        <select id="example"></select>
+        <span class="privacy">Runs locally in your browser</span>
+        <button id="reset" class="quiet" type="button">Reset</button>
+      </section>
+
+      <section class="workspace" aria-label="YAML command playground">
+        <article class="panel editor-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step">01</span>
+              <h1>Original YAML</h1>
+            </div>
+            <span id="document-count" class="meta"></span>
+          </div>
+          <div id="source-editor" class="editor" aria-label="Original YAML editor"></div>
+        </article>
+
+        <article class="panel command-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step">02</span>
+              <h2>Command</h2>
+            </div>
+            <span id="run-state" class="status loading" role="status">Loading WASM…</span>
+          </div>
+
+          <div class="command-form">
+            <label>Operation
+              <select id="command">
+                <option value="query">query</option>
+                <option value="get">get</option>
+                <option value="add">add</option>
+                <option value="remove">remove</option>
+                <option value="replace">replace</option>
+                <option value="rename-key">rename-key</option>
+                <option value="move">move</option>
+                <option value="copy">copy</option>
+                <option value="test">test</option>
+                <option value="patch">patch</option>
+              </select>
+            </label>
+
+            <label id="selector-kind-field">Selector
+              <select id="selector-kind">
+                <option value="pointer">JSON Pointer</option>
+                <option value="jsonpath">JSONPath (RFC 9535)</option>
+              </select>
+            </label>
+
+            <label id="selector-field"><span id="selector-label">JSON Pointer</span>
+              <input id="selector" type="text" spellcheck="false" autocomplete="off">
+            </label>
+
+            <label id="from-field">Source JSON Pointer
+              <input id="from" type="text" spellcheck="false" autocomplete="off">
+            </label>
+
+            <label id="destination-field">Destination JSON Pointer
+              <input id="destination" type="text" spellcheck="false" autocomplete="off">
+            </label>
+
+            <label id="value-field">YAML value
+              <textarea id="value" rows="3" spellcheck="false"></textarea>
+            </label>
+
+            <label id="new-key-field">New key
+              <input id="new-key" type="text" spellcheck="false" autocomplete="off">
+            </label>
+
+            <label id="patch-field">YAML or JSON patch
+              <textarea id="patch" rows="9" spellcheck="false"></textarea>
+            </label>
+
+            <label>Document
+              <select id="document-index"><option value="0">0</option></select>
+            </label>
+          </div>
+
+          <div class="command-preview-wrap">
+            <span>Equivalent CLI</span>
+            <code id="command-preview"></code>
+            <button id="copy-command" class="icon-button" type="button" title="Copy command">Copy</button>
+          </div>
+
+          <div class="actions">
+            <button id="run" class="primary" type="button">Run command</button>
+          </div>
+
+          <div id="diagnostic" class="diagnostic" role="alert" hidden></div>
+          <div id="command-output-wrap" class="command-output-wrap" hidden>
+            <div class="output-heading">
+              <span>Command output</span>
+              <span id="match-count" class="meta"></span>
+            </div>
+            <pre id="command-output" tabindex="0"></pre>
+          </div>
+        </article>
+
+        <article class="panel editor-panel result-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="step">03</span>
+              <h2>Result YAML</h2>
+            </div>
+            <div class="result-actions">
+              <span id="stale" class="stale" hidden>Last valid result</span>
+              <button id="copy-result" class="quiet" type="button">Copy result</button>
+            </div>
+          </div>
+          <div id="result-editor" class="editor" aria-label="Result YAML editor"></div>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <span>YAML 1.2.2 · source-preserving edits</span>
+      <a href="https://github.com/hdevalke/yaml-rt">Source on GitHub</a>
+    </footer>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

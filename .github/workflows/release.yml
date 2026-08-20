@@ -76,6 +76,7 @@ jobs:
           -p yaml-rt-serde
           -p yaml-rt
           -p yaml-rt-cli
+          -p yaml-rt-wasm
           --all-targets
           --all-features
           --locked
@@ -92,6 +93,7 @@ jobs:
           -p yaml-rt-serde
           -p yaml-rt
           -p yaml-rt-cli
+          -p yaml-rt-wasm
           --all-features
           --no-deps
           --locked

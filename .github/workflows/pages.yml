@@ -1,0 +1,85 @@
+name: Playground Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/pages.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/yaml-rt-core/**"
+      - "crates/yaml-rt-rfc9535/**"
+      - "crates/yaml-rt-wasm/**"
+      - "playground/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build playground
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: recursive
+      - name: Install Rust and WebAssembly target
+        run: >-
+          rustup toolchain install
+          --profile minimal
+          stable
+          --target wasm32-unknown-unknown
+          --component rustfmt
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test browser command engine
+        run: cargo test -p yaml-rt-wasm --locked
+      - name: Build WebAssembly package
+        run: >-
+          wasm-pack build crates/yaml-rt-wasm
+          --release
+          --target web
+          --out-dir ../../playground/pkg
+      - name: Assemble Pages artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p playground/dist/pkg
+          cp playground/index.html playground/styles.css playground/app.js playground/dist/
+          cp playground/pkg/yaml_rt_wasm.js playground/pkg/yaml_rt_wasm_bg.wasm playground/dist/pkg/
+          test -s playground/dist/index.html
+          test -s playground/dist/pkg/yaml_rt_wasm.js
+          test -s playground/dist/pkg/yaml_rt_wasm_bg.wasm
+          grep -Fq './pkg/yaml_rt_wasm.js' playground/dist/app.js
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: playground/dist
+
+  deploy:
+    name: Deploy playground
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

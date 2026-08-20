@@ -5,6 +5,7 @@ members = [
     "crates/yaml-rt-derive",
     "crates/yaml-rt-serde",
     "crates/yaml-rt-cli",
+    "crates/yaml-rt-wasm",
     "crates/yaml-rt",
     "crates/yaml-rt-bench",
 ]
@@ -30,3 +31,4 @@ quote = "1"
 regex = "1"
 serde = "1"
 syn = { version = "2", features = ["derive"] }
+wasm-bindgen = "=0.2.127"

@@ -1,2 +1,4 @@
 **/target/
+/playground/pkg/
+/playground/dist/
 /.convco/

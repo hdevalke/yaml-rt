@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { resultPresentation } from "./state.mjs";
+import { copyText, resultPresentation } from "./state.mjs";
 
 test("read commands put command output in the right pane", () => {
   const presentation = resultPresentation(
@@ -36,4 +36,16 @@ test("application failures show rollback while malformed inputs clear output", (
     resultPresentation({ ok: false, error_source: "patch" }, "patch", source).content,
     "",
   );
+});
+
+test("copy falls back when clipboard access is unavailable or rejected", async () => {
+  let fallbackValue = "";
+  const copied = await copyText("result", {
+    clipboard: { writeText: async () => { throw new Error("insecure origin"); } },
+    fallback(value) { fallbackValue = value; return true; },
+  });
+  assert.equal(copied, true);
+  assert.equal(fallbackValue, "result");
+
+  assert.equal(await copyText("result", { clipboard: undefined, fallback: () => false }), false);
 });

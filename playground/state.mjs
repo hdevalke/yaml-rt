@@ -1,5 +1,21 @@
 export const READ_COMMANDS = new Set(["query", "get", "test"]);
 
+export async function copyText(value, { clipboard, fallback }) {
+  if (clipboard?.writeText) {
+    try {
+      await clipboard.writeText(value);
+      return true;
+    } catch {
+      // Insecure HTTP origins commonly expose the API but reject the write.
+    }
+  }
+  try {
+    return Boolean(fallback(value));
+  } catch {
+    return false;
+  }
+}
+
 export function resultPresentation(result, command, source) {
   if (result.ok && READ_COMMANDS.has(command)) {
     return {

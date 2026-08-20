@@ -3,7 +3,7 @@ import { EditorState, StateEffect, StateField } from "https://esm.sh/@codemirror
 import { Decoration, EditorView } from "https://esm.sh/@codemirror/view@6.43.9";
 import { yaml } from "https://esm.sh/@codemirror/lang-yaml@6.1.3?deps=@codemirror/state@6.7.1,@codemirror/view@6.43.9";
 import init, { run_command } from "./pkg/yaml_rt_wasm.js";
-import { resultPresentation } from "./state.mjs";
+import { copyText, resultPresentation } from "./state.mjs";
 
 const baseSource = `# Production services — comments and style stay put
 services:
@@ -291,10 +291,31 @@ function loadExample(index) {
   run();
 }
 
+function legacyCopy(value) {
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.append(textarea);
+  textarea.select();
+  try {
+    return document.execCommand("copy");
+  } finally {
+    textarea.remove();
+  }
+}
+
 async function copy(value, button) {
-  await navigator.clipboard.writeText(value);
   const previous = button.textContent;
-  button.textContent = "Copied";
+  const copied = await copyText(value, {
+    clipboard: navigator.clipboard,
+    fallback: legacyCopy,
+  });
+  button.textContent = copied ? "Copied" : "Copy failed";
+  $("clipboard-status").textContent = copied
+    ? `${previous} copied to clipboard.`
+    : `Unable to copy ${previous.toLowerCase()}.`;
   setTimeout(() => { button.textContent = previous; }, 1000);
 }
 

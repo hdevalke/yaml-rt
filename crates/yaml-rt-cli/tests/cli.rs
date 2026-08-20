@@ -546,6 +546,41 @@ fn remove_preserves_multiline_flow_layout() {
 }
 
 #[test]
+fn add_preserves_multiline_flow_layout() {
+    let directory = temp_dir();
+    let input = directory.join("flow.yaml");
+    fs::write(&input, "map: {\n  a: 1 # keep\n}\nitems: [\n  first\n]\n").unwrap();
+
+    let mapping = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["add", "/map/b", "--value", "2", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(mapping.status.success(), "{:?}", mapping.stderr);
+    assert_eq!(
+        mapping.stdout,
+        b"map: {\n  a: 1, # keep\n  b: 2\n}\nitems: [\n  first\n]\n"
+    );
+
+    let sequence = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "add",
+            "/items/-",
+            "--value",
+            "second",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(sequence.status.success(), "{:?}", sequence.stderr);
+    assert_eq!(
+        sequence.stdout,
+        b"map: {\n  a: 1 # keep\n}\nitems: [\n  first,\n  second\n]\n"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn in_place_replaces_only_after_success() {
     let directory = temp_dir();
     let input = directory.join("document.yaml");

@@ -802,6 +802,19 @@ impl YamlDoc {
             CollectionStyle::Flow => {
                 let mapping_node = self.expect_node(mapping)?;
                 let close = closing_delimiter_offset(self, mapping_node.span, '}')?;
+                let entries = self
+                    .children(mapping)
+                    .filter(|node| self.containing_entry_child(*node))
+                    .collect::<Vec<_>>();
+                let value = value.render_flow(self)?;
+                if self.queue_multiline_flow_append(
+                    mapping,
+                    close,
+                    &entries,
+                    &format!("{key}: {value}"),
+                )? {
+                    return Ok(());
+                }
                 let has_pending_entry = self.edits.iter().any(|edit| {
                     edit.span == Span::empty_from_usize(close) && !edit.replacement.is_empty()
                 });
@@ -811,7 +824,6 @@ impl YamlDoc {
                 } else {
                     ""
                 };
-                let value = value.render_flow(self)?;
                 self.queue_edit(
                     Span::empty_from_usize(close),
                     format!("{prefix}{key}: {value}"),
@@ -855,6 +867,19 @@ impl YamlDoc {
         let entry = self.expect_node(before_entry)?;
         let key = emit_string_key(key);
         let value = value.render_flow(self)?;
+        if self.flow_collection_is_multiline(mapping)? {
+            let content_start = self.flow_entry_content_start(before_entry)?;
+            let line_start = self.line_start_offset(content_start);
+            if line_start != self.line_start_offset(self.expect_node(mapping)?.span.start as usize)
+            {
+                let indent = &self.source().as_str()[line_start..content_start];
+                self.queue_edit(
+                    Span::empty_from_usize(line_start),
+                    format!("{indent}{key}: {value},{}", self.preferred_line_ending()),
+                )?;
+                return Ok(());
+            }
+        }
         self.queue_edit(Span::empty(entry.span.start), format!("{key}: {value}, "))?;
         Ok(())
     }
@@ -873,13 +898,37 @@ impl YamlDoc {
         let items = self.sequence_items(sequence).collect::<Vec<_>>();
         match style {
             CollectionStyle::Flow => {
-                let sequence_node = self.expect_node(sequence)?;
+                let sequence_span = self.expect_node(sequence)?.span;
+                let entries = self
+                    .children(sequence)
+                    .filter(|node| self.containing_entry_child(*node))
+                    .collect::<Vec<_>>();
+                let close = closing_delimiter_offset(self, sequence_span, ']')?;
+                let value = value.render_flow(self)?;
+                if index == items.len()
+                    && self.queue_multiline_flow_append(sequence, close, &entries, &value)?
+                {
+                    return Ok(());
+                }
+                if let Some(entry) = entries.get(index).copied()
+                    && self.flow_collection_is_multiline(sequence)?
+                {
+                    let content_start = self.flow_entry_content_start(entry)?;
+                    let line_start = self.line_start_offset(content_start);
+                    if line_start != self.line_start_offset(sequence_span.start as usize) {
+                        let indent = &self.source().as_str()[line_start..content_start];
+                        self.queue_edit(
+                            Span::empty_from_usize(line_start),
+                            format!("{indent}{value},{}", self.preferred_line_ending()),
+                        )?;
+                        return Ok(());
+                    }
+                }
                 let offset = if let Some(item) = items.get(index).copied() {
                     self.expect_node(item)?.span.start as usize
                 } else {
-                    closing_delimiter_offset(self, sequence_node.span, ']')?
+                    close
                 };
-                let value = value.render_flow(self)?;
                 let insertion = if items.is_empty() {
                     value
                 } else if index < items.len() {
@@ -909,6 +958,49 @@ impl YamlDoc {
             }
         }
         Ok(())
+    }
+
+    fn flow_entry_content_start(&self, entry: NodeId) -> Result<usize, YamlEditError> {
+        self.semantic_children(entry)
+            .next()
+            .and_then(|value| self.node(value))
+            .map(|value| value.span.start as usize)
+            .ok_or_else(|| YamlEditError::new("flow collection entry does not contain a value"))
+    }
+
+    fn queue_multiline_flow_append(
+        &mut self,
+        collection: NodeId,
+        close: usize,
+        entries: &[NodeId],
+        rendered: &str,
+    ) -> Result<bool, YamlEditError> {
+        if !self.flow_collection_is_multiline(collection)? {
+            return Ok(false);
+        }
+        let close_line = self.line_start_offset(close);
+        let indent = if let Some(last) = entries.last().copied() {
+            let content_start = self.flow_entry_content_start(last)?;
+            if self.line_start_offset(content_start) == close_line {
+                return Ok(false);
+            }
+            self.source().as_str()[self.line_start_offset(content_start)..content_start].to_owned()
+        } else {
+            let close_indent = self.source().as_str()[close_line..close]
+                .bytes()
+                .take_while(|byte| *byte == b' ')
+                .count();
+            " ".repeat(close_indent + 2)
+        };
+        if let Some(last) = entries.last().copied() {
+            let separator = Span::empty_from_usize(self.flow_entry_value_end(last)?);
+            self.queue_edit(separator, ",".to_owned())?;
+        }
+        self.queue_edit(
+            Span::empty_from_usize(close_line),
+            format!("{indent}{rendered}{}", self.preferred_line_ending()),
+        )?;
+        Ok(true)
     }
 
     pub(crate) fn is_flow_context(&self, mut node: NodeId) -> bool {
@@ -1336,6 +1428,58 @@ mod tests {
         flow.add_at(0, &pointer("/items/1"), &fragment("b"))
             .unwrap();
         assert_eq!(flow.as_source(), "items: [a, b, c]\n");
+    }
+
+    #[test]
+    fn inserts_into_multiline_flow_collections_without_collapsing_layout() {
+        let mut mapping = YamlDoc::parse("map: {\n  a: 1 # keep\n}\ntail: keep\n").unwrap();
+        mapping
+            .add_at(0, &pointer("/map/b"), &fragment("2"))
+            .unwrap();
+        assert_eq!(
+            mapping.as_source(),
+            "map: {\n  a: 1, # keep\n  b: 2\n}\ntail: keep\n"
+        );
+        mapping.commit_edits().unwrap();
+
+        let mut empty_mapping = YamlDoc::parse("outer:\n  map: {\n  }\ntail: keep\n").unwrap();
+        empty_mapping
+            .add_at(0, &pointer("/outer/map/a"), &fragment("1"))
+            .unwrap();
+        assert_eq!(
+            empty_mapping.as_source(),
+            "outer:\n  map: {\n    a: 1\n  }\ntail: keep\n"
+        );
+        empty_mapping.commit_edits().unwrap();
+
+        let mut sequence = YamlDoc::parse("items: [\r\n  a,\r\n  c\r\n]\r\n").unwrap();
+        sequence
+            .add_at(0, &pointer("/items/1"), &fragment("b"))
+            .unwrap();
+        sequence
+            .add_at(0, &pointer("/items/-"), &fragment("d"))
+            .unwrap();
+        assert_eq!(
+            sequence.as_source(),
+            "items: [\r\n  a,\r\n  b,\r\n  c,\r\n  d\r\n]\r\n"
+        );
+        sequence.commit_edits().unwrap();
+
+        let mut empty_sequence = YamlDoc::parse("items: [\n]\ntail: keep\n").unwrap();
+        empty_sequence
+            .add_at(0, &pointer("/items/-"), &fragment("a"))
+            .unwrap();
+        assert_eq!(empty_sequence.as_source(), "items: [\n  a\n]\ntail: keep\n");
+        empty_sequence.commit_edits().unwrap();
+
+        let mut compact = YamlDoc::parse("map: {a: 1}\nitems: [a]\n").unwrap();
+        compact
+            .add_at(0, &pointer("/map/b"), &fragment("2"))
+            .unwrap();
+        compact
+            .add_at(0, &pointer("/items/-"), &fragment("b"))
+            .unwrap();
+        assert_eq!(compact.as_source(), "map: {a: 1, b: 2}\nitems: [a, b]\n");
     }
 
     #[test]

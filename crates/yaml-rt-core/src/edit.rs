@@ -579,7 +579,8 @@ impl YamlDoc {
             )
         );
         if !flow {
-            self.remove_node(entry)?;
+            let span = self.block_collection_entry_removal_span(collection, entry)?;
+            self.queue_edit(span, String::new())?;
             return Ok(());
         }
 
@@ -1163,6 +1164,34 @@ mod tests {
         flow.add_at(0, &pointer("/items/1"), &fragment("b"))
             .unwrap();
         assert_eq!(flow.as_source(), "items: [a, b, c]\n");
+    }
+
+    #[test]
+    fn removes_complete_multiline_block_collection_entries() {
+        let input = "items:\n  - name: first\n    enabled: true\n  - name: second\n    enabled: false\ntail: keep\n";
+        let mut sequence = YamlDoc::parse(input).unwrap();
+        sequence.remove_at(0, &pointer("/items/0")).unwrap();
+        assert_eq!(
+            sequence.as_source(),
+            "items:\n  - name: second\n    enabled: false\ntail: keep\n"
+        );
+        sequence.commit_edits().unwrap();
+
+        let input = "server:\n  host: localhost\n  tls:\n    enabled: true\ntail: keep\n";
+        let mut mapping = YamlDoc::parse(input).unwrap();
+        mapping.remove_at(0, &pointer("/server")).unwrap();
+        assert_eq!(mapping.as_source(), "tail: keep\n");
+        mapping.commit_edits().unwrap();
+    }
+
+    #[test]
+    fn removes_multiple_block_sequence_entries_transactionally() {
+        let input = "items:\n  - name: first\n    enabled: true\n  - name: second\n    enabled: false\ntail: keep\n";
+        let mut doc = YamlDoc::parse(input).unwrap();
+        doc.remove_at(0, &pointer("/items/1")).unwrap();
+        doc.remove_at(0, &pointer("/items/0")).unwrap();
+        assert_eq!(doc.as_source(), "items:\ntail: keep\n");
+        doc.commit_edits().unwrap();
     }
 
     #[test]

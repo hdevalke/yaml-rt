@@ -1648,6 +1648,85 @@ impl YamlDoc {
         self.queue_edit(span, String::new())
     }
 
+    pub(crate) fn block_collection_entry_removal_span(
+        &self,
+        collection: NodeId,
+        entry: NodeId,
+    ) -> Result<Span, YamlError> {
+        let collection_node = self.expect_node(collection)?;
+        let entry_node = self.expect_node(entry)?;
+        let entry_kind = match self.semantic_kind(collection) {
+            Some(SemanticKind::Mapping { .. }) => NodeKind::MappingEntry,
+            Some(SemanticKind::Sequence { .. }) => NodeKind::SequenceEntry,
+            _ => {
+                return Err(YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Semantic,
+                        "block entry parent is not a semantic collection",
+                        collection_node.span,
+                    )
+                    .with_expected("a block mapping or sequence"),
+                ));
+            }
+        };
+        let entries = self
+            .children(collection)
+            .filter(|child| {
+                self.node(*child)
+                    .is_some_and(|node| node.kind == entry_kind)
+            })
+            .collect::<Vec<_>>();
+        let index = entries
+            .iter()
+            .position(|candidate| *candidate == entry)
+            .ok_or_else(|| {
+                YamlError::new(
+                    Diagnostic::new(
+                        DiagnosticKind::Semantic,
+                        "block collection entry is missing from its parent",
+                        entry_node.span,
+                    )
+                    .with_expected("an entry owned by the selected collection"),
+                )
+            })?;
+        let start = self.line_start_for_offset(entry_node.span.start as usize);
+        let end = if let Some(next) = entries.get(index + 1).copied() {
+            self.line_start_for_offset(self.expect_node(next)?.span.start as usize)
+        } else {
+            self.block_entry_extent_end(entry_node)
+        };
+        Ok(Span::from_usize(start, end))
+    }
+
+    fn block_entry_extent_end(&self, entry: &Node) -> usize {
+        let source = self.source.as_str();
+        let line_start = self.line_start_for_offset(entry.span.start as usize);
+        let entry_indent = source[line_start..entry.span.start as usize]
+            .bytes()
+            .take_while(|byte| *byte == b' ')
+            .count();
+        let line_index = self
+            .source
+            .line_starts()
+            .binary_search(&Span::usize_to_u32(line_start))
+            .expect("entry line start is indexed");
+        for next_start in self.source.line_starts().iter().skip(line_index + 1) {
+            let next_start = *next_start as usize;
+            let line_end = source[next_start..]
+                .find(['\r', '\n'])
+                .map_or(source.len(), |relative| next_start + relative);
+            let line = &source[next_start..line_end];
+            if line.trim().is_empty() {
+                continue;
+            }
+            let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+            if indent <= entry_indent {
+                return next_start;
+            }
+        }
+        source.len()
+    }
+
     pub(crate) fn scalar_replacement_target(
         &self,
         node: NodeId,

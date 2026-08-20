@@ -702,6 +702,20 @@ mod tests {
     }
 
     #[test]
+    fn jsonpath_remove_deletes_complete_multiline_sequence_items() {
+        let mut remove = request("remove");
+        remove.selector_kind = Some("jsonpath".to_owned());
+        remove.selector = Some("$.services[0,1]".to_owned());
+
+        let result = execute(&remove);
+
+        assert!(result.ok, "{:?}", result.message);
+        assert_eq!(result.matched_pointers, ["/services/0", "/services/1"]);
+        assert_eq!(result.output_yaml, "# services\nservices:\n");
+        YamlDoc::parse(&result.output_yaml).unwrap();
+    }
+
+    #[test]
     fn query_get_and_test_do_not_change_yaml() {
         for command in ["query", "get", "test"] {
             let mut value = request(command);

@@ -529,6 +529,23 @@ fn remove_preserves_empty_block_collection_types() {
 }
 
 #[test]
+fn remove_preserves_multiline_flow_layout() {
+    let directory = temp_dir();
+    let input = directory.join("flow.yaml");
+    fs::write(&input, "map: {\n  a: 1, # keep\n  b: 2\n}\ntail: keep\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["remove", "/map/b", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, b"map: {\n  a: 1 # keep\n}\ntail: keep\n");
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn in_place_replaces_only_after_success() {
     let directory = temp_dir();
     let input = directory.join("document.yaml");

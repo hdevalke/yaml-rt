@@ -609,7 +609,7 @@ impl YamlDoc {
         Children::new(&self.nodes, node)
     }
 
-    fn semantic_children(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    pub(crate) fn semantic_children(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         self.children(node)
             .filter(|child| self.semantic_metadata(*child).is_some())
     }

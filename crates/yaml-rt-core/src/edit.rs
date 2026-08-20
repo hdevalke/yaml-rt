@@ -612,6 +612,15 @@ impl YamlDoc {
             .position(|candidate| *candidate == entry)
             .ok_or_else(|| YamlEditError::new("flow collection entry is missing"))?;
         let entry_span = self.expect_node(entry)?.span;
+        if entries.get(index + 1).is_none() && self.flow_collection_is_multiline(collection)? {
+            if let Some(previous) = index.checked_sub(1).and_then(|index| entries.get(index)) {
+                let separator = self.flow_separator_after(*previous, entry)?;
+                self.queue_edit(separator, String::new())?;
+            }
+            let span = self.multiline_flow_terminal_entry_span(collection, entry)?;
+            self.queue_edit(span, String::new())?;
+            return Ok(());
+        }
         let span = if let Some(next) = entries.get(index + 1).copied() {
             Span::new(entry_span.start, self.expect_node(next)?.span.start)
         } else if index > 0 {
@@ -622,6 +631,67 @@ impl YamlDoc {
         };
         self.queue_edit(span, String::new())?;
         Ok(())
+    }
+
+    fn flow_collection_is_multiline(&self, collection: NodeId) -> Result<bool, YamlEditError> {
+        Ok(self
+            .source()
+            .slice(self.expect_node(collection)?.span)
+            .contains(['\r', '\n']))
+    }
+
+    fn flow_entry_value_end(&self, entry: NodeId) -> Result<usize, YamlEditError> {
+        self.semantic_children(entry)
+            .last()
+            .and_then(|value| self.node(value))
+            .map(|value| value.span.end as usize)
+            .ok_or_else(|| YamlEditError::new("flow collection entry does not contain a value"))
+    }
+
+    fn flow_separator_after(&self, previous: NodeId, next: NodeId) -> Result<Span, YamlEditError> {
+        let start = self.flow_entry_value_end(previous)?;
+        let end = self.expect_node(next)?.span.start as usize;
+        let separator = self.source().as_str()[start..end]
+            .find(',')
+            .map(|relative| start + relative)
+            .ok_or_else(|| YamlEditError::new("flow collection entries have no separator"))?;
+        Ok(Span::from_usize(separator, separator + 1))
+    }
+
+    fn multiline_flow_terminal_entry_span(
+        &self,
+        collection: NodeId,
+        entry: NodeId,
+    ) -> Result<Span, YamlEditError> {
+        let collection_node = self.expect_node(collection)?;
+        let entry_node = self.expect_node(entry)?;
+        let delimiter = match collection_node.kind() {
+            crate::NodeKind::FlowMapping => '}',
+            crate::NodeKind::FlowSequence => ']',
+            _ => return Err(YamlEditError::new("expected a flow collection")),
+        };
+        let close = closing_delimiter_offset(self, collection_node.span, delimiter)?;
+        let content_end = self.flow_entry_value_end(entry)?;
+        let line_end = self.source().as_str()[content_end..close]
+            .find(['\r', '\n'])
+            .map(|relative| content_end + relative)
+            .unwrap_or(close);
+        let entry_line = self.line_start_offset(entry_node.span.start as usize);
+        let collection_line = self.line_start_offset(collection_node.span.start as usize);
+        if entry_line == collection_line || line_end == close {
+            return Ok(Span::from_usize(entry_node.span.start as usize, line_end));
+        }
+        let bytes = self.source().as_str().as_bytes();
+        let mut end = line_end;
+        if bytes.get(end) == Some(&b'\r') {
+            end += 1;
+            if bytes.get(end) == Some(&b'\n') {
+                end += 1;
+            }
+        } else if bytes.get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        Ok(Span::from_usize(entry_line, end))
     }
 
     fn empty_block_collection_edit(
@@ -1340,6 +1410,37 @@ mod tests {
             only.semantic_kind(item),
             Some(SemanticKind::Mapping { .. })
         ));
+    }
+
+    #[test]
+    fn removes_terminal_entries_without_collapsing_multiline_flow_layout() {
+        let mut mapping =
+            YamlDoc::parse("map: {\n  a: 1, # keep\n  b: 2\n}\ntail: keep\n").unwrap();
+        mapping.remove_at(0, &pointer("/map/b")).unwrap();
+        assert_eq!(
+            mapping.as_source(),
+            "map: {\n  a: 1 # keep\n}\ntail: keep\n"
+        );
+        mapping.commit_edits().unwrap();
+        assert!(mapping.resolve_pointer(0, &pointer("/map/a")).is_ok());
+
+        let mut sequence =
+            YamlDoc::parse("items: [\r\n  a,\r\n  b\r\n]\r\ntail: keep\r\n").unwrap();
+        sequence.remove_at(0, &pointer("/items/1")).unwrap();
+        assert_eq!(
+            sequence.as_source(),
+            "items: [\r\n  a\r\n]\r\ntail: keep\r\n"
+        );
+        sequence.commit_edits().unwrap();
+
+        let mut only = YamlDoc::parse("map: {\n  only: value\n}\ntail: keep\n").unwrap();
+        only.remove_at(0, &pointer("/map/only")).unwrap();
+        assert_eq!(only.as_source(), "map: {\n}\ntail: keep\n");
+        only.commit_edits().unwrap();
+
+        let mut compact = YamlDoc::parse("map: {a: 1, b: 2}\n").unwrap();
+        compact.remove_at(0, &pointer("/map/b")).unwrap();
+        assert_eq!(compact.as_source(), "map: {a: 1}\n");
     }
 
     #[test]

@@ -10,6 +10,8 @@
   --accent-wash: #fff0e8;
   --success: #19724c;
   --danger: #a52a2a;
+  --change: #2563eb;
+  --change-wash: rgb(37 99 235 / 12%);
   --code-bg: #202724;
   --code-ink: #edf2ed;
   --shadow: 0 12px 34px rgb(31 43 37 / 8%);
@@ -104,7 +106,7 @@ h1, h2 { margin: 0; font-size: .94rem; }
 .cm-editor { height: 100%; background: transparent; }
 .cm-scroller { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace !important; font-size: 13px; line-height: 1.58; }
 .cm-focused { outline: 2px solid rgb(212 86 44 / 25%) !important; outline-offset: -2px; }
-.cm-changed-line { background: rgb(212 86 44 / 12%); box-shadow: inset 3px 0 var(--accent); }
+.cm-changed-line { background: var(--change-wash); box-shadow: inset 3px 0 var(--change); }
 .cm-error-line { background: rgb(165 42 42 / 13%); box-shadow: inset 3px 0 var(--danger); }
 
 .command-panel { padding-bottom: 14px; overflow-y: auto; }
@@ -167,6 +169,8 @@ footer a { color: inherit; }
     --accent-wash: #39231d;
     --success: #6fc99e;
     --danger: #ff8b83;
+    --change: #60a5fa;
+    --change-wash: rgb(96 165 250 / 16%);
     --code-bg: #101513;
     --code-ink: #edf2ed;
     --shadow: none;

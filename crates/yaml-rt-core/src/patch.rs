@@ -534,6 +534,20 @@ mod tests {
     }
 
     #[test]
+    fn patch_add_indents_compact_sequence_mapping_members() {
+        let mut doc = YamlDoc::parse("services:\n  - name: api\n    port: 8080\n").unwrap();
+        let patch =
+            YamlPatch::parse("- op: add\n  path: /services/0/protocol\n  value: https\n").unwrap();
+
+        doc.apply_patch(0, &patch).unwrap();
+        assert_eq!(
+            doc.as_source(),
+            "services:\n  - name: api\n    port: 8080\n    protocol: https\n"
+        );
+        doc.commit_edits().unwrap();
+    }
+
+    #[test]
     fn a_late_failure_rolls_back_every_operation() {
         let patch = YamlPatch::parse(
             "- {op: replace, path: /value, value: 2}\n\

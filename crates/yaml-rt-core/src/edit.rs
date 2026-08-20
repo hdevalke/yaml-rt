@@ -646,7 +646,7 @@ impl YamlDoc {
             }
             CollectionStyle::Block => {
                 let mapping_node = self.expect_node(mapping)?;
-                let indent = self.node_indent(mapping_node);
+                let indent = self.block_mapping_entry_indent(mapping);
                 let offset = self.mapping_insertion_offset(mapping_node);
                 let mut insertion = insertion_prefix(self, offset);
                 let value = value.prepared(self)?.to_yaml()?;
@@ -1104,6 +1104,35 @@ mod tests {
         );
         doc.remove_at(0, &pointer("/server/port")).unwrap();
         assert_eq!(doc.as_source(), "server:\n  host: example.com # keep\n");
+    }
+
+    #[test]
+    fn inserts_into_compact_sequence_entry_mappings_at_the_key_column() {
+        let input = "services:\n  - name: api\n    port: 8080\n";
+
+        let mut scalar = YamlDoc::parse(input).unwrap();
+        scalar
+            .add_at(0, &pointer("/services/0/enabled"), &fragment("true"))
+            .unwrap();
+        assert_eq!(
+            scalar.as_source(),
+            "services:\n  - name: api\n    port: 8080\n    enabled: true\n"
+        );
+        scalar.commit_edits().unwrap();
+
+        let mut nested = YamlDoc::parse(input).unwrap();
+        nested
+            .add_at(
+                0,
+                &pointer("/services/0/tls"),
+                &fragment("{enabled: true, mode: strict}"),
+            )
+            .unwrap();
+        assert_eq!(
+            nested.as_source(),
+            "services:\n  - name: api\n    port: 8080\n    tls: {enabled: true, mode: strict}\n"
+        );
+        nested.commit_edits().unwrap();
     }
 
     #[test]

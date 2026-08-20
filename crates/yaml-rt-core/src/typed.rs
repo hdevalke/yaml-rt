@@ -1299,7 +1299,7 @@ where
 
         match mapping.kind {
             NodeKind::BlockMapping => {
-                let mapping_indent = doc.node_indent(mapping);
+                let mapping_indent = doc.block_mapping_entry_indent(node);
                 for entry in doc.children(node) {
                     let entry_node = doc.expect_node(entry)?;
                     let mut children = doc.children(entry);
@@ -1392,7 +1392,7 @@ where
 
         match mapping.kind {
             NodeKind::BlockMapping => {
-                let mapping_indent = doc.node_indent(mapping);
+                let mapping_indent = doc.block_mapping_entry_indent(node);
                 for entry in doc.children(node) {
                     let entry_node = doc.expect_node(entry)?;
                     let mut children = doc.children(entry);

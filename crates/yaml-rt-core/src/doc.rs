@@ -1245,7 +1245,7 @@ impl YamlDoc {
     ) -> Result<(), YamlError> {
         let mapping_node = self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
         let indent = match style {
-            MappingEntryStyle::Inherit => self.node_indent(mapping_node),
+            MappingEntryStyle::Inherit => self.block_mapping_entry_indent(mapping),
             MappingEntryStyle::Indent(indent) => indent,
         };
         let insertion_offset = self.mapping_insertion_offset(mapping_node);
@@ -1297,7 +1297,7 @@ impl YamlDoc {
         }
         let mapping_node = self.expect_node_kind(mapping, NodeKind::BlockMapping)?;
         let indent = match style {
-            MappingEntryStyle::Inherit => self.node_indent(mapping_node),
+            MappingEntryStyle::Inherit => self.block_mapping_entry_indent(mapping),
             MappingEntryStyle::Indent(indent) => indent,
         };
         let insertion_offset = self.mapping_insertion_offset(mapping_node);
@@ -1387,7 +1387,7 @@ impl YamlDoc {
     ) -> Result<(), YamlError> {
         let before_node = self.expect_node_kind(before_entry, NodeKind::MappingEntry)?;
         let indent = match style {
-            MappingEntryStyle::Inherit => self.node_indent(before_node),
+            MappingEntryStyle::Inherit => self.node_column(before_node),
             MappingEntryStyle::Indent(indent) => indent,
         };
         let insertion_offset = self.line_start_for_offset(before_node.span.start as usize);
@@ -1437,7 +1437,7 @@ impl YamlDoc {
                 .map_err(YamlEditError::into_yaml_error);
         }
         let indent = match style {
-            MappingEntryStyle::Inherit => self.node_indent(before_node),
+            MappingEntryStyle::Inherit => self.node_column(before_node),
             MappingEntryStyle::Indent(indent) => indent,
         };
         let insertion_offset = self.line_start_for_offset(before_node.span.start as usize);
@@ -1940,6 +1940,18 @@ impl YamlDoc {
             .bytes()
             .filter(|byte| *byte == b' ')
             .count()
+    }
+
+    pub(crate) fn block_mapping_entry_indent(&self, mapping: NodeId) -> usize {
+        self.mapping_entries(mapping)
+            .next()
+            .and_then(|(key, _)| self.node(key).map(|node| self.node_column(node)))
+            .or_else(|| self.node(mapping).map(|node| self.node_column(node)))
+            .unwrap_or_default()
+    }
+
+    fn node_column(&self, node: &Node) -> usize {
+        node.span.start as usize - self.line_start_for_offset(node.span.start as usize)
     }
 
     fn line_start_for_offset(&self, offset: usize) -> usize {

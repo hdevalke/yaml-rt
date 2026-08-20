@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
-use crate::{NodeId, SemanticKind, YamlDoc, YamlError, YamlScalarStyle};
+use crate::{NodeId, SemanticKind, YamlDoc, YamlError, YamlScalarStyle, strip_inline_comment};
 
 /// A parsed YAML value document containing exactly one root node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +205,7 @@ impl YamlFragment {
                         output.push_str(&quote_string(&value));
                     } else {
                         let source = self.doc.extract_node(node).map_err(FragmentError::from)?;
+                        let source = strip_inline_comment(&source).trim_end();
                         if source.contains(['\n', '\r'])
                             || style == YamlScalarStyle::Plain
                                 && source.contains(['[', ']', '{', '}', ','])
@@ -213,7 +214,7 @@ impl YamlFragment {
                             output.push_str(&prefix);
                             output.push_str(&quote_string(&value));
                         } else {
-                            output.push_str(&source);
+                            output.push_str(source);
                         }
                     }
                 }

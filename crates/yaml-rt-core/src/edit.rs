@@ -1210,6 +1210,28 @@ mod tests {
     }
 
     #[test]
+    fn move_and_copy_strip_inline_comments_when_rendering_flow_values() {
+        let input = "value: 8080 # public endpoint\ntarget: {}\n";
+        let mut moved = YamlDoc::parse(input).unwrap();
+        moved
+            .move_at(0, &pointer("/value"), &pointer("/target/moved"))
+            .unwrap();
+        assert_eq!(moved.as_source(), "target: {moved: 8080}\n");
+        moved.commit_edits().unwrap();
+
+        let input = "value: \"a # b\" # keep here\ntarget: {}\n";
+        let mut copied = YamlDoc::parse(input).unwrap();
+        copied
+            .copy_at(0, &pointer("/value"), &pointer("/target/copied"))
+            .unwrap();
+        assert_eq!(
+            copied.as_source(),
+            "value: \"a # b\" # keep here\ntarget: {copied: \"a # b\"}\n"
+        );
+        copied.commit_edits().unwrap();
+    }
+
+    #[test]
     fn copy_rejects_anchors_and_test_is_semantic() {
         let mut doc = YamlDoc::parse("one: &one {value: 1}\ntwo: null\n").unwrap();
         assert!(

@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "yaml-rt-core",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-bench"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cc",
  "criterion",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "yaml-rt-core",
@@ -806,11 +806,11 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-core"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "yaml-rt-derive"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-rfc9535"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "regex",
  "yaml-rt-core",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-serde"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "yaml-rt-core",
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-wasm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "wasm-bindgen",
  "yaml-rt-core",

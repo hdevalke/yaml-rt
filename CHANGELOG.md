@@ -1,5 +1,26 @@
 # Changelog
 
+### v0.2.2 (2026-08-20)
+
+#### Features
+
+* add WebAssembly command playground (6a64221)
+
+#### Fixes
+
+* **yaml-rt-core:** preserve multiline flow layout on insertion (5b0e10a)
+* **yaml-rt-core:** preserve multiline flow layout on removal (b558097)
+* **yaml-rt-core:** preserve empty block collections after removal (5f6ab30)
+* **yaml-rt-core:** remove compact sequence mapping fields safely (2a307ca)
+* **yaml-rt-core:** use fixed-size source scan chunks (777b4da)
+* **ci:** enable GitHub Pages during deployment (cd3887e)
+* **playground:** copy results on insecure local origins (ff42699)
+* **playground:** make the result pane reflect command outcomes (f3e1ea0)
+* **yaml-rt-core:** render commented scalars safely in flow collections
+(06af88d)
+* **yaml-rt-core:** remove complete block collection entries (d93796a)
+* **yaml-rt-core:** indent compact mapping insertions correctly (35fe0f0)
+
 ### v0.2.1 (2026-08-17)
 
 #### Features

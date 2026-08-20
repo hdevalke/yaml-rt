@@ -1689,19 +1689,53 @@ impl YamlDoc {
                     .with_expected("an entry owned by the selected collection"),
                 )
             })?;
-        let start = self.line_start_for_offset(entry_node.span.start as usize);
-        let end = if let Some(next) = entries.get(index + 1).copied() {
-            self.line_start_for_offset(self.expect_node(next)?.span.start as usize)
+        let compact_sequence_mapping = entry_kind == NodeKind::MappingEntry
+            && self
+                .node(collection)
+                .and_then(Node::parent)
+                .and_then(|parent| self.node(parent))
+                .is_some_and(|parent| parent.kind == NodeKind::SequenceEntry);
+        if compact_sequence_mapping && entries.len() == 1 {
+            return Ok(collection_node.span);
+        }
+        let start = if compact_sequence_mapping && index == 0 {
+            collection_node.span.start as usize
         } else {
-            self.block_entry_extent_end(entry_node)
+            self.line_start_for_offset(entry_node.span.start as usize)
+        };
+        let end = if let Some(next) = entries.get(index + 1).copied() {
+            if compact_sequence_mapping && index == 0 {
+                self.collection_entry_content_start(next)?
+            } else {
+                self.line_start_for_offset(self.expect_node(next)?.span.start as usize)
+            }
+        } else {
+            self.block_entry_extent_end(entry)?
         };
         Ok(Span::from_usize(start, end))
     }
 
-    fn block_entry_extent_end(&self, entry: &Node) -> usize {
+    fn collection_entry_content_start(&self, entry: NodeId) -> Result<usize, YamlError> {
+        let entry_node = self.expect_node(entry)?;
+        Ok(self
+            .semantic_children(entry)
+            .next()
+            .and_then(|child| self.node(child))
+            .map_or(entry_node.span.start as usize, |child| {
+                child.span.start as usize
+            }))
+    }
+
+    fn block_entry_extent_end(&self, entry: NodeId) -> Result<usize, YamlError> {
         let source = self.source.as_str();
-        let line_start = self.line_start_for_offset(entry.span.start as usize);
-        let entry_indent = source[line_start..entry.span.start as usize]
+        let entry_node = self.expect_node(entry)?;
+        let content_start = if entry_node.kind == NodeKind::MappingEntry {
+            self.collection_entry_content_start(entry)?
+        } else {
+            entry_node.span.start as usize
+        };
+        let line_start = self.line_start_for_offset(content_start);
+        let entry_indent = source[line_start..content_start]
             .bytes()
             .take_while(|byte| *byte == b' ')
             .count();
@@ -1721,10 +1755,10 @@ impl YamlDoc {
             }
             let indent = line.bytes().take_while(|byte| *byte == b' ').count();
             if indent <= entry_indent {
-                return next_start;
+                return Ok(next_start);
             }
         }
-        source.len()
+        Ok(source.len())
     }
 
     pub(crate) fn scalar_replacement_target(

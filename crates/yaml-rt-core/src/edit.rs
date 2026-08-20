@@ -580,7 +580,21 @@ impl YamlDoc {
         );
         if !flow {
             let span = self.block_collection_entry_removal_span(collection, entry)?;
-            self.queue_edit(span, String::new())?;
+            let removes_only_compact_mapping_entry =
+                self.node(collection).is_some_and(|node| node.span == span)
+                    && self
+                        .node(collection)
+                        .and_then(crate::Node::parent)
+                        .and_then(|parent| self.node(parent))
+                        .is_some_and(|parent| parent.kind() == crate::NodeKind::SequenceEntry);
+            self.queue_edit(
+                span,
+                if removes_only_compact_mapping_entry {
+                    "{}".to_owned()
+                } else {
+                    String::new()
+                },
+            )?;
             return Ok(());
         }
 
@@ -1177,11 +1191,67 @@ mod tests {
         );
         sequence.commit_edits().unwrap();
 
+        let mut last_sequence = YamlDoc::parse(input).unwrap();
+        last_sequence.remove_at(0, &pointer("/items/1")).unwrap();
+        assert_eq!(
+            last_sequence.as_source(),
+            "items:\n  - name: first\n    enabled: true\ntail: keep\n"
+        );
+        last_sequence.commit_edits().unwrap();
+
         let input = "server:\n  host: localhost\n  tls:\n    enabled: true\ntail: keep\n";
         let mut mapping = YamlDoc::parse(input).unwrap();
         mapping.remove_at(0, &pointer("/server")).unwrap();
         assert_eq!(mapping.as_source(), "tail: keep\n");
         mapping.commit_edits().unwrap();
+    }
+
+    #[test]
+    fn removes_fields_from_compact_sequence_entry_mappings() {
+        let input = "services:\n  - name: api\n    port: 8080 # public endpoint\n    enabled: TRUE\n  - {name: worker, port: 8081, enabled: false}\ntail: keep\n";
+
+        let mut first = YamlDoc::parse(input).unwrap();
+        first.remove_at(0, &pointer("/services/0/name")).unwrap();
+        assert_eq!(
+            first.as_source(),
+            "services:\n  - port: 8080 # public endpoint\n    enabled: TRUE\n  - {name: worker, port: 8081, enabled: false}\ntail: keep\n"
+        );
+        first.commit_edits().unwrap();
+        assert!(
+            first
+                .resolve_pointer(0, &pointer("/services/0/port"))
+                .is_ok()
+        );
+
+        let mut middle = YamlDoc::parse(input).unwrap();
+        middle.remove_at(0, &pointer("/services/0/port")).unwrap();
+        assert_eq!(
+            middle.as_source(),
+            "services:\n  - name: api\n    enabled: TRUE\n  - {name: worker, port: 8081, enabled: false}\ntail: keep\n"
+        );
+        middle.commit_edits().unwrap();
+
+        let mut last = YamlDoc::parse(input).unwrap();
+        last.remove_at(0, &pointer("/services/0/enabled")).unwrap();
+        assert_eq!(
+            last.as_source(),
+            "services:\n  - name: api\n    port: 8080 # public endpoint\n  - {name: worker, port: 8081, enabled: false}\ntail: keep\n"
+        );
+        last.commit_edits().unwrap();
+        assert!(
+            last.resolve_pointer(0, &pointer("/services/1/name"))
+                .is_ok()
+        );
+
+        let mut only = YamlDoc::parse("services:\n  - name: api\ntail: keep\n").unwrap();
+        only.remove_at(0, &pointer("/services/0/name")).unwrap();
+        assert_eq!(only.as_source(), "services:\n  - {}\ntail: keep\n");
+        only.commit_edits().unwrap();
+        let item = only.resolve_pointer(0, &pointer("/services/0")).unwrap();
+        assert!(matches!(
+            only.semantic_kind(item),
+            Some(SemanticKind::Mapping { .. })
+        ));
     }
 
     #[test]

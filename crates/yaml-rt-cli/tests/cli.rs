@@ -464,6 +464,38 @@ fn stdin_mutation_and_failed_test_have_expected_streams() {
 }
 
 #[test]
+fn remove_preserves_compact_sequence_mapping_items() {
+    let directory = temp_dir();
+    let input = directory.join("services.yaml");
+    let yaml = "# Production services — comments and style stay put\nservices:\n  - name: api\n    port: 8080 # public endpoint\n    enabled: TRUE\n  - {name: worker, port: 8081, enabled: false}\ndefaults: &defaults\n  retries: 0x3\nmirror: *defaults\n";
+    fs::write(&input, yaml).unwrap();
+
+    let first = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["remove", "/services/0/name", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{:?}", first.stderr);
+    assert!(first.stderr.is_empty());
+    assert_eq!(
+        first.stdout,
+        b"# Production services \xe2\x80\x94 comments and style stay put\nservices:\n  - port: 8080 # public endpoint\n    enabled: TRUE\n  - {name: worker, port: 8081, enabled: false}\ndefaults: &defaults\n  retries: 0x3\nmirror: *defaults\n"
+    );
+
+    let last = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["remove", "/services/0/enabled", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(last.status.success(), "{:?}", last.stderr);
+    assert!(last.stderr.is_empty());
+    assert_eq!(
+        last.stdout,
+        b"# Production services \xe2\x80\x94 comments and style stay put\nservices:\n  - name: api\n    port: 8080 # public endpoint\n  - {name: worker, port: 8081, enabled: false}\ndefaults: &defaults\n  retries: 0x3\nmirror: *defaults\n"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn in_place_replaces_only_after_success() {
     let directory = temp_dir();
     let input = directory.join("document.yaml");

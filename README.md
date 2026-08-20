@@ -3,6 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/yaml-rt.svg)](https://crates.io/crates/yaml-rt)
 [![docs.rs](https://docs.rs/yaml-rt/badge.svg)](https://docs.rs/yaml-rt/latest/yaml_rt/)
 [![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+[![Playground](https://img.shields.io/badge/playground-try_it_online-blue)](https://hdevalke.github.io/yaml-rt/)
 
 `yaml-rt` is a YAML 1.2.2 parser and editor for Rust that keeps the original
 source text intact. It is designed for tools that need to change YAML without

@@ -326,10 +326,7 @@ impl YamlDoc {
         let line_start = self.source.as_str()[..node.span.start as usize]
             .rfind(['\n', '\r'])
             .map_or(0, |index| index + 1);
-        let base_indent = self.source.as_str()[line_start..node.span.start as usize]
-            .bytes()
-            .take_while(|byte| *byte == b' ')
-            .count();
+        let base_indent = node.span.start as usize - line_start;
         Ok(deindent_continuation_lines(source, base_indent))
     }
 
@@ -479,6 +476,22 @@ mod tests {
         assert_eq!(
             doc.extract_node(node).unwrap(),
             "one: 1\ntwo:\n  - a\n  - b"
+        );
+    }
+
+    #[test]
+    fn extraction_deindents_block_mapping_after_sequence_marker() {
+        let doc = YamlDoc::parse(
+            "services:\n  - name: api\n    port: 8080 # public endpoint\n    enabled: TRUE\n",
+        )
+        .unwrap();
+        let node = doc
+            .resolve_pointer(0, &crate::JsonPointer::parse("/services/0").unwrap())
+            .unwrap();
+
+        assert_eq!(
+            doc.extract_node(node).unwrap(),
+            "name: api\nport: 8080 # public endpoint\nenabled: TRUE"
         );
     }
 

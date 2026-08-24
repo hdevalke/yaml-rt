@@ -690,6 +690,25 @@ mod tests {
     }
 
     #[test]
+    fn pointer_get_aligns_keys_in_extracted_sequence_mapping() {
+        let mut get = request("get");
+        get.source =
+            "services:\n  - name: api\n    port: 8080 # public endpoint\n    enabled: TRUE\n"
+                .to_owned();
+        get.selector_kind = Some("pointer".to_owned());
+        get.selector = Some("/services/0".to_owned());
+
+        let result = execute(&get);
+
+        assert!(result.ok, "{:?}", result.message);
+        assert_eq!(
+            result.command_output,
+            "name: api\nport: 8080 # public endpoint\nenabled: TRUE"
+        );
+        assert_eq!(result.output_yaml, get.source);
+    }
+
+    #[test]
     fn jsonpath_commands_mutate_all_matches_transactionally() {
         let mut replace = request("replace");
         replace.selector_kind = Some("jsonpath".to_owned());

@@ -833,14 +833,19 @@ impl YamlDoc {
                 let mapping_node = self.expect_node(mapping)?;
                 let indent = self.block_mapping_entry_indent(mapping);
                 let offset = self.mapping_insertion_offset(mapping_node);
+                let preserve_unterminated_eof = insertion_at_unterminated_eof(self, offset);
                 let mut insertion = insertion_prefix(self, offset);
                 let value = value.prepared(self)?.to_yaml()?;
+                let line_ending = self.preferred_line_ending().to_owned();
                 insertion.push_str(&format_block_mapping_entry(
                     &key,
                     &value,
                     indent,
-                    self.preferred_line_ending(),
+                    &line_ending,
                 ));
+                if preserve_unterminated_eof && !value.contains(['\n', '\r']) {
+                    insertion.truncate(insertion.len() - line_ending.len());
+                }
                 self.queue_edit(Span::empty_from_usize(offset), insertion)?;
             }
         }
@@ -947,13 +952,14 @@ impl YamlDoc {
                 } else {
                     self.sequence_insertion_offset(sequence_node)
                 };
+                let preserve_unterminated_eof = insertion_at_unterminated_eof(self, offset);
                 let mut insertion = insertion_prefix(self, offset);
                 let value = value.prepared(self)?.to_yaml()?;
-                insertion.push_str(&format_block_sequence_entry(
-                    &value,
-                    indent,
-                    self.preferred_line_ending(),
-                ));
+                let line_ending = self.preferred_line_ending().to_owned();
+                insertion.push_str(&format_block_sequence_entry(&value, indent, &line_ending));
+                if preserve_unterminated_eof && !value.contains(['\n', '\r']) {
+                    insertion.truncate(insertion.len() - line_ending.len());
+                }
                 self.queue_edit(Span::empty_from_usize(offset), insertion)?;
             }
         }
@@ -1076,18 +1082,21 @@ pub(crate) fn closing_delimiter_offset(
 }
 
 fn insertion_prefix(doc: &YamlDoc, offset: usize) -> String {
-    if offset == doc.source.len()
+    if insertion_at_unterminated_eof(doc, offset) {
+        doc.preferred_line_ending().to_owned()
+    } else {
+        String::new()
+    }
+}
+
+fn insertion_at_unterminated_eof(doc: &YamlDoc, offset: usize) -> bool {
+    offset == doc.source.len()
         && !doc
             .source
             .as_str()
             .as_bytes()
             .last()
             .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
-    {
-        doc.preferred_line_ending().to_owned()
-    } else {
-        String::new()
-    }
 }
 
 fn format_block_mapping_entry(key: &str, value: &str, indent: usize, ending: &str) -> String {
@@ -1595,6 +1604,55 @@ mod tests {
         doc.remove_at(0, &pointer("/items/0")).unwrap();
         assert_eq!(doc.as_source(), "items: []\ntail: keep\n");
         doc.commit_edits().unwrap();
+    }
+
+    #[test]
+    fn block_removal_owns_only_attached_same_indented_comments() {
+        let mut mapping = YamlDoc::parse(
+            "root:\r\n  keep: one\r\n  # first\r\n  # second\r\n  remove: two # inline\r\n  tail: three\r\n",
+        )
+        .unwrap();
+        mapping.remove_at(0, &pointer("/root/remove")).unwrap();
+        assert_eq!(
+            mapping.as_source(),
+            "root:\r\n  keep: one\r\n  tail: three\r\n"
+        );
+
+        let mut separated = YamlDoc::parse(
+            "root:\n # different indent\n\n  # separated\n  remove: value\n  tail: keep\n",
+        )
+        .unwrap();
+        separated.remove_at(0, &pointer("/root/remove")).unwrap();
+        assert_eq!(
+            separated.as_source(),
+            "root:\n # different indent\n\n  tail: keep\n"
+        );
+
+        let mut sequence = YamlDoc::parse(
+            "items:\n  - keep\n  # attached\n  - remove\n  # belongs to last\n  - last\n",
+        )
+        .unwrap();
+        sequence.remove_at(0, &pointer("/items/1")).unwrap();
+        assert_eq!(
+            sequence.as_source(),
+            "items:\n  - keep\n  # belongs to last\n  - last\n"
+        );
+
+        let mut edges = YamlDoc::parse(
+            "root:\n    # different indentation\n  # first comment\n  first:\n    # nested comment\n    value: one\n  middle: keep\n  # last comment\n  last: three\n",
+        )
+        .unwrap();
+        edges.remove_at(0, &pointer("/root/first")).unwrap();
+        assert_eq!(
+            edges.as_source(),
+            "root:\n    # different indentation\n  middle: keep\n  # last comment\n  last: three\n"
+        );
+        edges.commit_edits().unwrap();
+        edges.remove_at(0, &pointer("/root/last")).unwrap();
+        assert_eq!(
+            edges.as_source(),
+            "root:\n    # different indentation\n  middle: keep\n"
+        );
     }
 
     #[test]

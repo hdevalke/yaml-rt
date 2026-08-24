@@ -260,6 +260,7 @@ impl YamlDoc {
         work.document_root(document)
             .map_err(|error| YamlPatchError::application(None, None, error.to_string()))?;
         for (index, operation) in patch.operations.iter().enumerate() {
+            let mutates = !matches!(operation, YamlPatchOperation::Test { .. });
             let result = match operation {
                 YamlPatchOperation::Add { path, value } => work.add_at(document, path, value),
                 YamlPatchOperation::Remove { path } => work.remove_at(document, path),
@@ -280,6 +281,13 @@ impl YamlDoc {
                 }
             };
             if let Err(error) = result {
+                return Err(YamlPatchError::application(
+                    Some(index),
+                    patch.operation_span(index),
+                    error.to_string(),
+                ));
+            }
+            if mutates && let Err(error) = work.commit_edits() {
                 return Err(YamlPatchError::application(
                     Some(index),
                     patch.operation_span(index),
@@ -561,6 +569,63 @@ mod tests {
         assert_eq!(error.operation_index(), Some(1));
         assert!(error.span().is_some());
         assert_eq!(doc.as_source(), input);
+    }
+
+    #[test]
+    fn later_removals_observe_earlier_structural_changes() {
+        let input = "groups:\n  first: [a, b, c]\n  second: [d, e]\ntail: keep\n";
+        for patch in [
+            "- {op: remove, path: /groups/first/0}\n- {op: remove, path: /groups/first/1}\n- {op: remove, path: /groups/second}\n",
+            "- {op: remove, path: /groups/second}\n- {op: remove, path: /groups/first/0}\n- {op: remove, path: /groups/first/1}\n",
+        ] {
+            let mut doc = YamlDoc::parse(input).unwrap();
+            doc.apply_patch(0, &YamlPatch::parse(patch).unwrap())
+                .unwrap();
+            assert_eq!(doc.as_source(), "groups:\n  first: [b]\ntail: keep\n");
+        }
+    }
+
+    // Regression examples adapted from:
+    // https://verrchu.github.io/blog/2-respectful-yaml-patching-in-rust/
+    #[test]
+    fn respectfully_patches_the_article_asset_groups() {
+        let input = "# outer comment\nasset_groups:\n  group_abc:    # group_abc comment\n    - BTC\n    - ETH\n    - SOL\n  # group_xyz outer comment\n  group_xyz:\n    -  DOGE       # asset comment\n    - PEPE\n  default:\n    # default group inner comment\n    - 1INCH\n    - ATOM\n    - LINK\n";
+        let listing = YamlPatch::parse(
+            "- {op: add, path: /asset_groups/default/2, value: BNB}\n- {op: add, path: /asset_groups/default/-, value: XRP}\n",
+        )
+        .unwrap();
+        let mut listed = YamlDoc::parse(input).unwrap();
+        listed.apply_patch(0, &listing).unwrap();
+        assert_eq!(
+            listed.as_source(),
+            "# outer comment\nasset_groups:\n  group_abc:    # group_abc comment\n    - BTC\n    - ETH\n    - SOL\n  # group_xyz outer comment\n  group_xyz:\n    -  DOGE       # asset comment\n    - PEPE\n  default:\n    # default group inner comment\n    - 1INCH\n    - ATOM\n    - BNB\n    - LINK\n    - XRP\n"
+        );
+
+        let delisting = YamlPatch::parse(
+            "- {op: remove, path: /asset_groups/group_abc/2}\n- {op: remove, path: /asset_groups/group_abc/0}\n- {op: remove, path: /asset_groups/group_xyz}\n- {op: remove, path: /asset_groups/default/1}\n",
+        )
+        .unwrap();
+        let mut delisted = YamlDoc::parse(input).unwrap();
+        delisted.apply_patch(0, &delisting).unwrap();
+        assert_eq!(
+            delisted.as_source(),
+            "# outer comment\nasset_groups:\n  group_abc:    # group_abc comment\n    - ETH\n  default:\n    # default group inner comment\n    - 1INCH\n    - LINK\n"
+        );
+    }
+
+    #[test]
+    fn article_listing_preserves_an_unterminated_final_line() {
+        let input = "asset_groups:\n  default:\n    - 1INCH\n    - ATOM\n    - LINK";
+        let patch = YamlPatch::parse(
+            "- {op: add, path: /asset_groups/default/2, value: BNB}\n- {op: add, path: /asset_groups/default/-, value: XRP}\n",
+        )
+        .unwrap();
+        let mut doc = YamlDoc::parse(input).unwrap();
+        doc.apply_patch(0, &patch).unwrap();
+        assert_eq!(
+            doc.as_source(),
+            "asset_groups:\n  default:\n    - 1INCH\n    - ATOM\n    - BNB\n    - LINK\n    - XRP"
+        );
     }
 
     #[test]

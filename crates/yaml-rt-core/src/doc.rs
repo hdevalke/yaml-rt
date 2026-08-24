@@ -1706,16 +1706,54 @@ impl YamlDoc {
         } else {
             self.line_start_for_offset(entry_node.span.start as usize)
         };
+        let entry_indent = self.source.as_str()[start..]
+            .bytes()
+            .take_while(|byte| *byte == b' ')
+            .count();
+        let start = self.attached_block_comment_start(start, entry_indent);
         let end = if let Some(next) = entries.get(index + 1).copied() {
             if compact_sequence_mapping && index == 0 {
                 self.collection_entry_content_start(next)?
             } else {
-                self.line_start_for_offset(self.expect_node(next)?.span.start as usize)
+                let next_start =
+                    self.line_start_for_offset(self.expect_node(next)?.span.start as usize);
+                let next_indent = self.source.as_str()[next_start..]
+                    .bytes()
+                    .take_while(|byte| *byte == b' ')
+                    .count();
+                self.attached_block_comment_start(next_start, next_indent)
             }
         } else {
             self.block_entry_extent_end(entry)?
         };
         Ok(Span::from_usize(start, end))
+    }
+
+    fn attached_block_comment_start(&self, entry_start: usize, entry_indent: usize) -> usize {
+        let source = self.source.as_str();
+        let line_starts = self.source.line_starts();
+        let Ok(mut line_index) = line_starts.binary_search(&Span::usize_to_u32(entry_start)) else {
+            return entry_start;
+        };
+        let mut start = entry_start;
+
+        while let Some(previous_index) = line_index.checked_sub(1) {
+            let line_start = line_starts[previous_index] as usize;
+            let mut line_end = line_starts[line_index] as usize;
+            while line_end > line_start && matches!(source.as_bytes()[line_end - 1], b'\r' | b'\n')
+            {
+                line_end -= 1;
+            }
+            let line = &source[line_start..line_end];
+            let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+            if indent != entry_indent || !line[indent..].starts_with('#') {
+                break;
+            }
+            start = line_start;
+            line_index = previous_index;
+        }
+
+        start
     }
 
     pub(crate) fn collection_entry_content_start(&self, entry: NodeId) -> Result<usize, YamlError> {
@@ -1738,7 +1776,7 @@ impl YamlDoc {
             entry_node.span.start as usize
         };
         let line_start = self.line_start_for_offset(content_start);
-        let entry_indent = source[line_start..content_start]
+        let entry_indent = source[line_start..]
             .bytes()
             .take_while(|byte| *byte == b' ')
             .count();

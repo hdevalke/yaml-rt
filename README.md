@@ -170,7 +170,10 @@ Supported field attributes are:
 Rust doc comments become comments for newly inserted entries when no explicit
 `comment` attribute is present. Struct-level policies control unknown fields
 with `preserve_unknown_fields` or `prune_unknown_fields`, and insertion order
-with `insert_order = "append"` or `insert_order = "struct"`.
+with `insert_order = "append"` or `insert_order = "struct"`. Struct-level
+`rename_all` supports `lowercase`, `snake_case`, `kebab-case`,
+`SCREAMING_SNAKE_CASE`, `camelCase`, and `PascalCase`; an explicit field
+`rename` takes precedence.
 
 `flatten` accepts both nested derived structs and one catch-all
 `BTreeMap<String, T>` or `HashMap<String, T>` across the recursively flattened
@@ -200,9 +203,10 @@ enum Mode {
 }
 ```
 
-Enum variants support `rename` and repeated `alias`. Enum-level `rename_all`
+Enum variants support `rename` and repeated `alias`, plus `rename_all` on a
+named-field variant to transform its payload keys. Enum-level `rename_all`
 accepts `lowercase`, `snake_case`, `kebab-case`, `SCREAMING_SNAKE_CASE`,
-`camelCase`, and `PascalCase`, following Serde's variant transformations.
+`camelCase`, and `PascalCase`, following Serde's transformations.
 Aliases are accepted when reading; new values emit the canonical name. An
 existing alias spelling is retained while the variant stays the same.
 

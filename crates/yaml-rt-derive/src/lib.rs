@@ -30,10 +30,10 @@ use syn::{
 /// !Struct {host: api}
 /// ```
 ///
-/// Enum-level `rename_all` accepts `lowercase`, `snake_case`, `kebab-case`,
-/// `SCREAMING_SNAKE_CASE`, `camelCase`, and `PascalCase`. Variants accept
-/// `rename` and repeated `alias` attributes. Unnamed newtype and tuple payload
-/// fields accept `with`.
+/// Struct- and enum-level `rename_all` accepts `lowercase`, `snake_case`,
+/// `kebab-case`, `SCREAMING_SNAKE_CASE`, `camelCase`, and `PascalCase`.
+/// Variants accept `rename`, repeated `alias`, and `rename_all` for named
+/// payload fields. Unnamed newtype and tuple payload fields accept `with`.
 ///
 /// Supported field attributes:
 ///
@@ -73,6 +73,8 @@ use syn::{
 ///
 /// Supported struct attributes:
 ///
+/// - `#[yaml(rename_all = "camelCase")]` transforms fields without an explicit
+///   `rename`
 /// - `#[yaml(preserve_unknown_fields)]` keeps unknown mapping entries, which is
 ///   the default behavior
 /// - `#[yaml(prune_unknown_fields)]` removes root mapping entries that are not
@@ -114,6 +116,7 @@ enum InsertOrder {
 struct StructOptions {
     unknown_field_policy: UnknownFieldPolicy,
     insert_order: InsertOrder,
+    rename_all: Option<RenameRule>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +138,7 @@ struct EnumOptions {
 struct VariantOptions {
     rename: Option<String>,
     aliases: Vec<String>,
+    rename_all: Option<RenameRule>,
 }
 
 #[derive(Default)]
@@ -211,7 +215,12 @@ fn expand_named_struct(
     fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
     let struct_options = parse_struct_options(attrs)?;
-    let fields = expand_fields(fields, struct_options.insert_order, FieldAccess::SelfFields)?;
+    let fields = expand_fields(
+        fields,
+        struct_options.insert_order,
+        FieldAccess::SelfFields,
+        struct_options.rename_all,
+    )?;
     validate_struct_options(name, &struct_options, fields.has_flatten)?;
 
     let ordered_keys_binding = match struct_options.insert_order {
@@ -649,6 +658,12 @@ fn parse_unit_variants(
             ));
         }
         let variant_options = parse_variant_options(&variant.attrs)?;
+        if variant_options.rename_all.is_some() {
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                "yaml(rename_all) is supported only on enum variants with named fields",
+            ));
+        }
         let rust_name = variant.ident.to_string();
         let canonical = variant_options
             .rename
@@ -864,6 +879,12 @@ fn parse_tagged_enum_variants(
             &variant_options.aliases,
             &mut names,
         )?;
+        if variant_options.rename_all.is_some() && !matches!(variant.fields, Fields::Named(_)) {
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                "yaml(rename_all) is supported only on enum variants with named fields",
+            ));
+        }
 
         let kind = match variant.fields {
             Fields::Unit => EnumVariantKind::Unit,
@@ -896,8 +917,12 @@ fn parse_tagged_enum_variants(
                     .iter()
                     .filter_map(|field| field.ident.clone())
                     .collect::<Vec<_>>();
-                let expansion =
-                    expand_fields(fields.named, InsertOrder::Append, FieldAccess::Bindings)?;
+                let expansion = expand_fields(
+                    fields.named,
+                    InsertOrder::Append,
+                    FieldAccess::Bindings,
+                    variant_options.rename_all,
+                )?;
                 validate_struct_options(
                     &variant.ident,
                     &StructOptions::default(),
@@ -1629,12 +1654,42 @@ fn variant_snake_case(name: &str) -> String {
     output
 }
 
+fn apply_field_rename_rule(name: &str, rule: Option<RenameRule>) -> String {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    match rule {
+        None | Some(RenameRule::SnakeCase) => name.to_owned(),
+        Some(RenameRule::Lowercase) => name.to_ascii_lowercase(),
+        Some(RenameRule::KebabCase) => name.replace('_', "-"),
+        Some(RenameRule::ScreamingSnakeCase) => name.to_ascii_uppercase(),
+        Some(RenameRule::PascalCase) => name
+            .split('_')
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let mut word = word.to_owned();
+                if let Some(first) = word.get_mut(0..1) {
+                    first.make_ascii_uppercase();
+                }
+                word
+            })
+            .collect(),
+        Some(RenameRule::CamelCase) => {
+            let mut value = apply_field_rename_rule(name, Some(RenameRule::PascalCase));
+            if let Some(first) = value.get_mut(0..1) {
+                first.make_ascii_lowercase();
+            }
+            value
+        }
+    }
+}
+
 fn expand_fields(
     fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
     insert_order: InsertOrder,
     access: FieldAccess,
+    rename_all: Option<RenameRule>,
 ) -> syn::Result<FieldExpansion> {
     let mut expansion = FieldExpansion::default();
+    let mut names = BTreeMap::<String, String>::new();
 
     for field in fields {
         let options = parse_field_options(&field.attrs)?;
@@ -1651,6 +1706,12 @@ fn expand_fields(
             continue;
         }
 
+        let canonical = options
+            .rename
+            .clone()
+            .unwrap_or_else(|| apply_field_rename_rule(&field_name.to_string(), rename_all));
+        register_field_names(&field_name, &canonical, &options.aliases, &mut names)?;
+
         push_regular_field(
             &mut expansion,
             &field_name,
@@ -1658,10 +1719,31 @@ fn expand_fields(
             &options,
             insert_order,
             access,
+            &canonical,
         )?;
     }
 
     Ok(expansion)
+}
+
+fn register_field_names(
+    field: &syn::Ident,
+    canonical: &str,
+    aliases: &[String],
+    names: &mut BTreeMap<String, String>,
+) -> syn::Result<()> {
+    let rust_name = field.to_string();
+    for accepted in std::iter::once(canonical).chain(aliases.iter().map(String::as_str)) {
+        if let Some(previous) = names.insert(accepted.to_owned(), rust_name.clone()) {
+            return Err(syn::Error::new_spanned(
+                field,
+                format!(
+                    "yaml field name `{accepted}` is used by both `{previous}` and `{rust_name}`"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn push_flatten_field(
@@ -1731,11 +1813,9 @@ fn push_regular_field(
     options: &FieldOptions,
     insert_order: InsertOrder,
     access: FieldAccess,
+    yaml_key: &str,
 ) -> syn::Result<()> {
-    let yaml_key = options
-        .rename
-        .clone()
-        .unwrap_or_else(|| field_name.to_string());
+    let yaml_key = yaml_key.to_owned();
     expansion.known_keys.push(yaml_key.clone());
     let aliases = options.aliases.clone();
     expansion.known_keys.extend(aliases.iter().cloned());
@@ -1994,20 +2074,7 @@ fn parse_enum_options(attrs: &[Attribute]) -> syn::Result<EnumOptions> {
                 return Err(meta.error("unsupported yaml enum attribute"));
             }
             let value = meta.value()?.parse::<LitStr>()?;
-            options.rename_all = Some(match value.value().as_str() {
-                "lowercase" => RenameRule::Lowercase,
-                "snake_case" => RenameRule::SnakeCase,
-                "kebab-case" => RenameRule::KebabCase,
-                "SCREAMING_SNAKE_CASE" => RenameRule::ScreamingSnakeCase,
-                "camelCase" => RenameRule::CamelCase,
-                "PascalCase" => RenameRule::PascalCase,
-                _ => {
-                    return Err(syn::Error::new_spanned(
-                        value,
-                        "rename_all must be lowercase, snake_case, kebab-case, SCREAMING_SNAKE_CASE, camelCase, or PascalCase",
-                    ));
-                }
-            });
+            options.rename_all = Some(parse_rename_rule(&value)?);
             Ok(())
         })?;
     }
@@ -2029,8 +2096,14 @@ fn parse_variant_options(attrs: &[Attribute]) -> syn::Result<VariantOptions> {
                     .aliases
                     .push(meta.value()?.parse::<LitStr>()?.value());
                 Ok(())
+            } else if meta.path.is_ident("rename_all") {
+                let value = meta.value()?.parse::<LitStr>()?;
+                options.rename_all = Some(parse_rename_rule(&value)?);
+                Ok(())
             } else {
-                Err(meta.error("enum variants support only yaml(rename) and yaml(alias)"))
+                Err(meta.error(
+                    "enum variants support only yaml(rename), yaml(alias), and yaml(rename_all)",
+                ))
             }
         })?;
     }
@@ -2056,10 +2129,29 @@ fn parse_struct_yaml_attr(attr: &Attribute, options: &mut StructOptions) -> syn:
                 }
             }
             Ok(())
+        } else if meta.path.is_ident("rename_all") {
+            let value = meta.value()?.parse::<LitStr>()?;
+            options.rename_all = Some(parse_rename_rule(&value)?);
+            Ok(())
         } else {
             Err(meta.error("unsupported yaml struct attribute"))
         }
     })
+}
+
+fn parse_rename_rule(value: &LitStr) -> syn::Result<RenameRule> {
+    match value.value().as_str() {
+        "lowercase" => Ok(RenameRule::Lowercase),
+        "snake_case" => Ok(RenameRule::SnakeCase),
+        "kebab-case" => Ok(RenameRule::KebabCase),
+        "SCREAMING_SNAKE_CASE" => Ok(RenameRule::ScreamingSnakeCase),
+        "camelCase" => Ok(RenameRule::CamelCase),
+        "PascalCase" => Ok(RenameRule::PascalCase),
+        _ => Err(syn::Error::new_spanned(
+            value,
+            "rename_all must be lowercase, snake_case, kebab-case, SCREAMING_SNAKE_CASE, camelCase, or PascalCase",
+        )),
+    }
 }
 
 fn parse_field_options(attrs: &[Attribute]) -> syn::Result<FieldOptions> {
@@ -2221,18 +2313,43 @@ mod tests {
 
     #[test]
     fn unsupported_rename_rule_is_targeted() {
-        let input: DeriveInput = syn::parse_quote! {
+        let enum_input: DeriveInput = syn::parse_quote! {
             #[yaml(rename_all = "UPPERCASE")]
             enum Invalid {
                 Value,
             }
         };
+        let struct_input: DeriveInput = syn::parse_quote! {
+            #[yaml(rename_all = "UPPERCASE")]
+            struct Invalid {
+                value: String,
+            }
+        };
 
-        let error = expand_yaml_rt(input).expect_err("unsupported rename rule must fail");
+        for input in [enum_input, struct_input] {
+            let error = expand_yaml_rt(input).expect_err("unsupported rename rule must fail");
 
-        assert!(error.to_string().contains(
-            "rename_all must be lowercase, snake_case, kebab-case, SCREAMING_SNAKE_CASE, camelCase, or PascalCase"
-        ));
+            assert!(error.to_string().contains(
+                "rename_all must be lowercase, snake_case, kebab-case, SCREAMING_SNAKE_CASE, camelCase, or PascalCase"
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_struct_field_names_report_both_fields() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[yaml(rename_all = "camelCase")]
+            struct Invalid {
+                first_value: String,
+                #[yaml(alias = "firstValue")]
+                second_value: String,
+            }
+        };
+
+        let error = expand_yaml_rt(input).expect_err("duplicate field names must fail");
+        let message = error.to_string();
+        assert!(message.contains("yaml field name `firstValue`"));
+        assert!(message.contains("both `first_value` and `second_value`"));
     }
 
     #[test]
@@ -2254,11 +2371,9 @@ mod tests {
         let payload_error =
             expand_yaml_rt(payload_input).expect_err("invalid payload attr must fail");
 
-        assert!(
-            variant_error
-                .to_string()
-                .contains("enum variants support only yaml(rename) and yaml(alias)")
-        );
+        assert!(variant_error.to_string().contains(
+            "enum variants support only yaml(rename), yaml(alias), and yaml(rename_all)"
+        ));
         assert!(
             payload_error
                 .to_string()

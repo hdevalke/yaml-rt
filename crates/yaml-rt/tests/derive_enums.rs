@@ -129,6 +129,36 @@ enum Mode {
 }
 
 #[derive(Debug, PartialEq, Eq, YamlRt)]
+enum FieldRenamedMode {
+    #[yaml(rename_all = "camelCase")]
+    ServerConfig { host_name: String, max_retries: u8 },
+}
+
+#[test]
+fn named_enum_variant_rename_all_patches_block_and_inserts_flow_fields() {
+    let mut block = YamlDoc::parse("!ServerConfig\nhostName: old\nmaxRetries: 1\n").unwrap();
+    let mut value = FieldRenamedMode::from_yaml_doc(&block).unwrap();
+    value = match value {
+        FieldRenamedMode::ServerConfig { .. } => FieldRenamedMode::ServerConfig {
+            host_name: "new".to_owned(),
+            max_retries: 2,
+        },
+    };
+    value.apply_to_yaml_doc(&mut block).unwrap();
+    assert_eq!(
+        block.to_string(),
+        "!ServerConfig\nhostName: new\nmaxRetries: 2\n"
+    );
+
+    let mut flow = YamlDoc::parse("!ServerConfig {hostName: old}\n").unwrap();
+    value.apply_to_yaml_doc(&mut flow).unwrap();
+    assert_eq!(
+        flow.to_string(),
+        "!ServerConfig {hostName: new, maxRetries: 2}\n"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq, YamlRt)]
 #[yaml(rename_all = "lowercase")]
 enum AdaptedPayload {
     Network(#[yaml(with = "ipv4_octets")] Ipv4Addr),

@@ -5,6 +5,60 @@ use std::{
 };
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlRt};
 
+#[derive(Debug, PartialEq, Eq, YamlRt)]
+#[yaml(rename_all = "camelCase")]
+struct RenamedFields {
+    first_value: String,
+    #[yaml(rename = "fixed", alias = "legacy")]
+    second_value: u16,
+}
+
+#[test]
+fn struct_rename_all_reads_patches_and_inserts_with_explicit_rename_precedence() {
+    let mut doc = YamlDoc::parse("firstValue: old\nlegacy: 1\n").expect("valid renamed fields");
+    let mut value = RenamedFields::from_yaml_doc(&doc).expect("renamed fields read");
+    assert_eq!(value.first_value, "old");
+    assert_eq!(value.second_value, 1);
+
+    value.first_value = "new".to_owned();
+    value.second_value = 2;
+    value
+        .apply_to_yaml_doc(&mut doc)
+        .expect("renamed fields patch");
+    assert_eq!(doc.to_string(), "firstValue: new\nlegacy: 2\n");
+
+    let mut missing = YamlDoc::parse("{}\n").expect("valid empty mapping");
+    value
+        .apply_to_yaml_doc(&mut missing)
+        .expect("renamed fields insert");
+    assert_eq!(missing.to_string(), "{firstValue: new, fixed: 2}\n");
+}
+
+#[test]
+fn struct_rename_all_supports_every_documented_field_case() {
+    macro_rules! assert_key {
+        ($name:ident, $rule:literal, $key:literal) => {{
+            #[derive(YamlRt)]
+            #[yaml(rename_all = $rule)]
+            struct $name {
+                http_server_id: u8,
+            }
+            let mut doc = YamlDoc::parse("{}\n").unwrap();
+            $name { http_server_id: 1 }
+                .apply_to_yaml_doc(&mut doc)
+                .unwrap();
+            assert_eq!(doc.to_string(), concat!("{", $key, ": 1}\n"));
+        }};
+    }
+
+    assert_key!(Lower, "lowercase", "http_server_id");
+    assert_key!(Snake, "snake_case", "http_server_id");
+    assert_key!(Kebab, "kebab-case", "http-server-id");
+    assert_key!(Screaming, "SCREAMING_SNAKE_CASE", "HTTP_SERVER_ID");
+    assert_key!(Camel, "camelCase", "httpServerId");
+    assert_key!(Pascal, "PascalCase", "HttpServerId");
+}
+
 mod duration_seconds {
     use std::time::Duration;
     use yaml_rt::YamlError;

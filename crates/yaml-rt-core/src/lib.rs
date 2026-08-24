@@ -40,10 +40,10 @@ pub use syntax::{
 #[doc(hidden)]
 pub use typed::{
     __mapping_fields_to_yaml_fragment, __mapping_overlay_to_yaml_fragment, __read_mapping_fields,
-    __read_mapping_overlay, __read_tagged_yaml_value, __read_yaml_document, __replace_yaml_value,
-    __sequence_fields_to_yaml_fragment, __tag_yaml_fragment, __typed_node_error,
-    __validate_yaml_flatten_layout, __write_mapping_fields, __write_mapping_overlay,
-    __write_tagged_yaml_value, __write_yaml_document,
+    __read_mapping_overlay, __read_tagged_yaml_value, __read_yaml_document, __read_yaml_null,
+    __replace_yaml_value, __sequence_fields_to_yaml_fragment, __tag_yaml_fragment,
+    __typed_node_error, __validate_yaml_flatten_layout, __write_mapping_fields,
+    __write_mapping_overlay, __write_tagged_yaml_value, __write_yaml_document,
 };
 pub use typed::{FromYamlDoc, ToYamlDoc, ToYamlFragment, YamlFlatten, YamlValue};
 pub use value::{

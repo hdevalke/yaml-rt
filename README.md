@@ -186,7 +186,10 @@ rejected before edits are queued.
 
 Single-field tuple structs are transparent automatically. Their inner value is
 represented directly, so `struct Port(u16)` reads and writes `8080`, not a
-mapping or tag. The unnamed field may use `yaml(with = "module")`.
+mapping or tag. Multi-field tuple structs use fixed-length YAML sequences, and
+unit structs use YAML null. Unnamed fields may use `yaml(with = "module")`.
+Existing tuple elements are patched positionally, preserving block or flow
+style and element presentation.
 
 Enums use the same YAML representation as `yaml-rt-serde`: unit variants are
 strings, and variants with data use local tags.
@@ -223,7 +226,7 @@ Common configuration shapes are supported directly:
 | Scalars | `String`, `bool`, `char`, all signed and unsigned integer widths including 128-bit values, `f32`, and `f64` |
 | Wrappers | `Option<T>`, `Box<T>`, and fixed arrays `[T; N]` |
 | Collections | `Vec<T>`, `BTreeMap<String, T>`, and `HashMap<String, T>` |
-| Structs | Named mapping structs and transparent single-field tuple structs |
+| Structs | Named mapping structs, transparent newtypes, positional tuple structs, and null-valued unit structs |
 | Enums | Unit, newtype, tuple, and named-field variants; data variants use local YAML tags |
 | Nested models | Derived structs, newtypes, and enums inside the wrappers and collections above |
 | Generics | Type, lifetime, and const generics with inferred field bounds and retained user `where` clauses |
@@ -519,9 +522,8 @@ cargo test -p yaml-rt-core --test yaml_test_suite
   expands merge keys when `Value::apply_merge()` is requested.
 - Typed-overlay `flatten` has intentionally conservative combinations with
   field and struct policies; unsupported combinations produce derive errors.
-- Typed mappings use string keys. Borrowed overlay fields, standalone unit
-  structs, standalone multi-field tuple structs, and full Serde attribute
-  compatibility remain future work.
+- Typed mappings use string keys. Borrowed overlay fields and full Serde
+  attribute compatibility remain future work.
 - Enum data variants use local tags only. Internally tagged, adjacently tagged,
   externally mapped, and untagged enum representations are not implemented.
 - Collection identity is positional for sequences. Mapping insertion accepts

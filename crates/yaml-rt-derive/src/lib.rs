@@ -1,7 +1,8 @@
 //! Derive macro entry point for typed YAML round-trip overlays.
 //!
 //! The derive supports named mapping structs, transparent single-field tuple
-//! structs, and every enum variant shape. It generates document- and
+//! structs, positional tuple structs, unit structs, and every enum variant
+//! shape. It generates document- and
 //! node-level overlay implementations that retain the lossless YAML document
 //! as the source of truth.
 
@@ -17,8 +18,8 @@ use syn::{
 /// Derives typed YAML round-trip overlay implementations.
 ///
 /// Named structs overlay YAML mappings. A tuple struct with exactly one field
-/// is transparent and delegates directly to that field. Unit and multi-field
-/// tuple structs are rejected.
+/// is transparent and delegates directly to that field. Multi-field tuple
+/// structs overlay YAML sequences, and unit structs overlay YAML null values.
 ///
 /// Enum unit variants are represented as scalar strings. Newtype, tuple, and
 /// struct variants use local YAML tags:
@@ -191,14 +192,8 @@ fn expand_yaml_rt(input: DeriveInput) -> syn::Result<TokenStream2> {
                     .expect("one unnamed field was checked");
                 expand_newtype_struct(&attrs, &name, generics, field)
             }
-            Fields::Unnamed(fields) => Err(syn::Error::new_spanned(
-                fields,
-                "YamlRt supports tuple structs only when they contain exactly one field",
-            )),
-            Fields::Unit => Err(syn::Error::new_spanned(
-                name,
-                "YamlRt does not support unit structs",
-            )),
+            Fields::Unnamed(fields) => expand_tuple_struct(&attrs, &name, generics, fields.unnamed),
+            Fields::Unit => expand_unit_struct(&attrs, &name, generics),
         },
         Data::Enum(data) => expand_enum(&attrs, &name, generics, data.variants),
         Data::Union(data) => Err(syn::Error::new_spanned(
@@ -606,6 +601,302 @@ fn expand_newtype_struct(
                 line_ending: &str,
             ) -> Result<String, ::yaml_rt::YamlError> {
                 #fragment_value
+            }
+        }
+    })
+}
+
+fn reject_tuple_container_attributes(attrs: &[Attribute], kind: &str) -> syn::Result<()> {
+    if let Some(attr) = attrs.iter().find(|attr| attr.path().is_ident("yaml")) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            format!("{kind} do not support container-level yaml attributes"),
+        ));
+    }
+    Ok(())
+}
+
+fn expand_unit_struct(
+    attrs: &[Attribute],
+    name: &syn::Ident,
+    generics: syn::Generics,
+) -> syn::Result<TokenStream2> {
+    reject_tuple_container_attributes(attrs, "unit structs")?;
+    let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
+
+    Ok(quote! {
+        impl #impl_generics ::yaml_rt::FromYamlDoc for #name #type_generics #where_clause {
+            fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
+                let node = doc.document_root(0)?.ok_or_else(|| {
+                    ::yaml_rt::YamlError::new(::yaml_rt::Diagnostic::new(
+                        ::yaml_rt::DiagnosticKind::Typed,
+                        "document does not contain a YAML unit struct value",
+                        ::yaml_rt::Span::empty(0),
+                    ))
+                })?;
+                ::yaml_rt::__read_yaml_null(doc, node)?;
+                Ok(Self)
+            }
+        }
+
+        impl #impl_generics ::yaml_rt::ToYamlDoc for #name #type_generics #where_clause {
+            fn apply_to_yaml_doc(&self, doc: &mut ::yaml_rt::YamlDoc) -> Result<(), ::yaml_rt::YamlError> {
+                ::yaml_rt::__write_yaml_document(self, doc)
+            }
+        }
+
+        impl #impl_generics ::yaml_rt::YamlValue for #name #type_generics #where_clause {
+            fn read_yaml(
+                doc: &::yaml_rt::YamlDoc,
+                node: ::yaml_rt::NodeId,
+            ) -> Result<Self, ::yaml_rt::YamlError> {
+                ::yaml_rt::__read_yaml_null(doc, node)?;
+                Ok(Self)
+            }
+
+            fn write_yaml(
+                &self,
+                doc: &mut ::yaml_rt::YamlDoc,
+                node: Option<::yaml_rt::NodeId>,
+            ) -> Result<::yaml_rt::NodeId, ::yaml_rt::YamlError> {
+                let node = node.ok_or_else(|| {
+                    ::yaml_rt::YamlError::new(::yaml_rt::Diagnostic::new(
+                        ::yaml_rt::DiagnosticKind::Typed,
+                        "cannot insert a standalone YAML unit struct without collection context",
+                        ::yaml_rt::Span::empty(0),
+                    ))
+                })?;
+                if ::yaml_rt::__read_yaml_null(doc, node).is_ok() {
+                    Ok(node)
+                } else {
+                    <Option<u8> as ::yaml_rt::YamlValue>::write_yaml(
+                        &None,
+                        doc,
+                        Some(node),
+                    )
+                }
+            }
+        }
+
+        impl #impl_generics ::yaml_rt::ToYamlFragment for #name #type_generics #where_clause {
+            fn to_yaml_fragment(
+                &self,
+                _indent: usize,
+                _line_ending: &str,
+            ) -> Result<String, ::yaml_rt::YamlError> {
+                Ok("null".to_owned())
+            }
+        }
+    })
+}
+
+fn expand_tuple_struct(
+    attrs: &[Attribute],
+    name: &syn::Ident,
+    generics: syn::Generics,
+    fields: syn::punctuated::Punctuated<syn::Field, syn::token::Comma>,
+) -> syn::Result<TokenStream2> {
+    reject_tuple_container_attributes(attrs, "tuple structs")?;
+    let mut read_bounds = Vec::new();
+    let mut write_bounds = Vec::new();
+    let fields = fields
+        .into_iter()
+        .map(|field| {
+            parse_unnamed_field(
+                field,
+                &mut read_bounds,
+                &mut write_bounds,
+                "tuple struct fields support only yaml(with)",
+            )
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    let arity = fields.len();
+    let reads = fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let ty = &field.ty;
+            if let Some(with) = &field.with {
+                quote! {{
+                    let __yaml_rt_repr = <#with::Repr as ::yaml_rt::YamlValue>::read_yaml(
+                        doc,
+                        __yaml_rt_items[#index],
+                    )?;
+                    #with::from_yaml(__yaml_rt_repr)?
+                }}
+            } else {
+                quote! {
+                    <#ty as ::yaml_rt::YamlValue>::read_yaml(doc, __yaml_rt_items[#index])?
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let bindings = (0..arity)
+        .map(|index| syn::Ident::new(&format!("field_{index}"), name.span()))
+        .collect::<Vec<_>>();
+    let writes = fields
+        .iter()
+        .zip(&bindings)
+        .enumerate()
+        .map(|(index, (field, binding))| {
+            let ty = &field.ty;
+            if let Some(with) = &field.with {
+                quote! {
+                    let __yaml_rt_repr = #with::to_yaml(#binding)?;
+                    <#with::Repr as ::yaml_rt::YamlValue>::write_yaml(
+                        &__yaml_rt_repr,
+                        doc,
+                        Some(__yaml_rt_items[#index]),
+                    )?;
+                }
+            } else {
+                quote! {
+                    <#ty as ::yaml_rt::YamlValue>::write_yaml(
+                        #binding,
+                        doc,
+                        Some(__yaml_rt_items[#index]),
+                    )?;
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let fragments = fields
+        .iter()
+        .zip(&bindings)
+        .map(|(field, binding)| {
+            let ty = &field.ty;
+            if let Some(with) = &field.with {
+                quote! {{
+                    let __yaml_rt_repr = #with::to_yaml(#binding)?;
+                    <#with::Repr as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                        &__yaml_rt_repr,
+                        indent + 2,
+                        line_ending,
+                    )?
+                }}
+            } else {
+                quote! {
+                    <#ty as ::yaml_rt::ToYamlFragment>::to_yaml_fragment(
+                        #binding,
+                        indent + 2,
+                        line_ending,
+                    )?
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let read_body = quote! {
+        if !matches!(doc.semantic_kind(node), Some(::yaml_rt::SemanticKind::Sequence { .. })) {
+            return Err(::yaml_rt::__typed_node_error(
+                doc,
+                node,
+                concat!("YAML tuple struct `", stringify!(#name), "` requires a sequence"),
+                &["a YAML sequence"],
+            ));
+        }
+        let __yaml_rt_items = doc.sequence_items(node).collect::<::std::vec::Vec<_>>();
+        if __yaml_rt_items.len() != #arity {
+            return Err(::yaml_rt::__typed_node_error(
+                doc,
+                node,
+                format!(
+                    "YAML tuple struct `{}` expects {} fields, found {}",
+                    stringify!(#name),
+                    #arity,
+                    __yaml_rt_items.len(),
+                ),
+                &[concat!(#arity, " sequence items")],
+            ));
+        }
+        Ok(Self(#(#reads),*))
+    };
+    let (read_generics, write_generics, combined_generics) =
+        enum_generics_with_bounds(generics, read_bounds, write_bounds);
+    let (read_impl_generics, read_type_generics, read_where_clause) =
+        read_generics.split_for_impl();
+    let (write_impl_generics, write_type_generics, write_where_clause) =
+        write_generics.split_for_impl();
+    let (combined_impl_generics, combined_type_generics, combined_where_clause) =
+        combined_generics.split_for_impl();
+
+    Ok(quote! {
+        impl #read_impl_generics ::yaml_rt::FromYamlDoc for #name #read_type_generics #read_where_clause {
+            fn from_yaml_doc(doc: &::yaml_rt::YamlDoc) -> Result<Self, ::yaml_rt::YamlError> {
+                let node = doc.document_root(0)?.ok_or_else(|| {
+                    ::yaml_rt::YamlError::new(::yaml_rt::Diagnostic::new(
+                        ::yaml_rt::DiagnosticKind::Typed,
+                        "document does not contain a YAML tuple struct value",
+                        ::yaml_rt::Span::empty(0),
+                    ))
+                })?;
+                #read_body
+            }
+        }
+
+        impl #combined_impl_generics ::yaml_rt::ToYamlDoc for #name #combined_type_generics #combined_where_clause {
+            fn apply_to_yaml_doc(&self, doc: &mut ::yaml_rt::YamlDoc) -> Result<(), ::yaml_rt::YamlError> {
+                ::yaml_rt::__write_yaml_document(self, doc)
+            }
+        }
+
+        impl #combined_impl_generics ::yaml_rt::YamlValue for #name #combined_type_generics #combined_where_clause {
+            fn read_yaml(doc: &::yaml_rt::YamlDoc, node: ::yaml_rt::NodeId) -> Result<Self, ::yaml_rt::YamlError> {
+                #read_body
+            }
+
+            fn write_yaml(
+                &self,
+                doc: &mut ::yaml_rt::YamlDoc,
+                node: Option<::yaml_rt::NodeId>,
+            ) -> Result<::yaml_rt::NodeId, ::yaml_rt::YamlError> {
+                let node = node.ok_or_else(|| {
+                    ::yaml_rt::YamlError::new(::yaml_rt::Diagnostic::new(
+                        ::yaml_rt::DiagnosticKind::Typed,
+                        "cannot insert a standalone YAML tuple struct without collection context",
+                        ::yaml_rt::Span::empty(0),
+                    ))
+                })?;
+                if !matches!(doc.semantic_kind(node), Some(::yaml_rt::SemanticKind::Sequence { .. })) {
+                    return Err(::yaml_rt::__typed_node_error(
+                        doc,
+                        node,
+                        concat!("YAML tuple struct `", stringify!(#name), "` requires a sequence"),
+                        &["a YAML sequence"],
+                    ));
+                }
+                let __yaml_rt_items = doc.sequence_items(node).collect::<::std::vec::Vec<_>>();
+                if __yaml_rt_items.len() != #arity {
+                    return Err(::yaml_rt::__typed_node_error(
+                        doc,
+                        node,
+                        format!(
+                            "YAML tuple struct `{}` expects {} fields, found {}",
+                            stringify!(#name),
+                            #arity,
+                            __yaml_rt_items.len(),
+                        ),
+                        &[concat!(#arity, " sequence items")],
+                    ));
+                }
+                let Self(#(#bindings),*) = self;
+                #(#writes)*
+                Ok(node)
+            }
+        }
+
+        impl #write_impl_generics ::yaml_rt::ToYamlFragment for #name #write_type_generics #write_where_clause {
+            fn to_yaml_fragment(
+                &self,
+                indent: usize,
+                line_ending: &str,
+            ) -> Result<String, ::yaml_rt::YamlError> {
+                let Self(#(#bindings),*) = self;
+                let __yaml_rt_fields = [#(#fragments),*];
+                Ok(::yaml_rt::__sequence_fields_to_yaml_fragment(
+                    &__yaml_rt_fields,
+                    indent,
+                    line_ending,
+                ))
             }
         }
     })
@@ -1209,6 +1500,20 @@ fn parse_payload_field(
     read_bounds: &mut Vec<WherePredicate>,
     write_bounds: &mut Vec<WherePredicate>,
 ) -> syn::Result<PayloadField> {
+    parse_unnamed_field(
+        field,
+        read_bounds,
+        write_bounds,
+        "unnamed enum fields support only yaml(with)",
+    )
+}
+
+fn parse_unnamed_field(
+    field: syn::Field,
+    read_bounds: &mut Vec<WherePredicate>,
+    write_bounds: &mut Vec<WherePredicate>,
+    unsupported_message: &str,
+) -> syn::Result<PayloadField> {
     let options = parse_field_options(&field.attrs)?;
     if options.rename.is_some()
         || !options.aliases.is_empty()
@@ -1218,10 +1523,7 @@ fn parse_payload_field(
         || options.skip_serializing_if.is_some()
         || options.flatten
     {
-        return Err(syn::Error::new_spanned(
-            &field,
-            "unnamed enum fields support only yaml(with)",
-        ));
+        return Err(syn::Error::new_spanned(&field, unsupported_message));
     }
     let ty = field.ty;
     if let Some(with) = &options.with {
@@ -2378,6 +2680,40 @@ mod tests {
             payload_error
                 .to_string()
                 .contains("unnamed enum fields support only yaml(with)")
+        );
+    }
+
+    #[test]
+    fn tuple_and_unit_struct_attributes_report_targeted_errors() {
+        let tuple_field: DeriveInput = syn::parse_quote! {
+            struct Invalid(#[yaml(default)] u16, bool);
+        };
+        let tuple_container: DeriveInput = syn::parse_quote! {
+            #[yaml(rename_all = "lowercase")]
+            struct Invalid(u16, bool);
+        };
+        let unit_container: DeriveInput = syn::parse_quote! {
+            #[yaml(rename_all = "lowercase")]
+            struct Invalid;
+        };
+
+        assert!(
+            expand_yaml_rt(tuple_field)
+                .expect_err("tuple field attribute must fail")
+                .to_string()
+                .contains("tuple struct fields support only yaml(with)")
+        );
+        assert!(
+            expand_yaml_rt(tuple_container)
+                .expect_err("tuple container attribute must fail")
+                .to_string()
+                .contains("tuple structs do not support container-level yaml attributes")
+        );
+        assert!(
+            expand_yaml_rt(unit_container)
+                .expect_err("unit container attribute must fail")
+                .to_string()
+                .contains("unit structs do not support container-level yaml attributes")
         );
     }
 }

@@ -525,6 +525,20 @@ where
 }
 
 #[doc(hidden)]
+pub fn __read_yaml_null(doc: &YamlDoc, node: NodeId) -> Result<(), YamlError> {
+    if matches!(resolved_scalar_at(doc, node)?, ResolvedScalar::Null) {
+        Ok(())
+    } else {
+        Err(__typed_node_error(
+            doc,
+            node,
+            "expected YAML null for unit struct",
+            &["a YAML null scalar"],
+        ))
+    }
+}
+
+#[doc(hidden)]
 pub fn __write_yaml_document<T>(value: &T, doc: &mut YamlDoc) -> Result<(), YamlError>
 where
     T: YamlValue,

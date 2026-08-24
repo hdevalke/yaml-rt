@@ -66,6 +66,10 @@ name = "derive_newtypes"
 required-features = ["derive"]
 
 [[test]]
+name = "derive_struct_shapes"
+required-features = ["derive"]
+
+[[test]]
 name = "usefulness_target"
 required-features = ["derive"]
 

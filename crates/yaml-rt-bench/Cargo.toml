@@ -28,11 +28,11 @@ harness = false
 criterion = "0.8.2"
 
 [dependencies]
-saphyr = { version = "0.0.6", optional = true }
+saphyr = { version = "0.0.12", optional = true }
 yaml-rt-core.workspace = true
 
 [build-dependencies]
-cc = "1.2.65"
+cc = "1.4.4"
 
 [features]
 baselines = ["rapidyaml-baseline", "saphyr-baseline"]

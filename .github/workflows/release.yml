@@ -209,11 +209,25 @@ jobs:
           --workspace
           --exclude yaml-rt-bench
           --no-confirm
+      - name: Prepare release commit message
+        id: release-config
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_CONFIG="${RUNNER_TEMP}/cargo-release.toml"
+          COMMIT_MESSAGE="chore: release v${VERSION}"
+          printf 'pre-release-commit-message = "%s"\n' "${COMMIT_MESSAGE}" > "${RELEASE_CONFIG}"
+          grep -Fqx "pre-release-commit-message = \"${COMMIT_MESSAGE}\"" "${RELEASE_CONFIG}"
+          echo "Release commit message: ${COMMIT_MESSAGE}"
+          echo "path=${RELEASE_CONFIG}" >> "${GITHUB_OUTPUT}"
       - name: Create release commit and tag
         run: >-
           cargo release "${{ steps.version.outputs.version }}"
           --workspace
           --exclude yaml-rt-bench
+          --config "${{ steps.release-config.outputs.path }}"
           --execute
           --no-confirm
           --no-publish

@@ -402,6 +402,11 @@ evaluation uses the YAML 1.2 core schema and rejects YAML values that are not
 JSON-compatible, including non-string or duplicate mapping keys and non-finite
 numbers.
 
+Each operation has a short alias: `v` for `validate`, `q` for `query`, `g` for
+`get`, `a` for `add`, `d` for `remove`, `r` for `replace`, `k` for
+`rename-key`, `m` for `move`, `c` for `copy`, `t` for `test`, and `p` for
+`patch`.
+
 `get`, `add`, `remove`, `replace`, `rename-key`, and `test` also accept
 `--query QUERY` in place of their positional JSON Pointer. `get --query` emits
 each match as a separate `---` YAML document in nodelist order. Query-targeted

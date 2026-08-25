@@ -33,6 +33,13 @@ fn help_and_version_report_distribution_metadata() {
         .unwrap();
     assert!(help.status.success(), "{:?}", help.stderr);
     assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: yaml-rt"));
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    for alias in ["v", "q", "g", "a", "d", "r", "k", "m", "c", "t", "p"] {
+        assert!(
+            help_text.contains(&format!("alias: {alias}")),
+            "{help_text}"
+        );
+    }
     assert!(help.stderr.is_empty());
 
     for operation in ["get", "add", "remove", "replace", "rename-key", "test"] {
@@ -52,6 +59,45 @@ fn help_and_version_report_distribution_metadata() {
         assert!(help.status.success(), "{:?}", help.stderr);
         assert!(!String::from_utf8_lossy(&help.stdout).contains("--query"));
     }
+}
+
+#[test]
+fn short_aliases_match_their_canonical_commands() {
+    let directory = temp_dir();
+    let input = directory.join("document.yaml");
+    fs::write(&input, "value: 1\n").unwrap();
+    let input = input.to_str().unwrap();
+    let cases: [(&str, &str, &[&str]); 11] = [
+        ("validate", "v", &[input]),
+        ("query", "q", &["$.value", input]),
+        ("get", "g", &["/value", input]),
+        ("add", "a", &["/added", "--value", "2", input]),
+        ("remove", "d", &["/value", input]),
+        ("replace", "r", &["/value", "--value", "2", input]),
+        ("rename-key", "k", &["/value", "--to", "renamed", input]),
+        ("move", "m", &["/value", "/moved", input]),
+        ("copy", "c", &["/value", "/copied", input]),
+        ("test", "t", &["/value", "--value", "1", input]),
+        ("patch", "p", &["--patch", "[]", input]),
+    ];
+
+    for (canonical, alias, arguments) in cases {
+        let canonical_output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .arg(canonical)
+            .args(arguments)
+            .output()
+            .unwrap();
+        let alias_output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .arg(alias)
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(alias_output.status, canonical_output.status, "{alias}");
+        assert_eq!(alias_output.stdout, canonical_output.stdout, "{alias}");
+        assert_eq!(alias_output.stderr, canonical_output.stderr, "{alias}");
+    }
+
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

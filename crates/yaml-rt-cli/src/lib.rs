@@ -105,26 +105,37 @@ struct Cli {
 #[derive(Subcommand)]
 enum Operation {
     /// Validate YAML syntax without producing output.
+    #[command(visible_alias = "v")]
     Validate(ValidateArgs),
     /// Search a YAML document with RFC 9535 `JSONPath`.
+    #[command(visible_alias = "q")]
     Query(QueryArgs),
     /// Print a selected YAML node.
+    #[command(visible_alias = "g")]
     Get(ReadArgs),
     /// Add or replace a value.
+    #[command(visible_alias = "a")]
     Add(ValueMutationArgs),
     /// Remove an existing value.
+    #[command(visible_alias = "d")]
     Remove(MutationArgs),
     /// Replace an existing value.
+    #[command(visible_alias = "r")]
     Replace(ValueMutationArgs),
     /// Rename one or more mapping keys.
+    #[command(visible_alias = "k")]
     RenameKey(RenameKeyArgs),
     /// Move an existing value.
+    #[command(visible_alias = "m")]
     Move(FromMutationArgs),
     /// Copy an existing value.
+    #[command(visible_alias = "c")]
     Copy(FromMutationArgs),
     /// Test semantic equality at a path.
+    #[command(visible_alias = "t")]
     Test(ValueArgs),
     /// Apply a transactional YAML or JSON patch document.
+    #[command(visible_alias = "p")]
     Patch(PatchArgs),
 }
 

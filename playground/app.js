@@ -1,9 +1,9 @@
 import { basicSetup } from "https://esm.sh/codemirror@6.0.2?deps=@codemirror/state@6.7.1,@codemirror/view@6.43.9";
-import { EditorState, StateEffect, StateField } from "https://esm.sh/@codemirror/state@6.7.1";
-import { Decoration, EditorView } from "https://esm.sh/@codemirror/view@6.43.9";
+import { EditorState, RangeSet, StateEffect, StateField } from "https://esm.sh/@codemirror/state@6.7.1";
+import { Decoration, EditorView, GutterMarker, gutter, lineNumbers } from "https://esm.sh/@codemirror/view@6.43.9";
 import { yaml } from "https://esm.sh/@codemirror/lang-yaml@6.1.3?deps=@codemirror/state@6.7.1,@codemirror/view@6.43.9";
 import init, { run_command } from "./pkg/yaml_rt_wasm.js";
-import { copyText, resultPresentation } from "./state.mjs";
+import { copyText, lineDiff, resultPresentation } from "./state.mjs";
 
 const baseSource = `# Production services — comments and style stay put
 services:
@@ -40,6 +40,7 @@ const controls = {
 
 const setChangedLines = StateEffect.define();
 const setErrorLine = StateEffect.define();
+const setDeletedLines = StateEffect.define();
 const changedLines = StateField.define({
   create: () => Decoration.none,
   update(value, transaction) {
@@ -62,6 +63,34 @@ const errorLine = StateField.define({
   },
   provide: (field) => EditorView.decorations.from(field),
 });
+class DeletedLineMarker extends GutterMarker {
+  constructor(removedLines) {
+    super();
+    this.removedLines = removedLines;
+  }
+
+  toDOM() {
+    const marker = document.createElement("span");
+    const count = this.removedLines.length;
+    const label = `${count} deleted line${count === 1 ? "" : "s"}:\n${this.removedLines.join("\n")}`;
+    marker.className = "cm-deleted-line-marker";
+    marker.title = label;
+    marker.setAttribute("aria-label", label);
+    marker.textContent = "−";
+    return marker;
+  }
+}
+const deletedLines = StateField.define({
+  create: () => RangeSet.empty,
+  update(value, transaction) {
+    value = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(setDeletedLines)) value = effect.value;
+    }
+    return value;
+  },
+  provide: (field) => gutter({ class: "cm-deletion-gutter", markers: (view) => view.state.field(field) }),
+});
 
 function editor(parent, text, readOnly, onChange) {
   return new EditorView({
@@ -70,11 +99,13 @@ function editor(parent, text, readOnly, onChange) {
       doc: text,
       extensions: [
         basicSetup,
+        lineNumbers(),
         yaml(),
         EditorView.lineWrapping,
         EditorState.readOnly.of(readOnly),
         changedLines,
         errorLine,
+        deletedLines,
         EditorView.updateListener.of((update) => {
           if (update.docChanged && onChange) onChange();
         }),
@@ -134,46 +165,23 @@ function updateFields() {
   commandPreview();
 }
 
-function changedLineNumbers(before, after) {
-  const left = before.split(/\r?\n/);
-  const right = after.split(/\r?\n/);
-  if (left.length * right.length <= 250000) {
-    const lengths = Array.from({ length: left.length + 1 }, () => new Uint32Array(right.length + 1));
-    for (let i = left.length - 1; i >= 0; i--) {
-      for (let j = right.length - 1; j >= 0; j--) {
-        lengths[i][j] = left[i] === right[j]
-          ? lengths[i + 1][j + 1] + 1
-          : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
-      }
-    }
-    const changed = [];
-    let i = 0;
-    let j = 0;
-    while (i < left.length && j < right.length) {
-      if (left[i] === right[j]) { i++; j++; }
-      else if (lengths[i + 1][j] >= lengths[i][j + 1]) i++;
-      else { changed.push(j + 1); j++; }
-    }
-    while (j < right.length) changed.push(++j);
-    return changed;
-  }
-  let prefix = 0;
-  while (prefix < left.length && prefix < right.length && left[prefix] === right[prefix]) prefix++;
-  let suffix = 0;
-  while (suffix < left.length - prefix && suffix < right.length - prefix && left[left.length - 1 - suffix] === right[right.length - 1 - suffix]) suffix++;
-  const lines = [];
-  for (let line = prefix + 1; line <= right.length - suffix; line++) lines.push(line);
-  return lines;
-}
-
 function markChanges(before, after) {
   const decorations = [];
-  for (const number of changedLineNumbers(before, after)) {
+  const deletionMarkers = [];
+  const diff = lineDiff(before, after);
+  for (const number of diff.changedLines) {
     if (number <= resultEditor.state.doc.lines) {
       decorations.push(Decoration.line({ class: "cm-changed-line" }).range(resultEditor.state.doc.line(number).from));
     }
   }
-  resultEditor.dispatch({ effects: setChangedLines.of(Decoration.set(decorations, true)) });
+  for (const deletion of diff.deletions) {
+    const line = resultEditor.state.doc.line(Math.max(1, deletion.line));
+    deletionMarkers.push(new DeletedLineMarker(deletion.removedLines).range(line.from));
+  }
+  resultEditor.dispatch({ effects: [
+    setChangedLines.of(Decoration.set(decorations, true)),
+    setDeletedLines.of(RangeSet.of(deletionMarkers, true)),
+  ] });
 }
 
 function setDocuments(count) {
@@ -191,6 +199,19 @@ function clearDiagnostics() {
   }
 }
 
+function codeUnitOffset(source, byteOffset) {
+  const target = Math.max(0, byteOffset);
+  let bytes = 0;
+  let units = 0;
+  for (const character of source) {
+    const width = new TextEncoder().encode(character).length;
+    if (bytes + width > target) break;
+    bytes += width;
+    units += character.length;
+  }
+  return units;
+}
+
 function markDiagnostic(result) {
   const field = {
     patch: controls.patch,
@@ -203,8 +224,13 @@ function markDiagnostic(result) {
     field.setAttribute("aria-invalid", "true");
   }
   if (result.error_source === "document" && result.line && result.line <= sourceEditor.state.doc.lines) {
-    const position = sourceEditor.state.doc.line(result.line).from;
-    sourceEditor.dispatch({ effects: setErrorLine.of(Decoration.set([Decoration.line({ class: "cm-error-line" }).range(position)])) });
+    const source = text(sourceEditor);
+    const start = codeUnitOffset(source, result.span_start ?? 0);
+    const end = codeUnitOffset(source, result.span_end ?? result.span_start ?? 0);
+    const decoration = end > start
+      ? Decoration.mark({ class: "cm-error-range" }).range(start, end)
+      : Decoration.line({ class: "cm-error-line" }).range(sourceEditor.state.doc.line(result.line).from);
+    sourceEditor.dispatch({ effects: setErrorLine.of(Decoration.set([decoration])) });
   }
 }
 
@@ -233,7 +259,10 @@ function run() {
     document_count: wasmResult.document_count,
     error_source: wasmResult.error_source,
     message: wasmResult.message,
+    rendered_diagnostic: wasmResult.rendered_diagnostic,
     operation_index: wasmResult.operation_index,
+    span_start: wasmResult.span_start,
+    span_end: wasmResult.span_end,
     line: wasmResult.line,
     column: wasmResult.column,
   };
@@ -243,7 +272,10 @@ function run() {
   replaceText(resultEditor, presentation.content);
   $("result-title").textContent = presentation.title;
   if (presentation.highlightChanges) markChanges(source, presentation.content);
-  else resultEditor.dispatch({ effects: setChangedLines.of(Decoration.none) });
+  else resultEditor.dispatch({ effects: [
+    setChangedLines.of(Decoration.none),
+    setDeletedLines.of(RangeSet.empty),
+  ] });
   $("match-summary").hidden = !presentation.showMatchCount;
   if (presentation.showMatchCount) {
     const count = result.matched_pointers.length;
@@ -258,7 +290,8 @@ function run() {
     $("run-state").className = "status error";
     const location = result.line ? ` at ${result.line}:${result.column}` : "";
     const operation = result.operation_index != null ? ` (operation ${result.operation_index})` : "";
-    $("diagnostic").textContent = `${result.error_source || "command"}${operation}${location}: ${result.message || "Unknown error"}`;
+    $("diagnostic").textContent = result.rendered_diagnostic
+      || `${result.error_source || "command"}${operation}${location}: ${result.message || "Unknown error"}`;
     $("diagnostic").hidden = false;
     markDiagnostic(result);
   }

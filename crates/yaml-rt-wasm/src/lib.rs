@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use wasm_bindgen::prelude::*;
-use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment, YamlPatch};
+use yaml_rt_core::{Diagnostic, DiagnosticKind, JsonPointer, YamlDoc, YamlFragment, YamlPatch};
 use yaml_rt_rfc9535::{JsonPath, QueryMatches};
 
 /// Structured command request shared by native tests and the WASM adapter.
@@ -32,6 +32,7 @@ pub struct CommandResult {
     pub document_count: usize,
     pub error_source: Option<String>,
     pub message: Option<String>,
+    pub rendered_diagnostic: Option<String>,
     pub operation_index: Option<usize>,
     pub span_start: Option<u32>,
     pub span_end: Option<u32>,
@@ -68,9 +69,14 @@ pub fn execute(request: &CommandRequest) -> CommandResult {
         Ok(doc) => doc,
         Err(error) => {
             let diagnostic = error.diagnostic;
+            let rendered_diagnostic = diagnostic
+                .render(&request.source)
+                .with_source_name("<input>")
+                .to_string();
             return CommandResult {
                 error_source: Some("document".to_owned()),
                 message: Some(diagnostic.to_string()),
+                rendered_diagnostic: Some(rendered_diagnostic),
                 span_start: Some(diagnostic.span.start),
                 span_end: Some(diagnostic.span.end),
                 line: diagnostic.position.map(|position| position.line),
@@ -158,9 +164,17 @@ fn execute_patch(
         Ok(patch) => patch,
         Err(error) => {
             let span = error.span();
+            let message = error.to_string();
+            let rendered_diagnostic = span.map(|span| {
+                Diagnostic::new(DiagnosticKind::Parser, &message, span)
+                    .render(source)
+                    .with_source_name("<patch>")
+                    .to_string()
+            });
             return CommandResult {
                 error_source: Some("patch".to_owned()),
-                message: Some(error.to_string()),
+                message: Some(message),
+                rendered_diagnostic,
                 operation_index: error.operation_index(),
                 span_start: span.map(|span| span.start),
                 span_end: span.map(|span| span.end),
@@ -175,9 +189,17 @@ fn execute_patch(
         }
         Err(error) => {
             let span = error.span();
+            let message = error.to_string();
+            let rendered_diagnostic = span.map(|span| {
+                Diagnostic::new(DiagnosticKind::Semantic, &message, span)
+                    .render(source)
+                    .with_source_name("<patch>")
+                    .to_string()
+            });
             CommandResult {
                 error_source: Some("application".to_owned()),
-                message: Some(error.to_string()),
+                message: Some(message),
+                rendered_diagnostic,
                 operation_index: error.operation_index(),
                 span_start: span.map(|span| span.start),
                 span_end: span.map(|span| span.end),
@@ -606,6 +628,10 @@ impl WasmCommandResult {
         self.0.message.clone()
     }
     #[wasm_bindgen(getter)]
+    pub fn rendered_diagnostic(&self) -> Option<String> {
+        self.0.rendered_diagnostic.clone()
+    }
+    #[wasm_bindgen(getter)]
     pub fn operation_index(&self) -> Option<usize> {
         self.0.operation_index
     }
@@ -800,6 +826,37 @@ mod tests {
         assert!(!result.ok);
         assert_eq!(result.error_source.as_deref(), Some("document"));
         assert!(result.line.is_some());
+        let rendered = result.rendered_diagnostic.as_deref().unwrap();
+        assert!(rendered.contains("error[parser]"), "{rendered}");
+        assert!(rendered.contains("--> <input>:2:"), "{rendered}");
+        assert!(rendered.contains("1 | a: ["), "{rendered}");
+        assert!(rendered.contains('^'), "{rendered}");
+        assert!(rendered.contains("expected"), "{rendered}");
+    }
+
+    #[test]
+    fn patch_diagnostics_render_spans_against_patch_source() {
+        let mut malformed = request("patch");
+        malformed.patch = Some("- op: replace\n  path: [\n".to_owned());
+        let result = execute(&malformed);
+        let rendered = result.rendered_diagnostic.as_deref().unwrap();
+        assert_eq!(result.error_source.as_deref(), Some("patch"));
+        assert!(rendered.contains("--> <patch>:3:"), "{rendered}");
+        assert!(rendered.contains("2 |   path: ["), "{rendered}");
+
+        let mut failed = request("patch");
+        failed.patch = Some("- op: test\n  path: /services/0/port\n  value: 999\n".to_owned());
+        let result = execute(&failed);
+        let rendered = result.rendered_diagnostic.as_deref().unwrap();
+        assert_eq!(result.error_source.as_deref(), Some("application"));
+        assert!(rendered.contains("error[semantic]"), "{rendered}");
+        assert!(rendered.contains("--> <patch>:1:"), "{rendered}");
+
+        let mut unspanned = request("patch");
+        unspanned.patch = None;
+        let result = execute(&unspanned);
+        assert!(result.rendered_diagnostic.is_none());
+        assert!(result.message.is_some());
     }
 
     #[test]

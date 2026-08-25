@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { copyText, resultPresentation } from "./state.mjs";
+import { copyText, lineDiff, resultPresentation } from "./state.mjs";
 
 test("read commands put command output in the right pane", () => {
   const presentation = resultPresentation(
@@ -48,4 +48,38 @@ test("copy falls back when clipboard access is unavailable or rejected", async (
   assert.equal(fallbackValue, "result");
 
   assert.equal(await copyText("result", { clipboard: undefined, fallback: () => false }), false);
+});
+
+test("line diff reports insertions and replacements as changed output lines", () => {
+  assert.deepEqual(lineDiff("a\nb\nc", "a\nnew\nb\nc"), {
+    changedLines: [2],
+    deletions: [],
+  });
+  assert.deepEqual(lineDiff("a\nb\nc", "a\nnew\nc"), {
+    changedLines: [2],
+    deletions: [{ line: 2, removedLines: ["b"] }],
+  });
+});
+
+test("line diff anchors deleted runs at the nearest output line", () => {
+  assert.deepEqual(lineDiff("first\na\nb\nlast", "a\nb\nlast"), {
+    changedLines: [],
+    deletions: [{ line: 1, removedLines: ["first"] }],
+  });
+  assert.deepEqual(lineDiff("first\na\nb\nlast", "first\nlast"), {
+    changedLines: [],
+    deletions: [{ line: 2, removedLines: ["a", "b"] }],
+  });
+  assert.deepEqual(lineDiff("first\na\nb", "first"), {
+    changedLines: [],
+    deletions: [{ line: 1, removedLines: ["a", "b"] }],
+  });
+});
+
+test("line diff handles unchanged and CRLF documents", () => {
+  assert.deepEqual(lineDiff("a\r\nb\r\n", "a\r\nb\r\n"), { changedLines: [], deletions: [] });
+  assert.deepEqual(lineDiff("a\r\nb\r\nc", "a\r\nc"), {
+    changedLines: [],
+    deletions: [{ line: 2, removedLines: ["b"] }],
+  });
 });

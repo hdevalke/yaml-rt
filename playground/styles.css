@@ -105,9 +105,13 @@ h1, h2 { margin: 0; font-size: .94rem; }
 .editor { height: 620px; }
 .cm-editor { height: 100%; background: transparent; }
 .cm-scroller { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace !important; font-size: 13px; line-height: 1.58; }
+.cm-lineNumbers + .cm-lineNumbers { display: none; }
 .cm-focused { outline: 2px solid rgb(212 86 44 / 25%) !important; outline-offset: -2px; }
 .cm-changed-line { background: var(--change-wash); box-shadow: inset 3px 0 var(--change); }
 .cm-error-line { background: rgb(165 42 42 / 13%); box-shadow: inset 3px 0 var(--danger); }
+.cm-error-range { border-bottom: 2px solid var(--danger); background: rgb(165 42 42 / 18%); }
+.cm-deletion-gutter { width: 16px; }
+.cm-deleted-line-marker { display: block; color: var(--danger); font-weight: 900; cursor: help; text-align: center; }
 
 .command-panel { padding-bottom: 14px; overflow-y: auto; }
 .command-form { display: grid; gap: 11px; padding: 14px; }
@@ -122,7 +126,7 @@ h1, h2 { margin: 0; font-size: .94rem; }
 .command-preview-wrap code { overflow-wrap: anywhere; font-size: .78rem; }
 .command-preview-wrap .icon-button { float: right; margin: -5px -5px 0 8px; border-color: #59635e; background: transparent; color: var(--code-ink); }
 .actions { padding: 0 14px; }
-.diagnostic { margin: 12px 14px 0; padding: 10px; border-left: 3px solid var(--danger); background: rgb(165 42 42 / 9%); color: var(--danger); font-size: .82rem; line-height: 1.4; }
+.diagnostic { max-height: 240px; overflow: auto; margin: 12px 14px 0; padding: 10px; border-left: 3px solid var(--danger); background: rgb(165 42 42 / 9%); color: var(--danger); font: .78rem/1.45 ui-monospace, monospace; white-space: pre; }
 .match-summary { margin: 12px 14px 0; color: var(--muted); font-size: .78rem; }
 .output-heading { display: flex; justify-content: space-between; margin-bottom: 6px; }
 .command-output { margin: 0; }

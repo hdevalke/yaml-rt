@@ -25,7 +25,9 @@ Try the [yaml-rt command playground](https://hdevalke.github.io/yaml-rt/) to
 query and edit YAML directly in a browser. It showcases every CLI operation,
 exact RFC 6901 JSON Pointer targets, multi-target RFC 9535 JSONPath selection,
 and transactional YAML or JSON patches while displaying the minimally changed
-document beside the original.
+document beside the original. Both editors show line numbers, changed output
+lines are highlighted, and gutter markers identify source lines removed by an
+edit. Source-aware failures use the same rustc-style diagnostics as the CLI.
 
 The playground runs the Rust parser and editor locally through WebAssembly.
 Documents are not uploaded to a server. Its interface is plain HTML, CSS, and

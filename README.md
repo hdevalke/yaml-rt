@@ -354,6 +354,26 @@ presentation must be retained.
 The CLI queries YAML with RFC 9535 JSONPath and applies JSON Pointer operations
 while preserving the rest of the document:
 
+Invalid YAML is reported with a source excerpt and an underline at the failing
+span, including the file path (or `<stdin>`), line, and column. The binary uses
+standard terminal colors when stderr is interactive, stays plain when output is
+redirected, and honors `NO_COLOR`.
+
+Library users can render the same dependency-free diagnostic format directly:
+
+```rust
+use yaml_rt_core::{DiagnosticColor, YamlDoc};
+
+let input = "items: [a, , b]\n";
+let error = YamlDoc::parse(input).unwrap_err();
+let rendered = error
+    .render(input)
+    .with_source_name("config.yaml")
+    .with_color(DiagnosticColor::Never)
+    .to_string();
+assert!(rendered.contains("--> config.yaml:1:"));
+```
+
 ```sh
 # Find every service port and print JSON Pointer/value pairs.
 yaml-rt query '$.services[*].port' config.yaml

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
-use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment, YamlPatch};
+use yaml_rt_core::{DiagnosticColor, JsonPointer, YamlDoc, YamlError, YamlFragment, YamlPatch};
 use yaml_rt_rfc9535::{JsonPath, QueryMatches};
 
 mod query;
@@ -33,6 +33,28 @@ pub fn run<I, T>(
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    run_with_options(args, stdin, stdout, stderr, RunOptions::default())
+}
+
+/// Controls presentation for [`run_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Whether source-aware YAML diagnostics use ANSI colors.
+    pub color: bool,
+}
+
+/// Runs the command-line application with explicit presentation options.
+pub fn run_with_options<I, T>(
+    args: I,
+    stdin: &mut dyn Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    options: RunOptions,
 ) -> i32
 where
     I: IntoIterator<Item = T>,
@@ -63,7 +85,7 @@ where
         }
         return USAGE;
     }
-    match execute(&cli.operation, stdin, stdout) {
+    match execute(&cli.operation, stdin, stdout, options) {
         Ok(()) | Err(RunError::BrokenPipe) => 0,
         Err(RunError::Usage(message)) => {
             let error = Cli::command().error(ErrorKind::ArgumentConflict, message);
@@ -84,6 +106,10 @@ where
         }
         Err(RunError::Message(message)) => {
             let _ = writeln!(stderr, "yaml-rt: {message}");
+            FAILURE
+        }
+        Err(RunError::Diagnostic(diagnostic)) => {
+            let _ = writeln!(stderr, "{diagnostic}");
             FAILURE
         }
     }
@@ -296,6 +322,7 @@ fn execute(
     operation: &Operation,
     stdin: &mut dyn Read,
     stdout: &mut dyn Write,
+    options: RunOptions,
 ) -> Result<(), RunError> {
     let targets = resolve_targets(operation.input_path())?;
     if matches!(targets, InputTargets::Batch { .. })
@@ -319,16 +346,31 @@ fn execute(
     match targets {
         InputTargets::Stdin => {
             let input = read_stream(stdin, "stdin")?;
-            execute_one(operation, &prepared, None, input, stdout, false)
+            execute_one(operation, &prepared, None, input, stdout, false, options)
         }
         InputTargets::File(path) => {
             let input = read_target(&path)?;
-            execute_one(operation, &prepared, Some(&path), input, stdout, false)
+            execute_one(
+                operation,
+                &prepared,
+                Some(&path),
+                input,
+                stdout,
+                false,
+                options,
+            )
         }
         InputTargets::Batch {
             files,
             discovery_failures,
-        } => execute_batch(operation, &prepared, &files, discovery_failures, stdout),
+        } => execute_batch(
+            operation,
+            &prepared,
+            &files,
+            discovery_failures,
+            stdout,
+            options,
+        ),
     }
 }
 
@@ -339,8 +381,13 @@ fn execute_one(
     input: String,
     stdout: &mut dyn Write,
     batch_capture: bool,
+    options: RunOptions,
 ) -> Result<(), RunError> {
-    let mut doc = YamlDoc::parse_owned(input).map_err(RunError::display)?;
+    let source_name = input_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<stdin>".to_owned());
+    let mut doc = YamlDoc::parse(&input)
+        .map_err(|error| RunError::yaml_diagnostic(error, &input, &source_name, options.color))?;
     if matches!(operation, Operation::Validate(_)) {
         return Ok(());
     }
@@ -418,7 +465,9 @@ fn execute_one(
             let node = doc
                 .resolve_pointer(document, path)
                 .map_err(RunError::display)?;
-            let output = doc.extract_node(node).map_err(RunError::display)?;
+            let output = doc.extract_node(node).map_err(|error| {
+                RunError::yaml_diagnostic(error, doc.as_source(), &source_name, options.color)
+            })?;
             write_result(
                 output.as_bytes(),
                 if batch_capture {
@@ -655,6 +704,7 @@ fn execute_batch(
     files: &[BatchTarget],
     discovery_failures: Vec<DiscoveryFailure>,
     stdout: &mut dyn Write,
+    options: RunOptions,
 ) -> Result<(), RunError> {
     if let Some(output) = operation.read_output()
         && let Some(input) = files
@@ -698,6 +748,7 @@ fn execute_batch(
             source,
             &mut result,
             true,
+            options,
         ) {
             Ok(()) => {
                 succeeded += 1;
@@ -707,6 +758,10 @@ fn execute_batch(
             }
             Err(RunError::Message(message)) => {
                 diagnostics.push(format!("{}: {message}", render_batch_path(&input.relative)));
+                failed += 1;
+            }
+            Err(RunError::Diagnostic(diagnostic)) => {
+                diagnostics.push(diagnostic);
                 failed += 1;
             }
             Err(error) => return Err(error),
@@ -1300,6 +1355,7 @@ impl Drop for TempGuard {
 enum RunError {
     BrokenPipe,
     Message(String),
+    Diagnostic(String),
     Usage(String),
     Batch {
         diagnostics: Vec<String>,
@@ -1318,6 +1374,21 @@ impl RunError {
 
     fn display(error: impl std::fmt::Display) -> Self {
         Self::Message(error.to_string())
+    }
+
+    fn yaml_diagnostic(error: YamlError, source: &str, source_name: &str, color: bool) -> Self {
+        let color = if color {
+            DiagnosticColor::Always
+        } else {
+            DiagnosticColor::Never
+        };
+        Self::Diagnostic(
+            error
+                .render(source)
+                .with_source_name(source_name)
+                .with_color(color)
+                .to_string(),
+        )
     }
 
     fn io(error: &io::Error) -> Self {
@@ -1345,6 +1416,46 @@ mod tests {
             String::from_utf8(stdout).unwrap(),
             String::from_utf8(stderr).unwrap(),
         )
+    }
+
+    #[test]
+    fn validation_errors_render_source_aware_diagnostics() {
+        let input = "enabled: true\nitems: [a, , b]\n";
+        let mut stdin = input.as_bytes();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = run(
+            ["yaml-rt", "validate", "-"],
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        );
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert_eq!(status, 1, "{stderr}");
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("error[parser]:"), "{stderr}");
+        assert!(stderr.contains(" --> <stdin>:2:"), "{stderr}");
+        assert!(stderr.contains("2 | items: [a, , b]"), "{stderr}");
+        assert!(stderr.contains('^'), "{stderr}");
+        assert!(!stderr.contains("\x1b["), "{stderr:?}");
+    }
+
+    #[test]
+    fn explicit_cli_color_uses_standard_ansi_colors() {
+        let mut stdin = "[\n".as_bytes();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = run_with_options(
+            ["yaml-rt", "validate", "-"],
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            RunOptions { color: true },
+        );
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert_eq!(status, 1, "{stderr}");
+        assert!(stderr.contains("\x1b[1;31merror\x1b[0m"), "{stderr:?}");
+        assert!(stderr.contains("\x1b[1;34m-->\x1b[0m"), "{stderr:?}");
     }
 
     #[test]

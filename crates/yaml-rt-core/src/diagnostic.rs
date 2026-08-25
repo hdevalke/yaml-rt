@@ -25,6 +25,12 @@ impl YamlError {
         }
         self
     }
+
+    /// Creates a source-aware renderer for this error.
+    #[must_use]
+    pub fn render<'a>(&'a self, source: &'a str) -> DiagnosticRenderer<'a> {
+        self.diagnostic.render(source)
+    }
 }
 
 impl fmt::Display for YamlError {
@@ -86,6 +92,17 @@ impl Diagnostic {
         self.notes.push(note.into());
         self
     }
+
+    /// Creates a source-aware renderer for this diagnostic.
+    #[must_use]
+    pub const fn render<'a>(&'a self, source: &'a str) -> DiagnosticRenderer<'a> {
+        DiagnosticRenderer {
+            diagnostic: self,
+            source,
+            source_name: None,
+            color: DiagnosticColor::Never,
+        }
+    }
 }
 
 impl fmt::Display for Diagnostic {
@@ -123,6 +140,203 @@ pub enum DiagnosticKind {
     Typed,
     /// Emitter failure.
     Emitter,
+}
+
+impl DiagnosticKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Lexer => "lexer",
+            Self::Parser => "parser",
+            Self::Semantic => "semantic",
+            Self::Typed => "typed",
+            Self::Emitter => "emitter",
+        }
+    }
+}
+
+/// ANSI color policy for source-aware diagnostic rendering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiagnosticColor {
+    /// Never emit ANSI escape sequences.
+    #[default]
+    Never,
+    /// Use standard terminal foreground colors and bold emphasis.
+    Always,
+}
+
+/// A source-aware, rustc-style diagnostic display adapter.
+#[derive(Debug, Clone, Copy)]
+pub struct DiagnosticRenderer<'a> {
+    diagnostic: &'a Diagnostic,
+    source: &'a str,
+    source_name: Option<&'a str>,
+    color: DiagnosticColor,
+}
+
+impl<'a> DiagnosticRenderer<'a> {
+    /// Sets the filename or logical input name shown in the location header.
+    #[must_use]
+    pub const fn with_source_name(mut self, source_name: &'a str) -> Self {
+        self.source_name = Some(source_name);
+        self
+    }
+
+    /// Sets the ANSI color policy.
+    #[must_use]
+    pub const fn with_color(mut self, color: DiagnosticColor) -> Self {
+        self.color = color;
+        self
+    }
+
+    fn styled(
+        &self,
+        formatter: &mut fmt::Formatter<'_>,
+        code: &str,
+        value: impl fmt::Display,
+    ) -> fmt::Result {
+        if self.color == DiagnosticColor::Always {
+            write!(formatter, "\x1b[{code}m{value}\x1b[0m")
+        } else {
+            write!(formatter, "{value}")
+        }
+    }
+}
+
+impl fmt::Display for DiagnosticRenderer<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.styled(formatter, "1;31", "error")?;
+        write!(
+            formatter,
+            "[{}]: {}",
+            self.diagnostic.kind.label(),
+            self.diagnostic.message
+        )?;
+
+        let source_len = self.source.len();
+        let start = (self.diagnostic.span.start as usize).min(source_len);
+        let requested_end = self.diagnostic.span.end as usize;
+        let end = requested_end.max(start).min(source_len);
+        if !self.source.is_char_boundary(start) || !self.source.is_char_boundary(end) {
+            return write!(formatter, "\n{}", self.diagnostic);
+        }
+
+        let starts = line_starts(self.source);
+        let line_index = starts
+            .partition_point(|offset| *offset <= start)
+            .saturating_sub(1);
+        let line_start = starts[line_index];
+        let line_end = source_line_end(self.source, &starts, line_index);
+        let position = LineCol {
+            line: line_index + 1,
+            column: display_width(&self.source[line_start..start]) + 1,
+        };
+
+        write!(formatter, "\n ")?;
+        self.styled(formatter, "1;34", "-->")?;
+        write!(
+            formatter,
+            " {}:{}:{}",
+            self.source_name.unwrap_or("<input>"),
+            position.line,
+            position.column
+        )?;
+
+        let first_shown = line_index.saturating_sub(1);
+        let width = (line_index + 1).to_string().len();
+        write!(formatter, "\n{:width$} ", "", width = width)?;
+        self.styled(formatter, "1;34", "|")?;
+        for shown in first_shown..=line_index {
+            let shown_start = starts[shown];
+            let shown_end = source_line_end(self.source, &starts, shown);
+            let text = expand_tabs(&self.source[shown_start..shown_end]);
+            write!(formatter, "\n{:>width$} ", shown + 1, width = width)?;
+            self.styled(formatter, "1;34", "|")?;
+            write!(formatter, " {text}")?;
+        }
+
+        let prefix_width = display_width(&self.source[line_start..start]);
+        let underline_end = end.min(line_end);
+        let underline_width = if underline_end > start {
+            display_width(&self.source[start..underline_end]).max(1)
+        } else {
+            1
+        };
+        write!(formatter, "\n{:width$} ", "", width = width)?;
+        self.styled(formatter, "1;34", "|")?;
+        write!(formatter, " {}", " ".repeat(prefix_width))?;
+        self.styled(formatter, "1;31", "^".repeat(underline_width))?;
+        if !self.diagnostic.expected.is_empty() {
+            write!(
+                formatter,
+                " expected {}",
+                self.diagnostic.expected.join(", ")
+            )?;
+        }
+
+        let end_line = starts
+            .partition_point(|offset| *offset <= end)
+            .saturating_sub(1);
+        if end_line > line_index || requested_end > source_len {
+            write!(formatter, "\n{:width$} ", "", width = width)?;
+            self.styled(formatter, "1;34", "|")?;
+            write!(formatter, " ... span continues")?;
+        }
+        write!(formatter, "\n{:width$} ", "", width = width)?;
+        self.styled(formatter, "1;34", "|")?;
+
+        for note in &self.diagnostic.notes {
+            write!(formatter, "\n")?;
+            self.styled(formatter, "1;32", "note")?;
+            write!(formatter, ": {note}")?;
+        }
+        Ok(())
+    }
+}
+
+fn line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    starts.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    starts
+}
+
+fn source_line_end(source: &str, starts: &[usize], line_index: usize) -> usize {
+    let mut end = starts.get(line_index + 1).copied().unwrap_or(source.len());
+    if end > starts[line_index] && source.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > starts[line_index] && source.as_bytes()[end - 1] == b'\r' {
+        end -= 1;
+    }
+    end
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().fold(0, |width, character| match character {
+        '\t' => width + (4 - width % 4),
+        _ => width + 1,
+    })
+}
+
+fn expand_tabs(text: &str) -> String {
+    let mut expanded = String::with_capacity(text.len());
+    let mut width = 0;
+    for character in text.chars() {
+        if character == '\t' {
+            let spaces = 4 - width % 4;
+            expanded.push_str(&" ".repeat(spaces));
+            width += spaces;
+        } else {
+            expanded.push(character);
+            width += 1;
+        }
+    }
+    expanded
 }
 
 /// Alias for parse errors until richer phase-specific errors are introduced.

@@ -21,7 +21,9 @@ mod syntax;
 mod typed;
 mod value;
 
-pub use diagnostic::{Diagnostic, DiagnosticKind, ParseError, YamlError};
+pub use diagnostic::{
+    Diagnostic, DiagnosticColor, DiagnosticKind, DiagnosticRenderer, ParseError, YamlError,
+};
 pub use doc::{
     Edit, MappingEntryStyle, ReservedDirective, TagDirective, YamlDirective, YamlDoc, YamlEvents,
 };

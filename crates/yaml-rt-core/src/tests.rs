@@ -4867,3 +4867,63 @@ fn diagnostics_render_expected_items_and_notes() {
         "Parser: unexpected token (expected: mapping value, sequence entry)\nnote: while parsing a block collection"
     );
 }
+
+#[test]
+fn diagnostics_render_source_excerpts_and_color() {
+    let source = "enabled: true\nitems: [a, , b]\n";
+    let comma = source.find(", ,").unwrap() + 2;
+    let diagnostic = Diagnostic::new(
+        DiagnosticKind::Parser,
+        "unexpected comma in flow sequence",
+        Span::from_usize(comma, comma + 1),
+    )
+    .with_expected("a sequence entry")
+    .with_note("while parsing a flow sequence");
+
+    assert_eq!(
+        diagnostic
+            .render(source)
+            .with_source_name("config.yaml")
+            .to_string(),
+        "error[parser]: unexpected comma in flow sequence\n --> config.yaml:2:12\n  |\n1 | enabled: true\n2 | items: [a, , b]\n  |            ^ expected a sequence entry\n  |\nnote: while parsing a flow sequence"
+    );
+
+    let colored = diagnostic
+        .render(source)
+        .with_source_name("config.yaml")
+        .with_color(DiagnosticColor::Always)
+        .to_string();
+    assert!(colored.starts_with("\x1b[1;31merror\x1b[0m[parser]:"));
+    assert!(colored.contains("\x1b[1;34m-->\x1b[0m config.yaml:2:12"));
+    assert!(colored.contains("\x1b[1;31m^\x1b[0m expected a sequence entry"));
+    assert!(colored.ends_with("\x1b[1;32mnote\x1b[0m: while parsing a flow sequence"));
+}
+
+#[test]
+fn diagnostics_render_empty_multiline_and_untrusted_spans() {
+    let source = "first\r\n\tsecond\nthird\n";
+    let start = source.find("second").unwrap();
+    let multiline = Diagnostic::new(
+        DiagnosticKind::Lexer,
+        "unterminated scalar",
+        Span::from_usize(start, source.len()),
+    );
+    let rendered = multiline.render(source).to_string();
+    assert!(rendered.contains(" --> <input>:2:5"), "{rendered}");
+    assert!(rendered.contains("2 |     second"), "{rendered}");
+    assert!(rendered.contains("... span continues"), "{rendered}");
+
+    let eof = Diagnostic::new(
+        DiagnosticKind::Parser,
+        "expected value",
+        Span::empty_from_usize(source.len()),
+    )
+    .render(source)
+    .to_string();
+    assert!(eof.contains('^'), "{eof}");
+
+    let invalid = Diagnostic::new(DiagnosticKind::Source, "bad span", Span::new(1, u32::MAX))
+        .render("é")
+        .to_string();
+    assert!(invalid.contains("Source: bad span"), "{invalid}");
+}

@@ -60,6 +60,36 @@ impl CommandResult {
             ..Self::default()
         }
     }
+
+    fn document_error(
+        doc: &YamlDoc,
+        message: impl Into<String>,
+        source_span: Option<yaml_rt_core::Span>,
+        fallback_source: &str,
+        document_count: usize,
+    ) -> Self {
+        let message = message.into();
+        let Some(span) = source_span else {
+            return Self::request_error(fallback_source, message, document_count);
+        };
+        let position = doc.source().line_col(span.start as usize);
+        let rendered_diagnostic = Diagnostic::new(DiagnosticKind::Semantic, &message, span)
+            .with_position(position)
+            .render(doc.as_source())
+            .with_source_name("<input>")
+            .to_string();
+        Self {
+            error_source: Some("document".to_owned()),
+            message: Some(message),
+            rendered_diagnostic: Some(rendered_diagnostic),
+            span_start: Some(span.start),
+            span_end: Some(span.end),
+            line: Some(position.line),
+            column: Some(position.column),
+            document_count,
+            ..Self::default()
+        }
+    }
 }
 
 /// Executes one playground command without filesystem access.
@@ -241,9 +271,13 @@ fn execute_from_command(
     };
     match result {
         Ok(()) => CommandResult::success(doc, String::new(), Vec::new()),
-        Err(error) => {
-            CommandResult::request_error("application", error.to_string(), document_count)
-        }
+        Err(error) => CommandResult::document_error(
+            doc,
+            error.to_string(),
+            error.source_span(),
+            "application",
+            document_count,
+        ),
     }
 }
 
@@ -275,9 +309,13 @@ fn execute_pointer_command(
                     CommandResult::request_error("application", error.to_string(), document_count)
                 }
             },
-            Err(error) => {
-                CommandResult::request_error("application", error.to_string(), document_count)
-            }
+            Err(error) => CommandResult::document_error(
+                doc,
+                error.to_string(),
+                error.source_span(),
+                "application",
+                document_count,
+            ),
         },
         "test" => {
             let value = match parse_value(request, document_count) {
@@ -294,9 +332,13 @@ fn execute_pointer_command(
                     ),
                     document_count,
                 ),
-                Err(error) => {
-                    CommandResult::request_error("application", error.to_string(), document_count)
-                }
+                Err(error) => CommandResult::document_error(
+                    doc,
+                    error.to_string(),
+                    error.source_span(),
+                    "application",
+                    document_count,
+                ),
             }
         }
         "rename-key" => {
@@ -309,9 +351,13 @@ fn execute_pointer_command(
             };
             match doc.rename_key_at(request.document_index, &pointer, new_key) {
                 Ok(()) => CommandResult::success(doc, String::new(), pointers),
-                Err(error) => {
-                    CommandResult::request_error("application", error.to_string(), document_count)
-                }
+                Err(error) => CommandResult::document_error(
+                    doc,
+                    error.to_string(),
+                    error.source_span(),
+                    "application",
+                    document_count,
+                ),
             }
         }
         "add" | "replace" => {
@@ -326,16 +372,24 @@ fn execute_pointer_command(
             };
             match result {
                 Ok(()) => CommandResult::success(doc, String::new(), pointers),
-                Err(error) => {
-                    CommandResult::request_error("application", error.to_string(), document_count)
-                }
+                Err(error) => CommandResult::document_error(
+                    doc,
+                    error.to_string(),
+                    error.source_span(),
+                    "application",
+                    document_count,
+                ),
             }
         }
         "remove" => match doc.remove_at(request.document_index, &pointer) {
             Ok(()) => CommandResult::success(doc, String::new(), pointers),
-            Err(error) => {
-                CommandResult::request_error("application", error.to_string(), document_count)
-            }
+            Err(error) => CommandResult::document_error(
+                doc,
+                error.to_string(),
+                error.source_span(),
+                "application",
+                document_count,
+            ),
         },
         _ => CommandResult::request_error("command", "unsupported pointer command", document_count),
     }
@@ -350,13 +404,25 @@ fn execute_query_command(
     let query = match JsonPath::parse(selector) {
         Ok(query) => query,
         Err(error) => {
-            return CommandResult::request_error("selector", error.to_string(), document_count);
+            return CommandResult::document_error(
+                doc,
+                error.to_string(),
+                error.source_span(),
+                "selector",
+                document_count,
+            );
         }
     };
     let matches = match query.query(doc, request.document_index) {
         Ok(matches) => matches,
         Err(error) => {
-            return CommandResult::request_error("selector", error.to_string(), document_count);
+            return CommandResult::document_error(
+                doc,
+                error.to_string(),
+                error.source_span(),
+                "selector",
+                document_count,
+            );
         }
     };
     let pointers = matches
@@ -396,9 +462,11 @@ fn execute_query_command(
                         );
                     }
                     Err(error) => {
-                        return CommandResult::request_error(
-                            "application",
+                        return CommandResult::document_error(
+                            doc,
                             error.to_string(),
+                            error.source_span(),
+                            "application",
                             document_count,
                         );
                     }
@@ -423,9 +491,13 @@ fn execute_query_command(
                 .collect::<Vec<_>>();
             match doc.rename_keys_at(request.document_index, &targets, new_key) {
                 Ok(()) => CommandResult::success(doc, String::new(), pointers),
-                Err(error) => {
-                    CommandResult::request_error("application", error.to_string(), document_count)
-                }
+                Err(error) => CommandResult::document_error(
+                    doc,
+                    error.to_string(),
+                    error.source_span(),
+                    "application",
+                    document_count,
+                ),
             }
         }
         "add" | "replace" | "remove" => {
@@ -455,9 +527,11 @@ fn execute_query_command(
                     _ => unreachable!(),
                 };
                 if let Err(error) = result {
-                    return CommandResult::request_error(
-                        "application",
+                    return CommandResult::document_error(
+                        doc,
                         error.to_string(),
+                        error.source_span(),
+                        "application",
                         document_count,
                     );
                 }
@@ -832,6 +906,39 @@ mod tests {
         assert!(rendered.contains("1 | a: ["), "{rendered}");
         assert!(rendered.contains('^'), "{rendered}");
         assert!(rendered.contains("expected"), "{rendered}");
+    }
+
+    fn assert_alias_document_diagnostic(result: &CommandResult) {
+        assert!(!result.ok);
+        assert_eq!(result.error_source.as_deref(), Some("document"));
+        assert_eq!(result.span_start, Some(5));
+        assert_eq!(result.span_end, Some(13));
+        assert_eq!(result.line, Some(1));
+        assert_eq!(result.column, Some(6));
+        let rendered = result.rendered_diagnostic.as_deref().unwrap();
+        assert!(rendered.contains("error[semantic]"), "{rendered}");
+        assert!(rendered.contains("--> <input>:1:6"), "{rendered}");
+        assert!(rendered.contains("1 | bad: *missing"), "{rendered}");
+        assert!(rendered.contains("^^^^^^^^"), "{rendered}");
+    }
+
+    #[test]
+    fn jsonpath_and_pointer_alias_errors_are_source_aware() {
+        let mut query = request("query");
+        query.source = "bad: *missing\n".to_owned();
+        query.selector_kind = Some("jsonpath".to_owned());
+        query.selector = Some("$".to_owned());
+        assert_alias_document_diagnostic(&execute(&query));
+
+        let mut get = request("get");
+        get.source = "bad: *missing\n".to_owned();
+        get.selector = Some("/bad/value".to_owned());
+        assert_alias_document_diagnostic(&execute(&get));
+
+        let mut remove = request("remove");
+        remove.source = "bad: *missing\n".to_owned();
+        remove.selector = Some("/bad/value".to_owned());
+        assert_alias_document_diagnostic(&execute(&remove));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::{NodeId, ResolvedScalar, SemanticKind, YamlDoc, resolve_scalar};
+use crate::{NodeId, ResolvedScalar, SemanticKind, Span, YamlDoc, resolve_scalar};
 
 /// One decoded RFC 6901 reference token.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -173,6 +173,7 @@ pub struct PointerError {
     token_index: Option<usize>,
     kind: PointerErrorKind,
     message: String,
+    source_span: Option<Span>,
 }
 
 impl PointerError {
@@ -187,7 +188,13 @@ impl PointerError {
             token_index,
             kind,
             message: message.into(),
+            source_span: None,
         }
+    }
+
+    fn with_source_span(mut self, source_span: Span) -> Self {
+        self.source_span = Some(source_span);
+        self
     }
 
     /// Returns the pointer associated with the failure.
@@ -206,6 +213,12 @@ impl PointerError {
     #[must_use]
     pub const fn kind(&self) -> PointerErrorKind {
         self.kind
+    }
+
+    /// Returns the relevant YAML source span for a resolution failure.
+    #[must_use]
+    pub const fn source_span(&self) -> Option<Span> {
+        self.source_span
     }
 }
 
@@ -328,23 +341,32 @@ impl YamlDoc {
         let mut seen = HashSet::new();
         while matches!(self.semantic_kind(node), Some(SemanticKind::Alias)) {
             if !seen.insert(node) {
-                return Err(PointerError::new(
+                let mut error = PointerError::new(
                     pointer.as_str(),
                     Some(token_index),
                     PointerErrorKind::AliasCycle,
                     "cyclic alias chain",
-                ));
+                );
+                if let Some(span) = self.node(node).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                return Err(error);
             }
-            node = self.resolve_alias(node).ok_or_else(|| {
-                PointerError::new(
+            let alias = node;
+            node = self.resolve_alias(alias).ok_or_else(|| {
+                let mut error = PointerError::new(
                     pointer.as_str(),
                     Some(token_index),
                     PointerErrorKind::UnresolvedAlias,
                     format!(
                         "unresolved alias `*{}`",
-                        self.alias_name(node).unwrap_or_default()
+                        self.alias_name(alias).unwrap_or_default()
                     ),
-                )
+                );
+                if let Some(span) = self.node(alias).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                error
             })?;
         }
         Ok(node)
@@ -511,6 +533,19 @@ mod tests {
             .resolve_pointer(0, &JsonPointer::parse("/service/config/timeout").unwrap())
             .unwrap();
         assert_eq!(doc.scalar_value(traversed).unwrap(), "30");
+    }
+
+    #[test]
+    fn unresolved_alias_errors_preserve_source_spans_through_edits() {
+        let doc = YamlDoc::parse("bad: *missing\n").unwrap();
+        let pointer = JsonPointer::parse("/bad/value").unwrap();
+        let error = doc.resolve_pointer(0, &pointer).unwrap_err();
+        assert_eq!(error.kind(), PointerErrorKind::UnresolvedAlias);
+        assert_eq!(error.source_span(), Some(Span::new(5, 13)));
+
+        let mut edited = doc;
+        let error = edited.remove_at(0, &pointer).unwrap_err();
+        assert_eq!(error.source_span(), Some(Span::new(5, 13)));
     }
 
     #[test]

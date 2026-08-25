@@ -13,18 +13,32 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YamlEditError {
     message: String,
+    source_span: Option<Span>,
 }
 
 impl YamlEditError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            source_span: None,
         }
     }
 
+    fn with_source_span(mut self, source_span: Span) -> Self {
+        self.source_span = Some(source_span);
+        self
+    }
+
+    /// Returns the relevant YAML source span for the edit failure.
+    #[must_use]
+    pub const fn source_span(&self) -> Option<Span> {
+        self.source_span
+    }
+
     pub(crate) fn into_yaml_error(self) -> YamlError {
+        let span = self.source_span.unwrap_or_else(|| Span::empty(0));
         YamlError::new(
-            Diagnostic::new(DiagnosticKind::Emitter, self.message, Span::empty(0))
+            Diagnostic::new(DiagnosticKind::Emitter, self.message, span)
                 .with_expected("a source-preserving YAML edit"),
         )
     }
@@ -40,7 +54,12 @@ impl std::error::Error for YamlEditError {}
 
 impl From<PointerError> for YamlEditError {
     fn from(error: PointerError) -> Self {
-        Self::new(error.to_string())
+        let source_span = error.source_span();
+        let mut converted = Self::new(error.to_string());
+        if let Some(span) = source_span {
+            converted = converted.with_source_span(span);
+        }
+        converted
     }
 }
 
@@ -385,11 +404,20 @@ impl YamlDoc {
         let mut seen = HashSet::new();
         while matches!(self.semantic_kind(resolved), Some(SemanticKind::Alias)) {
             if !seen.insert(resolved) {
-                return Err(YamlEditError::new("cyclic YAML alias key"));
+                let mut error = YamlEditError::new("cyclic YAML alias key");
+                if let Some(span) = self.node(resolved).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                return Err(error);
             }
-            resolved = self
-                .resolve_alias(resolved)
-                .ok_or_else(|| YamlEditError::new("unresolved YAML alias key"))?;
+            let alias = resolved;
+            resolved = self.resolve_alias(alias).ok_or_else(|| {
+                let mut error = YamlEditError::new("unresolved YAML alias key");
+                if let Some(span) = self.node(alias).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                error
+            })?;
         }
         if !scalar_is_string(self, resolved)? {
             return Err(YamlEditError::new(

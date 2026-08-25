@@ -361,6 +361,9 @@ span, including the file path (or `<stdin>`), line, and column. The binary uses
 standard terminal colors when stderr is interactive, stays plain when output is
 redirected, and honors `NO_COLOR`.
 
+Resolution errors expose YAML source spans when they identify concrete syntax,
+including unresolved aliases reached through JSON Pointer or JSONPath.
+
 Library users can render the same dependency-free diagnostic format directly:
 
 ```rust

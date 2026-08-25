@@ -26,7 +26,7 @@ use std::fmt;
 
 use regex::Regex;
 use yaml_rt_core::{
-    JsonPointer, NodeId, ResolvedScalar, SemanticKind, YamlDoc, YamlNumber, YamlScalarStyle,
+    JsonPointer, NodeId, ResolvedScalar, SemanticKind, Span, YamlDoc, YamlNumber, YamlScalarStyle,
     resolve_scalar, semantically_equal,
 };
 
@@ -62,6 +62,7 @@ pub struct Error {
     kind: ErrorKind,
     byte_offset: Option<usize>,
     message: String,
+    source_span: Option<Span>,
 }
 
 impl Error {
@@ -78,7 +79,13 @@ impl Error {
             kind,
             byte_offset,
             message: message.into(),
+            source_span: None,
         }
+    }
+
+    fn with_source_span(mut self, source_span: Span) -> Self {
+        self.source_span = Some(source_span);
+        self
     }
 
     /// Returns the broad failure classification.
@@ -91,6 +98,12 @@ impl Error {
     #[must_use]
     pub const fn byte_offset(&self) -> Option<usize> {
         self.byte_offset
+    }
+
+    /// Returns the relevant YAML source span for an evaluation failure.
+    #[must_use]
+    pub const fn source_span(&self) -> Option<Span> {
+        self.source_span
     }
 }
 
@@ -1299,22 +1312,26 @@ impl<'a> Evaluator<'a> {
                 break;
             }
             if !seen.insert(current) {
-                return Err(Error::with_kind(
-                    ErrorKind::Alias,
-                    None,
-                    "cyclic YAML alias chain",
-                ));
+                let mut error = Error::with_kind(ErrorKind::Alias, None, "cyclic YAML alias chain");
+                if let Some(span) = self.doc.node(current).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                return Err(error);
             }
             node = self.doc.resolve_alias(current);
             if node.is_none() {
-                return Err(Error::with_kind(
+                let mut error = Error::with_kind(
                     ErrorKind::Alias,
                     None,
                     format!(
                         "unresolved YAML alias `*{}`",
                         self.doc.alias_name(current).unwrap_or_default()
                     ),
-                ));
+                );
+                if let Some(span) = self.doc.node(current).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                return Err(error);
             }
         }
         Ok(node)
@@ -1399,21 +1416,26 @@ impl<'a> Validator<'a> {
         let mut aliases = HashSet::new();
         while matches!(self.doc.semantic_kind(node), Some(SemanticKind::Alias)) {
             if !aliases.insert(node) {
-                return Err(Error::with_kind(
-                    ErrorKind::Alias,
-                    None,
-                    "cyclic YAML alias chain",
-                ));
+                let mut error = Error::with_kind(ErrorKind::Alias, None, "cyclic YAML alias chain");
+                if let Some(span) = self.doc.node(node).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                return Err(error);
             }
-            node = self.doc.resolve_alias(node).ok_or_else(|| {
-                Error::with_kind(
+            let alias = node;
+            node = self.doc.resolve_alias(alias).ok_or_else(|| {
+                let mut error = Error::with_kind(
                     ErrorKind::Alias,
                     None,
                     format!(
                         "unresolved YAML alias `*{}`",
-                        self.doc.alias_name(node).unwrap_or_default()
+                        self.doc.alias_name(alias).unwrap_or_default()
                     ),
-                )
+                );
+                if let Some(span) = self.doc.node(alias).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                error
             })?;
         }
         match self.doc.semantic_kind(node) {
@@ -1481,14 +1503,20 @@ impl<'a> Validator<'a> {
         let mut seen = HashSet::new();
         while matches!(self.doc.semantic_kind(node), Some(SemanticKind::Alias)) {
             if !seen.insert(node) {
-                return Err(Error::with_kind(
-                    ErrorKind::Alias,
-                    None,
-                    "cyclic YAML alias key",
-                ));
+                let mut error = Error::with_kind(ErrorKind::Alias, None, "cyclic YAML alias key");
+                if let Some(span) = self.doc.node(node).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                return Err(error);
             }
-            node = self.doc.resolve_alias(node).ok_or_else(|| {
-                Error::with_kind(ErrorKind::Alias, None, "unresolved YAML alias key")
+            let alias = node;
+            node = self.doc.resolve_alias(alias).ok_or_else(|| {
+                let mut error =
+                    Error::with_kind(ErrorKind::Alias, None, "unresolved YAML alias key");
+                if let Some(span) = self.doc.node(alias).map(|node| node.span()) {
+                    error = error.with_source_span(span);
+                }
+                error
             })?;
         }
         let Some(SemanticKind::Scalar { style }) = self.doc.semantic_kind(node) else {
@@ -1693,6 +1721,11 @@ mod tests {
         let doc = YamlDoc::parse("&root [*root]\n").unwrap();
         let error = JsonPath::parse("$").unwrap().query(&doc, 0).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Alias);
+
+        let doc = YamlDoc::parse("copy: *missing\n").unwrap();
+        let error = JsonPath::parse("$").unwrap().query(&doc, 0).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Alias);
+        assert_eq!(error.source_span(), Some(Span::new(6, 14)));
     }
 
     #[test]
@@ -1718,5 +1751,6 @@ mod tests {
         let error = JsonPath::parse("value").unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Syntax);
         assert_eq!(error.byte_offset(), Some(0));
+        assert_eq!(error.source_span(), None);
     }
 }

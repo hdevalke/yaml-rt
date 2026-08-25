@@ -286,7 +286,7 @@ impl fmt::Display for DiagnosticRenderer<'_> {
         self.styled(formatter, "1;34", "|")?;
 
         for note in &self.diagnostic.notes {
-            write!(formatter, "\n")?;
+            writeln!(formatter)?;
             self.styled(formatter, "1;32", "note")?;
             write!(formatter, ": {note}")?;
         }

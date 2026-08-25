@@ -2,7 +2,7 @@
 name = "yaml-rt-wasm"
 description = "Browser bindings for the yaml-rt command playground"
 edition = "2024"
-version = "0.2.2"
+version = "0.2.3"
 license = "MIT OR Apache-2.0"
 authors = ["Hannes De Valkeneer <hannes@de-valkeneer.be>"]
 readme = "../../README.md"

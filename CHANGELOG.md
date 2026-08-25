@@ -1,5 +1,21 @@
 # Changelog
 
+### v0.2.3 (2026-08-25)
+
+#### Features
+
+* add rustc-style YAML diagnostics (fa60d51)
+* **cli:** add short command aliases (1c56a26)
+* **cli:** add validate subcommand (839c610)
+* **yaml-rt-derive:** support unit and tuple structs (58cf31d)
+* **yaml-rt-derive:** support rename_all for struct fields (f68a02c)
+
+#### Fixes
+
+* diagnostic newline clippy warning (85efd11)
+* extracted sequence node indentation (a5da1e5)
+* sequential YAML patch preservation (db046ea)
+
 ### v0.2.2 (2026-08-20)
 
 #### Features

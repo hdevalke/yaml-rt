@@ -55,6 +55,69 @@ fn help_and_version_report_distribution_metadata() {
 }
 
 #[test]
+fn validate_accepts_complete_yaml_streams_without_output() {
+    for input in ["", "name: valid\n", "---\nfirst\n---\nsecond\n"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .args(["validate", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
+fn validate_reports_file_and_directory_failures() {
+    let directory = temp_dir();
+    let valid = directory.join("valid.yaml");
+    let invalid = directory.join("invalid.yml");
+    fs::write(&valid, "name: valid\n").unwrap();
+    fs::write(&invalid, "[\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["validate", valid.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["validate", invalid.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["validate", directory.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid.yml:"), "{stderr}");
+    assert!(
+        stderr.contains("processed 2 YAML files: 1 succeeded, 1 failed; 0 traversal errors"),
+        "{stderr}"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn directory_targets_recurse_with_sorted_path_headers() {
     let directory = temp_dir();
     fs::create_dir_all(directory.join(".hidden")).unwrap();

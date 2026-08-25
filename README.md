@@ -358,6 +358,9 @@ while preserving the rest of the document:
 # Find every service port and print JSON Pointer/value pairs.
 yaml-rt query '$.services[*].port' config.yaml
 
+# Validate one file, or recursively validate a directory.
+yaml-rt validate config.yaml
+
 # Read a node.
 yaml-rt get /server/port config.yaml
 
@@ -392,7 +395,7 @@ yaml-rt patch --patch-file changes.yaml --in-place config.yaml
 yaml-rt replace /server/port --value 9090 --in-place configs/
 ```
 
-Available operations are `query`, `get`, `add`, `remove`, `replace`,
+Available operations are `validate`, `query`, `get`, `add`, `remove`, `replace`,
 `rename-key`, `move`, `copy`, `test`, and `patch`. Query results are emitted in
 nodelist order as one compact JSON Pointer/value pair per line. JSONPath
 evaluation uses the YAML 1.2 core schema and rejects YAML values that are not
@@ -426,6 +429,10 @@ recursively for `.yaml` and `.yml` files using case-insensitive extensions;
 hidden paths are included, symbolic links are skipped, and files are processed
 in sorted relative-path order. A directory with no matching files succeeds
 without output.
+
+`validate` parses the complete YAML stream and produces no output when it is
+valid. Empty and multi-document streams are accepted. Directory validation
+continues after failures and reports each invalid file in the batch summary.
 
 Batch `query` and `get --query` output identifies each input containing a match
 with an `==> relative/path.yaml <==` header and a blank line between files;

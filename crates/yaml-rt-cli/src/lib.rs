@@ -104,6 +104,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Operation {
+    /// Validate YAML syntax without producing output.
+    Validate(ValidateArgs),
     /// Search a YAML document with RFC 9535 `JSONPath`.
     Query(QueryArgs),
     /// Print a selected YAML node.
@@ -124,6 +126,13 @@ enum Operation {
     Test(ValueArgs),
     /// Apply a transactional YAML or JSON patch document.
     Patch(PatchArgs),
+}
+
+#[derive(Args)]
+struct ValidateArgs {
+    /// Input YAML file or directory; defaults to the current directory. Use - for stdin.
+    #[arg(value_name = "FILE")]
+    file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -320,8 +329,11 @@ fn execute_one(
     stdout: &mut dyn Write,
     batch_capture: bool,
 ) -> Result<(), RunError> {
-    let target = operation.target();
     let mut doc = YamlDoc::parse_owned(input).map_err(RunError::display)?;
+    if matches!(operation, Operation::Validate(_)) {
+        return Ok(());
+    }
+    let target = operation.target();
     let document = select_document(&doc, target.doc)?;
 
     if let Operation::Query(arguments) = operation {
@@ -389,6 +401,7 @@ fn execute_one(
         .expect("pointer operation is prepared");
     let from = prepared.from.as_ref();
     match operation {
+        Operation::Validate(_) => unreachable!("validate returned after parsing"),
         Operation::Query(_) => unreachable!("query returned before pointer operations"),
         Operation::Get(arguments) => {
             let node = doc
@@ -482,11 +495,12 @@ fn prepare_operation(
         .map(JsonPath::parse)
         .transpose()
         .map_err(RunError::display)?;
-    let path = if query.is_none() && !matches!(operation, Operation::Patch(_)) {
-        Some(JsonPointer::parse(operation.path()).map_err(RunError::display)?)
-    } else {
-        None
-    };
+    let path =
+        if query.is_none() && !matches!(operation, Operation::Patch(_) | Operation::Validate(_)) {
+            Some(JsonPointer::parse(operation.path()).map_err(RunError::display)?)
+        } else {
+            None
+        };
     let from = operation
         .from()
         .map(JsonPointer::parse)
@@ -741,6 +755,7 @@ impl Operation {
 
     fn target(&self) -> &TargetArgs {
         match self {
+            Self::Validate(_) => unreachable!("validate does not select a document"),
             Self::Query(args) => &args.target,
             Self::Get(args) => &args.path.target,
             Self::Add(args) | Self::Replace(args) => &args.value.path.target,
@@ -754,7 +769,7 @@ impl Operation {
 
     fn path(&self) -> &str {
         match self {
-            Self::Query(_) | Self::Patch(_) => {
+            Self::Validate(_) | Self::Query(_) | Self::Patch(_) => {
                 unreachable!("operation does not use a JSON Pointer argument")
             }
             Self::Get(args) => args.path.pointer(),
@@ -791,7 +806,7 @@ impl Operation {
             Self::Remove(args) => Some(&args.output),
             Self::Move(args) | Self::Copy(args) => Some(&args.output),
             Self::Patch(args) => Some(&args.output),
-            Self::Query(_) | Self::Get(_) | Self::Test(_) => None,
+            Self::Validate(_) | Self::Query(_) | Self::Get(_) | Self::Test(_) => None,
         }
     }
 
@@ -818,6 +833,7 @@ impl Operation {
 
     fn input_path(&self) -> Option<&Path> {
         match self {
+            Self::Validate(args) => args.file.as_deref(),
             Self::Get(args) => args.path.input_path(),
             Self::Add(args) | Self::Replace(args) => args.value.path.input_path(),
             Self::RenameKey(args) => args.path.input_path(),

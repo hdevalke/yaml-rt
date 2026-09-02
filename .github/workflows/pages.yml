@@ -7,6 +7,8 @@ on:
       - ".github/workflows/pages.yml"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "package.json"
+      - "package-lock.json"
       - "crates/yaml-rt-core/**"
       - "crates/yaml-rt-rfc9535/**"
       - "crates/yaml-rt-wasm/**"
@@ -43,12 +45,18 @@ jobs:
           --component rustfmt
       - name: Install wasm-pack
         run: cargo install wasm-pack --version 0.15.0 --locked
+      - name: Install playground dependencies
+        run: npm ci
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test browser command engine
         run: cargo test -p yaml-rt-wasm --locked
       - name: Test playground state
         run: node --test playground/state.test.mjs
+      - name: Build and test playground editor
+        run: |
+          npm run build:playground-editor
+          npm run test:playground-editor
       - name: Build WebAssembly package
         run: >-
           wasm-pack build crates/yaml-rt-wasm
@@ -60,12 +68,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p playground/dist/pkg
-          cp playground/index.html playground/styles.css playground/app.js playground/state.mjs playground/dist/
+          cp playground/index.html playground/styles.css playground/app.js playground/state.mjs playground/generated/codemirror.js playground/dist/
           cp playground/pkg/yaml_rt_wasm.js playground/pkg/yaml_rt_wasm_bg.wasm playground/dist/pkg/
           test -s playground/dist/index.html
           test -s playground/dist/pkg/yaml_rt_wasm.js
           test -s playground/dist/pkg/yaml_rt_wasm_bg.wasm
           grep -Fq './pkg/yaml_rt_wasm.js' playground/dist/app.js
+          grep -Fq './codemirror.js' playground/dist/app.js
+          if grep -Fq 'esm.sh' playground/dist/app.js; then
+            echo 'remote CodeMirror import found in playground app' >&2
+            exit 1
+          fi
       - uses: actions/configure-pages@v5
         with:
           enablement: true

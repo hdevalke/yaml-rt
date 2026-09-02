@@ -1,7 +1,16 @@
-import { basicSetup } from "https://esm.sh/codemirror@6.0.2?deps=@codemirror/state@6.7.1,@codemirror/view@6.43.9";
-import { EditorState, RangeSet, StateEffect, StateField } from "https://esm.sh/@codemirror/state@6.7.1";
-import { Decoration, EditorView, GutterMarker, gutter, lineNumbers } from "https://esm.sh/@codemirror/view@6.43.9";
-import { yaml } from "https://esm.sh/@codemirror/lang-yaml@6.1.3?deps=@codemirror/state@6.7.1,@codemirror/view@6.43.9";
+import {
+  basicSetup,
+  Decoration,
+  EditorState,
+  EditorView,
+  GutterMarker,
+  RangeSet,
+  StateEffect,
+  StateField,
+  gutter,
+  lineNumbers,
+  yaml,
+} from "./codemirror.js";
 import init, { run_command } from "./pkg/yaml_rt_wasm.js";
 import { copyText, lineDiff, resultPresentation } from "./state.mjs";
 

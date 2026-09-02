@@ -1,4 +1,6 @@
 **/target/
 /playground/pkg/
 /playground/dist/
+/playground/generated/
+/node_modules/
 /.convco/

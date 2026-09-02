@@ -31,7 +31,7 @@ edit. Source-aware failures use the same rustc-style diagnostics as the CLI.
 
 The playground runs the Rust parser and editor locally through WebAssembly.
 Documents are not uploaded to a server. Its interface is plain HTML, CSS, and
-JavaScript with CodeMirror loaded from a pinned CDN release.
+JavaScript with a pinned CodeMirror bundle built into the deployed site.
 
 ## When to use yaml-rt
 

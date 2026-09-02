@@ -37,6 +37,7 @@ const examples = [
   { name: "Test semantic equality", command: "test", selectorKind: "pointer", selector: "/defaults/retries", value: "3" },
   { name: "Transactional patch", command: "patch", patch: "- op: test\n  path: /services/0/port\n  value: 8080\n- op: replace\n  path: /services/0/port\n  value: 8443\n- op: add\n  path: /services/0/protocol\n  value: https\n" },
   { name: "Patch rollback on failure", command: "patch", patch: "- op: replace\n  path: /services/0/port\n  value: 8443\n- op: test\n  path: /services/1/port\n  value: 9999\n" },
+  { name: "Validate YAML and locate an error", source: "services:\n  - name: api\n    ports: [8080, , 8443]\n", command: "validate" },
   { name: "Edit a multi-document stream", source: "---\nname: development\nport: 3000\n---\nname: production\nport: 8080 # keep\n", command: "replace", selectorKind: "pointer", selector: "/port", value: "443", documentIndex: 1 },
 ];
 
@@ -142,6 +143,10 @@ function shellQuote(value) {
 function commandPreview() {
   const command = controls.command.value;
   let preview = `yaml-rt ${command}`;
+  if (command === "validate") {
+    $("command-preview").textContent = preview;
+    return preview;
+  }
   if (command === "query") preview += ` ${shellQuote(controls.selector.value)}`;
   else if (["move", "copy"].includes(command)) preview += ` ${shellQuote(controls.from.value)} ${shellQuote(controls.destination.value)}`;
   else if (command === "patch") preview += ` --patch ${shellQuote(controls.patch.value)}`;
@@ -168,6 +173,7 @@ function updateFields() {
   $("value-field").hidden = !["add", "replace", "test"].includes(command);
   $("new-key-field").hidden = command !== "rename-key";
   $("patch-field").hidden = command !== "patch";
+  $("document-field").hidden = command === "validate";
   if (command === "query") controls.selectorKind.value = "jsonpath";
   $("selector-label").textContent = controls.selectorKind.value === "jsonpath" ? "JSONPath (RFC 9535)" : "JSON Pointer (RFC 6901)";
   controls.selector.placeholder = controls.selectorKind.value === "jsonpath" ? "$.services[*].port" : "/services/0/port";
@@ -286,6 +292,7 @@ function run() {
     setDeletedLines.of(RangeSet.empty),
   ] });
   $("match-summary").hidden = !presentation.showMatchCount;
+  $("copy-result").hidden = !presentation.showCopyResult;
   if (presentation.showMatchCount) {
     const count = result.matched_pointers.length;
     $("match-count").textContent = `${count} match${count === 1 ? "" : "es"}`;

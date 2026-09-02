@@ -48,6 +48,7 @@
           <div class="command-form">
             <label>Operation
               <select id="command">
+                <option value="validate">validate</option>
                 <option value="query">query</option>
                 <option value="get">get</option>
                 <option value="add">add</option>
@@ -92,7 +93,7 @@
               <textarea id="patch" rows="9" spellcheck="false"></textarea>
             </label>
 
-            <label>Document
+            <label id="document-field">Document
               <select id="document-index"><option value="0">0</option></select>
             </label>
           </div>

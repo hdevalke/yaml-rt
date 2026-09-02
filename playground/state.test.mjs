@@ -26,6 +26,29 @@ test("mutations put edited YAML in the right pane", () => {
   assert.equal(presentation.highlightChanges, true);
 });
 
+test("validation uses a dedicated non-copyable result presentation", () => {
+  assert.deepEqual(
+    resultPresentation({ ok: true, command_output: "Valid YAML." }, "validate", "key: value\n"),
+    {
+      content: "Valid YAML.",
+      title: "Validation Result",
+      highlightChanges: false,
+      showMatchCount: false,
+      showCopyResult: false,
+    },
+  );
+  assert.deepEqual(
+    resultPresentation({ ok: false, error_source: "document" }, "validate", "key: [\n"),
+    {
+      content: "",
+      title: "Validation Result",
+      highlightChanges: false,
+      showMatchCount: false,
+      showCopyResult: false,
+    },
+  );
+});
+
 test("application failures show rollback while malformed inputs clear output", () => {
   const source = "value: 1\n";
   assert.equal(

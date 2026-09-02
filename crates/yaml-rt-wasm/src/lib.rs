@@ -116,6 +116,9 @@ pub fn execute(request: &CommandRequest) -> CommandResult {
         }
     };
     let document_count = doc.document_count();
+    if request.command == "validate" {
+        return CommandResult::success(&doc, "Valid YAML.".to_owned(), Vec::new());
+    }
     if request.document_index >= document_count {
         return CommandResult::request_error(
             "document",
@@ -787,6 +790,39 @@ mod tests {
         assert!(result.ok);
         assert_eq!(result.output_yaml, get.source);
         assert_eq!(result.command_output, "api");
+    }
+
+    #[test]
+    fn validate_accepts_complete_yaml_streams_and_ignores_document_selection() {
+        for source in ["", "name: api\n", "---\nname: api\n---\nname: web\n"] {
+            let result = execute(&CommandRequest {
+                source: source.to_owned(),
+                document_index: usize::MAX,
+                command: "validate".to_owned(),
+                ..CommandRequest::default()
+            });
+
+            assert!(result.ok, "{source:?}: {:?}", result.message);
+            assert_eq!(result.command_output, "Valid YAML.");
+            assert_eq!(result.output_yaml, source);
+            assert!(result.matched_pointers.is_empty());
+        }
+    }
+
+    #[test]
+    fn validate_reports_malformed_yaml_with_source_location() {
+        let result = execute(&CommandRequest {
+            source: "ports: [8080, , 8443]\n".to_owned(),
+            command: "validate".to_owned(),
+            ..CommandRequest::default()
+        });
+
+        assert!(!result.ok);
+        assert_eq!(result.error_source.as_deref(), Some("document"));
+        assert!(result.rendered_diagnostic.is_some());
+        assert!(result.span_start.is_some());
+        assert!(result.line.is_some());
+        assert!(result.column.is_some());
     }
 
     #[test]

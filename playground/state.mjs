@@ -78,12 +78,22 @@ export async function copyText(value, { clipboard, fallback }) {
 }
 
 export function resultPresentation(result, command, source) {
+  if (command === "validate") {
+    return {
+      content: result.ok ? result.command_output : "",
+      title: "Validation Result",
+      highlightChanges: false,
+      showMatchCount: false,
+      showCopyResult: false,
+    };
+  }
   if (result.ok && READ_COMMANDS.has(command)) {
     return {
       content: result.command_output,
       title: "Command Output",
       highlightChanges: false,
       showMatchCount: true,
+      showCopyResult: true,
     };
   }
   if (result.ok) {
@@ -92,6 +102,7 @@ export function resultPresentation(result, command, source) {
       title: "Result YAML",
       highlightChanges: true,
       showMatchCount: false,
+      showCopyResult: true,
     };
   }
   return {
@@ -99,5 +110,6 @@ export function resultPresentation(result, command, source) {
     title: "Result YAML",
     highlightChanges: false,
     showMatchCount: false,
+    showCopyResult: true,
   };
 }

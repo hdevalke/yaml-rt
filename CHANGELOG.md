@@ -1,5 +1,18 @@
 # Changelog
 
+### v0.2.4 (2026-09-03)
+
+#### Features
+
+* **playground:** add validate command (9246c8d)
+* **playground:** improve diagnostics and editor diffs (2d50873)
+
+#### Fixes
+
+* replace_at when replacing a block sequence with a flow-sequence fragment
+(4014aec)
+* preserve yaml alias diagnostic spans (daf632a)
+
 ### v0.2.3 (2026-08-25)
 
 #### Features

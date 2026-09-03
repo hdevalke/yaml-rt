@@ -3302,6 +3302,25 @@ fn semantic_lookup_can_return_nested_sequences() {
 }
 
 #[test]
+fn compact_block_collection_spans_include_continued_descendants() {
+    let input = "deployments:\n  - service: gateway\n    replicas: 3\n    zones:\n      - west\n      - east\nafter: unchanged\n";
+    let doc = YamlDoc::parse(input).expect("valid compact deployment sequence");
+    let deployments = doc
+        .get_path(&["deployments"])
+        .expect("lookup succeeds")
+        .expect("deployment sequence exists");
+    let zones = doc
+        .resolve_pointer(0, &JsonPointer::parse("/deployments/0/zones").unwrap())
+        .expect("nested zone sequence exists");
+
+    assert_eq!(
+        doc.extract_node(deployments).unwrap(),
+        "- service: gateway\n  replicas: 3\n  zones:\n    - west\n    - east"
+    );
+    assert_eq!(doc.extract_node(zones).unwrap(), "- west\n- east");
+}
+
+#[test]
 fn document_selection_counts_stream_documents() {
     assert_eq!(
         YamlDoc::parse("").expect("empty stream").document_count(),

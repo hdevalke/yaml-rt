@@ -1409,6 +1409,57 @@ mod tests {
     }
 
     #[test]
+    fn replaces_compact_and_expanded_block_sequences_with_flow_fragments() {
+        for input in [
+            "releases:\n  - artifact: client\n    channel: stable\ntail: retained\n",
+            "releases:\n  -\n    artifact: client\n    channel: stable\ntail: retained\n",
+        ] {
+            let mut doc = YamlDoc::parse(input).unwrap();
+            doc.replace_at(
+                0,
+                &pointer("/releases"),
+                &fragment("[{artifact: server, channel: preview}]"),
+            )
+            .unwrap();
+
+            assert_eq!(
+                doc.as_source(),
+                "releases:\n  [{artifact: server, channel: preview}]\ntail: retained\n"
+            );
+            let reparsed = YamlDoc::parse(doc.as_source()).unwrap();
+            let artifact = reparsed
+                .resolve_pointer(0, &pointer("/releases/0/artifact"))
+                .unwrap();
+            let channel = reparsed
+                .resolve_pointer(0, &pointer("/releases/0/channel"))
+                .unwrap();
+            assert_eq!(reparsed.scalar_value(artifact).unwrap(), "server");
+            assert_eq!(reparsed.scalar_value(channel).unwrap(), "preview");
+        }
+    }
+
+    #[test]
+    fn collection_replacement_keeps_the_owning_entry_comment() {
+        let mut doc = YamlDoc::parse(
+            "jobs: # scheduling note\n  - # obsolete job note\n    command: build\n    retries: 2\nafter: unchanged\n",
+        )
+        .unwrap();
+
+        doc.replace_at(
+            0,
+            &pointer("/jobs"),
+            &fragment("[{command: test, retries: 1}]"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            doc.as_source(),
+            "jobs: # scheduling note\n  [{command: test, retries: 1}]\nafter: unchanged\n"
+        );
+        doc.commit_edits().unwrap();
+    }
+
+    #[test]
     fn inserts_into_compact_sequence_entry_mappings_at_the_key_column() {
         let input = "services:\n  - name: api\n    port: 8080\n";
 

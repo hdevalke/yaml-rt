@@ -2901,8 +2901,13 @@ impl<'source> Parser<'source> {
     }
 
     fn extend_node_span(&mut self, node: NodeId, end: usize) {
-        let node = &mut self.nodes[node.as_usize()];
-        node.span.end = node.span.end.max(Span::usize_to_u32(end));
+        let end = Span::usize_to_u32(end);
+        let mut current = Some(node);
+        while let Some(node) = current {
+            let syntax = &mut self.nodes[node.as_usize()];
+            syntax.span.end = syntax.span.end.max(end);
+            current = node_link(syntax.parent);
+        }
     }
 
     fn push_event(&mut self, kind: YamlEventKind, span: Span) {
@@ -4452,7 +4457,8 @@ impl<'source> BlockMachine<'source> {
         let prepared = PreparedBlockLine::new(line, indent)?;
         let structural = is_sequence_entry(body)
             || is_explicit_mapping_key(body)
-            || prepared.mapping_colon().is_some();
+            || prepared.mapping_colon().is_some()
+            || body_starts_flow_value(body, absolute_start)?;
         let property_only = !structural
             && body_may_start_with_node_properties(body)
             && (property_only_block_collection_indent(body, self.lines, index, absolute_start)?

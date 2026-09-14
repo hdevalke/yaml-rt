@@ -127,6 +127,11 @@ assert_eq!(doc.as_source(), "items: [keep, added]\n");
 let items = doc.resolve_pointer(0, &JsonPointer::parse("/items")?)?;
 doc.sequence_editor(items)?.move_item(1, 0)?;
 assert_eq!(doc.as_source(), "items: [added, keep]\n");
+let items = doc.resolve_pointer(0, &JsonPointer::parse("/items")?)?;
+doc.sequence_editor(items)?.sort_by(|doc, left, right| {
+    doc.scalar_value(left).unwrap().cmp(&doc.scalar_value(right).unwrap())
+})?;
+assert_eq!(doc.as_source(), "items: [added, keep]\n");
 # Ok(())
 # }
 ```

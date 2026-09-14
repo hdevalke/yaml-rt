@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -23,6 +24,32 @@ pub struct SequenceEditor<'a> {
 }
 
 impl SequenceEditor<'_> {
+    /// Stably sorts items using semantic inspection of their lossless nodes.
+    pub fn sort_by(
+        self,
+        mut compare: impl FnMut(&YamlDoc, NodeId, NodeId) -> Ordering,
+    ) -> Result<(), YamlEditError> {
+        let sequence = self.sequence;
+        self.doc.transaction(|work| {
+            let original = work.sequence_items(sequence).collect::<Vec<_>>();
+            let mut sorted = original.clone();
+            sorted.sort_by(|left, right| compare(work, *left, *right));
+            if sorted == original {
+                return Ok(());
+            }
+            let order = sorted
+                .iter()
+                .map(|item| {
+                    original
+                        .iter()
+                        .position(|original| original == item)
+                        .expect("sorted items originate in the sequence")
+                })
+                .collect::<Vec<_>>();
+            work.queue_sequence_reorder(sequence, &order)
+        })
+    }
+
     /// Inserts `value` before the item at `index`, or appends at `len`.
     pub fn insert(self, index: usize, value: &YamlFragment) -> Result<(), YamlEditError> {
         let sequence = self.sequence;
@@ -1802,6 +1829,52 @@ mod tests {
         flow.sequence_editor(sequence)
             .unwrap()
             .move_item(1, 1)
+            .unwrap();
+        assert_eq!(flow.as_source(), before);
+    }
+
+    #[test]
+    fn sequence_editor_stably_sorts_complete_items() {
+        let mut block = YamlDoc::parse(
+            "items:\r\n  # second first\r\n  - b\r\n  # first\r\n  - a\r\n  # second duplicate\r\n  - b\r\n",
+        )
+        .unwrap();
+        let sequence = block.resolve_pointer(0, &pointer("/items")).unwrap();
+        block
+            .sequence_editor(sequence)
+            .unwrap()
+            .sort_by(|doc, left, right| {
+                doc.scalar_value(left)
+                    .unwrap()
+                    .cmp(&doc.scalar_value(right).unwrap())
+            })
+            .unwrap();
+        assert_eq!(
+            block.as_source(),
+            "items:\r\n  # first\r\n  - a\r\n  # second first\r\n  - b\r\n  # second duplicate\r\n  - b\r\n"
+        );
+
+        let mut flow = YamlDoc::parse("items: [c, # a\n  a, b]\n").unwrap();
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        flow.sequence_editor(sequence)
+            .unwrap()
+            .sort_by(|doc, left, right| {
+                doc.scalar_value(left)
+                    .unwrap()
+                    .cmp(&doc.scalar_value(right).unwrap())
+            })
+            .unwrap();
+        assert_eq!(flow.as_source(), "items: [ # a\n  a, b,c]\n");
+
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        let before = flow.as_source().to_owned();
+        flow.sequence_editor(sequence)
+            .unwrap()
+            .sort_by(|doc, left, right| {
+                doc.scalar_value(left)
+                    .unwrap()
+                    .cmp(&doc.scalar_value(right).unwrap())
+            })
             .unwrap();
         assert_eq!(flow.as_source(), before);
     }

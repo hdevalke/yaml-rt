@@ -524,6 +524,53 @@ Run `yaml-rt help <operation>` for operation-specific arguments.
 | `yaml-rt-bench` | Local comparison benchmarks | No |
 | `fuzz` | Separate cargo-fuzz workspace | No |
 
+## Parser fuzzing
+
+Parser fuzzing uses `cargo-fuzz` 0.13.2 and a nightly Rust toolchain. The target
+accepts UTF-8 text, exercises `YamlDoc::parse`, and requires every successful
+parse to emit byte-identically, reparse successfully, and retain the same YAML
+Test Suite event stream.
+
+Generate the reproducible YAML Test Suite and hand-written seeds separately
+from libFuzzer's evolving corpus, then start a bounded local run:
+
+```sh
+fuzz/scripts/seed_parse_yaml_corpus.sh
+mkdir -p fuzz/corpus/parse_yaml
+cd fuzz
+LSAN_OPTIONS=detect_leaks=0 cargo +nightly fuzz run parse_yaml \
+  corpus/parse_yaml corpus/seeds/parse_yaml -- \
+  -dict=parse_yaml.dict -max_len=8192 -timeout=10 -rss_limit_mb=1024 \
+  -max_total_time=300
+```
+
+New coverage inputs are written only to `corpus/parse_yaml`; regenerating the
+canonical seeds does not remove them. Periodically minimize that learned corpus
+before longer runs:
+
+```sh
+cd fuzz
+LSAN_OPTIONS=detect_leaks=0 cargo +nightly fuzz cmin parse_yaml \
+  corpus/parse_yaml -- -dict=parse_yaml.dict -max_len=8192
+```
+
+Reproduce and minimize a crash with a backtrace, then copy the minimized input
+under a descriptive name into `fuzz/regressions/parse_yaml/` so CI replays it:
+
+```sh
+cd fuzz
+LSAN_OPTIONS=detect_leaks=0 RUST_BACKTRACE=1 \
+  cargo +nightly fuzz run parse_yaml artifacts/parse_yaml/<crash-file>
+LSAN_OPTIONS=detect_leaks=0 cargo +nightly fuzz tmin parse_yaml \
+  artifacts/parse_yaml/<crash-file>
+cp artifacts/parse_yaml/<crash-file> \
+  regressions/parse_yaml/<descriptive-name>.yaml
+```
+
+CI replays committed regressions on every run, fuzzes for 30 seconds on pushes
+and pull requests, fuzzes for five minutes on scheduled/manual runs, and uploads
+failure artifacts for reproduction.
+
 The facade features are:
 
 | Feature | Default | Effect |

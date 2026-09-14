@@ -249,6 +249,8 @@ jobs:
   fuzz:
     name: Parser fuzz regressions
     runs-on: ubuntu-latest
+    env:
+      CARGO_FUZZ_VERSION: 0.13.2
     steps:
       - uses: actions/checkout@v6
         with:
@@ -258,7 +260,7 @@ jobs:
       - name: Install nightly toolchain
         run: rustup toolchain install --profile minimal nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version "${CARGO_FUZZ_VERSION}" --locked
       - name: Replay known artifacts
         working-directory: fuzz
         env:
@@ -271,18 +273,40 @@ jobs:
             cargo +nightly fuzz run parse_yaml "${artifact}"
           done
       - name: Seed parser corpus
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: fuzz/scripts/seed_parse_yaml_corpus.sh
-      - name: Run bounded parser fuzzing
+      - name: Create learned parser corpus
+        run: mkdir -p fuzz/corpus/parse_yaml
+      - name: Run parser fuzz smoke test
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        working-directory: fuzz
+        env:
+          LSAN_OPTIONS: detect_leaks=0
+        run: >-
+          cargo +nightly fuzz run parse_yaml corpus/parse_yaml corpus/seeds/parse_yaml --
+          -dict=parse_yaml.dict
+          -max_len=8192
+          -timeout=10
+          -rss_limit_mb=1024
+          -max_total_time=30
+      - name: Run sustained parser fuzzing
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         working-directory: fuzz
         env:
           LSAN_OPTIONS: detect_leaks=0
         run: >-
-          cargo +nightly fuzz run parse_yaml corpus/parse_yaml --
+          cargo +nightly fuzz run parse_yaml corpus/parse_yaml corpus/seeds/parse_yaml --
           -dict=parse_yaml.dict
           -max_len=8192
-          -max_total_time=60
+          -timeout=10
+          -rss_limit_mb=1024
+          -max_total_time=300
+      - name: Upload parser fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-fuzz-artifacts-${{ github.sha }}
+          path: fuzz/artifacts/parse_yaml
+          if-no-files-found: ignore
 
   workflows:
     name: Workflow syntax

@@ -5,33 +5,36 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fuzz_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 repo_root=$(CDPATH= cd -- "$fuzz_dir/.." && pwd)
 suite_dir="$repo_root/third_party/yaml-test-suite"
-corpus_dir="$fuzz_dir/corpus/parse_yaml"
+seed_dir=${1:-"$fuzz_dir/corpus/seeds/parse_yaml"}
 
 if [ ! -d "$suite_dir" ]; then
   echo "YAML Test Suite directory not found: $suite_dir" >&2
   exit 1
 fi
 
-mkdir -p "$corpus_dir"
+# This directory contains reproducible source seeds, not libFuzzer discoveries.
+# Clearing regular files prevents renamed or removed fixtures from accumulating.
+mkdir -p "$seed_dir"
+find "$seed_dir" -mindepth 1 -maxdepth 1 -type f -delete
 
 find "$suite_dir" \( -name in.yaml -o -name out.yaml -o -name emit.yaml \) | while IFS= read -r fixture; do
   relative=${fixture#"$suite_dir"/}
   safe=$(printf '%s' "$relative" | tr '/ ' '__')
-  cp "$fixture" "$corpus_dir/$safe"
+  cp "$fixture" "$seed_dir/$safe"
 done
 
-cat > "$corpus_dir/edge-flow-nested.yaml" <<'EOF'
+cat > "$seed_dir/edge-flow-nested.yaml" <<'EOF'
 {outer: [a, {b: c}, [d, e]], trailing: value}
 EOF
 
-cat > "$corpus_dir/edge-anchors-aliases.yaml" <<'EOF'
+cat > "$seed_dir/edge-anchors-aliases.yaml" <<'EOF'
 first: &anchor Foo
 second: *anchor
 third: &anchor [a, b, {c: d}]
 fourth: *anchor
 EOF
 
-cat > "$corpus_dir/edge-tags-directives.yaml" <<'EOF'
+cat > "$seed_dir/edge-tags-directives.yaml" <<'EOF'
 %YAML 1.2
 %TAG !e! tag:example.com,2000:app/
 ---
@@ -40,7 +43,7 @@ cat > "$corpus_dir/edge-tags-directives.yaml" <<'EOF'
 - ! local
 EOF
 
-cat > "$corpus_dir/edge-block-scalars.yaml" <<'EOF'
+cat > "$seed_dir/edge-block-scalars.yaml" <<'EOF'
 literal: |+
   a
 
@@ -52,7 +55,7 @@ folded: >-
   e
 EOF
 
-cat > "$corpus_dir/edge-tabs-comments.yaml" <<'EOF'
+cat > "$seed_dir/edge-tabs-comments.yaml" <<'EOF'
 plain: text
  	lines
 flow: [a, # comment
@@ -60,7 +63,7 @@ flow: [a, # comment
 -	-1
 EOF
 
-cat > "$corpus_dir/edge-explicit-keys.yaml" <<'EOF'
+cat > "$seed_dir/edge-explicit-keys.yaml" <<'EOF'
 ? [flow, key]
 : {value: yes}
 ? >
@@ -68,7 +71,7 @@ cat > "$corpus_dir/edge-explicit-keys.yaml" <<'EOF'
 : !!null
 EOF
 
-cat > "$corpus_dir/edge-doc-markers.yaml" <<'EOF'
+cat > "$seed_dir/edge-doc-markers.yaml" <<'EOF'
 ---
 doc: one
 ...
@@ -77,7 +80,7 @@ doc: one
 ...
 EOF
 
-cat > "$corpus_dir/edge-unicode-spans.yaml" <<'EOF'
+cat > "$seed_dir/edge-unicode-spans.yaml" <<'EOF'
 --- ߅foo:
 --- "߅":
 --- [߅]
@@ -91,12 +94,12 @@ key: ߅value
 &a ߅foo
 EOF
 
-cat > "$corpus_dir/regression-tag-directive-leading-space.yaml" <<'EOF'
+cat > "$seed_dir/regression-tag-directive-leading-space.yaml" <<'EOF'
  %TAG ! p-|er↓
 !
 EOF
 
-cat > "$corpus_dir/edge-malformed-flow.yaml" <<'EOF'
+cat > "$seed_dir/edge-malformed-flow.yaml" <<'EOF'
 &fl
  { &fl
  { &- |-
@@ -106,5 +109,5 @@ e e: f },g: h }
 ]
 EOF
 
-count=$(find "$corpus_dir" -type f | wc -l | tr -d ' ')
-echo "Seeded $count parser corpus files in $corpus_dir"
+count=$(find "$seed_dir" -type f | wc -l | tr -d ' ')
+echo "Seeded $count parser corpus files in $seed_dir"

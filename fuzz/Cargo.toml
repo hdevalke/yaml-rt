@@ -10,8 +10,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.yaml-rt]
-path = "../crates/yaml-rt"
+[dependencies.yaml-rt-core]
+path = "../crates/yaml-rt-core"
 
 [[bin]]
 name = "parse_yaml"

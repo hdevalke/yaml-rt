@@ -1,25 +1,19 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use yaml_rt::YamlDoc;
+use yaml_rt_core::YamlDoc;
 
-fuzz_target!(|data: &[u8]| {
-    if let Ok(yaml_str) = std::str::from_utf8(data) {
-        if yaml_str.len() > 1_000_000 {
-            return;
-        }
+fuzz_target!(|yaml: &str| {
+    let doc = YamlDoc::parse(yaml);
+    if let Ok(doc) = doc {
+        let output = doc.to_string();
+        assert_eq!(output, yaml);
 
-        let doc = YamlDoc::parse(yaml_str);
-        if let Ok(doc) = doc {
-            let output = doc.to_string();
-            assert_eq!(output, yaml_str);
-
-            let reparsed = YamlDoc::parse(&output).expect("round-tripped YAML should reparse");
-            assert_eq!(reparsed.to_string(), output);
-            assert_eq!(
-                reparsed.events_to_test_string(),
-                doc.events_to_test_string()
-            );
-        }
+        let reparsed = YamlDoc::parse(&output).expect("round-tripped YAML should reparse");
+        assert_eq!(reparsed.to_string(), output);
+        assert_eq!(
+            reparsed.events_to_test_string(),
+            doc.events_to_test_string()
+        );
     }
 });

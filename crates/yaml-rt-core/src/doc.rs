@@ -1571,8 +1571,30 @@ impl YamlDoc {
             ));
         };
         if style == CollectionStyle::Block {
+            let entries = self
+                .children(collection)
+                .filter(|node| self.containing_entry_child(*node))
+                .collect::<Vec<_>>();
+            if removals.len() == entries.len() {
+                let first = self.block_collection_entry_removal_span(collection, entries[0])?;
+                let last = self.block_collection_entry_removal_span(
+                    collection,
+                    *entries.last().expect("nonempty removals have entries"),
+                )?;
+                let span = Span::new(first.start, last.end);
+                let empty = match self.semantic_kind(collection) {
+                    Some(SemanticKind::Mapping { .. }) => "{}",
+                    Some(SemanticKind::Sequence { .. }) => "[]",
+                    _ => unreachable!(),
+                };
+                let (span, replacement) = self
+                    .empty_block_collection_edit(collection, span, empty)
+                    .map_err(crate::YamlEditError::into_yaml_error)?;
+                return self.queue_edit(span, replacement);
+            }
             for entry in removals {
-                self.remove_node(*entry)?;
+                let span = self.block_collection_entry_removal_span(collection, *entry)?;
+                self.queue_edit(span, String::new())?;
             }
             return Ok(());
         }

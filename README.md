@@ -108,6 +108,23 @@ members transactionally. Key quoting changes only when required to keep the
 new name a YAML string; entry position, values, comments, tags, anchors, and
 surrounding whitespace remain source-owned.
 
+Sequences have a focused, transactional editor. Its callbacks receive lossless
+node handles, so filtering can use semantic values without reparsing snippets:
+
+```rust
+use yaml_rt::{JsonPointer, YamlDoc, YamlEditError};
+
+# fn example() -> Result<(), YamlEditError> {
+let mut doc = YamlDoc::parse("items: [keep, remove]\n")?;
+let items = doc.resolve_pointer(0, &JsonPointer::parse("/items")?)?;
+doc.sequence_editor(items)?.retain(|doc, item| {
+    doc.scalar_value(item).is_ok_and(|value| value != "remove")
+})?;
+assert_eq!(doc.as_source(), "items: [keep]\n");
+# Ok(())
+# }
+```
+
 The lower-level API exposes the lossless concrete syntax tree, semantic node
 metadata, JSON Pointer operations, fragments, diagnostics with spans, and
 patch-oriented editing primitives.

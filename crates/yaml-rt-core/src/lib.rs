@@ -27,7 +27,7 @@ pub use diagnostic::{
 pub use doc::{
     Edit, MappingEntryStyle, ReservedDirective, TagDirective, YamlDirective, YamlDoc, YamlEvents,
 };
-pub use edit::YamlEditError;
+pub use edit::{SequenceEditor, YamlEditError};
 pub use fragment::{FragmentError, YamlFragment};
 pub use lexer::{Token, TokenKind, lex, tokens_to_string};
 pub use parser::events_to_test_string;

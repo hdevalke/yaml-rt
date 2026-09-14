@@ -16,6 +16,35 @@ pub struct YamlEditError {
     source_span: Option<Span>,
 }
 
+/// A transactional, source-preserving editor for one YAML sequence.
+pub struct SequenceEditor<'a> {
+    doc: &'a mut YamlDoc,
+    sequence: NodeId,
+}
+
+impl SequenceEditor<'_> {
+    /// Retains only items for which `predicate` returns `true`.
+    ///
+    /// The predicate is called once per original item in source order. Removed
+    /// items take their attached comments and other entry trivia with them.
+    pub fn retain(
+        self,
+        mut predicate: impl FnMut(&YamlDoc, NodeId) -> bool,
+    ) -> Result<(), YamlEditError> {
+        let sequence = self.sequence;
+        self.doc.transaction(|work| {
+            let items = work.sequence_items(sequence).collect::<Vec<_>>();
+            let entries = items
+                .iter()
+                .filter(|item| !predicate(work, **item))
+                .filter_map(|item| work.containing_entry(*item))
+                .collect::<Vec<_>>();
+            work.remove_collection_entries(sequence, &entries)
+                .map_err(Into::into)
+        })
+    }
+}
+
 impl YamlEditError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
@@ -101,6 +130,33 @@ struct RenameTarget {
 }
 
 impl YamlDoc {
+    /// Creates a focused editor for `sequence`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node is missing or is not a YAML sequence.
+    pub fn sequence_editor(
+        &mut self,
+        sequence: NodeId,
+    ) -> Result<SequenceEditor<'_>, YamlEditError> {
+        let node = self
+            .node(sequence)
+            .ok_or_else(|| YamlEditError::new("sequence editor target does not exist"))?;
+        if !matches!(
+            self.semantic_kind(sequence),
+            Some(SemanticKind::Sequence { .. })
+        ) {
+            return Err(
+                YamlEditError::new("sequence editor target is not a sequence")
+                    .with_source_span(node.span),
+            );
+        }
+        Ok(SequenceEditor {
+            doc: self,
+            sequence,
+        })
+    }
+
     /// Applies RFC 6902 `add` semantics at a JSON Pointer destination.
     ///
     /// # Errors
@@ -722,7 +778,7 @@ impl YamlDoc {
         Ok(Span::from_usize(entry_line, end))
     }
 
-    fn empty_block_collection_edit(
+    pub(crate) fn empty_block_collection_edit(
         &self,
         collection: NodeId,
         removal_span: Span,
@@ -805,7 +861,7 @@ impl YamlDoc {
         ))
     }
 
-    fn containing_entry_child(&self, node: NodeId) -> bool {
+    pub(crate) fn containing_entry_child(&self, node: NodeId) -> bool {
         self.node(node).is_some_and(|node| {
             matches!(
                 node.kind(),
@@ -1516,6 +1572,39 @@ mod tests {
         flow.add_at(0, &pointer("/items/1"), &fragment("b"))
             .unwrap();
         assert_eq!(flow.as_source(), "items: [a, b, c]\n");
+    }
+
+    #[test]
+    fn sequence_editor_retains_block_and_flow_items_with_trivia() {
+        let mut block = YamlDoc::parse(
+            "items:\n  # first\n  - keep # inline\n  # second\n  - remove\n  - last\n",
+        )
+        .unwrap();
+        let sequence = block.resolve_pointer(0, &pointer("/items")).unwrap();
+        block
+            .sequence_editor(sequence)
+            .unwrap()
+            .retain(|doc, item| doc.scalar_value(item).unwrap() != "remove")
+            .unwrap();
+        assert_eq!(
+            block.as_source(),
+            "items:\n  # first\n  - keep # inline\n  - last\n"
+        );
+
+        let mut flow = YamlDoc::parse("items: [one, two, three]\n").unwrap();
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        flow.sequence_editor(sequence)
+            .unwrap()
+            .retain(|doc, item| doc.scalar_value(item).unwrap() != "two")
+            .unwrap();
+        assert_eq!(flow.as_source(), "items: [one, three]\n");
+
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        flow.sequence_editor(sequence)
+            .unwrap()
+            .retain(|_, _| false)
+            .unwrap();
+        assert_eq!(flow.as_source(), "items: []\n");
     }
 
     #[test]

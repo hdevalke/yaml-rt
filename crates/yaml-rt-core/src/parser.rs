@@ -1197,7 +1197,10 @@ impl<'source> Parser<'source> {
         );
         self.attach_child_at(stream.0 as usize, directive);
 
-        let body = strip_inline_comment(line.content_without_break).trim();
+        let uncommented = strip_inline_comment(line.content_without_break);
+        let body_offset = uncommented.len() - uncommented.trim_start().len();
+        let body = uncommented.trim();
+        let body_start = line.content_start + body_offset;
         let mut parts = body.split_whitespace();
         let Some(name) = parts.next() else {
             return Err(invalid_directive(line, "missing directive name"));
@@ -1247,12 +1250,12 @@ impl<'source> Parser<'source> {
                         .expect("parsed TAG prefix occurs after its handle");
                 self.semantics.push_tag_directive(
                     Span::from_usize(
-                        line.content_start + handle_offset,
-                        line.content_start + handle_offset + handle.len(),
+                        body_start + handle_offset,
+                        body_start + handle_offset + handle.len(),
                     ),
                     Span::from_usize(
-                        line.content_start + prefix_offset,
-                        line.content_start + prefix_offset + prefix.len(),
+                        body_start + prefix_offset,
+                        body_start + prefix_offset + prefix.len(),
                     ),
                 );
                 self.tag_handles

@@ -91,6 +91,11 @@ key: ߅value
 &a ߅foo
 EOF
 
+cat > "$corpus_dir/regression-tag-directive-leading-space.yaml" <<'EOF'
+ %TAG ! p-|er↓
+!
+EOF
+
 cat > "$corpus_dir/edge-malformed-flow.yaml" <<'EOF'
 &fl
  { &fl

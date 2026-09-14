@@ -825,6 +825,46 @@ fn tag_directive_percent_decodes_suffix() {
 }
 
 #[test]
+fn tag_directive_spans_account_for_leading_whitespace_and_utf8() {
+    let input = " %TAG ! p-|er↓\n!";
+    let doc = YamlDoc::parse(input).expect("leading whitespace before a TAG directive parses");
+    let document = doc.documents().next().expect("document exists");
+    let value = doc
+        .children(document)
+        .find(|child| doc.semantic_kind(*child).is_some())
+        .expect("tagged scalar exists");
+
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(doc.raw_tag(value), Some("!"));
+    assert_eq!(
+        doc.resolved_tag(value).expect("tag resolves").as_deref(),
+        Some("p-|er↓")
+    );
+
+    let events = doc.events_to_test_string();
+    let reparsed = YamlDoc::parse(&doc.to_string()).expect("round-tripped YAML reparses");
+    assert_eq!(reparsed.events_to_test_string(), events);
+
+    for (input, expected_tag) in [
+        ("  %TAG ! préfix\n!", "préfix"),
+        ("    %TAG ! ↓prefix\n!", "↓prefix"),
+    ] {
+        let doc = YamlDoc::parse(input).expect("indented TAG directive with UTF-8 prefix parses");
+        let document = doc.documents().next().expect("document exists");
+        let value = doc
+            .children(document)
+            .find(|child| doc.semantic_kind(*child).is_some())
+            .expect("tagged scalar exists");
+
+        assert_eq!(
+            doc.resolved_tag(value).expect("tag resolves").as_deref(),
+            Some(expected_tag)
+        );
+        assert_eq!(doc.to_string(), input);
+    }
+}
+
+#[test]
 fn events_render_multi_document_stream_with_explicit_end() {
     let doc =
         YamlDoc::parse("%YAML 1.2\n--- |\n%!PS-Adobe-2.0\n...\n%YAML 1.2\n---\n# Empty\n...\n")

@@ -124,6 +124,9 @@ assert_eq!(doc.as_source(), "items: [keep]\n");
 let items = doc.resolve_pointer(0, &JsonPointer::parse("/items")?)?;
 doc.sequence_editor(items)?.insert(1, &YamlFragment::parse("added")?)?;
 assert_eq!(doc.as_source(), "items: [keep, added]\n");
+let items = doc.resolve_pointer(0, &JsonPointer::parse("/items")?)?;
+doc.sequence_editor(items)?.move_item(1, 0)?;
+assert_eq!(doc.as_source(), "items: [added, keep]\n");
 # Ok(())
 # }
 ```

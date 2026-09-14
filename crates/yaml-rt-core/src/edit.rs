@@ -35,6 +35,27 @@ impl SequenceEditor<'_> {
         })
     }
 
+    /// Moves an existing item to its index in the finished sequence.
+    pub fn move_item(self, from: usize, to: usize) -> Result<(), YamlEditError> {
+        let sequence = self.sequence;
+        self.doc.transaction(|work| {
+            let len = work.sequence_items(sequence).count();
+            if from >= len {
+                return Err(work.sequence_index_error(sequence, from, len, false));
+            }
+            if to >= len {
+                return Err(work.sequence_index_error(sequence, to, len, false));
+            }
+            if from == to {
+                return Ok(());
+            }
+            let mut order = (0..len).collect::<Vec<_>>();
+            let moved = order.remove(from);
+            order.insert(to, moved);
+            work.queue_sequence_reorder(sequence, &order)
+        })
+    }
+
     /// Retains only items for which `predicate` returns `true`.
     ///
     /// The predicate is called once per original item in source order. Removed
@@ -190,6 +211,82 @@ impl YamlDoc {
             self.node(sequence)
                 .map_or_else(|| Span::empty(0), |node| node.span),
         )
+    }
+
+    fn queue_sequence_reorder(
+        &mut self,
+        sequence: NodeId,
+        order: &[usize],
+    ) -> Result<(), YamlEditError> {
+        let entries = self
+            .children(sequence)
+            .filter(|node| self.containing_entry_child(*node))
+            .collect::<Vec<_>>();
+        if entries.len() != order.len() || order.iter().any(|index| *index >= entries.len()) {
+            return Err(YamlEditError::new("invalid sequence item ordering"));
+        }
+        let Some(SemanticKind::Sequence { style }) = self.semantic_kind(sequence) else {
+            return Err(YamlEditError::new(
+                "sequence reorder target is not a sequence",
+            ));
+        };
+        match style {
+            CollectionStyle::Block => {
+                let spans = entries
+                    .iter()
+                    .map(|entry| self.block_collection_entry_removal_span(sequence, *entry))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let chunks = spans
+                    .iter()
+                    .map(|span| self.source().slice(*span).to_owned())
+                    .collect::<Vec<_>>();
+                let span = Span::new(spans[0].start, spans.last().expect("entries exist").end);
+                let replacement = order.iter().map(|index| chunks[*index].as_str()).collect();
+                self.queue_edit(span, replacement)?;
+            }
+            CollectionStyle::Flow => {
+                let sequence_span = self.expect_node(sequence)?.span;
+                let open = self
+                    .source()
+                    .slice(sequence_span)
+                    .find('[')
+                    .map(|offset| sequence_span.start as usize + offset + 1)
+                    .ok_or_else(|| {
+                        YamlEditError::new("flow sequence opening bracket is missing")
+                    })?;
+                let close = closing_delimiter_offset(self, sequence_span, ']')?;
+                let mut chunks = Vec::with_capacity(entries.len());
+                let mut leading = &self.source().as_str()
+                    [open..self.expect_node(entries[0])?.span.start as usize];
+                for (index, entry) in entries.iter().copied().enumerate() {
+                    let entry_span = self.expect_node(entry)?.span;
+                    let next_start = entries.get(index + 1).map_or(close, |next| {
+                        self.expect_node(*next).unwrap().span.start as usize
+                    });
+                    let gap = &self.source().as_str()[entry_span.end as usize..next_start];
+                    let (trailing, next_leading) = if index + 1 < entries.len() {
+                        let comma = gap.find(',').ok_or_else(|| {
+                            YamlEditError::new("flow sequence separator is missing")
+                        })?;
+                        (&gap[..comma], &gap[comma + 1..])
+                    } else {
+                        (gap, "")
+                    };
+                    chunks.push(format!(
+                        "{leading}{}{trailing}",
+                        self.source().slice(entry_span)
+                    ));
+                    leading = next_leading;
+                }
+                let replacement = order
+                    .iter()
+                    .map(|index| chunks[*index].as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.queue_edit(Span::from_usize(open, close), replacement)?;
+            }
+        }
+        Ok(())
     }
 
     /// Applies RFC 6902 `add` semantics at a JSON Pointer destination.
@@ -1672,6 +1769,40 @@ mod tests {
                 .insert(4, &fragment("nope"))
                 .is_err()
         );
+        assert_eq!(flow.as_source(), before);
+    }
+
+    #[test]
+    fn sequence_editor_moves_complete_items_with_their_trivia() {
+        let mut block = YamlDoc::parse(
+            "items:\n  # alpha\n  - name: a\n    value: 1\n  # beta\n  - name: b # inline\n  - name: c\n",
+        )
+        .unwrap();
+        let sequence = block.resolve_pointer(0, &pointer("/items")).unwrap();
+        block
+            .sequence_editor(sequence)
+            .unwrap()
+            .move_item(1, 0)
+            .unwrap();
+        assert_eq!(
+            block.as_source(),
+            "items:\n  # beta\n  - name: b # inline\n  # alpha\n  - name: a\n    value: 1\n  - name: c\n"
+        );
+
+        let mut flow = YamlDoc::parse("items: [a, # beta\n  b, c]\n").unwrap();
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        flow.sequence_editor(sequence)
+            .unwrap()
+            .move_item(1, 2)
+            .unwrap();
+        assert_eq!(flow.as_source(), "items: [a, c, # beta\n  b]\n");
+
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        let before = flow.as_source().to_owned();
+        flow.sequence_editor(sequence)
+            .unwrap()
+            .move_item(1, 1)
+            .unwrap();
         assert_eq!(flow.as_source(), before);
     }
 

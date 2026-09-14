@@ -23,6 +23,18 @@ pub struct SequenceEditor<'a> {
 }
 
 impl SequenceEditor<'_> {
+    /// Inserts `value` before the item at `index`, or appends at `len`.
+    pub fn insert(self, index: usize, value: &YamlFragment) -> Result<(), YamlEditError> {
+        let sequence = self.sequence;
+        self.doc.transaction(|work| {
+            let len = work.sequence_items(sequence).count();
+            if index > len {
+                return Err(work.sequence_index_error(sequence, index, len, true));
+            }
+            work.queue_sequence_insert(sequence, index, value)
+        })
+    }
+
     /// Retains only items for which `predicate` returns `true`.
     ///
     /// The predicate is called once per original item in source order. Removed
@@ -155,6 +167,29 @@ impl YamlDoc {
             doc: self,
             sequence,
         })
+    }
+
+    fn sequence_index_error(
+        &self,
+        sequence: NodeId,
+        index: usize,
+        len: usize,
+        allow_end: bool,
+    ) -> YamlEditError {
+        let expected = if allow_end {
+            format!("a sequence insertion index from 0 through {len}")
+        } else if len == 0 {
+            "an item index in a nonempty sequence".to_owned()
+        } else {
+            format!("a sequence item index from 0 through {}", len - 1)
+        };
+        YamlEditError::new(format!(
+            "sequence index {index} is out of bounds; expected {expected}"
+        ))
+        .with_source_span(
+            self.node(sequence)
+                .map_or_else(|| Span::empty(0), |node| node.span),
+        )
     }
 
     /// Applies RFC 6902 `add` semantics at a JSON Pointer destination.
@@ -1605,6 +1640,39 @@ mod tests {
             .retain(|_, _| false)
             .unwrap();
         assert_eq!(flow.as_source(), "items: []\n");
+    }
+
+    #[test]
+    fn sequence_editor_inserts_fragments_without_changing_existing_items() {
+        let mut block = YamlDoc::parse("items:\r\n  - one # keep\r\n  - three\r\n").unwrap();
+        let sequence = block.resolve_pointer(0, &pointer("/items")).unwrap();
+        block
+            .sequence_editor(sequence)
+            .unwrap()
+            .insert(1, &fragment("{name: two}"))
+            .unwrap();
+        assert_eq!(
+            block.as_source(),
+            "items:\r\n  - one # keep\r\n  - {name: two}\r\n  - three\r\n"
+        );
+
+        let mut flow = YamlDoc::parse("items: [\n  one,\n  three\n]\n").unwrap();
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        flow.sequence_editor(sequence)
+            .unwrap()
+            .insert(1, &fragment("two"))
+            .unwrap();
+        assert_eq!(flow.as_source(), "items: [\n  one,\n  two,\n  three\n]\n");
+
+        let sequence = flow.resolve_pointer(0, &pointer("/items")).unwrap();
+        let before = flow.as_source().to_owned();
+        assert!(
+            flow.sequence_editor(sequence)
+                .unwrap()
+                .insert(4, &fragment("nope"))
+                .is_err()
+        );
+        assert_eq!(flow.as_source(), before);
     }
 
     #[test]

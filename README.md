@@ -112,7 +112,7 @@ Sequences have a focused, transactional editor. Its callbacks receive lossless
 node handles, so filtering can use semantic values without reparsing snippets:
 
 ```rust
-use yaml_rt::{JsonPointer, YamlDoc, YamlEditError};
+use yaml_rt::{JsonPointer, YamlDoc, YamlEditError, YamlFragment};
 
 # fn example() -> Result<(), YamlEditError> {
 let mut doc = YamlDoc::parse("items: [keep, remove]\n")?;
@@ -121,6 +121,9 @@ doc.sequence_editor(items)?.retain(|doc, item| {
     doc.scalar_value(item).is_ok_and(|value| value != "remove")
 })?;
 assert_eq!(doc.as_source(), "items: [keep]\n");
+let items = doc.resolve_pointer(0, &JsonPointer::parse("/items")?)?;
+doc.sequence_editor(items)?.insert(1, &YamlFragment::parse("added")?)?;
+assert_eq!(doc.as_source(), "items: [keep, added]\n");
 # Ok(())
 # }
 ```

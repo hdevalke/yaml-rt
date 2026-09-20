@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.3.0 (2026-09-20)
+
+### Features
+
+* **playground:** add input and output schema validation (03c74ae)
+* **cli:** add schema validation and generation commands (e00f8cc)
+* **schema:** add JSON Schema validation and inference crate (67912ca)
+* **core:** add source-preserving stable sequence sorting (f9c2da0)
+* **core:** add source-preserving sequence item moves (a519542)
+* **core:** add source-preserving sequence insertion (43c24c3)
+* **core:** add source-preserving sequence retain editor (2544c6a)
+
+### Fixes
+
+* correct UTF-8 tag directive spans (e63ad3c)
+
 ### v0.2.4 (2026-09-03)
 
 #### Features

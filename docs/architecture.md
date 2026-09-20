@@ -92,6 +92,13 @@ sparse store; it does not convert or scan a transient semantic-node arena.
 Schema resolution and JSON Pointer lookup use a derived semantic view while
 emission continues to use source spans.
 
+`yaml-rt-schema` is an overlay on this semantic view. It converts each selected
+YAML document to a JSON-compatible value, recording source spans by JSON
+Pointer. A reusable `Schema` validates the converted value without changing
+the CST. The separate generator infers a permissive JSON Schema from the same
+value model. The CLI loads one schema before traversing file or directory
+targets and validates every document independently.
+
 ### Editing and emission
 
 Editor methods queue non-overlapping replacements, insertions, and removals.

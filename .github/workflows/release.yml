@@ -74,6 +74,7 @@ jobs:
           -p yaml-rt-rfc9535
           -p yaml-rt-derive
           -p yaml-rt-serde
+          -p yaml-rt-schema
           -p yaml-rt
           -p yaml-rt-cli
           -p yaml-rt-wasm
@@ -91,6 +92,7 @@ jobs:
           -p yaml-rt-rfc9535
           -p yaml-rt-derive
           -p yaml-rt-serde
+          -p yaml-rt-schema
           -p yaml-rt
           -p yaml-rt-cli
           -p yaml-rt-wasm
@@ -102,6 +104,8 @@ jobs:
           YAML_TEST_SUITE_RUN_ALL: "1"
           YAML_TEST_SUITE_CHECK_JSON: "1"
         run: cargo test -p yaml-rt-core --test yaml_test_suite --locked
+      - name: Run JSON Schema Test Suite 2020-12 cases
+        run: cargo test -p yaml-rt-schema --test official --locked
       - name: Verify package contents
         shell: bash
         run: |
@@ -111,6 +115,7 @@ jobs:
             yaml-rt-rfc9535
             yaml-rt-derive
             yaml-rt-serde
+            yaml-rt-schema
             yaml-rt
             yaml-rt-cli
           )
@@ -385,6 +390,7 @@ jobs:
             yaml-rt-rfc9535
             yaml-rt-derive
             yaml-rt-serde
+            yaml-rt-schema
             yaml-rt-cli
             yaml-rt
           )

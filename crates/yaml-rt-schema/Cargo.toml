@@ -1,0 +1,21 @@
+[package]
+name = "yaml-rt-schema"
+description = "JSON Schema 2020-12 validation and inference for yaml-rt"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+documentation = "https://docs.rs/yaml-rt-schema"
+keywords = ["yaml", "json-schema", "validation", "configuration"]
+categories = ["config", "parser-implementations"]
+
+[dependencies]
+yaml-rt-core.workspace = true
+regex.workspace = true
+url.workspace = true
+jiff.workspace = true
+iri-string.workspace = true
+idna.workspace = true

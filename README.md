@@ -516,6 +516,7 @@ Run `yaml-rt help <operation>` for operation-specific arguments.
 | --- | --- | --- |
 | `yaml-rt-core` | Dependency-free source model, parser, CST, semantic graph, diagnostics, editor, and emitter | Yes |
 | `yaml-rt-rfc9535` | Native RFC 9535 JSONPath parsing and evaluation over `YamlDoc` | Yes |
+| `yaml-rt-schema` | JSON Schema validation and permissive inference over `YamlDoc` | No |
 | `yaml-rt-derive` | `YamlRt` procedural derive | Yes |
 | `yaml-rt-serde` | Serde serializer and deserializer | Yes |
 | `yaml-rt` | Facade re-exporting the public APIs | Yes |
@@ -588,6 +589,13 @@ on `YamlDoc` without a generic JSON value dependency. Compact JSON rendering
 remains private to `yaml-rt-cli`; the RFC 9535 crate is not re-exported by the
 `yaml-rt` facade.
 
+The schema crate reuses `yaml-rt-core` for JSON and YAML parsing and writes JSON
+through its own small value model. Exact decimal arithmetic uses decimal digits.
+`regex` checks patterns, `url` resolves references, `iri-string` and `idna` check
+internationalized formats, and `jiff` checks dates and times. These dependencies
+do not enter the core parser. The official JSON Schema Test Suite is pinned at
+`third_party/json-schema-test-suite` and runs in CI.
+
 ## YAML 1.2.2 conformance
 
 The parser is tested against all 402 cases in the YAML Test Suite tag
@@ -630,6 +638,10 @@ cargo test -p yaml-rt-core --test yaml_test_suite
 - CLI and patch `test` operations compare YAML values using the supported YAML
   1.2 core scalar and collection model; they are not a general tag-aware
   application schema.
+- JSON Schema 2020-12 validation passes the selected official core and format
+  assertion cases. Remote fetches, custom vocabularies, and ECMAScript regex
+  compatibility remain outside this release; see
+  [`docs/json-schema-conformance.md`](docs/json-schema-conformance.md).
 - Serde `Value` conversion does not preserve presentation metadata and only
   expands merge keys when `Value::apply_merge()` is requested.
 - Typed-overlay `flatten` has intentionally conservative combinations with

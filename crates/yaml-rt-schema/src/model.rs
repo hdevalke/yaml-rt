@@ -12,6 +12,10 @@ pub(crate) struct Instance {
 
 pub(crate) fn from_document(doc: &YamlDoc, document: usize) -> Result<Instance, Error> {
     let root = doc.document_root(document).map_err(Error::source)?;
+    from_node(doc, root)
+}
+
+pub(crate) fn from_node(doc: &YamlDoc, root: Option<NodeId>) -> Result<Instance, Error> {
     let mut converter = Converter {
         doc,
         spans: HashMap::new(),

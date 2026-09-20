@@ -29,11 +29,18 @@
           <div class="panel-heading">
             <div>
               <span class="step">01</span>
-              <h1>Original YAML</h1>
+              <h1>Input</h1>
             </div>
             <span id="document-count" class="meta"></span>
           </div>
-          <div id="source-editor" class="editor" aria-label="Original YAML editor"></div>
+          <div class="editor-tabs" role="tablist" aria-label="Input editor">
+            <button id="input-yaml-tab" class="editor-tab active" type="button" role="tab" aria-controls="source-editor" aria-selected="true">YAML</button>
+            <button id="input-schema-tab" class="editor-tab" type="button" role="tab" aria-controls="input-schema-editor" aria-selected="false" title="Optional JSON or YAML schema; leave empty to skip">Schema</button>
+            <span id="input-validation" class="validation-state" role="status">No schema</span>
+          </div>
+          <div id="source-editor" class="editor" role="tabpanel" aria-labelledby="input-yaml-tab" aria-label="Input YAML editor"></div>
+          <div id="input-schema-editor" class="editor" role="tabpanel" aria-labelledby="input-schema-tab" aria-label="Input schema editor" hidden></div>
+          <div id="input-validation-detail" class="validation-detail" hidden></div>
         </article>
 
         <article class="panel command-panel">
@@ -49,6 +56,7 @@
             <label>Operation
               <select id="command">
                 <option value="validate">validate</option>
+                <option value="schema">schema</option>
                 <option value="query">query</option>
                 <option value="get">get</option>
                 <option value="add">add</option>
@@ -99,7 +107,7 @@
           </div>
 
           <div class="command-preview-wrap">
-            <span>Equivalent CLI</span>
+            <span>CLI command · schema tabs are playground checks</span>
             <code id="command-preview"></code>
             <button id="copy-command" class="icon-button" type="button" title="Copy command">Copy</button>
           </div>
@@ -118,13 +126,21 @@
           <div class="panel-heading">
             <div>
               <span class="step">03</span>
-              <h2 id="result-title">Result YAML</h2>
+              <h2 id="result-title">Output</h2>
             </div>
             <div class="result-actions">
+              <button id="use-schema" class="quiet" type="button" hidden>Use as input schema</button>
               <button id="copy-result" class="quiet" type="button">Copy result</button>
             </div>
           </div>
-          <div id="result-editor" class="editor" aria-label="Result YAML editor"></div>
+          <div class="editor-tabs" role="tablist" aria-label="Output editor">
+            <button id="output-yaml-tab" class="editor-tab active" type="button" role="tab" aria-controls="result-editor" aria-selected="true">YAML</button>
+            <button id="output-schema-tab" class="editor-tab" type="button" role="tab" aria-controls="output-schema-editor" aria-selected="false" title="Optional JSON or YAML schema; leave empty to skip">Schema</button>
+            <span id="output-validation" class="validation-state" role="status">No schema</span>
+          </div>
+          <div id="result-editor" class="editor" role="tabpanel" aria-labelledby="output-yaml-tab" aria-label="Output YAML editor"></div>
+          <div id="output-schema-editor" class="editor" role="tabpanel" aria-labelledby="output-schema-tab" aria-label="Output schema editor" hidden></div>
+          <div id="output-validation-detail" class="validation-detail" hidden></div>
         </article>
       </section>
     </main>

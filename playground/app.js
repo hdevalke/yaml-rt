@@ -12,7 +12,7 @@ import {
   yaml,
 } from "./codemirror.js";
 import init, { run_command } from "./pkg/yaml_rt_wasm.js";
-import { copyText, lineDiff, resultPresentation } from "./state.mjs";
+import { copyText, lineDiff, resultPresentation, validationPresentation } from "./state.mjs";
 
 const baseSource = `# Production services — comments and style stay put
 services:
@@ -25,8 +25,31 @@ defaults: &defaults
 mirror: *defaults
 `;
 
+const serviceSchema = `type: object
+properties:
+  services:
+    type: array
+    items:
+      type: object
+      properties:
+        port:
+          type: integer
+`;
+const portSchema = `type: object
+properties:
+  service:
+    type: object
+    required: [port]
+    properties:
+      port:
+        type: integer
+`;
+
 const examples = [
-  { name: "Replace every service port (JSONPath)", command: "replace", selectorKind: "jsonpath", selector: "$.services[*].port", value: "9090" },
+  { name: "Replace ports and validate both sides", command: "replace", selectorKind: "jsonpath", selector: "$.services[*].port", value: "9090", inputSchema: serviceSchema, outputSchema: `${serviceSchema}          const: 9090\n` },
+  { name: "Repair input that fails its schema", source: "service:\n  port: closed\n", command: "replace", selector: "/service/port", value: "8080", inputSchema: portSchema, outputSchema: portSchema },
+  { name: "Detect output that fails its schema", source: "service:\n  port: 8080\n", command: "replace", selector: "/service/port", value: "closed", inputSchema: portSchema, outputSchema: portSchema },
+  { name: "Generate a schema from input", source: "service:\n  name: api\n  port: 8080\n  enabled: true\n", command: "schema" },
   { name: "Get an exact node (JSON Pointer)", command: "get", selectorKind: "pointer", selector: "/services/0" },
   { name: "Query enabled services", command: "query", selectorKind: "jsonpath", selector: "$.services[?@.enabled == true].name" },
   { name: "Add a nested value", command: "add", selectorKind: "pointer", selector: "/services/0/tls", value: "{enabled: true, mode: strict}" },
@@ -50,6 +73,8 @@ const controls = {
 
 const setChangedLines = StateEffect.define();
 const setErrorLine = StateEffect.define();
+const setValidationLine = StateEffect.define();
+const setReadValidationLine = StateEffect.define();
 const setDeletedLines = StateEffect.define();
 const changedLines = StateField.define({
   create: () => Decoration.none,
@@ -68,6 +93,28 @@ const errorLine = StateField.define({
     value = value.map(transaction.changes);
     for (const effect of transaction.effects) {
       if (effect.is(setErrorLine)) value = effect.value;
+    }
+    return value;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+const validationLine = StateField.define({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    value = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(setValidationLine)) value = effect.value;
+    }
+    return value;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+const readValidationLine = StateField.define({
+  create: () => Decoration.none,
+  update(value, transaction) {
+    value = value.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (effect.is(setReadValidationLine)) value = effect.value;
     }
     return value;
   },
@@ -115,6 +162,8 @@ function editor(parent, text, readOnly, onChange) {
         EditorState.readOnly.of(readOnly),
         changedLines,
         errorLine,
+        validationLine,
+        readValidationLine,
         deletedLines,
         EditorView.updateListener.of((update) => {
           if (update.docChanged && onChange) onChange();
@@ -126,9 +175,24 @@ function editor(parent, text, readOnly, onChange) {
 
 let sourceEditor;
 let resultEditor;
+let inputSchemaEditor;
+let outputSchemaEditor;
 let ready = false;
 let debounce;
 let activeExample = 0;
+let loadedExample = null;
+const exampleSchemaDrafts = new Map();
+
+function selectTab(side, tab) {
+  const yamlEditor = side === "input" ? "source-editor" : "result-editor";
+  $(`${side}-schema-editor`).hidden = tab !== "schema";
+  $(yamlEditor).hidden = tab !== "yaml";
+  for (const choice of ["yaml", "schema"]) {
+    const button = $(`${side}-${choice}-tab`);
+    button.classList.toggle("active", choice === tab);
+    button.setAttribute("aria-selected", String(choice === tab));
+  }
+}
 
 function text(view) { return view.state.doc.toString(); }
 function replaceText(view, value) {
@@ -144,6 +208,12 @@ function commandPreview() {
   const command = controls.command.value;
   let preview = `yaml-rt ${command}`;
   if (command === "validate") {
+    if (text(inputSchemaEditor).trim()) preview += " --schema input.schema.yaml";
+    $("command-preview").textContent = preview;
+    return preview;
+  }
+  if (command === "schema") {
+    preview += " -";
     $("command-preview").textContent = preview;
     return preview;
   }
@@ -173,7 +243,7 @@ function updateFields() {
   $("value-field").hidden = !["add", "replace", "test"].includes(command);
   $("new-key-field").hidden = command !== "rename-key";
   $("patch-field").hidden = command !== "patch";
-  $("document-field").hidden = command === "validate";
+  $("document-field").hidden = ["validate", "schema"].includes(command);
   if (command === "query") controls.selectorKind.value = "jsonpath";
   $("selector-label").textContent = controls.selectorKind.value === "jsonpath" ? "JSONPath (RFC 9535)" : "JSON Pointer (RFC 6901)";
   controls.selector.placeholder = controls.selectorKind.value === "jsonpath" ? "$.services[*].port" : "/services/0/port";
@@ -212,6 +282,36 @@ function clearDiagnostics() {
     control.classList.remove("invalid");
     control.removeAttribute("aria-invalid");
   }
+}
+
+function markValidation(view, result, effect = setValidationLine) {
+  let decoration = Decoration.none;
+  if (result.status === "invalid" && result.line && result.line <= view.state.doc.lines) {
+    const source = text(view);
+    const start = codeUnitOffset(source, result.span_start ?? 0);
+    const end = codeUnitOffset(source, result.span_end ?? result.span_start ?? 0);
+    const range = end > start
+      ? Decoration.mark({ class: "cm-error-range" }).range(start, end)
+      : Decoration.line({ class: "cm-error-line" }).range(view.state.doc.line(result.line).from);
+    decoration = Decoration.set([range]);
+  }
+  view.dispatch({ effects: effect.of(decoration) });
+}
+
+function showValidation(side, result, command) {
+  const state = $(`${side}-validation`);
+  const detail = $(`${side}-validation-detail`);
+  const presentation = validationPresentation(result);
+  state.className = `validation-state ${result.status}`;
+  state.textContent = presentation.label;
+  detail.className = `validation-detail ${result.status}`;
+  detail.textContent = presentation.detail;
+  detail.hidden = !presentation.detail;
+  const schemaEditor = side === "input" ? inputSchemaEditor : outputSchemaEditor;
+  const yamlEditor = side === "input" ? sourceEditor : resultEditor;
+  markValidation(schemaEditor, result.target === "schema" ? result : { status: "skipped" });
+  markValidation(yamlEditor, result.target === "yaml" && (side === "input" || !["query", "get", "validate"].includes(command))
+    ? result : { status: "skipped" });
 }
 
 function codeUnitOffset(source, byteOffset) {
@@ -265,7 +365,16 @@ function run() {
     controls.value.value,
     controls.newKey.value,
     controls.patch.value,
+    text(inputSchemaEditor),
+    text(outputSchemaEditor),
   );
+  const validationResult = (value) => ({
+    status: value.status, message: value.message, target: value.target,
+    span_start: value.span_start, span_end: value.span_end,
+    line: value.line, column: value.column, document_index: value.document_index,
+  });
+  const inputValidation = wasmResult.input_validation;
+  const outputValidation = wasmResult.output_validation;
   const result = {
     ok: wasmResult.ok,
     output_yaml: wasmResult.output_yaml,
@@ -281,6 +390,10 @@ function run() {
     line: wasmResult.line,
     column: wasmResult.column,
   };
+  result.input_validation = validationResult(inputValidation);
+  result.output_validation = validationResult(outputValidation);
+  inputValidation.free();
+  outputValidation.free();
   wasmResult.free();
   setDocuments(result.document_count);
   const presentation = resultPresentation(result, controls.command.value, source);
@@ -293,6 +406,7 @@ function run() {
   ] });
   $("match-summary").hidden = !presentation.showMatchCount;
   $("copy-result").hidden = !presentation.showCopyResult;
+  $("use-schema").hidden = !(controls.command.value === "schema" && result.ok);
   if (presentation.showMatchCount) {
     const count = result.matched_pointers.length;
     $("match-count").textContent = `${count} match${count === 1 ? "" : "es"}`;
@@ -311,6 +425,11 @@ function run() {
     $("diagnostic").hidden = false;
     markDiagnostic(result);
   }
+  showValidation("input", result.input_validation, controls.command.value);
+  showValidation("output", result.output_validation, controls.command.value);
+  markValidation(sourceEditor, ["get", "query"].includes(controls.command.value)
+    && result.output_validation.target === "yaml"
+    ? result.output_validation : { status: "skipped" }, setReadValidationLine);
 }
 
 function scheduleRun() {
@@ -319,9 +438,18 @@ function scheduleRun() {
   debounce = setTimeout(run, 280);
 }
 
-function loadExample(index) {
+function loadExample(index, reset = false) {
+  if (loadedExample != null && !reset) {
+    exampleSchemaDrafts.set(loadedExample, {
+      input: text(inputSchemaEditor), output: text(outputSchemaEditor),
+    });
+  }
+  if (reset) exampleSchemaDrafts.delete(index);
   activeExample = index;
   const example = examples[index];
+  const schemas = exampleSchemaDrafts.get(index);
+  replaceText(inputSchemaEditor, schemas?.input ?? example.inputSchema ?? "");
+  replaceText(outputSchemaEditor, schemas?.output ?? example.outputSchema ?? "");
   replaceText(sourceEditor, example.source || baseSource);
   controls.command.value = example.command;
   controls.selectorKind.value = example.selectorKind || "pointer";
@@ -338,6 +466,7 @@ function loadExample(index) {
   controls.documentIndex.value = String(requestedDocument);
   updateFields();
   run();
+  loadedExample = index;
 }
 
 function legacyCopy(value) {
@@ -371,12 +500,24 @@ async function copy(value, button) {
 async function start() {
   sourceEditor = editor($("source-editor"), baseSource, false, scheduleRun);
   resultEditor = editor($("result-editor"), baseSource, true);
+  inputSchemaEditor = editor($("input-schema-editor"), "", false, scheduleRun);
+  outputSchemaEditor = editor($("output-schema-editor"), "", false, scheduleRun);
+  for (const side of ["input", "output"]) {
+    for (const tab of ["yaml", "schema"]) {
+      $(`${side}-${tab}-tab`).addEventListener("click", () => selectTab(side, tab));
+    }
+  }
   examples.forEach((example, index) => controls.example.add(new Option(example.name, String(index))));
   Object.values(controls).forEach((control) => control.addEventListener("input", scheduleRun));
   controls.example.addEventListener("change", () => loadExample(Number(controls.example.value)));
   $("run").addEventListener("click", run);
-  $("reset").addEventListener("click", () => loadExample(activeExample));
+  $("reset").addEventListener("click", () => loadExample(activeExample, true));
   $("copy-result").addEventListener("click", () => copy(text(resultEditor), $("copy-result")));
+  $("use-schema").addEventListener("click", () => {
+    replaceText(inputSchemaEditor, text(resultEditor));
+    selectTab("input", "schema");
+    scheduleRun();
+  });
   $("copy-command").addEventListener("click", () => copy(commandPreview(), $("copy-command")));
   updateFields();
   try {

@@ -1190,6 +1190,7 @@ dependencies = [
  "wasm-bindgen",
  "yaml-rt-core",
  "yaml-rt-rfc9535",
+ "yaml-rt-schema",
 ]
 
 [[package]]

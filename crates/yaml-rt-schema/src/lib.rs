@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub use value::Value;
-use yaml_rt_core::{Span, YamlDoc};
+use yaml_rt_core::{JsonPointer, Span, YamlDoc};
 
 pub use generate::generate_schema;
 
@@ -94,6 +94,7 @@ impl std::error::Error for Error {}
 /// Parsed JSON Schema reusable across YAML documents.
 pub struct Schema {
     root: Value,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     origin: Option<PathBuf>,
     format_assertion: bool,
     resources: std::collections::HashMap<String, Value>,
@@ -137,6 +138,20 @@ impl Schema {
         validate::validate(self, &instance)
     }
 
+    /// Validates one selected YAML value while retaining its source spans.
+    pub fn validate_pointer(
+        &self,
+        doc: &YamlDoc,
+        document: usize,
+        pointer: &JsonPointer,
+    ) -> Result<(), Error> {
+        let node = doc
+            .resolve_pointer(document, pointer)
+            .map_err(Error::source)?;
+        let instance = model::from_node(doc, Some(node))?;
+        validate::validate(self, &instance)
+    }
+
     /// Validates an already parsed JSON instance.
     pub fn validate_json(&self, value: &Value) -> Result<(), Error> {
         validate::validate(
@@ -173,7 +188,12 @@ fn parse_schema(source: &str, path: Option<&Path>) -> Result<Value, Error> {
     }) {
         return Value::parse(source);
     }
-    let doc = YamlDoc::parse(source).map_err(Error::source)?;
+    let doc = YamlDoc::parse(source).map_err(|error| {
+        let span = error.diagnostic.span;
+        let mut result = Error::source(error);
+        result.source_span = Some(span);
+        result
+    })?;
     if doc.document_count() != 1 {
         return Err(Error::new("schema must contain exactly one document"));
     }

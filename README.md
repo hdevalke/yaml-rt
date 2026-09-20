@@ -32,6 +32,18 @@ edit. Source-aware failures use the same rustc-style diagnostics as the CLI.
 The playground runs the Rust parser and editor locally through WebAssembly.
 Documents are not uploaded to a server. Its interface is plain HTML, CSS, and
 JavaScript with a pinned CodeMirror bundle built into the deployed site.
+The input and output panels each have an optional Schema tab. Enter a JSON or
+YAML schema to validate every input document and the resulting YAML after a
+command. Input schema failures do not stop edits, so a command can repair an
+invalid document. For `get` and `query`, the output schema checks each returned
+value; `test` has no YAML output to validate. Browser schemas are entered as
+text, so references requiring separate files are unavailable. These two
+playground checks are independent of the CLI command preview.
+The playground's `schema` command generates a copyable JSON Schema from one
+input document; Use as input schema places it in the Input Schema tab. Several
+examples include input and output schemas, and each
+example keeps schema edits when you switch away and back; Reset restores its
+original schemas.
 
 ## When to use yaml-rt
 
@@ -605,7 +617,9 @@ remains private to `yaml-rt-cli`; the RFC 9535 crate is not re-exported by the
 `yaml-rt` facade.
 
 The schema crate reuses `yaml-rt-core` for JSON and YAML parsing and writes JSON
-through its own small value model. Exact decimal arithmetic uses decimal digits.
+through its own small value model. `Schema::validate_pointer` checks a selected
+YAML value while retaining source locations for diagnostics. Exact decimal
+arithmetic uses decimal digits.
 `regex` checks patterns, `url` resolves references, `iri-string` and `idna` check
 internationalized formats, and `jiff` checks dates and times. These dependencies
 do not enter the core parser. The official JSON Schema Test Suite is pinned at

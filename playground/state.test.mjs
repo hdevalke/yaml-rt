@@ -1,7 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { copyText, lineDiff, resultPresentation } from "./state.mjs";
+import { copyText, lineDiff, resultPresentation, validationPresentation } from "./state.mjs";
+
+test("schema validation labels distinguish missing, bad, and mismatched schemas", () => {
+  assert.equal(validationPresentation({ status: "skipped" }).label, "No schema");
+  assert.equal(validationPresentation({ status: "invalid", target: "schema", message: "bad schema" }).label, "Invalid schema");
+  assert.deepEqual(validationPresentation({ status: "invalid", target: "yaml", document_index: 1, message: "wrong type" }), {
+    label: "Schema mismatch",
+    detail: "Document 1: wrong type",
+  });
+  assert.equal(validationPresentation({ status: "unavailable" }).label, "Not available");
+});
 
 test("read commands put command output in the right pane", () => {
   const presentation = resultPresentation(
@@ -26,27 +36,44 @@ test("mutations put edited YAML in the right pane", () => {
   assert.equal(presentation.highlightChanges, true);
 });
 
-test("validation uses a dedicated non-copyable result presentation", () => {
+test("validation shows the unchanged YAML stream on the output side", () => {
   assert.deepEqual(
-    resultPresentation({ ok: true, command_output: "Valid YAML." }, "validate", "key: value\n"),
+    resultPresentation({ ok: true, output_yaml: "key: value\n" }, "validate", "key: value\n"),
     {
-      content: "Valid YAML.",
-      title: "Validation Result",
+      content: "key: value\n",
+      title: "Output YAML",
       highlightChanges: false,
       showMatchCount: false,
-      showCopyResult: false,
+      showCopyResult: true,
     },
   );
   assert.deepEqual(
     resultPresentation({ ok: false, error_source: "document" }, "validate", "key: [\n"),
     {
       content: "",
-      title: "Validation Result",
+      title: "Output YAML",
       highlightChanges: false,
       showMatchCount: false,
       showCopyResult: false,
     },
   );
+});
+
+test("schema generation shows a copyable JSON schema", () => {
+  assert.deepEqual(resultPresentation({ ok: true, command_output: "{\"type\": \"object\"}\n" }, "schema", "name: api\n"), {
+    content: "{\"type\": \"object\"}\n",
+    title: "Generated JSON Schema",
+    highlightChanges: false,
+    showMatchCount: false,
+    showCopyResult: true,
+  });
+  assert.deepEqual(resultPresentation({ ok: false }, "schema", "name: api\n"), {
+    content: "",
+    title: "Generated JSON Schema",
+    highlightChanges: false,
+    showMatchCount: false,
+    showCopyResult: false,
+  });
 });
 
 test("application failures show rollback while malformed inputs clear output", () => {

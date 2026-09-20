@@ -1,5 +1,20 @@
 export const READ_COMMANDS = new Set(["query", "get", "test"]);
 
+export function validationPresentation(result) {
+  const labels = {
+    skipped: "No schema",
+    valid: "Schema valid",
+    invalid: result.target === "schema" ? "Invalid schema" : "Schema mismatch",
+    unavailable: "Not available",
+  };
+  return {
+    label: labels[result.status] || result.status,
+    detail: result.message
+      ? `${result.document_index != null ? `Document ${result.document_index}: ` : ""}${result.message}`
+      : "",
+  };
+}
+
 function lines(value) {
   return value.split(/\r?\n/);
 }
@@ -78,13 +93,22 @@ export async function copyText(value, { clipboard, fallback }) {
 }
 
 export function resultPresentation(result, command, source) {
-  if (command === "validate") {
+  if (command === "schema") {
     return {
       content: result.ok ? result.command_output : "",
-      title: "Validation Result",
+      title: "Generated JSON Schema",
       highlightChanges: false,
       showMatchCount: false,
-      showCopyResult: false,
+      showCopyResult: result.ok,
+    };
+  }
+  if (command === "validate") {
+    return {
+      content: result.ok ? result.output_yaml : "",
+      title: "Output YAML",
+      highlightChanges: false,
+      showMatchCount: false,
+      showCopyResult: result.ok,
     };
   }
   if (result.ok && READ_COMMANDS.has(command)) {

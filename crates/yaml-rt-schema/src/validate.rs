@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if, clippy::too_many_arguments)]
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs;
 
 use crate::value::{Map, Value};
@@ -7,10 +8,11 @@ use iri_string::types::{IriReferenceStr, IriStr, UriReferenceStr, UriStr};
 use regex::Regex;
 use url::Url;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::parse_schema;
 use crate::{
     DIALECT, Error, Schema,
     model::{Instance, escape},
-    parse_schema,
 };
 
 pub(crate) fn check_schema(schema: &Value, path: &str) -> Result<(), Error> {
@@ -263,11 +265,14 @@ struct Validator<'a> {
 }
 
 pub(crate) fn validate(schema: &Schema, instance: &Instance) -> Result<(), Error> {
+    #[cfg(not(target_arch = "wasm32"))]
     let base = schema
         .origin
         .as_ref()
         .and_then(|path| Url::from_file_path(path.canonicalize().ok()?).ok())
         .unwrap_or_else(|| Url::parse("https://yaml-rt.invalid/root").unwrap());
+    #[cfg(target_arch = "wasm32")]
+    let base = Url::parse("https://yaml-rt.invalid/root").unwrap();
     let mut validator = Validator {
         instance,
         resources: HashMap::new(),
@@ -641,20 +646,27 @@ impl Validator<'_> {
         target_base.set_fragment(None);
         let key = target_base.to_string();
         if !self.resources.contains_key(&key) {
-            if target_base.scheme() != "file" {
-                return Err(Error::new(format!(
-                    "remote schema reference is unsupported: {reference}"
-                )));
+            #[cfg(target_arch = "wasm32")]
+            return Err(Error::new(format!(
+                "separate schema references are unavailable in the browser: {reference}"
+            )));
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if target_base.scheme() != "file" {
+                    return Err(Error::new(format!(
+                        "remote schema reference is unsupported: {reference}"
+                    )));
+                }
+                let path = target_base
+                    .to_file_path()
+                    .map_err(|_| Error::new("invalid file schema reference"))?;
+                let source = fs::read_to_string(&path).map_err(Error::source)?;
+                let document = parse_schema(&source, Some(&path))?;
+                check_schema(&document, "")?;
+                check_meta_schema(&document)?;
+                self.resources.insert(key.clone(), document.clone());
+                index_resources(&document, &target_base, &mut self.resources);
             }
-            let path = target_base
-                .to_file_path()
-                .map_err(|_| Error::new("invalid file schema reference"))?;
-            let source = fs::read_to_string(&path).map_err(Error::source)?;
-            let document = parse_schema(&source, Some(&path))?;
-            check_schema(&document, "")?;
-            check_meta_schema(&document)?;
-            self.resources.insert(key.clone(), document.clone());
-            index_resources(&document, &target_base, &mut self.resources);
         }
         let document = &self.resources[&key];
         if fragment.is_empty() {

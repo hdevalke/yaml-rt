@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 use yaml_rt_core::{Diagnostic, DiagnosticKind, JsonPointer, YamlDoc, YamlFragment, YamlPatch};
 use yaml_rt_rfc9535::{JsonPath, QueryMatches};
+use yaml_rt_schema::{Error as SchemaError, Schema, generate_schema};
 
 /// Structured command request shared by native tests and the WASM adapter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,6 +21,62 @@ pub struct CommandRequest {
     pub value: Option<String>,
     pub new_key: Option<String>,
     pub patch: Option<String>,
+    pub input_schema: Option<String>,
+    pub output_schema: Option<String>,
+}
+
+/// Independent validation state for one side of the playground.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidationResult {
+    pub status: String,
+    pub message: Option<String>,
+    pub target: Option<String>,
+    pub span_start: Option<u32>,
+    pub span_end: Option<u32>,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub document_index: Option<usize>,
+}
+
+impl ValidationResult {
+    fn status(status: &str) -> Self {
+        Self {
+            status: status.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    fn unavailable(message: &str) -> Self {
+        Self {
+            status: "unavailable".to_owned(),
+            message: Some(message.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    fn error(
+        error: SchemaError,
+        target: &str,
+        source: &str,
+        document_index: Option<usize>,
+    ) -> Self {
+        let span = error.source_span();
+        let position = span.and_then(|span| {
+            yaml_rt_core::Source::new(source.to_owned())
+                .ok()
+                .map(|source| source.line_col(span.start as usize))
+        });
+        Self {
+            status: "invalid".to_owned(),
+            message: Some(error.to_string()),
+            target: Some(target.to_owned()),
+            span_start: span.map(|span| span.start),
+            span_end: span.map(|span| span.end),
+            line: position.map(|position| position.line),
+            column: position.map(|position| position.column),
+            document_index,
+        }
+    }
 }
 
 /// Structured command response returned by the command engine.
@@ -38,6 +95,8 @@ pub struct CommandResult {
     pub span_end: Option<u32>,
     pub line: Option<usize>,
     pub column: Option<usize>,
+    pub input_validation: ValidationResult,
+    pub output_validation: ValidationResult,
 }
 
 impl CommandResult {
@@ -95,6 +154,95 @@ impl CommandResult {
 /// Executes one playground command without filesystem access.
 #[must_use]
 pub fn execute(request: &CommandRequest) -> CommandResult {
+    let input_validation = validate_side(request.input_schema.as_deref(), &request.source, None);
+    let mut result = execute_command(request);
+    result.input_validation = input_validation;
+    let has_output_schema = request
+        .output_schema
+        .as_deref()
+        .is_some_and(|schema| !schema.trim().is_empty());
+    result.output_validation = if !result.ok {
+        if has_output_schema {
+            ValidationResult::unavailable("The command did not produce output to validate.")
+        } else {
+            ValidationResult::status("skipped")
+        }
+    } else if request.command == "test" {
+        if has_output_schema {
+            ValidationResult::unavailable("The test command returns a status, not a YAML value.")
+        } else {
+            ValidationResult::status("skipped")
+        }
+    } else {
+        let output = if request.command == "schema" {
+            &result.command_output
+        } else {
+            &result.output_yaml
+        };
+        validate_side(
+            request.output_schema.as_deref(),
+            output,
+            Some((
+                &request.command,
+                &result.matched_pointers,
+                request.document_index,
+            )),
+        )
+    };
+    result
+}
+
+fn validate_side(
+    schema_source: Option<&str>,
+    source: &str,
+    selection: Option<(&str, &[String], usize)>,
+) -> ValidationResult {
+    let Some(schema_source) = schema_source.filter(|schema| !schema.trim().is_empty()) else {
+        return ValidationResult::status("skipped");
+    };
+    let schema = match Schema::parse(schema_source, None) {
+        Ok(schema) => schema,
+        Err(error) => return ValidationResult::error(error, "schema", schema_source, None),
+    };
+    let doc = match YamlDoc::parse(source) {
+        Ok(doc) => doc,
+        Err(error) => {
+            return ValidationResult {
+                status: "unavailable".to_owned(),
+                message: Some(error.to_string()),
+                ..ValidationResult::default()
+            };
+        }
+    };
+    if let Some((command, pointers, document)) = selection
+        && matches!(command, "get" | "query")
+    {
+        for pointer in pointers {
+            let parsed = match JsonPointer::parse(pointer) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return ValidationResult {
+                        status: "invalid".to_owned(),
+                        message: Some(error.to_string()),
+                        ..ValidationResult::default()
+                    };
+                }
+            };
+            if let Err(error) = schema.validate_pointer(&doc, document, &parsed) {
+                return ValidationResult::error(error, "yaml", source, Some(document));
+            }
+        }
+        return ValidationResult::status("valid");
+    }
+    for document in 0..doc.document_count() {
+        if let Err(error) = schema.validate(&doc, document) {
+            return ValidationResult::error(error, "yaml", source, Some(document));
+        }
+    }
+    ValidationResult::status("valid")
+}
+
+fn execute_command(request: &CommandRequest) -> CommandResult {
     let mut doc = match YamlDoc::parse(&request.source) {
         Ok(doc) => doc,
         Err(error) => {
@@ -118,6 +266,27 @@ pub fn execute(request: &CommandRequest) -> CommandResult {
     let document_count = doc.document_count();
     if request.command == "validate" {
         return CommandResult::success(&doc, "Valid YAML.".to_owned(), Vec::new());
+    }
+    if request.command == "schema" {
+        if document_count != 1 {
+            return CommandResult::request_error(
+                "command",
+                "schema generation requires exactly one YAML document",
+                document_count,
+            );
+        }
+        return match generate_schema(&doc, 0) {
+            Ok(schema) => {
+                CommandResult::success(&doc, format!("{}\n", schema.to_pretty_string()), Vec::new())
+            }
+            Err(error) => CommandResult::document_error(
+                &doc,
+                error.to_string(),
+                error.source_span(),
+                "document",
+                document_count,
+            ),
+        };
     }
     if request.document_index >= document_count {
         return CommandResult::request_error(
@@ -675,7 +844,54 @@ fn removal_order(left: &JsonPointer, right: &JsonPointer) -> Ordering {
 pub struct WasmCommandResult(CommandResult);
 
 #[wasm_bindgen]
+pub struct WasmValidationResult(ValidationResult);
+
+#[wasm_bindgen]
+impl WasmValidationResult {
+    #[wasm_bindgen(getter)]
+    pub fn status(&self) -> String {
+        self.0.status.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn message(&self) -> Option<String> {
+        self.0.message.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn target(&self) -> Option<String> {
+        self.0.target.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn span_start(&self) -> Option<u32> {
+        self.0.span_start
+    }
+    #[wasm_bindgen(getter)]
+    pub fn span_end(&self) -> Option<u32> {
+        self.0.span_end
+    }
+    #[wasm_bindgen(getter)]
+    pub fn line(&self) -> Option<usize> {
+        self.0.line
+    }
+    #[wasm_bindgen(getter)]
+    pub fn column(&self) -> Option<usize> {
+        self.0.column
+    }
+    #[wasm_bindgen(getter)]
+    pub fn document_index(&self) -> Option<usize> {
+        self.0.document_index
+    }
+}
+
+#[wasm_bindgen]
 impl WasmCommandResult {
+    #[wasm_bindgen(getter)]
+    pub fn input_validation(&self) -> WasmValidationResult {
+        WasmValidationResult(self.0.input_validation.clone())
+    }
+    #[wasm_bindgen(getter)]
+    pub fn output_validation(&self) -> WasmValidationResult {
+        WasmValidationResult(self.0.output_validation.clone())
+    }
     #[wasm_bindgen(getter)]
     pub fn ok(&self) -> bool {
         self.0.ok
@@ -744,6 +960,8 @@ pub fn run_command(
     value: String,
     new_key: String,
     patch: String,
+    input_schema: String,
+    output_schema: String,
 ) -> WasmCommandResult {
     let optional = |value: String| (!value.is_empty()).then_some(value);
     WasmCommandResult(execute(&CommandRequest {
@@ -757,6 +975,8 @@ pub fn run_command(
         value: optional(value),
         new_key: optional(new_key),
         patch: optional(patch),
+        input_schema: optional(input_schema),
+        output_schema: optional(output_schema),
     }))
 }
 
@@ -823,6 +1043,136 @@ mod tests {
         assert!(result.span_start.is_some());
         assert!(result.line.is_some());
         assert!(result.column.is_some());
+    }
+
+    #[test]
+    fn independent_schemas_report_both_sides_without_blocking_edits() {
+        let mut request = request("replace");
+        request.selector = Some("/services/0/port".to_owned());
+        request.value = Some("9090".to_owned());
+        request.input_schema = Some(
+            r#"{"properties":{"services":{"items":{"properties":{"port":{"const":9090}}}}}}"#
+                .to_owned(),
+        );
+        request.output_schema = Some(
+            r#"{"properties":{"services":{"items":{"properties":{"port":{"type":"string"}}}}}}"#
+                .to_owned(),
+        );
+        let result = execute(&request);
+        assert!(result.ok);
+        assert!(result.output_yaml.contains("9090"));
+        assert_eq!(result.input_validation.status, "invalid");
+        assert_eq!(result.output_validation.status, "invalid");
+        assert_eq!(result.input_validation.target.as_deref(), Some("yaml"));
+        assert_eq!(result.output_validation.target.as_deref(), Some("yaml"));
+    }
+
+    #[test]
+    fn input_failure_can_be_repaired_by_an_edit() {
+        let mut request = request("replace");
+        request.selector = Some("/services/0/port".to_owned());
+        request.value = Some("9090".to_owned());
+        let schema =
+            r#"{"properties":{"services":{"items":{"properties":{"port":{"minimum":9000}}}}}}"#;
+        request.input_schema = Some(schema.to_owned());
+        request.output_schema = Some(schema.to_owned());
+        let result = execute(&request);
+        assert!(result.ok);
+        assert_eq!(result.input_validation.status, "invalid");
+        assert_eq!(result.output_validation.status, "invalid");
+        request.selector = Some("/services/1/port".to_owned());
+        request.value = Some("9091".to_owned());
+        let mut repaired = request.source.clone();
+        repaired = repaired.replace("port: 80", "port: 9090");
+        request.source = repaired;
+        let result = execute(&request);
+        assert!(result.ok);
+        assert_eq!(result.output_validation.status, "valid");
+    }
+
+    #[test]
+    fn validates_streams_and_reports_schema_errors_on_the_schema_side() {
+        let mut request = request("validate");
+        request.source = "---\nport: 80\n---\nport: bad\n".to_owned();
+        request.input_schema = Some("properties:\n  port:\n    type: integer\n".to_owned());
+        let result = execute(&request);
+        assert!(result.ok);
+        assert_eq!(result.input_validation.status, "invalid");
+        assert_eq!(result.input_validation.document_index, Some(1));
+        request.input_schema = Some("required: port\n".to_owned());
+        let result = execute(&request);
+        assert_eq!(result.input_validation.target.as_deref(), Some("schema"));
+        assert!(result.input_validation.line.is_some());
+        request.input_schema = Some("properties: [\n".to_owned());
+        let result = execute(&request);
+        assert_eq!(result.input_validation.target.as_deref(), Some("schema"));
+        assert!(result.input_validation.span_start.is_some());
+    }
+
+    #[test]
+    fn validates_read_values_and_skips_test_status() {
+        for command in ["get", "query"] {
+            let mut request = request(command);
+            request.selector = Some(
+                if command == "get" {
+                    "/services/0/port"
+                } else {
+                    "$.services[*].port"
+                }
+                .to_owned(),
+            );
+            request.output_schema = Some("type: integer\n".to_owned());
+            let result = execute(&request);
+            assert!(result.ok);
+            assert_eq!(result.output_validation.status, "valid");
+            request.output_schema = Some("type: string\n".to_owned());
+            let result = execute(&request);
+            assert_eq!(result.output_validation.status, "invalid");
+        }
+        let mut request = request("test");
+        request.selector = Some("/services/0/port".to_owned());
+        request.value = Some("80".to_owned());
+        request.output_schema = Some("type: integer\n".to_owned());
+        assert_eq!(execute(&request).output_validation.status, "unavailable");
+    }
+
+    #[test]
+    fn schema_command_generates_from_one_document_and_checks_its_output() {
+        let mut request = request("schema");
+        request.source = "name: api\nport: 8080\n".to_owned();
+        request.output_schema = Some("type: object\nrequired: [properties]\n".to_owned());
+        let result = execute(&request);
+        assert!(result.ok, "{:?}", result.message);
+        assert_eq!(result.output_yaml, request.source);
+        assert!(result.command_output.contains("\"properties\""));
+        assert_eq!(result.output_validation.status, "valid");
+
+        request.output_schema = Some("type: array\n".to_owned());
+        let result = execute(&request);
+        assert!(result.ok);
+        assert_eq!(result.output_validation.status, "invalid");
+
+        request.source = "---\nname: api\n---\nname: web\n".to_owned();
+        let result = execute(&request);
+        assert!(!result.ok);
+        assert_eq!(result.error_source.as_deref(), Some("command"));
+        assert_eq!(result.output_validation.status, "unavailable");
+    }
+
+    #[test]
+    fn schema_generation_reports_non_json_yaml_values() {
+        let mut request = request("schema");
+        request.source = "? [complex, key]\n: value\n".to_owned();
+        let result = execute(&request);
+        assert!(!result.ok);
+        assert_eq!(result.error_source.as_deref(), Some("document"));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("non-string mapping key")
+        );
     }
 
     #[test]

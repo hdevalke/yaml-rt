@@ -164,6 +164,225 @@ fn validate_reports_file_and_directory_failures() {
 }
 
 #[test]
+fn schema_validation_and_generation_work_for_files_and_streams() {
+    let directory = temp_dir();
+    let schema = directory.join("schema.json");
+    let yaml_schema = directory.join("schema.yaml");
+    let input = directory.join("valid.yaml");
+    let invalid = directory.join("invalid.yml");
+    fs::write(
+        &schema,
+        r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &yaml_schema,
+        "type: object\nrequired: [name]\nproperties:\n  name:\n    type: string\n",
+    )
+    .unwrap();
+    fs::write(&input, "name: Ada\n---\nname: Linus\n").unwrap();
+    fs::write(&invalid, "name: 42\n").unwrap();
+    for schema in [&schema, &yaml_schema] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .args([
+                "validate",
+                "-s",
+                schema.to_str().unwrap(),
+                input.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .args([
+                "validate",
+                "-s",
+                schema.to_str().unwrap(),
+                invalid.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("/name"));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["schema", invalid.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let generated =
+        yaml_rt_schema::Value::parse(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(
+        generated["properties"]["name"]["type"].as_str(),
+        Some("integer")
+    );
+    assert!(generated.get("required").is_none());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn schema_diagnostics_show_source_and_paths() {
+    let directory = temp_dir();
+    let schema = directory.join("schema.yaml");
+    let input = directory.join("input.yaml");
+    fs::write(
+        &schema,
+        "type: object\nproperties:\n  name:\n    type: string\n",
+    )
+    .unwrap();
+    fs::write(&input, "name: 42\n").unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .args([
+                "validate",
+                "--schema",
+                schema.to_str().unwrap(),
+                input.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "error[schema]",
+        "input.yaml:1:7",
+        "1 | name: 42",
+        "|       ^^",
+        "instance: /name",
+        "schema: /properties/name/type",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
+
+    fs::write(&schema, "required: name\n").unwrap();
+    let output = run();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "error[schema]: required must be an array",
+        "schema.yaml:1:11",
+        "1 | required: name",
+        "|           ^^^^",
+        "schema: /required",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
+
+    let json_schema = directory.join("schema.json");
+    fs::write(&json_schema, "{\"required\":\"name\"}\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "validate",
+            "--schema",
+            json_schema.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "error[schema]: required must be an array",
+        "schema.json:1:13",
+        "schema: /required",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
+
+    fs::write(
+        &schema,
+        "type: object\nproperties:\n  name:\n    type: string\n",
+    )
+    .unwrap();
+    fs::write(&input, "name: Ada\n").unwrap();
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn schema_generation_reports_source_aware_conversion_error() {
+    let directory = temp_dir();
+    let input = directory.join("input.yaml");
+    fs::write(&input, "? [a, b]\n: value\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args(["schema", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "error[schema]: non-string mapping key",
+        "input.yaml:1:3",
+        "1 | ? [a, b]",
+        "instance:",
+    ] {
+        assert!(stderr.contains(expected), "missing {expected:?}: {stderr}");
+    }
+    assert!(stderr.contains('^'), "{stderr}");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn schema_validation_resolves_local_refs_and_reports_non_json_yaml() {
+    let directory = temp_dir();
+    let schema = directory.join("schema.json");
+    let rules = directory.join("rules.json");
+    let input = directory.join("input.yaml");
+    fs::write(&schema, r#"{"$ref":"rules.json#/$defs/config"}"#).unwrap();
+    fs::write(
+        &rules,
+        r#"{"$defs":{"config":{"type":"object","properties":{"port":{"type":"integer"}}}}}"#,
+    )
+    .unwrap();
+    fs::write(&input, "port: 8080\n").unwrap();
+    let valid = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "validate",
+            "--schema",
+            schema.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    fs::write(&input, "? [a, b]\n: value\n").unwrap();
+    let invalid = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+        .args([
+            "validate",
+            "--schema",
+            schema.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("non-string mapping key"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn directory_targets_recurse_with_sorted_path_headers() {
     let directory = temp_dir();
     fs::create_dir_all(directory.join(".hidden")).unwrap();

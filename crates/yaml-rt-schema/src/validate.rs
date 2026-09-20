@@ -14,6 +14,24 @@ use crate::{
 };
 
 pub(crate) fn check_schema(schema: &Value, path: &str) -> Result<(), Error> {
+    check_schema_inner(schema, path).map_err(|mut error| {
+        if error.schema_path.is_none() {
+            let keyword = error.message.split_whitespace().next().unwrap_or("");
+            let suffix = if schema
+                .as_object()
+                .is_some_and(|object| object.contains_key(keyword))
+            {
+                format!("/{}", escape(keyword))
+            } else {
+                String::new()
+            };
+            error.schema_path = Some(format!("{path}{suffix}"));
+        }
+        error
+    })
+}
+
+fn check_schema_inner(schema: &Value, path: &str) -> Result<(), Error> {
     if let Some(value) = schema.as_bool() {
         let _ = value;
         return Ok(());
@@ -206,9 +224,11 @@ pub(crate) fn check_meta_schema(schema: &Value) -> Result<(), Error> {
         format_assertion: false,
         resources: Default::default(),
     };
-    validator
-        .validate_json(schema)
-        .map_err(|error| Error::new(format!("invalid 2020-12 schema: {error}")))
+    validator.validate_json(schema).map_err(|error| {
+        let mut result = Error::new(format!("invalid 2020-12 schema: {error}"));
+        result.schema_path = error.instance_path;
+        result
+    })
 }
 
 fn check_string_array(value: &Value, name: &str) -> Result<(), Error> {

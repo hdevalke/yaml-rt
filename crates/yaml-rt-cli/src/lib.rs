@@ -16,8 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
-use yaml_rt_core::{DiagnosticColor, JsonPointer, YamlDoc, YamlError, YamlFragment, YamlPatch};
+use yaml_rt_core::{
+    Diagnostic, DiagnosticColor, DiagnosticKind, JsonPointer, Span, YamlDoc, YamlError,
+    YamlFragment, YamlPatch,
+};
 use yaml_rt_rfc9535::{JsonPath, QueryMatches};
+use yaml_rt_schema::{Error as SchemaError, Schema, generate_schema};
 
 mod query;
 
@@ -133,6 +137,8 @@ enum Operation {
     /// Validate YAML syntax without producing output.
     #[command(visible_alias = "v")]
     Validate(ValidateArgs),
+    /// Generate a permissive JSON Schema from one YAML document.
+    Schema(SchemaArgs),
     /// Search a YAML document with RFC 9535 `JSONPath`.
     #[command(visible_alias = "q")]
     Query(QueryArgs),
@@ -170,6 +176,18 @@ struct ValidateArgs {
     /// Input YAML file or directory; defaults to the current directory. Use - for stdin.
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
+    /// Validate each YAML document against a JSON Schema file.
+    #[arg(short, long, value_name = "FILE")]
+    schema: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SchemaArgs {
+    /// One YAML input file. Use - for stdin.
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 #[derive(Args)]
@@ -324,6 +342,11 @@ fn execute(
     stdout: &mut dyn Write,
     options: RunOptions,
 ) -> Result<(), RunError> {
+    if let Operation::Schema(args) = operation
+        && fs::symlink_metadata(&args.file).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Err(RunError::usage("schema generation requires one YAML file"));
+    }
     let targets = resolve_targets(operation.input_path())?;
     if matches!(targets, InputTargets::Batch { .. })
         && operation
@@ -342,7 +365,7 @@ fn execute(
             "target YAML and --patch-file cannot both read stdin",
         ));
     }
-    let prepared = prepare_operation(operation, target_uses_stdin, stdin)?;
+    let prepared = prepare_operation(operation, target_uses_stdin, stdin, options)?;
     match targets {
         InputTargets::Stdin => {
             let input = read_stream(stdin, "stdin")?;
@@ -388,8 +411,33 @@ fn execute_one(
         .unwrap_or_else(|| "<stdin>".to_owned());
     let mut doc = YamlDoc::parse(&input)
         .map_err(|error| RunError::yaml_diagnostic(error, &input, &source_name, options.color))?;
-    if matches!(operation, Operation::Validate(_)) {
+    if let Operation::Validate(_) = operation {
+        if let Some(schema) = &prepared.schema {
+            for document in 0..doc.document_count() {
+                schema.validate(&doc, document).map_err(|error| {
+                    RunError::schema_diagnostic(error, &input, &source_name, options.color)
+                })?;
+            }
+        }
         return Ok(());
+    }
+    if let Operation::Schema(args) = operation {
+        if doc.document_count() != 1 {
+            return Err(RunError::message(
+                "schema generation requires exactly one YAML document",
+            ));
+        }
+        let schema = generate_schema(&doc, 0).map_err(|error| {
+            RunError::schema_diagnostic(error, &input, &source_name, options.color)
+        })?;
+        let mut rendered = schema.to_pretty_string();
+        rendered.push('\n');
+        return write_result(
+            rendered.as_bytes(),
+            args.output.output.as_deref(),
+            input_path,
+            stdout,
+        );
     }
     let target = operation.target();
     let document = select_document(&doc, target.doc)?;
@@ -459,7 +507,9 @@ fn execute_one(
         .expect("pointer operation is prepared");
     let from = prepared.from.as_ref();
     match operation {
-        Operation::Validate(_) => unreachable!("validate returned after parsing"),
+        Operation::Validate(_) | Operation::Schema(_) => {
+            unreachable!("operation returned after parsing")
+        }
         Operation::Query(_) => unreachable!("query returned before pointer operations"),
         Operation::Get(arguments) => {
             let node = doc
@@ -543,24 +593,29 @@ struct PreparedOperation {
     query: Option<JsonPath>,
     value: Option<YamlFragment>,
     patch: Option<YamlPatch>,
+    schema: Option<Schema>,
 }
 
 fn prepare_operation(
     operation: &Operation,
     target_uses_stdin: bool,
     stdin: &mut dyn Read,
+    options: RunOptions,
 ) -> Result<PreparedOperation, RunError> {
     let query = operation
         .query_source()
         .map(JsonPath::parse)
         .transpose()
         .map_err(RunError::display)?;
-    let path =
-        if query.is_none() && !matches!(operation, Operation::Patch(_) | Operation::Validate(_)) {
-            Some(JsonPointer::parse(operation.path()).map_err(RunError::display)?)
-        } else {
-            None
-        };
+    let path = if query.is_none()
+        && !matches!(
+            operation,
+            Operation::Patch(_) | Operation::Validate(_) | Operation::Schema(_)
+        ) {
+        Some(JsonPointer::parse(operation.path()).map_err(RunError::display)?)
+    } else {
+        None
+    };
     let from = operation
         .from()
         .map(JsonPointer::parse)
@@ -571,12 +626,37 @@ fn prepare_operation(
         Operation::Patch(arguments) => Some(read_patch(&arguments.source, stdin)?),
         _ => None,
     };
+    let schema = match operation {
+        Operation::Validate(args) => args
+            .schema
+            .as_deref()
+            .map(Schema::from_path)
+            .transpose()
+            .map_err(|error| {
+                let source = args
+                    .schema
+                    .as_deref()
+                    .and_then(|path| fs::read_to_string(path).ok());
+                if let (Some(source), Some(path)) = (source, args.schema.as_deref()) {
+                    RunError::schema_diagnostic(
+                        error,
+                        &source,
+                        &path.display().to_string(),
+                        options.color,
+                    )
+                } else {
+                    RunError::display(error)
+                }
+            })?,
+        _ => None,
+    };
     Ok(PreparedOperation {
         path,
         from,
         query,
         value,
         patch,
+        schema,
     })
 }
 
@@ -821,7 +901,9 @@ impl Operation {
 
     fn target(&self) -> &TargetArgs {
         match self {
-            Self::Validate(_) => unreachable!("validate does not select a document"),
+            Self::Validate(_) | Self::Schema(_) => {
+                unreachable!("operation does not select a document")
+            }
             Self::Query(args) => &args.target,
             Self::Get(args) => &args.path.target,
             Self::Add(args) | Self::Replace(args) => &args.value.path.target,
@@ -835,7 +917,7 @@ impl Operation {
 
     fn path(&self) -> &str {
         match self {
-            Self::Validate(_) | Self::Query(_) | Self::Patch(_) => {
+            Self::Validate(_) | Self::Schema(_) | Self::Query(_) | Self::Patch(_) => {
                 unreachable!("operation does not use a JSON Pointer argument")
             }
             Self::Get(args) => args.path.pointer(),
@@ -872,7 +954,9 @@ impl Operation {
             Self::Remove(args) => Some(&args.output),
             Self::Move(args) | Self::Copy(args) => Some(&args.output),
             Self::Patch(args) => Some(&args.output),
-            Self::Validate(_) | Self::Query(_) | Self::Get(_) | Self::Test(_) => None,
+            Self::Validate(_) | Self::Schema(_) | Self::Query(_) | Self::Get(_) | Self::Test(_) => {
+                None
+            }
         }
     }
 
@@ -880,12 +964,13 @@ impl Operation {
         match self {
             Self::Query(args) => args.output.output.as_deref(),
             Self::Get(args) => args.output.output.as_deref(),
+            Self::Schema(args) => args.output.output.as_deref(),
             _ => None,
         }
     }
 
     fn has_read_output(&self) -> bool {
-        matches!(self, Self::Query(_) | Self::Get(_))
+        matches!(self, Self::Query(_) | Self::Get(_) | Self::Schema(_))
     }
 
     fn should_emit_batch_result(&self, result: &[u8]) -> bool {
@@ -893,6 +978,7 @@ impl Operation {
             Self::Query(_) => !result.is_empty(),
             Self::Get(args) if args.path.query.is_some() => !result.is_empty(),
             Self::Get(_) => true,
+            Self::Schema(_) => true,
             _ => false,
         }
     }
@@ -900,6 +986,7 @@ impl Operation {
     fn input_path(&self) -> Option<&Path> {
         match self {
             Self::Validate(args) => args.file.as_deref(),
+            Self::Schema(args) => Some(&args.file),
             Self::Get(args) => args.path.input_path(),
             Self::Add(args) | Self::Replace(args) => args.value.path.input_path(),
             Self::RenameKey(args) => args.path.input_path(),
@@ -1385,6 +1472,33 @@ impl RunError {
         Self::Diagnostic(
             error
                 .render(source)
+                .with_source_name(source_name)
+                .with_color(color)
+                .to_string(),
+        )
+    }
+
+    fn schema_diagnostic(error: SchemaError, source: &str, source_name: &str, color: bool) -> Self {
+        let mut diagnostic = Diagnostic::new(
+            DiagnosticKind::Semantic,
+            error.message(),
+            error.source_span().unwrap_or(Span::new(0, 0)),
+        );
+        if let Some(path) = error.instance_path() {
+            diagnostic = diagnostic.with_note(format!("instance: {path}"));
+        }
+        if let Some(path) = error.schema_path() {
+            diagnostic = diagnostic.with_note(format!("schema: {path}"));
+        }
+        let color = if color {
+            DiagnosticColor::Always
+        } else {
+            DiagnosticColor::Never
+        };
+        Self::Diagnostic(
+            diagnostic
+                .render(source)
+                .with_label("schema")
                 .with_source_name(source_name)
                 .with_color(color)
                 .to_string(),

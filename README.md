@@ -414,6 +414,12 @@ yaml-rt query '$.services[*].port' config.yaml
 # Validate one file, or recursively validate a directory.
 yaml-rt validate config.yaml
 
+# Validate each YAML document against a JSON or YAML schema file.
+yaml-rt validate --schema config.schema.json config.yaml
+
+# Infer a permissive JSON Schema from one YAML document.
+yaml-rt schema config.yaml --output config.schema.json
+
 # Read a node.
 yaml-rt get /server/port config.yaml
 
@@ -448,7 +454,7 @@ yaml-rt patch --patch-file changes.yaml --in-place config.yaml
 yaml-rt replace /server/port --value 9090 --in-place configs/
 ```
 
-Available operations are `validate`, `query`, `get`, `add`, `remove`, `replace`,
+Available operations are `validate`, `schema`, `query`, `get`, `add`, `remove`, `replace`,
 `rename-key`, `move`, `copy`, `test`, and `patch`. Query results are emitted in
 nodelist order as one compact JSON Pointer/value pair per line. JSONPath
 evaluation uses the YAML 1.2 core schema and rejects YAML values that are not
@@ -491,6 +497,15 @@ without output.
 `validate` parses the complete YAML stream and produces no output when it is
 valid. Empty and multi-document streams are accepted. Directory validation
 continues after failures and reports each invalid file in the batch summary.
+With `--schema` (`-s`), every document is also checked against one compiled
+JSON Schema. Schema files can be JSON or YAML. Local file references are read
+relative to the schema file; references requiring a network fetch fail.
+YAML values outside the JSON data model, including non-string mapping keys,
+duplicate keys, non-finite numbers, and recursive aliases, fail validation.
+
+`schema <FILE>` requires one YAML document and prints a deterministic,
+pretty-printed JSON Schema. It infers types, properties, and array items while
+leaving properties optional and objects open. Use `--output` to write a file.
 
 Batch `query` and `get --query` output identifies each input containing a match
 with an `==> relative/path.yaml <==` header and a blank line between files;

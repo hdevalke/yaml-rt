@@ -101,6 +101,7 @@ impl Diagnostic {
             source,
             source_name: None,
             color: DiagnosticColor::Never,
+            label: None,
         }
     }
 }
@@ -172,9 +173,16 @@ pub struct DiagnosticRenderer<'a> {
     source: &'a str,
     source_name: Option<&'a str>,
     color: DiagnosticColor,
+    label: Option<&'a str>,
 }
 
 impl<'a> DiagnosticRenderer<'a> {
+    /// Overrides the diagnostic phase label.
+    #[must_use]
+    pub const fn with_label(mut self, label: &'a str) -> Self {
+        self.label = Some(label);
+        self
+    }
     /// Sets the filename or logical input name shown in the location header.
     #[must_use]
     pub const fn with_source_name(mut self, source_name: &'a str) -> Self {
@@ -209,7 +217,7 @@ impl fmt::Display for DiagnosticRenderer<'_> {
         write!(
             formatter,
             "[{}]: {}",
-            self.diagnostic.kind.label(),
+            self.label.unwrap_or(self.diagnostic.kind.label()),
             self.diagnostic.message
         )?;
 

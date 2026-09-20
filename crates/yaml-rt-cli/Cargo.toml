@@ -21,3 +21,4 @@ doc = false
 clap.workspace = true
 yaml-rt-core.workspace = true
 yaml-rt-rfc9535.workspace = true
+yaml-rt-schema.workspace = true

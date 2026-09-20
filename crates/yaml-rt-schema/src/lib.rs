@@ -71,6 +71,10 @@ impl Error {
     pub fn source_span(&self) -> Option<Span> {
         self.source_span
     }
+    /// Primary error message without location metadata.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl fmt::Display for Error {
@@ -99,8 +103,19 @@ impl Schema {
     /// Parses a JSON or YAML schema. `base_path` locates relative file references.
     pub fn parse(source: &str, base_path: Option<&Path>) -> Result<Self, Error> {
         let root = parse_schema(source, base_path)?;
-        validate::check_schema(&root, "")?;
-        validate::check_meta_schema(&root)?;
+        let attach_source = |mut error: Error| {
+            if let Ok(doc) = YamlDoc::parse(source)
+                && let Ok(instance) = model::from_document(&doc, 0)
+            {
+                error.source_span = error
+                    .schema_path
+                    .as_ref()
+                    .and_then(|path| instance.spans.get(path).copied());
+            }
+            error
+        };
+        validate::check_schema(&root, "").map_err(&attach_source)?;
+        validate::check_meta_schema(&root).map_err(&attach_source)?;
         let origin = base_path.map(Path::to_path_buf);
         Ok(Self {
             root,

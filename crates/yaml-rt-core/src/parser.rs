@@ -2836,12 +2836,12 @@ impl<'source> Parser<'source> {
         body: &str,
         known_mapping: bool,
     ) -> Result<(), YamlError> {
-        if self.mapping_is_open_at(indent) {
-            if let Some(comment) = mapping_comment_with_colon_offset(body) {
-                return Err(invalid_orphaned_block_content(
-                    line.content_start + indent + comment,
-                ));
-            }
+        if self.mapping_is_open_at(indent)
+            && let Some(comment) = mapping_comment_with_colon_offset(body)
+        {
+            return Err(invalid_orphaned_block_content(
+                line.content_start + indent + comment,
+            ));
         }
 
         let has_collection_at_indent =
@@ -6376,12 +6376,10 @@ fn validate_double_quoted_scalar_content(text: &str) -> Result<(), YamlError> {
     while position < text.len() {
         let (line, next_position) = next_literal_content_line(text, position);
         let (body, _) = split_line_break(line);
-        if !first_line {
-            if is_document_marker_line(body) {
-                return Err(invalid_double_quoted_escape(
-                    "document marker is not allowed inside a double-quoted scalar",
-                ));
-            }
+        if !first_line && is_document_marker_line(body) {
+            return Err(invalid_double_quoted_escape(
+                "document marker is not allowed inside a double-quoted scalar",
+            ));
         }
         first_line = false;
         position = next_position;

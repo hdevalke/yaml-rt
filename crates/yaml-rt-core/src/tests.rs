@@ -345,6 +345,49 @@ fn events_render_yaml_test_8udb_flow_sequence_shape() {
 }
 
 #[test]
+fn yaml_test_suite_block_complex_key_outputs() {
+    for (case, source, expected_events) in [
+        (
+            "4FJ6",
+            "---\n- ? - a\n    - - ? - - b\n            - c\n        : d\n      - e\n  : 23\n",
+            "+STR\n+DOC ---\n+SEQ\n+MAP\n+SEQ\n=VAL :a\n+SEQ\n+MAP\n+SEQ\n+SEQ\n=VAL :b\n=VAL :c\n-SEQ\n-SEQ\n=VAL :d\n-MAP\n=VAL :e\n-SEQ\n-SEQ\n=VAL :23\n-MAP\n-SEQ\n-DOC\n-STR\n",
+        ),
+        (
+            "6BFJ",
+            "--- &mapping\n? &key\n- &item a\n- b\n- c\n: value\n",
+            "+STR\n+DOC ---\n+MAP &mapping\n+SEQ &key\n=VAL &item :a\n=VAL :b\n=VAL :c\n-SEQ\n=VAL :value\n-MAP\n-DOC\n-STR\n",
+        ),
+        (
+            "Q9WF",
+            "? first: Sammy\n  last: Sosa\n: hr: 65\n  avg: 0.278\n",
+            "+STR\n+DOC\n+MAP\n+MAP\n=VAL :first\n=VAL :Sammy\n=VAL :last\n=VAL :Sosa\n-MAP\n+MAP\n=VAL :hr\n=VAL :65\n=VAL :avg\n=VAL :0.278\n-MAP\n-MAP\n-DOC\n-STR\n",
+        ),
+        (
+            "X38W",
+            "? &a\n- a\n- &b b\n: *b\n*a :\n- c\n- *b\n- d\n",
+            "+STR\n+DOC\n+MAP\n+SEQ &a\n=VAL :a\n=VAL &b :b\n-SEQ\n=ALI *b\n=ALI *a\n+SEQ\n=VAL :c\n=ALI *b\n=VAL :d\n-SEQ\n-MAP\n-DOC\n-STR\n",
+        ),
+    ] {
+        let doc = YamlDoc::parse(source).unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(doc.events_to_test_string(), expected_events, "{case}");
+        assert_eq!(doc.to_string(), source, "{case}");
+    }
+}
+
+#[test]
+fn complex_block_keys_reject_orphaned_indentation() {
+    for source in [
+        "? first: Sammy\n   last: Sosa\n: hr: 65\n",
+        "? first: Sammy\n: hr: 65\n   avg: 0.278\n",
+    ] {
+        assert!(
+            YamlDoc::parse(source).is_err(),
+            "accepted invalid YAML: {source}"
+        );
+    }
+}
+
+#[test]
 fn events_render_explicit_block_mapping_key_value_pair() {
     let doc = YamlDoc::parse("? key\n: value\n").expect("valid explicit mapping key");
 

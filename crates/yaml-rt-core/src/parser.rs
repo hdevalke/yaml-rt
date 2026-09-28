@@ -921,6 +921,19 @@ impl<'source> Parser<'source> {
             Span::from_usize(key_start, key_start + key_text.len()),
         )?;
         reject_invalid_node_property_placement(key_text, key_start, &key_properties)?;
+        if key_properties.value_start() == key_text.len()
+            && (key_properties.anchor().is_some() || key_properties.tag().is_some())
+        {
+            self.push_pending_node_properties(key_text, key_start, indent)?;
+            self.defer_explicit_mapping(
+                entry,
+                mapping,
+                indent,
+                BlockEntryPhase::Key,
+                line.content_end,
+            );
+            return Ok(1);
+        }
         let key_consumed =
             self.parse_explicit_mapping_key_node(entry, lines, index, indent, key_text, key_start)?;
         self.defer_explicit_mapping(
@@ -1571,10 +1584,12 @@ impl<'source> Parser<'source> {
         self.attach_child_at(entry.0 as usize, value);
         self.emit_scalar_event(value)?;
 
-        self.push_event(
-            YamlEventKind::MappingEnd,
-            Span::empty_from_usize(absolute_start + body.len()),
-        );
+        self.push_block_frame(BlockFrame {
+            indent: Span::usize_to_u32(self.source.line_col(absolute_start).column - 1),
+            node: mapping,
+            collection: OpenEventCollection::Mapping,
+            previous_same_kind: NO_BLOCK_FRAME,
+        });
         Ok(1)
     }
 
@@ -4398,6 +4413,22 @@ impl<'source> BlockMachine<'source> {
             let end = self.lines.content_end(index + consumed - 1);
             let active = &mut self.frames[frame_index];
             active.last_content_end = Span::usize_to_u32(end);
+            self.capture_deferred_frame();
+            return Ok(self.depth_transition(previous_depth, consumed));
+        }
+
+        if frame.phase == BlockEntryPhase::Separator
+            && indent > frame.indent as usize
+            && (self.parser.mapping_is_open_at(indent) || self.parser.sequence_is_open_at(indent))
+        {
+            self.parser.close_collections_deeper_than(indent);
+            let previous_depth = self.parser.block_frames.len();
+            let prepared = PreparedBlockLine::new(line, indent)?;
+            let consumed =
+                self.parser
+                    .parse_content_body(frame.owner, self.lines, index, prepared)?;
+            let end = self.lines.content_end(index + consumed - 1);
+            self.frames[frame_index].last_content_end = Span::usize_to_u32(end);
             self.capture_deferred_frame();
             return Ok(self.depth_transition(previous_depth, consumed));
         }

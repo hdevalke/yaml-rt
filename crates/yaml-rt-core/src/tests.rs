@@ -1379,6 +1379,54 @@ fn parser_closes_same_indent_sequence_before_next_mapping_entry() {
 }
 
 #[test]
+fn parser_closes_nested_indentless_sequence_before_mapping_sibling() {
+    let input = "outer:\n  first:\n  - one\n  second:\n  - two\n";
+    let doc = YamlDoc::parse(input).expect("valid nested indentless sequence values");
+
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+MAP\n=VAL :outer\n+MAP\n=VAL :first\n+SEQ\n=VAL :one\n-SEQ\n=VAL :second\n+SEQ\n=VAL :two\n-SEQ\n-MAP\n-MAP\n-DOC\n-STR\n"
+    );
+}
+
+#[test]
+fn parser_closes_nested_indentless_sequence_across_blank_and_comment_lines() {
+    let input = "outer:\n  first:\n  - one\n\n  # between entries\n  second:\n  - two\n";
+    let doc = YamlDoc::parse(input).expect("valid nested mapping sibling after trivia");
+
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+MAP\n=VAL :outer\n+MAP\n=VAL :first\n+SEQ\n=VAL :one\n-SEQ\n=VAL :second\n+SEQ\n=VAL :two\n-SEQ\n-MAP\n-MAP\n-DOC\n-STR\n"
+    );
+}
+
+#[test]
+fn parser_closes_nested_indentless_sequence_before_explicit_mapping_key() {
+    let input = "outer:\n  first:\n  - one\n  ? second\n  : two\n";
+    let doc = YamlDoc::parse(input).expect("valid explicit mapping sibling");
+
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+MAP\n=VAL :outer\n+MAP\n=VAL :first\n+SEQ\n=VAL :one\n-SEQ\n=VAL :second\n=VAL :two\n-MAP\n-MAP\n-DOC\n-STR\n"
+    );
+}
+
+#[test]
+fn parser_rejects_non_mapping_sibling_after_nested_indentless_sequence() {
+    let input = "outer:\n  first:\n  - one\n  stray\n";
+    let error = YamlDoc::parse(input).expect_err("scalar cannot follow a nested sequence");
+
+    assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+    assert_eq!(
+        error.diagnostic.message,
+        "invalid content after nested block sequence"
+    );
+}
+
+#[test]
 fn parser_attaches_sequence_before_nested_mapping_value() {
     let input = "sequence:\n- one\n- two\nmapping:\n  ? sky\n  : blue\n  sea : green\n";
     let doc = YamlDoc::parse(input).expect("valid sequence then mapping values");

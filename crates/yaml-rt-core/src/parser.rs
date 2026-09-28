@@ -371,16 +371,13 @@ impl<'source> Parser<'source> {
 
         self.validate_indent(indent, line, body)?;
         self.close_collections_deeper_than(indent);
+        self.transition_same_indent_sequence_sibling(
+            indent,
+            line,
+            body,
+            prepared.mapping_colon().is_some(),
+        )?;
         self.reject_invalid_block_sibling(indent, line, body, prepared.mapping_colon().is_some())?;
-        if self.sequence_is_open_at(indent)
-            && self.mapping_is_open_at(indent)
-            && !is_sequence_entry(body)
-            && (is_explicit_mapping_key(body)
-                || is_explicit_mapping_value(body)
-                || prepared.mapping_colon().is_some())
-        {
-            self.close_sequence_at_indent(indent);
-        }
         reject_unexpected_line_start(body, line.content_start + indent)?;
 
         let document = self.ensure_current_document(false, line);
@@ -2782,6 +2779,30 @@ impl<'source> Parser<'source> {
             .is_some()
     }
 
+    fn transition_same_indent_sequence_sibling(
+        &mut self,
+        indent: usize,
+        line: SourceLine<'_>,
+        body: &str,
+        known_mapping: bool,
+    ) -> Result<(), YamlError> {
+        if !self.sequence_is_open_at(indent) || is_sequence_entry(body) {
+            return Ok(());
+        }
+        let is_mapping_sibling = is_explicit_mapping_key(body)
+            || is_explicit_mapping_value(body)
+            || known_mapping
+            || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
+            || find_mapping_colon(body).is_some();
+        if !self.mapping_is_open_at(indent) || !is_mapping_sibling {
+            return Err(invalid_nested_block_sequence_sibling(
+                line.content_start + indent,
+            ));
+        }
+        self.close_sequence_at_indent(indent);
+        Ok(())
+    }
+
     fn reject_invalid_block_sibling(
         &self,
         indent: usize,
@@ -2789,19 +2810,6 @@ impl<'source> Parser<'source> {
         body: &str,
         known_mapping: bool,
     ) -> Result<(), YamlError> {
-        if self.sequence_is_open_at(indent) && !is_sequence_entry(body) {
-            let mapping_is_open_at_indent = self.mapping_is_open_at(indent);
-            let is_mapping_sibling = is_explicit_mapping_key(body)
-                || is_explicit_mapping_value(body)
-                || known_mapping
-                || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
-                || find_mapping_colon(body).is_some();
-            if !mapping_is_open_at_indent || !is_mapping_sibling {
-                return Err(invalid_nested_block_sequence_sibling(
-                    line.content_start + indent,
-                ));
-            }
-        }
         if self.mapping_is_open_at(indent) && comment_text_contains_mapping_colon(body) {
             return Err(invalid_orphaned_block_content(
                 line.content_start + indent + separated_comment_offset(body).unwrap_or(0),
@@ -4422,12 +4430,13 @@ impl<'source> BlockMachine<'source> {
         let body = &line.content_without_break[indent..];
         let absolute_start = line.content_start + indent;
         self.parser.close_collections_deeper_than(indent);
+        self.parser.transition_same_indent_sequence_sibling(
+            indent,
+            line,
+            body,
+            line.facts.mapping_colon().is_some(),
+        )?;
         reject_unexpected_line_start(body, line.content_start + indent)?;
-        if self.parser.sequence_is_open_at(indent) && !is_sequence_entry(body) {
-            return Err(invalid_nested_block_sequence_sibling(
-                line.content_start + indent,
-            ));
-        }
         let previous_depth = self.parser.block_frames.len();
         if let Some(facts) = source_line_simple_mapping_facts(line, absolute_start) {
             let consumed = if let Some(mapping) = self.parser.active_simple_mapping(indent) {

@@ -314,10 +314,9 @@ impl<'source> Parser<'source> {
             return Err(tab_indentation_error(line.content_start + indent));
         }
 
-        if let Some(rest) = document_marker_rest(body, "---") {
-            if indent != 0 {
-                return Err(invalid_document_marker(line));
-            }
+        if indent == 0
+            && let Some(rest) = document_marker_rest(body, "---")
+        {
             if self.document.is_some() {
                 self.close_document(false, Span::empty_from_usize(line.content_start))?;
             }
@@ -338,8 +337,10 @@ impl<'source> Parser<'source> {
             return self.parse_content_body(document, lines, index, prepared);
         }
 
-        if let Some(rest) = document_marker_rest(body, "...") {
-            if indent != 0 || !rest.trim().is_empty() && !rest.trim_start().starts_with('#') {
+        if indent == 0
+            && let Some(rest) = document_marker_rest(body, "...")
+        {
+            if !rest.trim().is_empty() && !rest.trim_start().starts_with('#') {
                 return Err(invalid_document_marker(line));
             }
             let has_prior_document = self.stream.is_some_and(|stream| {
@@ -616,6 +617,12 @@ impl<'source> Parser<'source> {
                 }
                 if quote == '"' {
                     validate_double_quoted_continuation_line(&line)?;
+                } else if is_document_marker_line(line.content_without_break) {
+                    return Err(quoted_document_marker_error(
+                        "single-quoted",
+                        line.content_start,
+                        line.content_end,
+                    ));
                 }
                 consumed += 1;
             } else {
@@ -1714,7 +1721,7 @@ impl<'source> Parser<'source> {
 
         for line in lines.iter_from(index + 1) {
             let trimmed = line.content_without_break.trim();
-            if trimmed == "---" || trimmed == "..." {
+            if is_document_marker_line(line.content_without_break) {
                 break;
             }
 
@@ -2533,7 +2540,11 @@ impl<'source> Parser<'source> {
 
         for line in lines.iter_from(index + 1) {
             let trimmed = line.content_without_break.trim();
-            if trimmed == "---" || trimmed == "..." {
+            // Inline headers and nested scalars already stop at column zero by indentation.
+            if !inline_header
+                && parent_indent == 0
+                && is_document_marker_line(line.content_without_break)
+            {
                 reached_end = false;
                 break;
             }
@@ -3874,6 +3885,13 @@ pub(crate) fn document_marker_rest<'text>(body: &'text str, marker: &str) -> Opt
     }
 }
 
+fn is_document_marker_line(line: &str) -> bool {
+    if !matches!(line.as_bytes().first(), Some(b'-' | b'.')) {
+        return false;
+    }
+    document_marker_rest(line, "---").is_some() || document_marker_rest(line, "...").is_some()
+}
+
 pub(crate) fn strip_inline_comment(text: &str) -> &str {
     if text.is_ascii() {
         return strip_inline_comment_ascii(text);
@@ -4803,9 +4821,7 @@ fn is_plain_scalar_continuation(
 }
 
 fn starts_new_same_indent_collection(body: &str) -> bool {
-    body.starts_with("---")
-        || body.starts_with("...")
-        || is_sequence_entry(body)
+    is_sequence_entry(body)
         || is_explicit_mapping_key(body)
         || is_explicit_mapping_value(body)
         || find_mapping_colon(body).is_some()
@@ -5336,13 +5352,13 @@ fn flow_scalar_end(
             return Ok(position);
         }
         match character {
-            '-' if is_forbidden_flow_plain_indicator(text, position, "---") => {
+            '-' if is_forbidden_flow_plain_indicator(text, position, absolute_start, "---") => {
                 return Err(forbidden_flow_plain_indicator(
                     absolute_start + position,
                     "---",
                 ));
             }
-            '.' if is_forbidden_flow_plain_indicator(text, position, "...") => {
+            '.' if is_forbidden_flow_plain_indicator(text, position, absolute_start, "...") => {
                 return Err(forbidden_flow_plain_indicator(
                     absolute_start + position,
                     "...",
@@ -5409,13 +5425,13 @@ fn flow_frame_scalar_end(
                     character,
                 ));
             }
-            '-' if is_forbidden_flow_plain_indicator(text, position, "---") => {
+            '-' if is_forbidden_flow_plain_indicator(text, position, absolute_start, "---") => {
                 return Err(forbidden_flow_plain_indicator(
                     absolute_start + position,
                     "---",
                 ));
             }
-            '.' if is_forbidden_flow_plain_indicator(text, position, "...") => {
+            '.' if is_forbidden_flow_plain_indicator(text, position, absolute_start, "...") => {
                 return Err(forbidden_flow_plain_indicator(
                     absolute_start + position,
                     "...",
@@ -5436,10 +5452,15 @@ fn flow_frame_scalar_end(
     Ok(position)
 }
 
-fn is_forbidden_flow_plain_indicator(text: &str, position: usize, indicator: &str) -> bool {
-    text[position..].starts_with(indicator)
-        && previous_flow_character_allows_plain_indicator(text, position)
-        && following_flow_character_terminates_indicator(text, position + indicator.len())
+fn is_forbidden_flow_plain_indicator(
+    text: &str,
+    position: usize,
+    absolute_start: usize,
+    indicator: &str,
+) -> bool {
+    (position == 0 && absolute_start == 0
+        || position > 0 && matches!(text.as_bytes()[position - 1], b'\n' | b'\r'))
+        && document_marker_rest(&text[position..], indicator).is_some()
 }
 
 fn is_bare_flow_dash(text: &str, position: usize) -> bool {
@@ -5561,10 +5582,7 @@ fn scan_double_quoted_scalar(text: &str, start: usize) -> Result<Option<usize>, 
 }
 
 fn reject_double_quoted_document_marker(line: &str) -> Result<(), YamlError> {
-    let trimmed = line.trim_start_matches([' ', '\t']);
-    if document_marker_rest(trimmed, "---").is_some()
-        || document_marker_rest(trimmed, "...").is_some()
-    {
+    if is_document_marker_line(line) {
         return Err(invalid_double_quoted_escape(
             "document marker is not allowed inside a double-quoted scalar",
         ));
@@ -5585,6 +5603,13 @@ fn single_quoted_flow_end(
             .next()
             .expect("position is inside text");
         position += character.len_utf8();
+        if matches!(character, '\n' | '\r') && is_document_marker_line(&text[position..]) {
+            return Err(quoted_document_marker_error(
+                "single-quoted",
+                absolute_start + position,
+                absolute_start + position + 3,
+            ));
+        }
         if character == '\'' {
             if text[position..].starts_with('\'') {
                 position += 1;
@@ -5602,6 +5627,17 @@ fn single_quoted_flow_end(
         )
         .with_expected("closing '"),
     ))
+}
+
+fn quoted_document_marker_error(style: &str, start: usize, end: usize) -> YamlError {
+    YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            format!("document marker is not allowed inside a {style} scalar"),
+            Span::from_usize(start, end),
+        )
+        .with_expected("quoted scalar content"),
+    )
 }
 
 fn missing_flow_sequence_end(absolute_start: usize, text_len: usize) -> YamlError {
@@ -6065,10 +6101,7 @@ pub(crate) fn double_quoted_scalar_end(text: &str) -> Option<usize> {
 }
 
 fn validate_double_quoted_continuation_line(line: &SourceLine<'_>) -> Result<(), YamlError> {
-    let trimmed = line.content_without_break.trim();
-    if document_marker_rest(trimmed, "---").is_some()
-        || document_marker_rest(trimmed, "...").is_some()
-    {
+    if is_document_marker_line(line.content_without_break) {
         return Err(YamlError::new(
             Diagnostic::new(
                 DiagnosticKind::Parser,
@@ -6298,10 +6331,7 @@ fn validate_double_quoted_scalar_content(text: &str) -> Result<(), YamlError> {
         let (line, next_position) = next_literal_content_line(text, position);
         let (body, _) = split_line_break(line);
         if !first_line {
-            let trimmed = body.trim();
-            if document_marker_rest(trimmed, "---").is_some()
-                || document_marker_rest(trimmed, "...").is_some()
-            {
+            if is_document_marker_line(body) {
                 return Err(invalid_double_quoted_escape(
                     "document marker is not allowed inside a double-quoted scalar",
                 ));

@@ -1910,6 +1910,88 @@ fn parser_builds_root_literal_scalar_cst() {
 }
 
 #[test]
+fn indented_marker_text_stays_inside_block_scalars() {
+    for (input, expected) in [
+        ("foo: |\n  bar\n  ---\n  baz\n", "bar\n---\nbaz\n"),
+        ("foo: |\n  bar\n  ...\n  baz\n", "bar\n...\nbaz\n"),
+        ("foo: |2\n  bar\n  ---\n  baz\n", "bar\n---\nbaz\n"),
+        ("foo: >\n  bar\n  ---\n  baz\n", "bar --- baz\n"),
+        ("foo: >\n  bar\n  ...\n  baz\n", "bar ... baz\n"),
+    ] {
+        let doc = YamlDoc::parse(input).expect("indented marker text is block scalar content");
+        let value = doc.get_path(&["foo"]).unwrap().unwrap();
+        assert_eq!(doc.scalar_value(value).unwrap(), expected);
+        assert_eq!(doc.documents().count(), 1);
+        assert_eq!(doc.to_string(), input);
+    }
+}
+
+#[test]
+fn indented_marker_text_stays_inside_plain_quoted_and_flow_scalars() {
+    for (input, expected) in [
+        ("foo: bar\n  ---\n  baz\n", "bar --- baz"),
+        ("foo: bar\n  ...\n  baz\n", "bar ... baz"),
+        ("foo: \"bar\n  ---\n  baz\"\n", "bar --- baz"),
+        ("foo: \"bar\n  ...\n  baz\"\n", "bar ... baz"),
+        ("foo: 'bar\n  ---\n  baz'\n", "bar --- baz"),
+    ] {
+        let doc = YamlDoc::parse(input).expect("indented marker text is scalar content");
+        let value = doc.get_path(&["foo"]).unwrap().unwrap();
+        assert_eq!(doc.scalar_value(value).unwrap(), expected);
+        assert_eq!(doc.to_string(), input);
+    }
+
+    let input = "foo: [---, ..., ok]\n";
+    let doc = YamlDoc::parse(input).expect("flow plain scalars may spell marker text");
+    let sequence = doc.get_path(&["foo"]).unwrap().unwrap();
+    let values = doc
+        .sequence_items(sequence)
+        .map(|item| doc.scalar_value(item).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["---", "...", "ok"]);
+    assert_eq!(doc.to_string(), input);
+}
+
+#[test]
+fn column_zero_markers_remain_document_boundaries() {
+    for marker in ["---", "..."] {
+        let input = format!("foo: |\n  bar\n{marker}\n");
+        let doc = YamlDoc::parse(&input).expect("column-zero marker ends the block scalar");
+        let value = doc.get_path(&["foo"]).unwrap().unwrap();
+        assert_eq!(doc.scalar_value(value).unwrap(), "bar\n");
+        assert!(doc.events_to_test_string().contains("=VAL |bar\\n\n"));
+        assert_eq!(doc.to_string(), input);
+
+        let quoted = format!("foo: \"bar\n{marker}\n  baz\"\n");
+        YamlDoc::parse(&quoted).expect_err("column-zero marker interrupts quoted content");
+        let flow = format!("foo: [\n{marker}\n]\n");
+        YamlDoc::parse(&flow).expect_err("column-zero marker interrupts flow content");
+        let single = format!("foo: 'bar\n{marker}\n  baz'\n");
+        YamlDoc::parse(&single).expect_err("column-zero marker interrupts single-quoted content");
+        let flow_single = format!("foo: ['bar\n{marker}\n  baz']\n");
+        YamlDoc::parse(&flow_single)
+            .expect_err("column-zero marker interrupts flow single-quoted content");
+    }
+
+    let crlf = "foo: |\r\n  bar\r\n  ---\r\n  baz\r\n";
+    let doc = YamlDoc::parse(crlf).expect("indented marker remains scalar content with CRLF");
+    let value = doc.get_path(&["foo"]).unwrap().unwrap();
+    assert_eq!(doc.scalar_value(value).unwrap(), "bar\r\n---\r\nbaz\n");
+    assert_eq!(doc.to_string(), crlf);
+
+    let input = "foo: |\n  bar\n---\nnext\n";
+    let doc = YamlDoc::parse(input).expect("document start marker opens another document");
+    assert_eq!(doc.documents().count(), 2);
+    assert!(doc.events_to_test_string().contains("+DOC ---"));
+    assert_eq!(doc.to_string(), input);
+
+    let root = "|\n  bar\n---\nnext\n";
+    let doc = YamlDoc::parse(root).expect("root block scalar stops at document marker");
+    assert_eq!(doc.documents().count(), 2);
+    assert_eq!(doc.to_string(), root);
+}
+
+#[test]
 fn parser_builds_literal_scalar_mapping_value_cst() {
     let input = "message: |\n  hello\n  world\nnext: value\n";
     let doc = YamlDoc::parse(input).expect("parser should accept literal mapping value");

@@ -2821,10 +2821,12 @@ impl<'source> Parser<'source> {
         body: &str,
         known_mapping: bool,
     ) -> Result<(), YamlError> {
-        if self.mapping_is_open_at(indent) && comment_text_contains_mapping_colon(body) {
-            return Err(invalid_orphaned_block_content(
-                line.content_start + indent + separated_comment_offset(body).unwrap_or(0),
-            ));
+        if self.mapping_is_open_at(indent) {
+            if let Some(comment) = mapping_comment_with_colon_offset(body) {
+                return Err(invalid_orphaned_block_content(
+                    line.content_start + indent + comment,
+                ));
+            }
         }
 
         let has_collection_at_indent =
@@ -5081,13 +5083,26 @@ fn separated_comment_offset(text: &str) -> Option<usize> {
     None
 }
 
-fn comment_text_contains_mapping_colon(text: &str) -> bool {
-    let Some(comment) = separated_comment_offset(text) else {
-        return false;
+fn mapping_comment_with_colon_offset(text: &str) -> Option<usize> {
+    let comment_search_start = if let Some(colon) = find_mapping_colon(text) {
+        let value = text[colon + 1..].trim_start_matches([' ', '\t']);
+        let value_start = text.len() - value.len();
+        let quoted_end = match value.chars().next() {
+            Some('"') => double_quoted_scalar_end(value),
+            Some('\'') => single_quoted_scalar_end(value),
+            _ => Some(0),
+        }?;
+        value_start + quoted_end
+    } else {
+        0
     };
-    text[comment..].char_indices().any(|(offset, character)| {
-        character == ':' && is_block_mapping_separator_colon(&text[comment..], offset)
-    })
+    let comment = comment_search_start + separated_comment_offset(&text[comment_search_start..])?;
+    text[comment..]
+        .char_indices()
+        .any(|(offset, character)| {
+            character == ':' && is_block_mapping_separator_colon(&text[comment..], offset)
+        })
+        .then_some(comment)
 }
 
 fn validate_quoted_scalar_trailing_content(

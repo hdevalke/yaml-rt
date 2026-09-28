@@ -1775,6 +1775,32 @@ fn parser_treats_inline_comment_mapping_value_as_empty_for_nested_block_value() 
 }
 
 #[test]
+fn parser_keeps_comment_markers_inside_quoted_mapping_values() {
+    let input = "version: 1\nsource: \"abc # more\\nport: \\\"8080 # public endpoint\\\"\\nenabled: TRUE\"\nother: 'text # not a comment: value'\n";
+    let doc = YamlDoc::parse(input).expect("quoted comment markers are scalar content");
+
+    assert_eq!(doc.to_string(), input);
+    let source = doc.get_path(&["source"]).unwrap().unwrap();
+    assert_eq!(
+        doc.scalar_value(source).unwrap(),
+        "abc # more\nport: \"8080 # public endpoint\"\nenabled: TRUE"
+    );
+}
+
+#[test]
+fn parser_keeps_comment_markers_inside_quoted_mapping_keys() {
+    let input = "first: value\n\"key # part: value\": second\n'other # part: value': third\n";
+    let doc = YamlDoc::parse(input).expect("quoted key content is not a comment");
+
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(
+        doc.scalar_value(doc.get_path(&["key # part: value"]).unwrap().unwrap())
+            .unwrap(),
+        "second"
+    );
+}
+
+#[test]
 fn parser_applies_anchor_to_root_block_sequence() {
     let input = "&sequence\n- a\n";
     let doc = YamlDoc::parse(input).expect("parser should accept anchored root sequence");

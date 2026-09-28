@@ -188,3 +188,31 @@ footer a { color: inherit; }
     --shadow: none;
   }
 }
+
+dialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  padding: 24px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+}
+dialog::backdrop { background: rgb(17 28 23 / 65%); }
+.dialog-heading, .dialog-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dialog-heading h2 { margin: 0; }
+dialog p { color: var(--muted); }
+dialog textarea {
+  display: block;
+  width: 100%;
+  height: min(46vh, 380px);
+  padding: 12px;
+  resize: vertical;
+  font: .85rem/1.5 ui-monospace, monospace;
+}
+.dialog-actions { justify-content: flex-end; flex-wrap: wrap; margin-top: 14px; }
+.file-picker { display: block; margin-top: 14px; }
+.file-picker input { display: block; width: 100%; margin-top: 6px; padding: 7px; }
+.dialog-error { color: var(--danger); white-space: pre-wrap; }

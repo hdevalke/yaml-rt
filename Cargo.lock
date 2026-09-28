@@ -1187,10 +1187,12 @@ dependencies = [
 name = "yaml-rt-wasm"
 version = "0.3.1"
 dependencies = [
+ "serde",
  "wasm-bindgen",
  "yaml-rt-core",
  "yaml-rt-rfc9535",
  "yaml-rt-schema",
+ "yaml-rt-serde",
 ]
 
 [[package]]

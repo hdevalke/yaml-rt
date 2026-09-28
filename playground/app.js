@@ -11,7 +11,7 @@ import {
   lineNumbers,
   yaml,
 } from "./codemirror.js";
-import init, { run_command } from "./pkg/yaml_rt_wasm.js";
+import init, { export_snapshot, import_snapshot, run_command } from "./pkg/yaml_rt_wasm.js";
 import { copyText, lineDiff, resultPresentation, validationPresentation } from "./state.mjs";
 
 const baseSource = `# Production services — comments and style stay put
@@ -270,8 +270,9 @@ function markChanges(before, after) {
 }
 
 function setDocuments(count) {
-  const selected = Math.min(Number(controls.documentIndex.value), Math.max(0, count - 1));
+  const selected = Number(controls.documentIndex.value);
   controls.documentIndex.replaceChildren(...Array.from({ length: Math.max(1, count) }, (_, index) => new Option(String(index), String(index))));
+  if (selected >= Math.max(1, count)) controls.documentIndex.add(new Option(String(selected), String(selected)));
   controls.documentIndex.value = String(selected);
   $("document-count").textContent = count ? `${count} document${count === 1 ? "" : "s"}` : "";
 }
@@ -439,6 +440,7 @@ function scheduleRun() {
 }
 
 function loadExample(index, reset = false) {
+  $("imported-example")?.remove();
   if (loadedExample != null && !reset) {
     exampleSchemaDrafts.set(loadedExample, {
       input: text(inputSchemaEditor), output: text(outputSchemaEditor),
@@ -465,8 +467,101 @@ function loadExample(index, reset = false) {
   }
   controls.documentIndex.value = String(requestedDocument);
   updateFields();
+  clearTimeout(debounce);
   run();
   loadedExample = index;
+}
+
+function currentSnapshotYaml() {
+  return export_snapshot(
+    text(sourceEditor), text(inputSchemaEditor), text(outputSchemaEditor),
+    controls.command.value, Number(controls.documentIndex.value),
+    controls.selectorKind.value, controls.selector.value, controls.from.value,
+    controls.destination.value, controls.value.value, controls.newKey.value,
+    controls.patch.value,
+  );
+}
+
+function dialogError(id, message = "") {
+  const element = $(id);
+  element.textContent = message;
+  element.hidden = !message;
+}
+
+function openExport() {
+  dialogError("export-error");
+  $("export-yaml").value = "";
+  try {
+    $("export-yaml").value = currentSnapshotYaml();
+    $("export-dialog").showModal();
+  } catch (error) {
+    dialogError("export-error", `Unable to export scenario: ${error}`);
+    $("export-dialog").showModal();
+  }
+}
+
+function applyImportedSnapshot(yamlText) {
+  const imported = import_snapshot(yamlText);
+  let values;
+  try {
+    values = {
+      source: imported.source,
+      inputSchema: imported.input_schema,
+      outputSchema: imported.output_schema,
+      command: imported.command,
+      documentIndex: imported.document_index,
+      selectorKind: imported.selector_kind,
+      selector: imported.selector,
+      from: imported.from,
+      destination: imported.destination,
+      value: imported.value,
+      newKey: imported.new_key,
+      patch: imported.patch,
+    };
+  } finally {
+    imported.free();
+  }
+  if (loadedExample != null) {
+    exampleSchemaDrafts.set(loadedExample, {
+      input: text(inputSchemaEditor), output: text(outputSchemaEditor),
+    });
+  }
+  replaceText(sourceEditor, values.source);
+  replaceText(inputSchemaEditor, values.inputSchema);
+  replaceText(outputSchemaEditor, values.outputSchema);
+  controls.command.value = values.command;
+  controls.selectorKind.value = values.selectorKind;
+  controls.selector.value = values.selector;
+  controls.from.value = values.from;
+  controls.destination.value = values.destination;
+  controls.value.value = values.value;
+  controls.newKey.value = values.newKey;
+  controls.patch.value = values.patch;
+  if (![...controls.documentIndex.options].some((option) => Number(option.value) === values.documentIndex)) {
+    controls.documentIndex.add(new Option(String(values.documentIndex), String(values.documentIndex)));
+  }
+  controls.documentIndex.value = String(values.documentIndex);
+  $("imported-example")?.remove();
+  const importedOption = new Option("Imported scenario", "imported");
+  importedOption.id = "imported-example";
+  controls.example.add(importedOption);
+  controls.example.value = "imported";
+  loadedExample = null;
+  updateFields();
+  clearTimeout(debounce);
+  run();
+}
+
+function downloadSnapshot() {
+  const blob = new Blob([$("export-yaml").value], { type: "application/yaml;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "yaml-rt-playground.yaml";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function legacyCopy(value) {
@@ -509,9 +604,50 @@ async function start() {
   }
   examples.forEach((example, index) => controls.example.add(new Option(example.name, String(index))));
   Object.values(controls).forEach((control) => control.addEventListener("input", scheduleRun));
-  controls.example.addEventListener("change", () => loadExample(Number(controls.example.value)));
+  controls.example.addEventListener("change", () => {
+    if (controls.example.value !== "imported") loadExample(Number(controls.example.value));
+  });
   $("run").addEventListener("click", run);
-  $("reset").addEventListener("click", () => loadExample(activeExample, true));
+  $("reset").addEventListener("click", () => {
+    const index = controls.example.value === "imported" ? 0 : activeExample;
+    controls.example.value = String(index);
+    loadExample(index, true);
+  });
+  $("export").addEventListener("click", openExport);
+  $("import").addEventListener("click", () => {
+    $("import-yaml").value = "";
+    $("import-file").value = "";
+    dialogError("import-error");
+    $("import-dialog").showModal();
+  });
+  document.querySelectorAll("[data-close-dialog]").forEach((button) => {
+    button.addEventListener("click", () => $(button.dataset.closeDialog).close());
+  });
+  $("copy-export").addEventListener("click", () => copy($("export-yaml").value, $("copy-export")));
+  $("download-export").addEventListener("click", downloadSnapshot);
+  $("import-file").addEventListener("change", async () => {
+    const file = $("import-file").files?.[0];
+    if (!file) return;
+    $("import-yaml").value = "";
+    $("apply-import").disabled = true;
+    try {
+      $("import-yaml").value = await file.text();
+      dialogError("import-error");
+    } catch (error) {
+      dialogError("import-error", `Unable to read file: ${error}`);
+    } finally {
+      $("apply-import").disabled = false;
+    }
+  });
+  $("apply-import").addEventListener("click", () => {
+    try {
+      applyImportedSnapshot($("import-yaml").value);
+      dialogError("import-error");
+      $("import-dialog").close();
+    } catch (error) {
+      dialogError("import-error", `Unable to import scenario: ${error}`);
+    }
+  });
   $("copy-result").addEventListener("click", () => copy(text(resultEditor), $("copy-result")));
   $("use-schema").addEventListener("click", () => {
     replaceText(inputSchemaEditor, text(resultEditor));
@@ -523,6 +659,8 @@ async function start() {
   try {
     await init();
     ready = true;
+    $("export").disabled = false;
+    $("import").disabled = false;
     loadExample(0);
   } catch (error) {
     $("run-state").textContent = "Load failed";

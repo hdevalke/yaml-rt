@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="Try yaml-rt lossless YAML queries and edits in your browser.">
     <title>yaml-rt playground</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg">
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body>
@@ -21,6 +22,8 @@
         <label for="example">Example</label>
         <select id="example"></select>
         <span class="privacy">Runs locally in your browser</span>
+        <button id="export" class="quiet" type="button" disabled>Export</button>
+        <button id="import" class="quiet" type="button" disabled>Import</button>
         <button id="reset" class="quiet" type="button">Reset</button>
       </section>
 
@@ -144,6 +147,32 @@
         </article>
       </section>
     </main>
+
+    <dialog id="export-dialog" aria-labelledby="export-title">
+      <div class="dialog-heading">
+        <h2 id="export-title">Export scenario</h2>
+        <button class="quiet" type="button" data-close-dialog="export-dialog" aria-label="Close export dialog">Close</button>
+      </div>
+      <p>Copy this YAML into a ticket, or save it as a file.</p>
+      <textarea id="export-yaml" aria-label="Exported scenario YAML" readonly spellcheck="false"></textarea>
+      <div class="dialog-actions">
+        <button id="copy-export" type="button">Copy YAML</button>
+        <button id="download-export" type="button">Download .yaml</button>
+      </div>
+      <p id="export-error" class="dialog-error" role="alert" hidden></p>
+    </dialog>
+
+    <dialog id="import-dialog" aria-labelledby="import-title">
+      <div class="dialog-heading">
+        <h2 id="import-title">Import scenario</h2>
+        <button class="quiet" type="button" data-close-dialog="import-dialog" aria-label="Close import dialog">Close</button>
+      </div>
+      <p>Paste exported YAML or choose a .yaml file.</p>
+      <textarea id="import-yaml" aria-label="Scenario YAML to import" spellcheck="false"></textarea>
+      <label class="file-picker">Choose file <input id="import-file" type="file" accept=".yaml,.yml,text/yaml,application/yaml,text/plain"></label>
+      <p id="import-error" class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions"><button id="apply-import" type="button">Import scenario</button></div>
+    </dialog>
 
     <footer>
       <span>YAML 1.2.2 · source-preserving edits</span>

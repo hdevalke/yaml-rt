@@ -68,9 +68,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p playground/dist/pkg
-          cp playground/index.html playground/styles.css playground/app.js playground/state.mjs playground/generated/codemirror.js playground/dist/
+          cp playground/index.html playground/favicon.svg playground/styles.css playground/app.js playground/state.mjs playground/generated/codemirror.js playground/dist/
           cp playground/pkg/yaml_rt_wasm.js playground/pkg/yaml_rt_wasm_bg.wasm playground/dist/pkg/
           test -s playground/dist/index.html
+          test -s playground/dist/favicon.svg
+          test -s playground/dist/codemirror.js
           test -s playground/dist/pkg/yaml_rt_wasm.js
           test -s playground/dist/pkg/yaml_rt_wasm_bg.wasm
           grep -Fq './pkg/yaml_rt_wasm.js' playground/dist/app.js

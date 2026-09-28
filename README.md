@@ -44,6 +44,11 @@ input document; Use as input schema places it in the Input Schema tab. Several
 examples include input and output schemas, and each
 example keeps schema edits when you switch away and back; Reset restores its
 original schemas.
+Export copies or downloads a versioned YAML scenario with the input YAML, both
+schemas, the selected operation and document, and every command field. Import
+accepts pasted YAML or a `.yaml` file and reruns the scenario, including inputs
+that intentionally contain invalid YAML or schemas. These snapshots stay local
+to the browser, so they can be attached to bug tickets without a URL size limit.
 
 ## When to use yaml-rt
 

@@ -1,5 +1,9 @@
 //! Browser command engine used by the yaml-rt playground.
 
+mod snapshot;
+
+pub use snapshot::{export_snapshot, import_snapshot};
+
 use std::cmp::Ordering;
 use std::collections::HashSet;
 

@@ -1,5 +1,11 @@
 # Changelog
 
+### v0.3.1 (2026-09-28)
+
+#### Fixes
+
+* **core:** parse nested indentless sequence siblings (15d0a4f)
+
 ## v0.3.0 (2026-09-20)
 
 ### Features

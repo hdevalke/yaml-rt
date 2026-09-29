@@ -1,5 +1,18 @@
 # Changelog
 
+### v0.3.2 (2026-09-28)
+
+#### Features
+
+* **playground:** add playground scenario import and export (d707935)
+
+#### Fixes
+
+* **core:** satisfy clippy checks (a3b20c6)
+* **parser:** accept complex block mapping keys (8c59386)
+* comment detection around quoted mapping entries (e898d1e)
+* **core:** keep indented document markers in scalars (a7204f4)
+
 ### v0.3.1 (2026-09-28)
 
 #### Fixes

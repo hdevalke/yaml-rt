@@ -31,7 +31,6 @@ use yaml_rt_core::{
 };
 
 const MAX_QUERY_DEPTH: usize = 128;
-const MAX_VALUE_DEPTH: usize = 1024;
 const MAP_TAG: &str = "tag:yaml.org,2002:map";
 const SEQ_TAG: &str = "tag:yaml.org,2002:seq";
 
@@ -151,7 +150,7 @@ impl JsonPath {
                 .map_err(|error| Error::with_kind(ErrorKind::Document, None, error.to_string()))?,
             path: Vec::new(),
         };
-        let budget = doc.as_source().len().saturating_mul(100).max(10_000);
+        let budget = doc.source().limits().max_expanded_nodes;
         let mut validator = Validator::new(doc, budget);
         validator.validate_candidate(&root)?;
 
@@ -1318,6 +1317,13 @@ impl<'a> Evaluator<'a> {
                 }
                 return Err(error);
             }
+            if seen.len() > self.doc.source().limits().max_alias_chain {
+                return Err(Error::with_kind(
+                    ErrorKind::Limit,
+                    None,
+                    "YAML alias chain limit exceeded",
+                ));
+            }
             node = self.doc.resolve_alias(current);
             if node.is_none() {
                 let mut error = Error::with_kind(
@@ -1379,6 +1385,8 @@ impl Atom {
 struct Validator<'a> {
     doc: &'a YamlDoc,
     remaining: usize,
+    depth_limit: usize,
+    alias_chain_limit: usize,
     active: HashSet<NodeId>,
 }
 
@@ -1387,6 +1395,8 @@ impl<'a> Validator<'a> {
         Self {
             doc,
             remaining: budget,
+            depth_limit: doc.source().limits().max_collection_depth,
+            alias_chain_limit: doc.source().limits().max_alias_chain,
             active: HashSet::new(),
         }
     }
@@ -1396,7 +1406,7 @@ impl<'a> Validator<'a> {
     }
 
     fn validate_node(&mut self, node: Option<NodeId>, depth: usize) -> Result<(), QueryError> {
-        if depth > MAX_VALUE_DEPTH {
+        if depth > self.depth_limit {
             return Err(Error::with_kind(
                 ErrorKind::Limit,
                 None,
@@ -1422,6 +1432,14 @@ impl<'a> Validator<'a> {
                 }
                 return Err(error);
             }
+            if aliases.len() > self.alias_chain_limit {
+                return Err(Error::with_kind(
+                    ErrorKind::Limit,
+                    None,
+                    "YAML alias chain limit exceeded",
+                ));
+            }
+            self.spend_alias()?;
             let alias = node;
             node = self.doc.resolve_alias(alias).ok_or_else(|| {
                 let mut error = Error::with_kind(
@@ -1498,7 +1516,7 @@ impl<'a> Validator<'a> {
         }
     }
 
-    fn string_key(&self, node: NodeId) -> Result<String, QueryError> {
+    fn string_key(&mut self, node: NodeId) -> Result<String, QueryError> {
         let mut node = node;
         let mut seen = HashSet::new();
         while matches!(self.doc.semantic_kind(node), Some(SemanticKind::Alias)) {
@@ -1509,6 +1527,14 @@ impl<'a> Validator<'a> {
                 }
                 return Err(error);
             }
+            if seen.len() > self.alias_chain_limit {
+                return Err(Error::with_kind(
+                    ErrorKind::Limit,
+                    None,
+                    "YAML alias chain limit exceeded",
+                ));
+            }
+            self.spend_alias()?;
             let alias = node;
             node = self.doc.resolve_alias(alias).ok_or_else(|| {
                 let mut error =
@@ -1539,6 +1565,17 @@ impl<'a> Validator<'a> {
             ));
         }
         Ok(value.into_owned())
+    }
+
+    fn spend_alias(&mut self) -> Result<(), QueryError> {
+        self.remaining = self.remaining.checked_sub(1).ok_or_else(|| {
+            Error::with_kind(
+                ErrorKind::Limit,
+                None,
+                "YAML alias expansion limit exceeded",
+            )
+        })?;
+        Ok(())
     }
 
     fn validate_collection_tag(&self, node: NodeId, expected: &str) -> Result<(), QueryError> {
@@ -1618,6 +1655,7 @@ fn slice_indices(length: usize, start: Option<i64>, end: Option<i64>, step: i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yaml_rt_core::ResourceLimits;
 
     fn pointers(path: &str, yaml: &str) -> Result<Vec<String>, Error> {
         let doc = YamlDoc::parse(yaml).unwrap();
@@ -1752,5 +1790,28 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::Syntax);
         assert_eq!(error.byte_offset(), Some(0));
         assert_eq!(error.source_span(), None);
+    }
+
+    #[test]
+    fn document_limits_bound_jsonpath_validation_and_aliases() {
+        let expansion_limits = ResourceLimits {
+            max_expanded_nodes: 3,
+            ..ResourceLimits::default()
+        };
+        let doc =
+            YamlDoc::parse_with_limits("items: [one, two, three]\n", expansion_limits).unwrap();
+        let error = JsonPath::parse("$").unwrap().query(&doc, 0).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Limit);
+        assert!(error.to_string().contains("expansion limit"));
+
+        let alias_limits = ResourceLimits {
+            max_alias_chain: 0,
+            ..ResourceLimits::default()
+        };
+        let doc = YamlDoc::parse_with_limits("source: &source one\ncopy: *source\n", alias_limits)
+            .unwrap();
+        let error = JsonPath::parse("$").unwrap().query(&doc, 0).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Limit);
+        assert!(error.to_string().contains("alias chain limit"));
     }
 }

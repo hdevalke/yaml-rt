@@ -3,6 +3,51 @@ use crate::{Diagnostic, DiagnosticKind, YamlError};
 /// YAML version targeted by this workspace.
 pub const TARGET_YAML_VERSION: &str = "1.2.2";
 
+/// Resource limits applied while parsing and traversing YAML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Maximum source length in bytes.
+    pub max_source_bytes: usize,
+    /// Maximum number of indexed source lines.
+    pub max_lines: usize,
+    /// Maximum number of CST nodes produced by the parser.
+    pub max_nodes: usize,
+    /// Maximum nested block or flow collection depth.
+    pub max_collection_depth: usize,
+    /// Maximum aliases followed in one direct alias chain.
+    pub max_alias_chain: usize,
+    /// Maximum expanded or traversed semantic nodes per high-level operation.
+    pub max_expanded_nodes: usize,
+}
+
+impl ResourceLimits {
+    /// Limits only values constrained by the parser's `u32` representation.
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self {
+            max_source_bytes: u32::MAX as usize,
+            max_lines: (u32::MAX - 1) as usize,
+            max_nodes: (u32::MAX - 1) as usize,
+            max_collection_depth: usize::MAX,
+            max_alias_chain: usize::MAX,
+            max_expanded_nodes: usize::MAX,
+        }
+    }
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: 64 * 1024 * 1024,
+            max_lines: 1_000_000,
+            max_nodes: 1_000_000,
+            max_collection_depth: 1_024,
+            max_alias_chain: 256,
+            max_expanded_nodes: 1_000_000,
+        }
+    }
+}
+
 /// Identifier for a node stored inside a [`crate::YamlDoc`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
@@ -99,8 +144,8 @@ impl TryFrom<(usize, usize)> for Span {
 
     fn try_from((start, end): (usize, usize)) -> Result<Self, Self::Error> {
         Ok(Self {
-            start: Self::usize_to_u32(start),
-            end: Self::usize_to_u32(end),
+            start: u32::try_from(start)?,
+            end: u32::try_from(end)?,
         })
     }
 }
@@ -119,6 +164,7 @@ pub struct Source {
     text: String,
     line_starts: Vec<u32>,
     line_facts: Vec<LineFacts>,
+    limits: ResourceLimits,
 }
 
 const NO_LINE_OFFSET: u16 = u16::MAX;
@@ -217,9 +263,35 @@ impl Source {
     /// Returns an error when `text` contains characters that are not valid in a
     /// YAML 1.2.2 stream.
     pub fn new(text: String) -> Result<Self, YamlError> {
+        Self::new_with_limits(text, ResourceLimits::default())
+    }
+
+    /// Builds a source buffer using explicit resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source exceeds a configured or representable
+    /// limit, or contains characters that are not valid YAML 1.2.2 text.
+    pub fn new_with_limits(text: String, limits: ResourceLimits) -> Result<Self, YamlError> {
+        if text.len() > limits.max_source_bytes || text.len() > u32::MAX as usize {
+            return Err(source_limit_error(
+                format!(
+                    "YAML source exceeds byte limit of {}",
+                    limits.max_source_bytes.min(u32::MAX as usize)
+                ),
+                0,
+            ));
+        }
         let bytes = text.as_bytes();
-        let mut line_starts = Vec::with_capacity(text.len() / 32 + 1);
+        let estimated_lines = text.len() / 32 + 1;
+        let mut line_starts = Vec::with_capacity(estimated_lines.min(limits.max_lines));
         line_starts.push(0);
+        if line_starts.len() > limits.max_lines {
+            return Err(source_limit_error(
+                format!("YAML source exceeds line limit of {}", limits.max_lines),
+                0,
+            ));
+        }
         const SOURCE_SCAN_CHUNK: usize = 32;
         let (chunks, remainder) = bytes.as_chunks::<SOURCE_SCAN_CHUNK>();
         for (chunk_index, chunk) in chunks.iter().enumerate() {
@@ -230,6 +302,12 @@ impl Source {
                 chunk,
                 &mut line_starts,
             )?;
+            if line_starts.len() > limits.max_lines {
+                return Err(source_limit_error(
+                    format!("YAML source exceeds line limit of {}", limits.max_lines),
+                    line_starts.last().copied().unwrap_or(0),
+                ));
+            }
         }
         validate_source_chunk(
             &text,
@@ -238,6 +316,12 @@ impl Source {
             remainder,
             &mut line_starts,
         )?;
+        if line_starts.len() > limits.max_lines {
+            return Err(source_limit_error(
+                format!("YAML source exceeds line limit of {}", limits.max_lines),
+                line_starts.last().copied().unwrap_or(0),
+            ));
+        }
         let line_facts = if text.len() >= LINE_FACTS_MIN_SOURCE_BYTES {
             build_line_facts(&text, &line_starts)
         } else {
@@ -248,6 +332,7 @@ impl Source {
             text,
             line_starts,
             line_facts,
+            limits,
         })
     }
 
@@ -273,6 +358,12 @@ impl Source {
     #[must_use]
     pub fn line_starts(&self) -> &[u32] {
         &self.line_starts
+    }
+
+    /// Returns the resource limits associated with this source.
+    #[must_use]
+    pub const fn limits(&self) -> ResourceLimits {
+        self.limits
     }
 
     pub(crate) fn line_facts(&self, index: usize) -> LineFacts {
@@ -363,6 +454,14 @@ impl Source {
     pub fn diagnostic_position(&self, diagnostic: &Diagnostic) -> LineCol {
         self.line_col(diagnostic.span.start as usize)
     }
+}
+
+fn source_limit_error(message: String, offset: u32) -> YamlError {
+    YamlError::new(Diagnostic::new(
+        DiagnosticKind::Source,
+        message,
+        Span::empty(offset),
+    ))
 }
 
 fn validate_source_chunk(

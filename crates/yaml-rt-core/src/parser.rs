@@ -15,7 +15,6 @@ use crate::{
     YamlEventKind, YamlScalarStyle, validate_yaml_chars,
 };
 
-const MAX_FLOW_COLLECTION_DEPTH: usize = 1024;
 fn scalar_style_from_first_char(character: char) -> YamlScalarStyle {
     match character {
         '"' => YamlScalarStyle::DoubleQuoted,
@@ -195,12 +194,17 @@ pub(crate) struct Parser<'source> {
     block_scalar_indents: Vec<BlockScalarIndent>,
     flow_frames: Vec<FlowFrame>,
     pending_block_values: InlineVec<BlockValueFrame, 2>,
+    limit_error: Option<YamlError>,
+    limit_node: Option<NodeId>,
 }
 
 impl<'source> Parser<'source> {
     pub(crate) fn new(source: &'source Source) -> Self {
         let line_estimate = source.line_starts().len();
-        let estimated_nodes = line_estimate.saturating_mul(3).saturating_add(4);
+        let estimated_nodes = line_estimate
+            .saturating_mul(3)
+            .saturating_add(4)
+            .min(source.limits().max_nodes);
         let estimated_events = line_estimate.saturating_mul(2).saturating_add(8);
         Self {
             source,
@@ -219,10 +223,19 @@ impl<'source> Parser<'source> {
             block_scalar_indents: Vec::new(),
             flow_frames: Vec::new(),
             pending_block_values: InlineVec::new(),
+            limit_error: None,
+            limit_node: None,
         }
     }
 
     pub(crate) fn parse(mut self) -> Result<ParsedYaml, YamlError> {
+        if self.source.limits().max_nodes == 0 {
+            return Err(YamlError::new(Diagnostic::new(
+                DiagnosticKind::Parser,
+                "YAML syntax tree exceeds node limit of 0",
+                Span::empty(0),
+            )));
+        }
         let stream = self.push_node(NodeKind::Stream, Span::from_usize(0, self.source.len()));
         self.stream = Some(stream);
         self.push_event(
@@ -232,6 +245,9 @@ impl<'source> Parser<'source> {
 
         let lines = LineTable::new(self.source);
         self = BlockMachine::new(self, lines).run()?;
+        if let Some(error) = self.limit_error.take() {
+            return Err(error);
+        }
         if self.document.is_some() {
             self.close_document(false, Span::empty_from_usize(self.source.len()))?;
         } else if self.nodes[stream.0 as usize].first_child == NO_NODE {
@@ -1851,6 +1867,9 @@ impl<'source> Parser<'source> {
         let frames = std::mem::take(&mut self.flow_frames);
         let mut flow = FlowParseState::new(text, absolute_start, root, open, frames);
         let result = loop {
+            if let Some(error) = self.limit_error.take() {
+                break Err(error);
+            }
             if let Some((child, child_end)) = flow.completed.take() {
                 match self.resume_completed_flow_node(&mut flow, child, child_end) {
                     Ok(Some(end)) => break Ok((flow.root, end)),
@@ -2397,9 +2416,10 @@ impl<'source> Parser<'source> {
                 flow.completed = Some((node, end));
             }
             FlowNode::Collection(frame, after_open) => {
-                if flow.frames.len() >= MAX_FLOW_COLLECTION_DEPTH {
+                if flow.frames.len() >= self.source.limits().max_collection_depth {
                     return Err(flow_collection_depth_limit_exceeded(
                         flow.absolute_start + after_open - 1,
+                        self.source.limits().max_collection_depth,
                     ));
                 }
                 flow.frames.push(frame);
@@ -2708,6 +2728,21 @@ impl<'source> Parser<'source> {
     }
 
     fn push_block_frame(&mut self, mut frame: BlockFrame) {
+        // The block parser retains one transition frame beyond the semantic
+        // collection depth while attaching a terminal nested value.
+        if self.block_frames.len() > self.source.limits().max_collection_depth {
+            self.limit_error.get_or_insert_with(|| {
+                YamlError::new(Diagnostic::new(
+                    DiagnosticKind::Parser,
+                    format!(
+                        "block collection nesting limit of {} exceeded",
+                        self.source.limits().max_collection_depth
+                    ),
+                    self.nodes[frame.node.as_usize()].span,
+                ))
+            });
+            return;
+        }
         let index = u32::try_from(self.block_frames.len())
             .expect("block collection stack exceeds u32 capacity");
         let last = match frame.collection {
@@ -2883,6 +2918,36 @@ impl<'source> Parser<'source> {
     }
 
     fn push_node(&mut self, kind: NodeKind, span: Span) -> NodeId {
+        if self.nodes.len() >= self.source.limits().max_nodes {
+            self.limit_error.get_or_insert_with(|| {
+                YamlError::new(Diagnostic::new(
+                    DiagnosticKind::Parser,
+                    format!(
+                        "YAML syntax tree exceeds node limit of {}",
+                        self.source.limits().max_nodes
+                    ),
+                    span,
+                ))
+            });
+            let node = Node {
+                kind,
+                syntax_flags: 0,
+                span,
+                parent: NO_NODE,
+                first_child: NO_NODE,
+                last_child: NO_NODE,
+                next_sibling: NO_NODE,
+                semantic: NO_SEMANTIC_NODE,
+            };
+            if let Some(id) = self.limit_node {
+                self.nodes[id.as_usize()] = node;
+                return id;
+            }
+            let id = NodeId::from_usize(self.nodes.len());
+            self.nodes.push(node);
+            self.limit_node = Some(id);
+            return id;
+        }
         let id = NodeId::from_usize(self.nodes.len());
         self.nodes.push(Node {
             kind,
@@ -4363,6 +4428,9 @@ impl<'source> BlockMachine<'source> {
                 | BlockTransition::Pop(consumed) => consumed,
                 BlockTransition::Reprocess => unreachable!("reprocessing completes in the loop"),
             };
+            if let Some(error) = self.parser.limit_error.take() {
+                return Err(error);
+            }
             self.cursor.advance_by(consumed.saturating_sub(1));
         }
         while let Some(frame) = self.frames.pop() {
@@ -5727,10 +5795,10 @@ fn invalid_flow_parser_state(offset: usize) -> YamlError {
     ))
 }
 
-fn flow_collection_depth_limit_exceeded(offset: usize) -> YamlError {
+fn flow_collection_depth_limit_exceeded(offset: usize, limit: usize) -> YamlError {
     YamlError::new(Diagnostic::new(
         DiagnosticKind::Parser,
-        format!("flow collection nesting limit of {MAX_FLOW_COLLECTION_DEPTH} exceeded"),
+        format!("flow collection nesting limit of {limit} exceeded"),
         Span::from_usize(offset, offset + 1),
     ))
 }

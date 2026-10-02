@@ -34,7 +34,7 @@ pub use parser::events_to_test_string;
 pub use patch::{YamlPatch, YamlPatchError, YamlPatchErrorKind, YamlPatchOperation};
 pub use pointer::{JsonPointer, PointerError, PointerErrorKind, ReferenceToken};
 pub use semantic::SemanticKind;
-pub use source::{LineCol, NodeId, Source, Span, TARGET_YAML_VERSION};
+pub use source::{LineCol, NodeId, ResourceLimits, Source, Span, TARGET_YAML_VERSION};
 pub(crate) use syntax::ParsedYaml;
 pub use syntax::{
     Children, CollectionStyle, Node, NodeKind, YamlEvent, YamlEventKind, YamlScalarStyle, parse_cst,

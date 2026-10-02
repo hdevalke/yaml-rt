@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn resource_limits_reject_input_before_unbounded_parser_growth() {
+    let byte_limits = ResourceLimits {
+        max_source_bytes: 3,
+        ..ResourceLimits::default()
+    };
+    let byte_error = YamlDoc::parse_with_limits("name: value\n", byte_limits).unwrap_err();
+    assert!(byte_error.to_string().contains("byte limit of 3"));
+
+    let line_limits = ResourceLimits {
+        max_lines: 2,
+        ..ResourceLimits::default()
+    };
+    let line_error = YamlDoc::parse_with_limits("a\nb\nc\n", line_limits).unwrap_err();
+    assert!(line_error.to_string().contains("line limit of 2"));
+
+    let node_limits = ResourceLimits {
+        max_nodes: 4,
+        ..ResourceLimits::default()
+    };
+    let node_error = YamlDoc::parse_with_limits("a: [b, c]\n", node_limits).unwrap_err();
+    assert!(node_error.to_string().contains("node limit of 4"));
+}
+
+#[test]
+fn configured_collection_depth_applies_to_flow_and_block_yaml() {
+    let limits = ResourceLimits {
+        max_collection_depth: 2,
+        ..ResourceLimits::default()
+    };
+    let flow = YamlDoc::parse_with_limits("[[[]]]\n", limits).unwrap_err();
+    assert!(flow.to_string().contains("nesting limit of 2"));
+
+    let block = YamlDoc::parse_with_limits("-\n  -\n    -\n      - value\n", limits).unwrap_err();
+    assert!(block.to_string().contains("nesting limit of 2"));
+}
+
+#[test]
 fn bootstrap_parser_preserves_source() {
     let source = "---\nkey: value\n# comment\n";
     let doc = YamlDoc::parse(source).expect("placeholder parser should accept text");

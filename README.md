@@ -19,6 +19,14 @@ Version 0.1 is suitable for production use within the guarantees and
 limitations documented below. Public APIs may still evolve between 0.x
 releases.
 
+Parsing uses conservative resource limits by default so YAML from untrusted
+sources cannot grow parser state without bound. The defaults accept sources up
+to 64 MiB, one million lines and CST nodes, collection nesting to 1,024 levels,
+alias chains to 256 jumps, and one million expanded semantic nodes per
+operation. Use `ResourceLimits` with `YamlDoc::parse_with_limits` to lower or
+raise those bounds. `ResourceLimits::unbounded()` is intended only for trusted
+inputs and still enforces the `u32` bounds used by source spans and node IDs.
+
 ## Playground
 
 Try the [yaml-rt command playground](https://hdevalke.github.io/yaml-rt/) to

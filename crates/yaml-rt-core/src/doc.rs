@@ -366,7 +366,29 @@ impl YamlDoc {
     /// Returns an error when source validation, CST parsing, or semantic view
     /// composition fails.
     pub fn parse(input: &str) -> Result<Self, YamlError> {
-        Self::parse_owned(input.to_owned())
+        Self::parse_with_limits(input, crate::ResourceLimits::default())
+    }
+
+    /// Parses a YAML stream using explicit resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a limit is exceeded or the YAML is invalid.
+    pub fn parse_with_limits(
+        input: &str,
+        limits: crate::ResourceLimits,
+    ) -> Result<Self, YamlError> {
+        if input.len() > limits.max_source_bytes || input.len() > u32::MAX as usize {
+            return Err(YamlError::new(Diagnostic::new(
+                DiagnosticKind::Source,
+                format!(
+                    "YAML source exceeds byte limit of {}",
+                    limits.max_source_bytes.min(u32::MAX as usize)
+                ),
+                Span::empty(0),
+            )));
+        }
+        Self::parse_owned_with_limits(input.to_owned(), limits)
     }
 
     /// Parses an owned YAML stream without copying its source buffer.
@@ -376,7 +398,19 @@ impl YamlDoc {
     /// Returns an error when source validation, CST parsing, or semantic view
     /// composition fails.
     pub fn parse_owned(input: String) -> Result<Self, YamlError> {
-        let source = Source::new(input)?;
+        Self::parse_owned_with_limits(input, crate::ResourceLimits::default())
+    }
+
+    /// Parses an owned YAML stream using explicit resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a limit is exceeded or the YAML is invalid.
+    pub fn parse_owned_with_limits(
+        input: String,
+        limits: crate::ResourceLimits,
+    ) -> Result<Self, YamlError> {
+        let source = Source::new_with_limits(input, limits)?;
         let parsed = Parser::new(&source)
             .parse()
             .map_err(|error| error.with_position_from(&source))?;

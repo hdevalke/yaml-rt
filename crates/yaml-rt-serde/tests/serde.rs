@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use serde::{Deserialize, Serialize};
+use yaml_rt_core::ResourceLimits;
 use yaml_rt_serde::{
-    Deserializer, Serializer, from_reader, from_slice, from_str, to_string, to_writer,
+    Deserializer, Serializer, from_reader, from_reader_with_limits, from_slice, from_str,
+    from_str_with_limits, to_string, to_writer,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -389,10 +391,35 @@ fn exponential_alias_expansion_hits_the_repetition_limit() {
         "c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]\n",
         "d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]\n",
         "e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]\n",
-        "root: *e\n",
+        "f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]\n",
+        "g: &g [*f, *f, *f, *f, *f, *f, *f, *f, *f]\n",
+        "root: *g\n",
     );
     let error = from_str::<Expand>(yaml).err().expect("expansion must stop");
-    assert!(error.to_string().contains("repetition limit"));
+    assert!(error.to_string().contains("expansion limit"));
+}
+
+#[test]
+fn configured_limits_bound_readers_and_alias_chains() {
+    let byte_limits = ResourceLimits {
+        max_source_bytes: 4,
+        ..ResourceLimits::default()
+    };
+    let reader_error =
+        from_reader_with_limits::<_, String>(Cursor::new(b"value\n"), byte_limits).unwrap_err();
+    assert!(reader_error.to_string().contains("byte limit of 4"));
+
+    let alias_limits = ResourceLimits {
+        max_alias_chain: 0,
+        ..ResourceLimits::default()
+    };
+    let alias_error =
+        from_str_with_limits::<BTreeMap<String, String>>("a: &a value\nroot: *a\n", alias_limits)
+            .unwrap_err();
+    assert!(
+        alias_error.to_string().contains("alias chain limit"),
+        "unexpected error: {alias_error}"
+    );
 }
 
 #[derive(Serialize)]

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cell::Cell, io::Read, rc::Rc, str};
+use std::{borrow::Cow, cell::Cell, collections::HashSet, io::Read, rc::Rc, str};
 
 use serde::Deserializer as _;
 use serde::de::{
@@ -6,8 +6,8 @@ use serde::de::{
     Visitor,
 };
 use yaml_rt_core::{
-    NodeId, NonFiniteFloat, ResolvedScalar, SemanticKind, Span, YamlDoc, YamlScalarStyle,
-    resolve_scalar,
+    NodeId, NonFiniteFloat, ResolvedScalar, ResourceLimits, SemanticKind, Span, YamlDoc,
+    YamlScalarStyle, resolve_scalar,
 };
 
 use crate::{Error, Result};
@@ -18,26 +18,20 @@ struct Input<'de> {
     doc: Option<YamlDoc>,
     borrowed: Option<&'de str>,
     error: Option<Error>,
-    semantic_len: usize,
 }
 
 impl<'de> Input<'de> {
-    fn parsed(text: String, borrowed: Option<&'de str>) -> Self {
-        match YamlDoc::parse_owned(text) {
-            Ok(doc) => {
-                let semantic_len = doc.events().count().max(1);
-                Self {
-                    doc: Some(doc),
-                    borrowed,
-                    error: None,
-                    semantic_len,
-                }
-            }
+    fn parsed(text: String, borrowed: Option<&'de str>, limits: ResourceLimits) -> Self {
+        match YamlDoc::parse_owned_with_limits(text, limits) {
+            Ok(doc) => Self {
+                doc: Some(doc),
+                borrowed,
+                error: None,
+            },
             Err(error) => Self {
                 doc: None,
                 borrowed,
                 error: Some(error.into()),
-                semantic_len: 1,
             },
         }
     }
@@ -47,7 +41,6 @@ impl<'de> Input<'de> {
             doc: None,
             borrowed: None,
             error: Some(error),
-            semantic_len: 1,
         }
     }
 }
@@ -68,14 +61,38 @@ impl<'de> Deserializer<'de> {
         reason = "FromStr cannot retain the borrowed input lifetime or this constructor's deferred errors"
     )]
     pub fn from_str(input: &'de str) -> Self {
-        Self::new(Input::parsed(input.to_owned(), Some(input)))
+        Self::from_str_with_limits(input, ResourceLimits::default())
+    }
+
+    /// Creates a deserializer with explicit resource limits.
+    #[must_use]
+    pub fn from_str_with_limits(input: &'de str, limits: ResourceLimits) -> Self {
+        if input.len() > limits.max_source_bytes || input.len() > u32::MAX as usize {
+            return Self::new(Input::failed(Error::message(format!(
+                "YAML source exceeds byte limit of {}",
+                limits.max_source_bytes.min(u32::MAX as usize)
+            ))));
+        }
+        Self::new(Input::parsed(input.to_owned(), Some(input), limits))
     }
 
     /// Creates a deserializer borrowing a UTF-8 YAML byte slice.
     #[must_use]
     pub fn from_slice(input: &'de [u8]) -> Self {
+        Self::from_slice_with_limits(input, ResourceLimits::default())
+    }
+
+    /// Creates a byte-slice deserializer with explicit resource limits.
+    #[must_use]
+    pub fn from_slice_with_limits(input: &'de [u8], limits: ResourceLimits) -> Self {
+        if input.len() > limits.max_source_bytes || input.len() > u32::MAX as usize {
+            return Self::new(Input::failed(Error::message(format!(
+                "YAML source exceeds byte limit of {}",
+                limits.max_source_bytes.min(u32::MAX as usize)
+            ))));
+        }
         match str::from_utf8(input) {
-            Ok(input) => Self::from_str(input),
+            Ok(input) => Self::from_str_with_limits(input, limits),
             Err(error) => Self::new(Input::failed(Error::message(error.to_string()))),
         }
     }
@@ -117,7 +134,7 @@ impl<'de> Deserializer<'de> {
             node,
             path: ".".to_owned(),
             depth: MAX_DEPTH,
-            alias_jumps: Rc::new(Cell::new(0)),
+            expanded_nodes: Rc::new(Cell::new(0)),
             ignore_tag: false,
         })
     }
@@ -130,9 +147,25 @@ impl Deserializer<'static> {
     where
         R: Read,
     {
+        Self::from_reader_with_limits(&mut reader, ResourceLimits::default())
+    }
+
+    /// Creates a reader deserializer with explicit resource limits.
+    #[must_use]
+    pub fn from_reader_with_limits<R>(reader: R, limits: ResourceLimits) -> Self
+    where
+        R: Read,
+    {
+        let byte_limit = limits.max_source_bytes.min(u32::MAX as usize);
         let mut input = String::new();
-        match reader.read_to_string(&mut input) {
-            Ok(_) => Self::new(Input::parsed(input, None)),
+        match reader
+            .take(byte_limit as u64 + 1)
+            .read_to_string(&mut input)
+        {
+            Ok(_) if input.len() > byte_limit => Self::new(Input::failed(Error::message(format!(
+                "YAML source exceeds byte limit of {byte_limit}"
+            )))),
+            Ok(_) => Self::new(Input::parsed(input, None, limits)),
             Err(error) => Self::new(Input::failed(Error::io(error))),
         }
     }
@@ -182,6 +215,14 @@ where
     T::deserialize(Deserializer::from_str(input))
 }
 
+/// Deserializes one YAML document from a string with explicit resource limits.
+pub fn from_str_with_limits<'de, T>(input: &'de str, limits: ResourceLimits) -> Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(Deserializer::from_str_with_limits(input, limits))
+}
+
 /// Deserializes exactly one YAML document from a byte slice.
 ///
 /// # Errors
@@ -193,6 +234,14 @@ where
     T: serde::Deserialize<'de>,
 {
     T::deserialize(Deserializer::from_slice(input))
+}
+
+/// Deserializes one YAML document from bytes with explicit resource limits.
+pub fn from_slice_with_limits<'de, T>(input: &'de [u8], limits: ResourceLimits) -> Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(Deserializer::from_slice_with_limits(input, limits))
 }
 
 /// Deserializes exactly one owned YAML document from a reader.
@@ -207,6 +256,15 @@ where
     T: DeserializeOwned,
 {
     T::deserialize(Deserializer::from_reader(reader))
+}
+
+/// Deserializes one YAML document from a reader with explicit resource limits.
+pub fn from_reader_with_limits<R, T>(reader: R, limits: ResourceLimits) -> Result<T>
+where
+    R: Read,
+    T: DeserializeOwned,
+{
+    T::deserialize(Deserializer::from_reader_with_limits(reader, limits))
 }
 
 macro_rules! delegate_deserializer {
@@ -270,7 +328,7 @@ struct NodeDeserializer<'input, 'de> {
     node: Option<NodeId>,
     path: String,
     depth: u8,
-    alias_jumps: Rc<Cell<usize>>,
+    expanded_nodes: Rc<Cell<usize>>,
     ignore_tag: bool,
 }
 
@@ -290,6 +348,7 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
     }
 
     fn descend(&self, node: Option<NodeId>, path: String) -> Result<Self> {
+        self.spend_expansion()?;
         let depth = self
             .depth
             .checked_sub(1)
@@ -300,26 +359,24 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
             node,
             path,
             depth,
-            alias_jumps: Rc::clone(&self.alias_jumps),
+            expanded_nodes: Rc::clone(&self.expanded_nodes),
             ignore_tag: false,
         })
     }
 
     fn resolved(mut self) -> Result<Self> {
-        let mut seen = Vec::new();
+        let mut seen = HashSet::new();
         while let Some(node) = self.node {
             if !matches!(self.doc().semantic_kind(node), Some(SemanticKind::Alias)) {
                 break;
             }
-            if seen.contains(&node) {
+            if !seen.insert(node) {
                 return self.annotate(Err(Error::message("recursive alias")));
             }
-            seen.push(node);
-            let jumps = self.alias_jumps.get().saturating_add(1);
-            self.alias_jumps.set(jumps);
-            if jumps > self.input.semantic_len.saturating_mul(100) {
-                return self.annotate(Err(Error::message("alias repetition limit exceeded")));
+            if seen.len() > self.doc().source().limits().max_alias_chain {
+                return self.annotate(Err(Error::message("alias chain limit exceeded")));
             }
+            self.spend_expansion()?;
             let target = self.doc().resolve_alias(node).ok_or_else(|| {
                 Error::message(format!(
                     "unknown anchor `{}`",
@@ -329,6 +386,15 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
             self.node = Some(self.annotate(target)?);
         }
         Ok(self)
+    }
+
+    fn spend_expansion(&self) -> Result<()> {
+        let expanded = self.expanded_nodes.get().saturating_add(1);
+        self.expanded_nodes.set(expanded);
+        if expanded > self.doc().source().limits().max_expanded_nodes {
+            return self.annotate(Err(Error::message("YAML expansion limit exceeded")));
+        }
+        Ok(())
     }
 
     fn child(&self, node: Option<NodeId>, path: String) -> Result<Self> {

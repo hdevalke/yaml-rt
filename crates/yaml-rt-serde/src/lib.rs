@@ -17,7 +17,10 @@ mod error;
 mod ser;
 pub mod value;
 
-pub use de::{Deserializer, from_reader, from_slice, from_str};
+pub use de::{
+    Deserializer, from_reader, from_reader_with_limits, from_slice, from_slice_with_limits,
+    from_str, from_str_with_limits,
+};
 pub use error::{Error, Location, Result};
 pub use ser::{Serializer, to_string, to_writer};
 pub use value::{Index, Mapping, Number, Sequence, Value, from_value, to_value};

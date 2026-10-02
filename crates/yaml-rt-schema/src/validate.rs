@@ -200,11 +200,9 @@ fn check_schema_inner(schema: &Value, path: &str) -> Result<(), Error> {
             }
         }
     }
-    for keyword in ["enum"] {
-        if let Some(value) = object.get(keyword) {
-            if value.as_array().is_none() {
-                return Err(Error::new("enum must be an array"));
-            }
+    if let Some(value) = object.get("enum") {
+        if value.as_array().is_none() {
+            return Err(Error::new("enum must be an array"));
         }
     }
     for keyword in ["uniqueItems", "readOnly", "writeOnly", "deprecated"] {
@@ -436,9 +434,9 @@ impl Validator<'_> {
                 "integer" => crate::numeric::is_integer(value),
                 _ => false,
             };
-            let valid = types.as_str().is_some_and(&accepts)
+            let valid = types.as_str().is_some_and(accepts)
                 || types.as_array().is_some_and(|types| {
-                    types.iter().any(|kind| kind.as_str().is_some_and(&accepts))
+                    types.iter().any(|kind| kind.as_str().is_some_and(accepts))
                 });
             if !valid {
                 return Err(self.fail(path, &format!("{schema_path}/type"), "type mismatch"));

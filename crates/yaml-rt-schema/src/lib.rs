@@ -115,8 +115,8 @@ impl Schema {
             }
             error
         };
-        validate::check_schema(&root, "").map_err(&attach_source)?;
-        validate::check_meta_schema(&root).map_err(&attach_source)?;
+        validate::check_schema(&root, "").map_err(attach_source)?;
+        validate::check_meta_schema(&root).map_err(attach_source)?;
         let origin = base_path.map(Path::to_path_buf);
         Ok(Self {
             root,

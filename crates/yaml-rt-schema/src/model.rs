@@ -20,7 +20,9 @@ pub(crate) fn from_node(doc: &YamlDoc, root: Option<NodeId>) -> Result<Instance,
         doc,
         spans: HashMap::new(),
         active: HashSet::new(),
-        budget: doc.as_source().len().saturating_mul(100).max(10_000),
+        budget: doc.source().limits().max_expanded_nodes,
+        depth_limit: doc.source().limits().max_collection_depth,
+        alias_chain_limit: doc.source().limits().max_alias_chain,
     };
     let value = converter.convert(root, String::new(), 0)?;
     Ok(Instance {
@@ -34,6 +36,8 @@ struct Converter<'a> {
     spans: HashMap<String, Span>,
     active: HashSet<NodeId>,
     budget: usize,
+    depth_limit: usize,
+    alias_chain_limit: usize,
 }
 
 impl Converter<'_> {
@@ -43,10 +47,10 @@ impl Converter<'_> {
         path: String,
         depth: usize,
     ) -> Result<Value, Error> {
-        if depth > 1024 || self.budget == 0 {
+        if depth > self.depth_limit {
             return Err(Error::instance(path, "YAML expansion limit exceeded", None));
         }
-        self.budget -= 1;
+        self.spend(&path, node)?;
         let Some(mut node) = node else {
             return Ok(Value::Null);
         };
@@ -55,6 +59,10 @@ impl Converter<'_> {
             if !aliases.insert(node) {
                 return Err(self.fail(&path, node, "cyclic YAML alias chain"));
             }
+            if aliases.len() > self.alias_chain_limit {
+                return Err(self.fail(&path, node, "YAML alias chain limit exceeded"));
+            }
+            self.spend(&path, Some(node))?;
             node = self
                 .doc
                 .resolve_alias(node)
@@ -118,12 +126,16 @@ impl Converter<'_> {
         }
     }
 
-    fn string_key(&self, mut node: NodeId, path: &str) -> Result<String, Error> {
+    fn string_key(&mut self, mut node: NodeId, path: &str) -> Result<String, Error> {
         let mut aliases = HashSet::new();
         while matches!(self.doc.semantic_kind(node), Some(SemanticKind::Alias)) {
             if !aliases.insert(node) {
                 return Err(self.fail(path, node, "cyclic YAML alias key"));
             }
+            if aliases.len() > self.alias_chain_limit {
+                return Err(self.fail(path, node, "YAML alias chain limit exceeded"));
+            }
+            self.spend(path, Some(node))?;
             node = self
                 .doc
                 .resolve_alias(node)
@@ -154,6 +166,17 @@ impl Converter<'_> {
         Ok(())
     }
 
+    fn spend(&mut self, path: &str, node: Option<NodeId>) -> Result<(), Error> {
+        self.budget = self.budget.checked_sub(1).ok_or_else(|| {
+            Error::instance(
+                path.to_owned(),
+                "YAML expansion limit exceeded",
+                node.and_then(|node| self.doc.node(node).map(|node| node.span())),
+            )
+        })?;
+        Ok(())
+    }
+
     fn fail(&self, path: &str, node: NodeId, message: &str) -> Error {
         Error::instance(
             path.to_owned(),
@@ -165,4 +188,34 @@ impl Converter<'_> {
 
 pub(crate) fn escape(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::from_document;
+    use yaml_rt_core::{ResourceLimits, YamlDoc};
+
+    #[test]
+    fn conversion_uses_document_expansion_and_alias_limits() {
+        let expansion_limits = ResourceLimits {
+            max_expanded_nodes: 4,
+            ..ResourceLimits::default()
+        };
+        let doc = YamlDoc::parse_with_limits(
+            "source: &source [one, two]\nroot: [*source, *source]\n",
+            expansion_limits,
+        )
+        .unwrap();
+        let error = from_document(&doc, 0).err().expect("conversion is limited");
+        assert!(error.to_string().contains("expansion limit"));
+
+        let alias_limits = ResourceLimits {
+            max_alias_chain: 0,
+            ..ResourceLimits::default()
+        };
+        let doc = YamlDoc::parse_with_limits("source: &source one\nroot: *source\n", alias_limits)
+            .unwrap();
+        let error = from_document(&doc, 0).err().expect("alias is limited");
+        assert!(error.to_string().contains("alias chain limit"));
+    }
 }

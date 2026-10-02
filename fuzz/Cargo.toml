@@ -13,9 +13,19 @@ libfuzzer-sys = "0.4"
 [dependencies.yaml-rt-core]
 path = "../crates/yaml-rt-core"
 
+[dependencies.yaml-rt-serde]
+path = "../crates/yaml-rt-serde"
+
 [[bin]]
 name = "parse_yaml"
 path = "fuzz_targets/parse_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deserialize_yaml"
+path = "fuzz_targets/deserialize_yaml.rs"
 test = false
 doc = false
 bench = false

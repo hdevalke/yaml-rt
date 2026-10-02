@@ -41,6 +41,10 @@ impl Mode {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing the full document would distort allocation-profile measurements"
+)]
 enum Parsed {
     Full(YamlDoc),
     Cst { source: Source, nodes: Vec<Node> },

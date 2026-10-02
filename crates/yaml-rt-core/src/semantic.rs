@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::inline_vec::InlineVec;
 use crate::syntax::{
     COMMON_SEMANTIC_NODE, NO_SEMANTIC_NODE, NODE_EXPLICIT_END, NODE_EXPLICIT_START,
@@ -99,6 +101,7 @@ pub(crate) struct SemanticStore {
     metadata: Vec<SemanticMetadata>,
     properties: Vec<PropertyRecord>,
     anchors: Vec<AnchorBinding>,
+    anchor_index: HashMap<NodeId, HashMap<String, Vec<(u32, NodeId)>>>,
     tag_directives: Vec<TagDirectiveBinding>,
     pub(crate) documents: InlineVec<NodeId, 1>,
 }
@@ -159,10 +162,47 @@ impl SemanticStore {
         (node.property != NO_PROPERTIES).then(|| self.properties[node.property as usize].document)
     }
 
-    pub(crate) fn anchors(&self) -> impl DoubleEndedIterator<Item = (Span, NodeId, NodeId)> + '_ {
-        self.anchors
-            .iter()
-            .map(|binding| (binding.name, binding.target, binding.document))
+    pub(crate) fn index_anchors(&mut self, source: &crate::Source, nodes: &[Node]) {
+        self.anchor_index.clear();
+        for binding in &self.anchors {
+            let Some(target) = nodes.get(binding.target.as_usize()) else {
+                continue;
+            };
+            self.anchor_index
+                .entry(binding.document)
+                .or_default()
+                .entry(source.slice(binding.name).to_owned())
+                .or_default()
+                .push((target.span.start, binding.target));
+        }
+    }
+
+    pub(crate) fn resolve_anchor(
+        &self,
+        document: NodeId,
+        name: &str,
+        alias_start: u32,
+    ) -> (Option<NodeId>, usize) {
+        let Some(bindings) = self
+            .anchor_index
+            .get(&document)
+            .and_then(|anchors| anchors.get(name))
+        else {
+            return (None, 0);
+        };
+        let mut low = 0;
+        let mut high = bindings.len();
+        let mut probes = 0;
+        while low < high {
+            probes += 1;
+            let middle = low + (high - low) / 2;
+            if bindings[middle].0 <= alias_start {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        (low.checked_sub(1).map(|index| bindings[index].1), probes)
     }
 
     pub(crate) fn tag_directives(
@@ -190,6 +230,7 @@ impl SemanticBuilder {
                 metadata: Vec::new(),
                 properties: Vec::new(),
                 anchors: Vec::new(),
+                anchor_index: HashMap::new(),
                 tag_directives: Vec::new(),
                 documents: InlineVec::new(),
             },

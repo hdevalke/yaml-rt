@@ -414,10 +414,12 @@ impl YamlDoc {
         let parsed = Parser::new(&source)
             .parse()
             .map_err(|error| error.with_position_from(&source))?;
+        let mut semantics = parsed.semantics;
+        semantics.index_anchors(&source, &parsed.nodes);
         Ok(Self {
             source,
             nodes: parsed.nodes,
-            semantics: parsed.semantics,
+            semantics,
             root_override: None,
             edits: Vec::new(),
         })
@@ -719,17 +721,7 @@ impl YamlDoc {
         let name = self.alias_name(node)?;
         let document = self.semantics.property_document(self.node(node)?)?;
         let alias_start = self.node(node)?.span.start;
-        self.semantics
-            .anchors()
-            .rev()
-            .find(|(span, target, anchor_document)| {
-                *anchor_document == document
-                    && self
-                        .node(*target)
-                        .is_some_and(|node| node.span.start <= alias_start)
-                    && self.source.slice(*span) == name
-            })
-            .map(|(_, target, _)| target)
+        self.semantics.resolve_anchor(document, name, alias_start).0
     }
 
     fn semantic_span(&self, node: NodeId, metadata: crate::semantic::SemanticNode) -> Span {

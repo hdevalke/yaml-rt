@@ -615,6 +615,32 @@ fn alias_resolution_uses_the_latest_document_local_anchor() {
 }
 
 #[test]
+fn alias_resolution_uses_a_logarithmic_document_local_index() {
+    let mut yaml = String::new();
+    for index in 0..4_096 {
+        yaml.push_str(&format!("anchor{index}: &shared {index}\n"));
+    }
+    yaml.push_str("resolved: *shared\n");
+    let doc = YamlDoc::parse(&yaml).expect("large anchor table parses");
+    let alias = doc
+        .get_path(&["resolved"])
+        .expect("lookup succeeds")
+        .expect("alias exists");
+    let document = doc
+        .semantics
+        .property_document(doc.node(alias).expect("alias node exists"))
+        .expect("alias belongs to a document");
+    let alias_start = doc.node(alias).expect("alias node exists").span.start;
+    let (target, probes) = doc
+        .semantics
+        .resolve_anchor(document, "shared", alias_start);
+
+    assert_eq!(target, doc.resolve_alias(alias));
+    assert!(probes <= 13, "4,096 bindings need at most 13 probes");
+    assert_eq!(doc.scalar_value(target.unwrap()).unwrap(), "4095");
+}
+
+#[test]
 fn custom_tag_resolution_is_document_local() {
     let doc = YamlDoc::parse(
         "%TAG !e! tag:first/\n--- !e!value one\n...\n%TAG !e! tag:second/\n--- !e!value two\n",

@@ -2,6 +2,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
+use std::sync::OnceLock;
 
 use crate::value::{Map, Value};
 use iri_string::types::{IriReferenceStr, IriStr, UriReferenceStr, UriStr};
@@ -216,18 +217,56 @@ fn check_schema_inner(schema: &Value, path: &str) -> Result<(), Error> {
 }
 
 pub(crate) fn check_meta_schema(schema: &Value) -> Result<(), Error> {
-    let meta: Value = Value::parse(include_str!("../meta/schema.json"))
-        .expect("bundled meta-schema is valid JSON");
-    let validator = Schema {
-        root: meta,
-        origin: None,
-        format_assertion: false,
-        resources: Default::default(),
-    };
-    validator.validate_json(schema).map_err(|error| {
-        let mut result = Error::new(format!("invalid 2020-12 schema: {error}"));
-        result.schema_path = error.instance_path;
-        result
+    bundled_meta_schemas()
+        .schema
+        .validate_json(schema)
+        .map_err(|error| {
+            let mut result = Error::new(format!("invalid 2020-12 schema: {error}"));
+            result.schema_path = error.instance_path;
+            result
+        })
+}
+
+struct BundledMetaSchemas {
+    schema: Schema,
+    resources: HashMap<String, Value>,
+}
+
+fn bundled_meta_schemas() -> &'static BundledMetaSchemas {
+    static BUNDLED: OnceLock<BundledMetaSchemas> = OnceLock::new();
+    BUNDLED.get_or_init(|| {
+        let mut resources = HashMap::new();
+        for source in [
+            include_str!("../meta/schema.json"),
+            include_str!("../meta/core.json"),
+            include_str!("../meta/applicator.json"),
+            include_str!("../meta/unevaluated.json"),
+            include_str!("../meta/validation.json"),
+            include_str!("../meta/meta-data.json"),
+            include_str!("../meta/format-annotation.json"),
+            include_str!("../meta/content.json"),
+        ] {
+            let resource = Value::parse(source).expect("bundled meta-schema is valid JSON");
+            let id = resource
+                .get("$id")
+                .and_then(Value::as_str)
+                .expect("bundled meta-schema has $id");
+            let url = Url::parse(id).expect("bundled meta-schema $id is an absolute URI");
+            resources.insert(url.to_string(), resource.clone());
+            index_resources(&resource, &url, &mut resources);
+        }
+        BundledMetaSchemas {
+            schema: Schema {
+                root: resources
+                    .get(DIALECT)
+                    .expect("bundled root meta-schema")
+                    .clone(),
+                origin: None,
+                format_assertion: false,
+                resources: Default::default(),
+            },
+            resources,
+        }
     })
 }
 
@@ -290,27 +329,10 @@ pub(crate) fn validate(schema: &Schema, instance: &Instance) -> Result<(), Error
             .insert(url.to_string(), resource.clone());
         index_resources(resource, &url, &mut validator.resources);
     }
-    for source in [
-        include_str!("../meta/schema.json"),
-        include_str!("../meta/core.json"),
-        include_str!("../meta/applicator.json"),
-        include_str!("../meta/unevaluated.json"),
-        include_str!("../meta/validation.json"),
-        include_str!("../meta/meta-data.json"),
-        include_str!("../meta/format-annotation.json"),
-        include_str!("../meta/content.json"),
-    ] {
-        let resource: Value = Value::parse(source).expect("bundled meta-schema is valid JSON");
-        let id = resource
-            .get("$id")
-            .and_then(Value::as_str)
-            .expect("bundled meta-schema has $id");
-        let url = Url::parse(id).expect("bundled meta-schema $id is an absolute URI");
-        validator
-            .resources
-            .insert(url.to_string(), resource.clone());
-        index_resources(&resource, &url, &mut validator.resources);
-    }
+    // Keep instance-specific resources local and preserve built-in precedence.
+    validator
+        .resources
+        .extend(bundled_meta_schemas().resources.clone());
     validator.eval(&schema.root, &instance.value, "", "", Some(&base), 0)?;
     Ok(())
 }
@@ -1424,6 +1446,35 @@ fn percent_decode(input: &str) -> Result<String, Error> {
 mod tests {
     use super::*;
     use yaml_rt_core::YamlDoc;
+
+    #[test]
+    fn concurrent_validations_keep_registered_resources_independent() {
+        let mut integer = Schema::parse(r#"{"$ref":"https://example.com/value"}"#, None).unwrap();
+        integer
+            .register_resource("https://example.com/value", r#"{"type":"integer"}"#)
+            .unwrap();
+        let mut string = Schema::parse(r#"{"$ref":"https://example.com/value"}"#, None).unwrap();
+        string
+            .register_resource("https://example.com/value", r#"{"type":"string"}"#)
+            .unwrap();
+        let number = Value::parse("42").unwrap();
+        let text = Value::String("value".into());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..4 {
+                    assert!(integer.validate_json(&number).is_ok());
+                    assert!(integer.validate_json(&text).is_err());
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..4 {
+                    assert!(string.validate_json(&text).is_ok());
+                    assert!(string.validate_json(&number).is_err());
+                }
+            });
+        });
+    }
+
     #[test]
     fn validates_nested_properties_and_required() {
         let schema = Schema::parse(

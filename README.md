@@ -632,7 +632,9 @@ remains private to `yaml-rt-cli`; the RFC 9535 crate is not re-exported by the
 The schema crate reuses `yaml-rt-core` for JSON and YAML parsing and writes JSON
 through its own small value model. `Schema::validate_pointer` checks a selected
 YAML value while retaining source locations for diagnostics. Exact decimal
-arithmetic uses decimal digits.
+arithmetic uses decimal digits. Bundled 2020-12 meta-schemas are parsed and
+indexed once per process; validation resources and dynamic scope remain local
+to each validation.
 `regex` checks patterns, `url` resolves references, `iri-string` and `idna` check
 internationalized formats, and `jiff` checks dates and times. These dependencies
 do not enter the core parser. The official JSON Schema Test Suite is pinned at

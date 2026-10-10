@@ -683,8 +683,9 @@ cargo test -p yaml-rt-core --test yaml_test_suite
   1.2 core scalar and collection model; they are not a general tag-aware
   application schema.
 - JSON Schema 2020-12 validation passes the selected official core and format
-  assertion cases. Remote fetches, custom vocabularies, and ECMAScript regex
-  compatibility remain outside this release; see
+  assertion cases, plus unknown-format annotation cases. The harness distinguishes
+  validation failures from execution errors. Remote fetches, custom vocabularies,
+  and ECMAScript regex compatibility remain outside this release; see
   [`docs/json-schema-conformance.md`](docs/json-schema-conformance.md).
 - Serde `Value` conversion does not preserve presentation metadata and only
   expands merge keys when `Value::apply_merge()` is requested.

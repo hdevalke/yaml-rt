@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use yaml_rt_schema::{Schema, Value};
+use yaml_rt_schema::{Error, Schema, Value};
 
 const CORE_EXCLUSIONS: &[(&str, &str)] = &[
     (
@@ -12,13 +12,26 @@ const CORE_EXCLUSIONS: &[(&str, &str)] = &[
     ("vocabulary.json", "custom meta-schemas are unsupported"),
 ];
 const FORMAT_EXCLUSIONS: &[(&str, &str)] = &[
+    ("unknown.json", "covered by the separate annotation test"),
     (
-        "unknown.json",
-        "tests annotation behavior rather than assertions",
+        "ecmascript-regex.json",
+        "Rust regex grammar differs from ECMAScript",
+    ),
+];
+const OPTIONAL_EXCLUSIONS: &[(&str, &str)] = &[
+    ("bignum.json", "covered by the separate big-number test"),
+    ("cross-draft.json", "historic dialects are unsupported"),
+    (
+        "dependencies-compatibility.json",
+        "legacy dependencies keyword is unsupported",
     ),
     (
         "ecmascript-regex.json",
         "Rust regex grammar differs from ECMAScript",
+    ),
+    (
+        "format-assertion.json",
+        "custom meta-schemas are unsupported",
     ),
 ];
 const REMOTE_FIXTURES: &[&str] = &["tree", "extendible-dynamic-ref", "detached-dynamicref"];
@@ -47,10 +60,71 @@ fn json_files(directory: &Path, exclusions: &[(&str, &str)]) -> Vec<PathBuf> {
         .collect();
     paths.sort();
     for (file, reason) in exclusions {
+        assert!(
+            directory.join(file).is_file(),
+            "{}: stale exclusion {file}",
+            directory.display()
+        );
         eprintln!("excluded {file}: {reason}");
     }
     assert!(!paths.is_empty(), "{}: no suite files", directory.display());
     paths
+}
+
+fn required_field<'a>(value: &'a Value, name: &str, context: &str) -> &'a Value {
+    value
+        .as_object()
+        .and_then(|object| object.get(name))
+        .unwrap_or_else(|| panic!("{context}: missing required field {name}"))
+}
+
+fn case_failure(result: Result<(), Error>, expected: bool) -> Option<String> {
+    match result {
+        Ok(()) if expected => None,
+        Ok(()) => Some("accepted invalid instance".to_owned()),
+        Err(error) if error.schema_path().is_none() => {
+            Some(format!("validation could not complete: {error}"))
+        }
+        Err(_) if !expected => None,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+#[test]
+fn execution_errors_do_not_pass_invalid_cases() {
+    let schema = Schema::parse(r#"{"$ref":"http://example.com/missing.json"}"#, None).unwrap();
+    let failure = case_failure(schema.validate_json(&Value::Null), false).unwrap();
+    assert!(failure.contains("validation could not complete"));
+    assert!(failure.contains("remote schema reference is unsupported"));
+
+    let schema = Schema::parse(r#"{"type":"integer"}"#, None).unwrap();
+    assert!(case_failure(schema.validate_json(&Value::Null), false).is_none());
+    assert!(case_failure(schema.validate_json(&Value::Null), true).is_some());
+    let integer = Value::parse("1").unwrap();
+    assert!(case_failure(schema.validate_json(&integer), false).is_some());
+    assert!(case_failure(schema.validate_json(&integer), true).is_none());
+}
+
+#[test]
+#[should_panic(expected = "missing required field data")]
+fn missing_instance_is_not_treated_as_null() {
+    required_field(
+        &Value::parse(r#"{"valid":false}"#).unwrap(),
+        "data",
+        "fixture",
+    );
+}
+
+#[test]
+fn explicit_null_instance_is_present() {
+    assert_eq!(
+        required_field(
+            &Value::parse(r#"{"data":null}"#).unwrap(),
+            "data",
+            "fixture"
+        ),
+        &Value::Null
+    );
 }
 
 // Inspect reference keywords, including those in nested schemas. Relative
@@ -137,12 +211,13 @@ fn run_suite(label: &str, files: Vec<PathBuf>, formats: bool, remotes: bool) {
         for (group_index, group) in groups.iter().enumerate() {
             groups_run += 1;
             let context = format!("{file}: group {group_index} ({})", group["description"]);
-            let tests = group["tests"]
+            let schema_value = required_field(group, "schema", &context);
+            let tests = required_field(group, "tests", &context)
                 .as_array()
                 .unwrap_or_else(|| panic!("{context}: expected tests array"));
             assert!(!tests.is_empty(), "{context}: no cases");
             cases += tests.len();
-            let mut schema = match Schema::parse(&group["schema"].to_string(), None) {
+            let mut schema = match Schema::parse(&schema_value.to_string(), None) {
                 Ok(schema) => schema.with_format_assertions(formats),
                 Err(error) => {
                     failures.push(format!("{context}: schema rejected: {error}"));
@@ -150,7 +225,7 @@ fn run_suite(label: &str, files: Vec<PathBuf>, formats: bool, remotes: bool) {
                 }
             };
             for (filename, source) in &resources {
-                if references_fixture(&group["schema"], filename) {
+                if references_fixture(schema_value, filename) {
                     schema
                         .register_resource(
                             &format!("http://localhost:1234/draft2020-12/{filename}"),
@@ -160,15 +235,15 @@ fn run_suite(label: &str, files: Vec<PathBuf>, formats: bool, remotes: bool) {
                 }
             }
             for (case_index, case) in tests.iter().enumerate() {
-                let expected = case["valid"].as_bool().unwrap_or_else(|| {
-                    panic!("{context}: case {case_index}: expected valid boolean")
-                });
-                let result = schema.validate_json(&case["data"]);
-                if result.is_ok() != expected {
-                    let error = result.err().map_or_else(
-                        || "accepted invalid instance".to_owned(),
-                        |error| error.to_string(),
-                    );
+                let case_context =
+                    format!("{context}: case {case_index} ({})", case["description"]);
+                let data = required_field(case, "data", &case_context);
+                let expected = required_field(case, "valid", &case_context)
+                    .as_bool()
+                    .unwrap_or_else(|| {
+                        panic!("{context}: case {case_index}: expected valid boolean")
+                    });
+                if let Some(error) = case_failure(schema.validate_json(data), expected) {
                     failures.push(format!(
                         "{context}: case {case_index} ({}): expected valid={expected}: {error}",
                         case["description"],
@@ -219,21 +294,21 @@ fn draft2020_12_big_numbers() {
 }
 
 #[test]
+fn draft2020_12_format_annotations() {
+    run_suite(
+        "format annotations",
+        vec![suite_root().join("tests/draft2020-12/optional/format/unknown.json")],
+        false,
+        false,
+    );
+}
+
+#[test]
 fn draft2020_12_optional_local_cases() {
     let root = suite_root().join("tests/draft2020-12/optional");
-    let files = [
-        "anchor.json",
-        "dynamicRef.json",
-        "id.json",
-        "no-schema.json",
-        "unknownKeyword.json",
-        "refOfUnknownKeyword.json",
-        "float-overflow.json",
-        "non-bmp-regex.json",
-    ];
     run_suite(
         "optional local",
-        files.iter().map(|file| root.join(file)).collect(),
+        json_files(&root, OPTIONAL_EXCLUSIONS),
         false,
         false,
     );

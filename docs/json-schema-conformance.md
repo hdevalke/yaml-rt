@@ -21,11 +21,17 @@ remote fixtures once and registers them only for groups referencing those
 fixtures, exercising reference and dynamic scope behavior without network access.
 The pinned fixtures have no dependencies on other external resources.
 
-All four suite categories share a runner with sorted directory discovery,
+All five suite categories share a runner with sorted directory discovery,
 explicit exclusion reasons, and checks against empty suites, groups, and case
-lists. Summaries report file, group, and case counts plus elapsed time. Failures
+lists. Missing schema, data, tests, or validity fields fail rather than being
+interpreted as null. Exclusions must name existing files; optional local fixtures
+are discovered automatically, with unsupported historic dialects, legacy
+dependencies, ECMAScript regexes, and custom format vocabularies explicitly
+excluded. Summaries report file, group, and case counts plus elapsed time. Failures
 include the file, group and case indices and descriptions, expected validity,
 and validation error; schema rejection retains its underlying error.
+An invalid case passes only for an error carrying a schema keyword location.
+Execution errors such as unresolved resources fail even for invalid instances.
 
 The validator lazily parses and indexes the bundled 2020-12 meta-schemas once
 per process using `std::sync::OnceLock`. Each validation retains its own resource
@@ -33,7 +39,8 @@ map and dynamic scope, so registered resources are isolated between schemas and
 concurrent validations. Built-in resource precedence is preserved.
 
 With format assertions enabled, all 847 selected optional format cases pass.
-The format harness excludes `unknown.json`, which tests annotation behavior,
+Seven cases in `unknown.json` run separately with format assertions disabled
+to cover annotation behavior. The assertion harness excludes that file
 and `ecmascript-regex.json`, whose regex grammar differs from the Rust `regex`
 crate. ECMAScript regular-expression compatibility remains a known gap. The
 CLI uses the built-in 2020-12 dialect, which treats `format` as an annotation.

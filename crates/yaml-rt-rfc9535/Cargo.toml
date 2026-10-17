@@ -2,7 +2,7 @@
 name = "yaml-rt-rfc9535"
 description = "RFC 9535 JSONPath queries for yaml-rt documents"
 edition.workspace = true
-version = "0.3.2"
+version = "0.3.3"
 license.workspace = true
 authors.workspace = true
 readme = "README.md"

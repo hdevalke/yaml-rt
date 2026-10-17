@@ -21,7 +21,7 @@ rust-version = "1.96"
 
 [workspace.dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
-yaml-rt-core = { version = "0.3.2", path = "crates/yaml-rt-core" }
+yaml-rt-core = { version = "0.3.3", path = "crates/yaml-rt-core" }
 yaml-rt-rfc9535 = { version = "0.3.2", path = "crates/yaml-rt-rfc9535" }
 yaml-rt-derive = { version = "0.3.2", path = "crates/yaml-rt-derive" }
 yaml-rt-serde = { version = "0.3.2", path = "crates/yaml-rt-serde" }

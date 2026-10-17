@@ -2,7 +2,7 @@
 name = "yaml-rt"
 description = "Facade crate for YAML 1.2.2 round-trip parsing and typed overlays"
 edition.workspace = true
-version = "0.3.2"
+version = "0.3.3"
 license.workspace = true
 authors.workspace = true
 readme = "README.md"

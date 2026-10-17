@@ -1,5 +1,10 @@
 # yaml-rt-cli
 
+[![Crates.io](https://img.shields.io/crates/v/yaml-rt-cli.svg)](https://crates.io/crates/yaml-rt-cli)
+[![docs.rs](https://docs.rs/yaml-rt-cli/badge.svg)](https://docs.rs/yaml-rt-cli/latest/yaml_rt_cli/)
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+[![Playground](https://img.shields.io/badge/playground-try_it_online-blue)](https://hdevalke.github.io/yaml-rt/)
+
 The `yaml-rt` command-line query and editor for YAML 1.2.2. Query with RFC 9535
 JSONPath and edit with RFC 6901 JSON Pointers while preserving unrelated
 comments, whitespace, scalar spelling, and collection styles.

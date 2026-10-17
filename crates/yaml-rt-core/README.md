@@ -1,5 +1,9 @@
 # yaml-rt-core
 
+[![Crates.io](https://img.shields.io/crates/v/yaml-rt-core.svg)](https://crates.io/crates/yaml-rt-core)
+[![docs.rs](https://docs.rs/yaml-rt-core/badge.svg)](https://docs.rs/yaml-rt-core/latest/yaml_rt_core/)
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+
 Dependency-free YAML 1.2.2 parser and lossless editor. This crate owns the source
 model, lexer, concrete syntax tree, semantic graph, diagnostics, editing APIs,
 and patch-based emitter. Use it directly when you need the foundational APIs

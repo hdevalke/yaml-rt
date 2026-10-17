@@ -1,5 +1,7 @@
 # yaml-rt-bench
 
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+
 Parse-only benchmarks for yaml-rt against ordinary YAML loader baselines.
 
 yaml-rt preserves lossless round-trip state such as source spans, comments, trivia,

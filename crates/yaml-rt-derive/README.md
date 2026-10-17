@@ -1,5 +1,9 @@
 # yaml-rt-derive
 
+[![Crates.io](https://img.shields.io/crates/v/yaml-rt-derive.svg)](https://crates.io/crates/yaml-rt-derive)
+[![docs.rs](https://docs.rs/yaml-rt-derive/badge.svg)](https://docs.rs/yaml-rt-derive/latest/yaml_rt_derive/)
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+
 The `YamlRt` procedural derive macro for typed, presentation-preserving overlays
 on YAML documents. Rust values read from and patch the lossless document; they
 do not replace it as the source of truth.

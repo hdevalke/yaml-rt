@@ -1,5 +1,9 @@
 # yaml-rt-rfc9535
 
+[![Crates.io](https://img.shields.io/crates/v/yaml-rt-rfc9535.svg)](https://crates.io/crates/yaml-rt-rfc9535)
+[![docs.rs](https://docs.rs/yaml-rt-rfc9535/badge.svg)](https://docs.rs/yaml-rt-rfc9535/latest/yaml_rt_rfc9535/)
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+
 Native RFC 9535 JSONPath parsing and evaluation over yaml-rt documents. Queries
 operate on the semantic document without converting it into an intermediate
 JSON value tree. Parse a query once and reuse it across documents.

@@ -1,5 +1,8 @@
 # yaml-rt-wasm
 
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+[![Playground](https://img.shields.io/badge/playground-try_it_online-blue)](https://hdevalke.github.io/yaml-rt/)
+
 Filesystem-free command engine and WebAssembly bindings for the
 [yaml-rt browser playground](https://hdevalke.github.io/yaml-rt/).
 This workspace crate is unpublished (`publish = false`). Documents are processed

@@ -1,5 +1,9 @@
 # yaml-rt-serde
 
+[![Crates.io](https://img.shields.io/crates/v/yaml-rt-serde.svg)](https://crates.io/crates/yaml-rt-serde)
+[![docs.rs](https://docs.rs/yaml-rt-serde/badge.svg)](https://docs.rs/yaml-rt-serde/latest/yaml_rt_serde/)
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+
 Serde serialization and deserialization backed by yaml-rt's YAML 1.2.2 parser.
 Use this crate for typed data conversion or a dynamic YAML value model.
 Conversions discard comments, anchors, styles, and original scalar spelling;

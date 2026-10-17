@@ -1,5 +1,9 @@
 # yaml-rt-schema
 
+[![Crates.io](https://img.shields.io/crates/v/yaml-rt-schema.svg)](https://crates.io/crates/yaml-rt-schema)
+[![docs.rs](https://docs.rs/yaml-rt-schema/badge.svg)](https://docs.rs/yaml-rt-schema/latest/yaml_rt_schema/)
+[![CI](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/hdevalke/yaml-rt/actions/workflows/ci.yml)
+
 JSON Schema 2020-12 validation and permissive schema inference over yaml-rt
 YAML documents. Validation retains instance paths and source spans for useful
 diagnostics. Schemas may be written in JSON or YAML.

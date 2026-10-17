@@ -40,6 +40,11 @@ edit. Source-aware failures use the same rustc-style diagnostics as the CLI.
 The playground runs the Rust parser and editor locally through WebAssembly.
 Documents are not uploaded to a server. Its interface is plain HTML, CSS, and
 JavaScript with a pinned CodeMirror bundle built into the deployed site.
+The theme selector offers System (the default), Light, and Dark, and remembers
+the choice in the browser. Editors and controls follow the selected theme.
+The browser bundle uses CodeMirror language highlighting and Lezer token tags
+to match YAML colors to the page palette; these dependencies do not affect the
+Rust crates.
 The input and output panels each have an optional Schema tab. Enter a JSON or
 YAML schema to validate every input document and the resulting YAML after a
 command. Input schema failures do not stop edits, so a command can repair an

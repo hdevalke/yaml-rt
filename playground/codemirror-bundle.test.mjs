@@ -12,6 +12,7 @@ const requiredExports = [
   "StateField",
   "gutter",
   "lineNumbers",
+  "playgroundTheme",
   "yaml",
 ];
 
@@ -31,6 +32,7 @@ test("the browser bundle exposes every CodeMirror API used by the playground", a
     doc: "key: value\n",
     extensions: [
       codeMirror.basicSetup,
+      codeMirror.playgroundTheme,
       codeMirror.lineNumbers(),
       codeMirror.yaml(),
       codeMirror.EditorView.lineWrapping,

@@ -8,3 +8,4 @@ export {
   lineNumbers,
 } from "@codemirror/view";
 export { yaml } from "@codemirror/lang-yaml";
+export { playgroundTheme } from "./editor-theme.js";

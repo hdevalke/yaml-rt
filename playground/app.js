@@ -9,6 +9,7 @@ import {
   StateField,
   gutter,
   lineNumbers,
+  playgroundTheme,
   yaml,
 } from "./codemirror.js";
 import init, { export_snapshot, import_snapshot, run_command } from "./pkg/yaml_rt_wasm.js";
@@ -156,6 +157,7 @@ function editor(parent, text, readOnly, onChange) {
       doc: text,
       extensions: [
         basicSetup,
+        playgroundTheme,
         lineNumbers(),
         yaml(),
         EditorView.lineWrapping,

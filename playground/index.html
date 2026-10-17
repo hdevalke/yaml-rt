@@ -6,6 +6,7 @@
     <meta name="description" content="Try yaml-rt lossless YAML queries and edits in your browser.">
     <title>yaml-rt playground</title>
     <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+    <script src="./theme.js"></script>
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body>
@@ -22,6 +23,14 @@
         <label for="example">Example</label>
         <select id="example"></select>
         <span class="privacy">Runs locally in your browser</span>
+        <div class="theme-control">
+          <label for="theme">Theme</label>
+          <select id="theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
         <button id="export" class="quiet" type="button" disabled>Export</button>
         <button id="import" class="quiet" type="button" disabled>Import</button>
         <button id="reset" class="quiet" type="button">Reset</button>

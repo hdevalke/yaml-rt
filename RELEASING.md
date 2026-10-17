@@ -17,6 +17,7 @@ Use Python 3.12+, Git, the workspace Rust toolchain, and authenticated GitHub CL
 
 ```sh
 cargo install cargo-release --version 1.1.5 --locked
+cargo install convco --version 0.7.2 --locked
 ```
 
 Configure the repository once:
@@ -50,8 +51,11 @@ The CLI-only example is:
 Preparation updates only the selected package version, dependency requirements
 that no longer accept it, and Cargo.lock. It prints the diff, creates no commit
 or tag, and never publishes or pushes. A CLI patch does not bump library versions.
-The version argument also accepts an explicit SemVer or cargo-release's
-`minor`, `major`, `release`, `alpha`, `beta`, and `rc` levels.
+The version argument also accepts `auto` (the default when omitted), an explicit
+SemVer, or cargo-release's `minor`, `major`, `release`, `alpha`, `beta`, and `rc`
+levels. `prepare yaml-rt-cli auto` uses the same per-package Convco policy as
+batch preparation below. For a new package without release history, use
+`prepare-all` to retain its initial version.
 
 Keep `## Unreleased` in every changelog. Before committing, add a nonempty section
 for the selected version, with the actual release date and reviewed notes:
@@ -63,8 +67,10 @@ for the selected version, with the actual release date and reviewed notes:
 ```
 
 Replace `YYYY-MM-DD` with a valid date. Record deliberate dependency minimum
-changes in the affected package's notes. Never infer a shared version from
-Conventional Commits; Convco remains a commit validation tool.
+changes in the affected package's notes. Convco validates commits and can
+recommend a package-specific bump during local preparation. Versions are still
+reviewed and committed in Git; CI never calculates a shared version or commits
+release changes.
 
 Commit with a Conventional Commit message, then validate:
 
@@ -100,16 +106,39 @@ version. Fetch current tags before planning a batch:
 
 ```sh
 git fetch origin --tags
-./scripts/release prepare-all patch --dry-run
-./scripts/release prepare-all patch
+./scripts/release prepare-all auto --dry-run
+./scripts/release prepare-all auto
 ```
 
-`patch` is the default; `minor` and `major` are also available. Choose individual
-levels or exact versions when needed, for example:
+`auto` is the default when omitted. Convco 0.7.2 recommends a bump independently
+for each changed crate using `--paths crates/<package>` and its own tag prefix.
+It reads committed history in your repository, not the synthetic commits used
+by the release simulation. The reviewed policy is in
+`scripts/convco-release.yml`; local `CONVCO_*` environment overrides are ignored.
+
+- Before 1.0, `feat` and `fix` commits bump patch; `!` or `BREAKING CHANGE` bumps
+  minor. For example, `0.3.2 -> 0.3.3` or `0.3.2 -> 0.4.0`.
+- At 1.0 and later, features bump minor, fixes bump patch, and breaking changes
+  bump major.
+- Changed packages with no release-bearing commits get a patch fallback. This
+  covers documentation, inherited metadata and dependency-only updates. Unchanged
+  packages remain excluded regardless of commits elsewhere in the repository.
+
+Only commits touching the crate directory contribute severity. Root-only changes
+can select a package through inherited metadata but use the patch fallback;
+choose an explicit override if their impact requires a larger bump. The tool
+rejects inconsistent Convco/tag baselines. For prereleases, use an explicit
+`--bump PACKAGE=rc` or `--bump PACKAGE=release` override (or single-package
+preparation) instead of `auto` to avoid accidental promotion.
+
+Explicit `patch`, `minor` and `major` modes remain available. Override individual
+crates with a level or exact version when needed:
 
 ```sh
-./scripts/release prepare-all patch --bump yaml-rt-core=minor --dry-run
-./scripts/release prepare-all patch --bump yaml-rt-core=minor
+./scripts/release prepare-all auto --bump yaml-rt-core=minor --dry-run
+./scripts/release prepare-all auto --bump yaml-rt-core=minor
+# Force patch bumps for every selected package instead of using commit severity:
+./scripts/release prepare-all patch --dry-run
 ```
 
 The helper compares each crate's Cargo package file list and file contents, plus
@@ -125,7 +154,9 @@ The migration itself changes manifests and adds package changelogs, so the first
 batch preview may select all seven packages. Subsequent previews use each
 package's independent tag. Detection uses local tags and includes tracked and
 untracked, non-ignored working files. Actual preparation requires a clean tree;
-its dry run can preview uncommitted development changes.
+its dry run can preview uncommitted development changes. Automatic severity
+uses committed history only, so review the preview again after committing any
+uncommitted features or breaking changes.
 
 Both modes simulate cargo-release edits in disposable local checkouts. The dry
 run prints the selected packages, resulting versions, exact manifest/lockfile
@@ -139,8 +170,10 @@ preparation to deliberately increment an already prepared version again.
 Cargo-release fixes incompatible dependency requirements. If those fixes change
 other packages' published inputs, the batch includes and bumps those dependents
 as well. A compatible core patch alone leaves unchanged dependents out. Version
-levels are deliberate maintainer choices, not inferred from commits or APIs;
-review the default patch bumps and any breaking API changes. Raise compatible
+levels come from Convco recommendations or explicit maintainer choices, and
+always require review. Convco does not inspect Rust API compatibility. Review
+dependency-only patch bumps especially when a crate re-exports a changed public
+API; override those crates to minor/major where necessary. Raise compatible
 minimum dependency versions manually when a consumer needs a newly introduced
 API, as described below. Package selection cannot infer that requirement from
 Rust source.

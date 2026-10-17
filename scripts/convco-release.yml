@@ -1,0 +1,5 @@
+# Keep automatic release preparation on Convco 0.7.2's SemVer defaults.
+# Before 1.0, features/fixes bump patch and breaking changes bump minor.
+# Changed packages with no release-bearing commits get a patch in scripts/release.
+treatMajorZeroAsStable: false
+versionScheme: semver

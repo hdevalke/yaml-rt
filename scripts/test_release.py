@@ -210,6 +210,16 @@ class Guards(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "failed-run.*No further tags"):
                 release.wait_release("yaml-rt-cli/v0.3.3", "abc", 60)
 
+    def test_prepare_cli_defaults_to_auto(self):
+        with patch.object(release.sys, "argv", ["release", "prepare-all", "--dry-run"]), \
+             patch.object(release, "prepare_all") as prepare:
+            release.main()
+            prepare.assert_called_once_with("auto", True, [])
+        with patch.object(release.sys, "argv", ["release", "prepare", "yaml-rt-cli"]), \
+             patch.object(release, "prepare") as prepare:
+            release.main()
+            prepare.assert_called_once_with("yaml-rt-cli", "auto")
+
     def test_workflow_limits_cli_artifacts(self):
         workflow = (release.ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("if: needs.validate.outputs.package == 'yaml-rt-cli'", workflow)
@@ -247,6 +257,8 @@ class CargoReleaseIntegration(unittest.TestCase):
         (self.root / "Cargo.toml").write_text(manifest)
         (self.root / ".gitignore").write_text("/target/\n")
         shutil.copy(release.ROOT / "release.toml", self.root)
+        (self.root / "scripts").mkdir()
+        shutil.copy(release.ROOT / "scripts/convco-release.yml", self.root / "scripts/convco-release.yml")
         self.execute("git", "init", "-b", "main")
         self.execute("git", "config", "user.email", "fixture@example.invalid")
         self.execute("git", "config", "user.name", "Release fixture")
@@ -314,9 +326,9 @@ class CargoReleaseIntegration(unittest.TestCase):
             (self.root / "crates" / name / "src/lib.rs").write_text("pub fn changed() {}\n")
         self.commit()
 
-    def batch(self, dry_run=False, overrides=()):
+    def batch(self, dry_run=False, overrides=(), bump="patch"):
         with patch.object(release, "ROOT", self.root), contextlib.redirect_stdout(io.StringIO()):
-            return release.prepare_all(dry_run=dry_run, overrides=overrides)
+            return release.prepare_all(bump=bump, dry_run=dry_run, overrides=overrides)
 
     def versions(self):
         return {name: tomllib.loads((self.root / "crates" / name / "Cargo.toml").read_text())["package"]["version"]
@@ -491,6 +503,137 @@ class CargoReleaseIntegration(unittest.TestCase):
             tag.assert_not_called()
             validate.assert_called_once_with(release_tag)
             self.assertEqual(wait.call_args.args[0], release_tag)
+
+
+    def auto_available(self):
+        if not shutil.which("convco"):
+            self.skipTest("Convco required for automatic release tests")
+        self.assertEqual(self.execute("convco", "--version").strip(), f"convco {release.CONVCO_VERSION}")
+
+    def conventional_change(self, name, message):
+        path = self.root / "crates" / name / "src/lib.rs"
+        text = path.read_text()
+        path.write_text(text + f"\npub fn new_behavior_{text.count('pub fn')}() {{}}\n")
+        self.execute("git", "add", ".")
+        self.execute("git", "commit", "-m", message)
+
+    def test_auto_uses_paths_and_does_not_leak_another_packages_breaking_change(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-core", "fix(core): correct package behavior")
+        self.conventional_change("yaml-rt-cli", "feat(cli)!: change command behavior")
+        self.assertEqual(self.batch(bump="auto"), ["yaml-rt-core", "yaml-rt-cli"])
+        self.assertEqual(self.versions()["yaml-rt-core"], "0.3.3")
+        self.assertEqual(self.versions()["yaml-rt-cli"], "0.4.0")
+        self.assertEqual(self.versions()["yaml-rt"], "0.3.2")
+
+    def test_auto_zero_major_feature_uses_convco_patch_and_ignores_local_force_flags(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-core", "feat(core): add compatible behavior")
+        with patch.dict(release.os.environ, {"CONVCO_FORCE_MAJOR_BUMP": "true", "CONVCO_TREAT_MAJOR_ZERO_AS_STABLE": "true"}):
+            self.assertEqual(self.batch(bump="auto"), ["yaml-rt-core"])
+        self.assertEqual(self.versions()["yaml-rt-core"], "0.3.3")
+
+    def test_auto_breaking_core_minor_updates_requirements_and_patches_dependents(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-core", "refactor(core): change public behavior\n\nBREAKING CHANGE: remove the prior API.")
+        order = self.batch(bump="auto")
+        self.assertEqual(order, ["yaml-rt-core", "yaml-rt-rfc9535", "yaml-rt-serde", "yaml-rt-schema", "yaml-rt", "yaml-rt-cli"])
+        versions = self.versions()
+        self.assertEqual(versions.pop("yaml-rt-core"), "0.4.0")
+        self.assertEqual(versions.pop("yaml-rt-derive"), "0.3.2")
+        self.assertEqual(set(versions.values()), {"0.3.3"})
+
+    def test_auto_package_prefix_excludes_already_released_breaking_history(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-core", "feat(core)!: previous released behavior")
+        self.execute("git", "tag", "-a", "yaml-rt-core/v0.3.2", "-m", "Independent fixture baseline")
+        self.conventional_change("yaml-rt-core", "fix(core): correct subsequent behavior")
+        self.assertEqual(self.batch(bump="auto"), ["yaml-rt-core"])
+        self.assertEqual(self.versions()["yaml-rt-core"], "0.3.3")
+
+    def test_auto_docs_only_change_gets_fallback_patch_and_retains_prepared_version(self):
+        self.auto_available()
+        self.baseline()
+        (self.root / "crates/yaml-rt-cli/README.md").write_text("Improved command documentation\n")
+        self.execute("git", "add", ".")
+        self.execute("git", "commit", "-m", "docs(cli): document command usage")
+        self.assertEqual(self.batch(bump="auto"), ["yaml-rt-cli"])
+        self.assertEqual(self.versions()["yaml-rt-cli"], "0.3.3")
+        self.commit()
+        with patch.object(release, "automatic_bump", side_effect=AssertionError("already prepared")):
+            self.assertEqual(self.batch(bump="auto"), ["yaml-rt-cli"])
+        self.assertEqual(self.versions()["yaml-rt-cli"], "0.3.3")
+
+    def test_auto_override_can_replace_convco_recommendation(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-cli", "feat(cli)!: change command behavior")
+        self.assertEqual(self.batch(bump="auto", overrides=("yaml-rt-cli=patch",)), ["yaml-rt-cli"])
+        self.assertEqual(self.versions()["yaml-rt-cli"], "0.3.3")
+
+    def test_auto_dry_run_leaves_files_versions_and_refs_unchanged(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-cli", "feat(cli)!: change command behavior")
+        before = {p: (self.root / p).read_bytes() for p in self.execute("git", "ls-files").splitlines()}
+        refs = self.execute("git", "show-ref")
+        self.assertEqual(self.batch(bump="auto", dry_run=True), ["yaml-rt-cli"])
+        self.assertEqual(before, {p: (self.root / p).read_bytes() for p in before})
+        self.assertEqual(refs, self.execute("git", "show-ref"))
+
+    def test_auto_keeps_initial_versions_without_any_release_baseline(self):
+        with patch.object(release, "automatic_bump", side_effect=AssertionError("no release history")):
+            order = self.batch(bump="auto")
+        self.assertEqual(set(order), set(release.PACKAGES))
+        self.assertEqual(set(self.versions().values()), {"0.3.2"})
+        self.assertFalse(self.execute("git", "status", "--porcelain").strip())
+
+    def test_auto_single_package_preparation(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-cli", "feat(cli)!: change command behavior")
+        versions = self.bump("yaml-rt-cli", "auto")
+        self.assertEqual(versions.pop("yaml-rt-cli"), "0.4.0")
+        self.assertEqual(set(versions.values()), {"0.3.2"})
+
+    def stable_core_baseline(self):
+        manifest = self.root / "crates/yaml-rt-core/Cargo.toml"
+        manifest.write_text(manifest.read_text().replace('version = "0.3.2"', 'version = "1.2.3"'))
+        workspace = self.root / "Cargo.toml"
+        workspace.write_text(workspace.read_text().replace('version = "0.3.2" }', 'version = "1.2.3" }', 1))
+        self.execute("cargo", "generate-lockfile", "--offline")
+        self.commit()
+        self.baseline()
+        self.execute("git", "tag", "-a", "yaml-rt-core/v1.2.3", "-m", "Stable independent core fixture")
+
+    def test_auto_stable_feature_bumps_minor(self):
+        self.auto_available()
+        self.stable_core_baseline()
+        self.conventional_change("yaml-rt-core", "feat(core): add compatible behavior")
+        self.assertEqual(self.batch(bump="auto"), ["yaml-rt-core"])
+        self.assertEqual(self.versions()["yaml-rt-core"], "1.3.0")
+
+    def test_auto_stable_breaking_change_bumps_major(self):
+        self.auto_available()
+        self.stable_core_baseline()
+        self.conventional_change("yaml-rt-core", "feat(core)!: change public behavior")
+        order = self.batch(bump="auto")
+        self.assertEqual(order[0], "yaml-rt-core")
+        self.assertEqual(self.versions()["yaml-rt-core"], "2.0.0")
+        self.assertNotIn("yaml-rt-derive", order)
+
+    def test_auto_rejects_prerelease_promotion_and_wrong_convco_baseline(self):
+        self.auto_available()
+        self.baseline()
+        with patch.object(release, "ROOT", self.root):
+            with self.assertRaisesRegex(RuntimeError, "prerelease"):
+                release.automatic_bump("yaml-rt-core", "v0.3.2", "0.4.0-rc.1")
+            with self.assertRaisesRegex(RuntimeError, "baseline differs"):
+                release.automatic_bump("yaml-rt-core", "v0.3.2", "0.3.3")
 
 
 if __name__ == "__main__":

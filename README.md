@@ -759,8 +759,9 @@ and per-package changelogs in Git; package-specific tags publish only the select
 crate. Only `yaml-rt-cli` releases produce standalone binaries. The root changelog
 archives earlier synchronized releases. See [`RELEASING.md`](RELEASING.md) for
 preparation, validation, tagging, and recovery commands. Use
-`./scripts/release prepare-all patch --dry-run` to preview a batch of changed
-packages, and `./scripts/release tag-all --dry-run` to preview sequential tagging
+`./scripts/release prepare-all auto --dry-run` to preview a batch of changed
+packages with per-package Convco recommendations, and
+`./scripts/release tag-all --dry-run` to preview sequential tagging
 after preparing their versions and changelogs.
 
 ## License

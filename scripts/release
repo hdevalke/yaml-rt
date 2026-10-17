@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small release guard around Cargo, cargo-release 1.1.5, Git and gh.
+"""Small release guard around Cargo, cargo-release 1.1.5, Convco 0.7.2, Git and gh.
 
 No dependency solver: Cargo resolves dependencies and cargo-release edits requirements.
 Preparation edits source; tag commands create/push annotated tags. See RELEASING.md.
@@ -29,6 +29,7 @@ PACKAGES = (
     "yaml-rt-schema", "yaml-rt", "yaml-rt-cli",
 )
 TOOL_VERSION = "1.1.5"
+CONVCO_VERSION = "0.7.2"
 # SemVer 2.0: numeric prerelease identifiers cannot have leading zeros.
 NUM = r"(?:0|[1-9][0-9]*)"
 PRE = rf"(?:{NUM}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
@@ -193,12 +194,17 @@ def check(selected=None, ci=False):
                 raise RuntimeError(f"Publish dry run failed for {name}")
 
 
-def prepare(name, bump):
-    package(name)
-    require(bump in ("patch", "minor", "major", "release", "alpha", "beta", "rc") or SEMVER.fullmatch(bump), "Invalid version/bump")
+def prepare(name, bump="auto"):
+    version = package(name)
+    require(bump in ("auto", "patch", "minor", "major", "release", "alpha", "beta", "rc") or SEMVER.fullmatch(bump), "Invalid version/bump")
     require(run("cargo", "release", "--version", capture=True) == f"cargo-release {TOOL_VERSION}",
             f"Install cargo-release {TOOL_VERSION} with --locked")
     clean()
+    if bump == "auto":
+        ref = prior_release(name)
+        require(ref is not None, "No release baseline; prepare-all retains new packages' initial versions")
+        bump = automatic_bump(name, ref, version)
+        print(f"{name}: Convco selected {bump} from commits under crates/{name}", flush=True)
     before = {n: package(n) for n in PACKAGES}
     # The version subcommand has no commit, publish, tag or push steps.
     run("cargo", "release", "version", bump, "-p", name, "--execute", "--no-confirm")
@@ -422,12 +428,37 @@ def batch_source(scratch):
 
 
 def bump_argument(value):
-    require(value in ("patch", "minor", "major", "release", "alpha", "beta", "rc")
+    require(value in ("auto", "patch", "minor", "major", "release", "alpha", "beta", "rc")
             or SEMVER.fullmatch(value), f"Invalid version/bump: {value}")
     return value
 
 
-def prepare_all(bump="patch", dry_run=False, overrides=()):
+def automatic_bump(name, ref, version):
+    """Ask pinned Convco about this package's history, never the workspace version."""
+    require(name in PACKAGES and ref, "Automatic bump needs an allowed package and release baseline")
+    require("-" not in version.split("+", 1)[0], "Use an explicit release/rc/alpha/beta bump for prerelease versions")
+    config = ROOT / "scripts" / "convco-release.yml"
+    require(config.is_file(), "Missing scripts/convco-release.yml")
+    require(shutil.which("convco"), f"Install Convco: cargo install convco --version {CONVCO_VERSION} --locked")
+    # Local CONVCO_FORCE_* or CONVCO_CONFIG values must not alter reviewed policy.
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("CONVCO_")}
+    def query(*arguments):
+        result = subprocess.run(["convco", *arguments], cwd=ROOT, env=environment,
+                                text=True, capture_output=True)
+        require(result.returncode == 0, "Convco failed: " + result.stdout + result.stderr)
+        return result.stdout.strip()
+    require(query("--version") == f"convco {CONVCO_VERSION}",
+            f"Install pinned Convco: cargo install convco --version {CONVCO_VERSION} --locked")
+    prefix = f"{name}/v" if ref.startswith(f"{name}/v") else "v"
+    arguments = ("version", "--config", str(config), "--prefix", prefix, "--paths", f"crates/{name}")
+    require(query(*arguments) == version,
+            f"Convco baseline differs from {ref}; review tags/version or choose an explicit bump")
+    level = query(*arguments, "--bump", "--label")
+    require(level in ("major", "minor", "patch", "release"), f"Unexpected Convco bump: {level!r}")
+    return "patch" if level == "release" else level
+
+
+def prepare_all(bump="auto", dry_run=False, overrides=()):
     for name in PACKAGES:
         package(name)
     bump_argument(bump)
@@ -440,19 +471,28 @@ def prepare_all(bump="patch", dry_run=False, overrides=()):
             f"Install cargo-release {TOOL_VERSION} with --locked")
     if not dry_run:
         clean()
+    elif (bump == "auto" or "auto" in levels.values()) and run("git", "status", "--porcelain", capture=True):
+        print("Auto decisions use committed history only; uncommitted changes can alter the final bump.")
     original_head = run("git", "rev-parse", "HEAD", capture=True)
     with tempfile.TemporaryDirectory(prefix="yaml-rt-prepare-all-") as temporary:
         current, packages, initial, baselines = batch_source(Path(temporary))
         start = run("git", "rev-parse", "HEAD", capture=True, cwd=current)
         selected = {name for name in PACKAGES if initial[name] != baselines[name][1]}
         processed = set()
+        decisions = {}
         while selected - processed:
             for name in release_order(selected - processed, packages):
                 old = baselines[name][1]
                 # Retain explicitly prepared versions and the initial version of new crates.
                 if old and packages[name]["version"] == old["package"]["version"]:
+                    level = levels.get(name, bump)
+                    if level == "auto":
+                        level = automatic_bump(name, baselines[name][0], old["package"]["version"])
+                        decisions[name] = f"auto {level} (Convco paths: crates/{name})"
+                    else:
+                        decisions[name] = f"explicit {level}"
                     result = subprocess.run(
-                        ["cargo", "release", "version", levels.get(name, bump), "-p", name, "--execute", "--no-confirm"],
+                        ["cargo", "release", "version", level, "-p", name, "--execute", "--no-confirm"],
                         cwd=current, text=True, capture_output=True)
                     require(result.returncode == 0, f"cargo-release failed preparing {name} in an isolated checkout:\n"
                             + result.stdout + result.stderr)
@@ -473,7 +513,7 @@ def prepare_all(bump="patch", dry_run=False, overrides=()):
             version = packages[name]["version"]
             reason = baselines[name][0] or "new package"
             status = f"{old_version} -> {version}" if old_version != version else f"{version} (already prepared or initial release)"
-            print(f"  {name}: {status}; baseline: {reason}")
+            print(f"  {name}: {status}; baseline: {reason}; {decisions.get(name, 'retain current version')}")
         print("Publication order: " + " -> ".join(order))
         changed = run("git", "diff", "--name-only", start, capture=True, cwd=current).splitlines()
         allowed = {"Cargo.toml", "Cargo.lock"} | {f"crates/{name}/Cargo.toml" for name in PACKAGES}
@@ -588,9 +628,9 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare")
     prepare_parser.add_argument("package", choices=PACKAGES)
-    prepare_parser.add_argument("bump")
+    prepare_parser.add_argument("bump", nargs="?", default="auto")
     batch_prepare_parser = commands.add_parser("prepare-all")
-    batch_prepare_parser.add_argument("bump", choices=("patch", "minor", "major"), nargs="?", default="patch")
+    batch_prepare_parser.add_argument("bump", choices=("auto", "patch", "minor", "major"), nargs="?", default="auto")
     batch_prepare_parser.add_argument("--bump", action="append", default=[], dest="overrides", metavar="PACKAGE=LEVEL")
     batch_prepare_parser.add_argument("--dry-run", action="store_true")
     batch_tag_parser = commands.add_parser("tag-all")

@@ -13,6 +13,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CONVCO_VERSION: "0.7.2"
 
 jobs:
   commits:
@@ -27,7 +28,7 @@ jobs:
       - name: Install Convco
         uses: convco/convco-action@v0.3.0
         with:
-          convco_version: 0.7.0
+          convco_version: ${{ env.CONVCO_VERSION }}
       - name: Validate commit history
         run: convco check
 
@@ -194,6 +195,10 @@ jobs:
         run: cargo install cargo-release --version "$CARGO_RELEASE_VERSION" --locked
       - name: Verify cargo-release version
         run: test "$(cargo release --version)" = "cargo-release ${CARGO_RELEASE_VERSION}"
+      - name: Install Convco for automatic release tests
+        uses: convco/convco-action@v0.3.0
+        with:
+          convco_version: ${{ env.CONVCO_VERSION }}
       - name: Test release guards and cargo-release dependency handling
         env:
           PYTHONDONTWRITEBYTECODE: "1"

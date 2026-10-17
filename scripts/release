@@ -72,7 +72,7 @@ def notes(name, version, required=True):
     pattern = rf"^## {re.escape(version)} - (\d{{4}}-\d{{2}}-\d{{2}})\n(.*?)(?=^## |\Z)"
     match = re.search(pattern, text, flags=re.M | re.S)
     if not match:
-        require(not required, f"Add a dated, reviewed changelog section: ## {version} - YYYY-MM-DD in {name}")
+        require(not required, f"Missing dated changelog section; run release preparation: ## {version} - YYYY-MM-DD in {name}")
         return ""
     datetime.date.fromisoformat(match[1])
     require(match[2].strip() and not re.search(r"\b(TODO|TBD)\b", match[2]), "Release notes are empty or unfinished")
@@ -205,14 +205,28 @@ def prepare(name, bump="auto"):
         require(ref is not None, "No release baseline; prepare-all retains new packages' initial versions")
         bump = automatic_bump(name, ref, version)
         print(f"{name}: Convco selected {bump} from commits under crates/{name}", flush=True)
+    ref = prior_release(name)
+    with tempfile.TemporaryDirectory(prefix="yaml-rt-notes-") as temporary:
+        old = None
+        if ref:
+            baseline = Path(temporary) / "baseline"
+            snapshot(baseline, ref)
+            packages = workspace_packages(baseline)
+            if name in packages:
+                old = {"package": packages[name]}
+        # Validate Convco before editing the checkout, including explicit bumps.
+        convco("--version")
     before = {n: package(n) for n in PACKAGES}
     # The version subcommand has no commit, publish, tag or push steps.
     run("cargo", "release", "version", bump, "-p", name, "--execute", "--no-confirm")
     require(all(package(n) == v for n, v in before.items() if n != name), "Unrelated package version changed")
+    changelog = ROOT / "crates" / name / "CHANGELOG.md"
+    changelog.write_text(release_changelog(name, package(name), ref, old,
+                                         workspace_packages(ROOT)[name], changelog.read_text()))
     run("git", "diff", "--stat")
     run("git", "diff", "--", "Cargo.toml", "Cargo.lock", "crates")
     print(f"Review dependency requirement changes; bump affected dependents deliberately.\n"
-          f"Write ## {package(name)} - YYYY-MM-DD in crates/{name}/CHANGELOG.md, then commit and run scripts/release check {name}.")
+          f"Changelog generated; commit and run scripts/release check {name}.")
 
 
 def tag(name):
@@ -433,29 +447,79 @@ def bump_argument(value):
     return value
 
 
-def automatic_bump(name, ref, version):
-    """Ask pinned Convco about this package's history, never the workspace version."""
-    require(name in PACKAGES and ref, "Automatic bump needs an allowed package and release baseline")
-    require("-" not in version.split("+", 1)[0], "Use an explicit release/rc/alpha/beta bump for prerelease versions")
+def convco(*arguments):
     config = ROOT / "scripts" / "convco-release.yml"
     require(config.is_file(), "Missing scripts/convco-release.yml")
     require(shutil.which("convco"), f"Install Convco: cargo install convco --version {CONVCO_VERSION} --locked")
     # Local CONVCO_FORCE_* or CONVCO_CONFIG values must not alter reviewed policy.
     environment = {key: value for key, value in os.environ.items() if not key.startswith("CONVCO_")}
-    def query(*arguments):
-        result = subprocess.run(["convco", *arguments], cwd=ROOT, env=environment,
-                                text=True, capture_output=True)
-        require(result.returncode == 0, "Convco failed: " + result.stdout + result.stderr)
-        return result.stdout.strip()
-    require(query("--version") == f"convco {CONVCO_VERSION}",
+    result = subprocess.run(["convco", "--version"], cwd=ROOT, env=environment,
+                            text=True, capture_output=True, check=True)
+    require(result.stdout.strip() == f"convco {CONVCO_VERSION}",
             f"Install pinned Convco: cargo install convco --version {CONVCO_VERSION} --locked")
+    result = subprocess.run(["convco", *arguments], cwd=ROOT, env=environment,
+                            text=True, capture_output=True)
+    require(result.returncode == 0, "Convco failed: " + result.stdout + result.stderr)
+    return result.stdout.strip()
+
+
+def automatic_bump(name, ref, version):
+    """Ask pinned Convco about this package's history, never the workspace version."""
+    require(name in PACKAGES and ref, "Automatic bump needs an allowed package and release baseline")
+    require("-" not in version.split("+", 1)[0], "Use an explicit release/rc/alpha/beta bump for prerelease versions")
     prefix = f"{name}/v" if ref.startswith(f"{name}/v") else "v"
-    arguments = ("version", "--config", str(config), "--prefix", prefix, "--paths", f"crates/{name}")
-    require(query(*arguments) == version,
+    arguments = ("version", "--config", str(ROOT / "scripts/convco-release.yml"), "--prefix", prefix, "--paths", f"crates/{name}")
+    require(convco(*arguments) == version,
             f"Convco baseline differs from {ref}; review tags/version or choose an explicit bump")
-    level = query(*arguments, "--bump", "--label")
+    level = convco(*arguments, "--bump", "--label")
     require(level in ("major", "minor", "patch", "release"), f"Unexpected Convco bump: {level!r}")
     return "patch" if level == "release" else level
+
+
+def release_changelog(name, version, ref, old, new, text):
+    """Generate only the new section; retain committed history and prepared notes."""
+    require("## Unreleased\n" in text, f"Missing Unreleased section for {name}")
+    if re.search(rf"^## {re.escape(version)} - ", text, re.M):
+        return text
+    prefix = f"{name}/v" if ref and ref.startswith(f"{name}/v") else "v"
+    rendered = convco("changelog", f"{ref}..HEAD" if ref else "HEAD",
+                      "--config", str(ROOT / "scripts/convco-release.yml"),
+                      "--prefix", prefix, "--paths", f"crates/{name}",
+                      "--max-versions", "1", "--unreleased", "Prepared release",
+                      "--include-hidden-sections", "--no-links")
+    # The pinned default template has a document title and one release heading.
+    # A range with no commits can produce only the document title.
+    heading = re.search(r"^## Prepared release(?: \([^\n]*\))?\n?", rendered, re.M)
+    body = rendered[heading.end():].strip() if heading else ""
+    require(heading or rendered.strip() in ("", "# Changelog"), "Unexpected Convco changelog output")
+
+    def requirements(data):
+        return {(d["name"], d["kind"] or "normal", d["target"] or "", d.get("rename") or ""): d["req"]
+                for d in data["dependencies"]}
+
+    previous = requirements(old["package"]) if old else {}
+    current = requirements(new)
+    updates = []
+    for key in sorted(previous.keys() | current.keys()):
+        before, after = previous.get(key), current.get(key)
+        if before != after:
+            label = f"`{key[0]}` ({key[1]}" + (f", {key[2]}" if key[2] else "") + ")"
+            if before is None:
+                updates.append(f"- Add {label} requirement `{after}`.")
+            elif after is None:
+                updates.append(f"- Remove {label} requirement `{before}`.")
+            else:
+                updates.append(f"- Update {label} requirement from `{before}` to `{after}`.")
+    if updates:
+        body += "\n\n### Dependencies\n\n" + "\n".join(updates)
+    if not body.strip():
+        body = "- Initial independent package release." if old is None else "- Update packaged contents and inherited workspace metadata."
+    unreleased = re.search(r"^## Unreleased\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    pending = unreleased[1].strip()
+    if pending:
+        body = pending + "\n\n" + body.strip()
+    section = f"## {version} - {datetime.date.today().isoformat()}\n\n{body.strip()}\n\n"
+    return text[:unreleased.start()] + "## Unreleased\n\n" + section + text[unreleased.end():]
 
 
 def prepare_all(bump="auto", dry_run=False, overrides=()):
@@ -515,8 +579,13 @@ def prepare_all(bump="auto", dry_run=False, overrides=()):
             status = f"{old_version} -> {version}" if old_version != version else f"{version} (already prepared or initial release)"
             print(f"  {name}: {status}; baseline: {reason}; {decisions.get(name, 'retain current version')}")
         print("Publication order: " + " -> ".join(order))
+        for name in order:
+            path = current / "crates" / name / "CHANGELOG.md"
+            path.write_text(release_changelog(name, packages[name]["version"], baselines[name][0],
+                                              baselines[name][1], packages[name], path.read_text()))
         changed = run("git", "diff", "--name-only", start, capture=True, cwd=current).splitlines()
-        allowed = {"Cargo.toml", "Cargo.lock"} | {f"crates/{name}/Cargo.toml" for name in PACKAGES}
+        allowed = {"Cargo.toml", "Cargo.lock"} | {f"crates/{name}/{file}" for name in PACKAGES
+                                                       for file in ("Cargo.toml", "CHANGELOG.md")}
         require(set(changed).issubset(allowed), "cargo-release modified unexpected source files")
         diff = subprocess.check_output(["git", "diff", "--binary", start], cwd=current, text=True)
         if diff:
@@ -528,7 +597,7 @@ def prepare_all(bump="auto", dry_run=False, overrides=()):
                 # Apply the same simulated edits atomically, without intermediate commits.
                 for arguments in (("--check",), ()):
                     subprocess.run(["git", "apply", *arguments, "-"], input=diff, text=True, cwd=ROOT, check=True)
-        print("Review dependency minimums and write dated changelog entries for these packages before committing.")
+        print("Generated package changelogs. Review the diff and dependency minimums, then commit before tagging.")
         return order
 
 

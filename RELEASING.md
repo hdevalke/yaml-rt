@@ -45,32 +45,33 @@ The CLI-only example is:
 
 ```sh
 ./scripts/release prepare yaml-rt-cli patch
-# Edit crates/yaml-rt-cli/CHANGELOG.md; review all changes.
+# Versions and dated changelog entries are generated; review the diff.
 ```
 
-Preparation updates only the selected package version, dependency requirements
-that no longer accept it, and Cargo.lock. It prints the diff, creates no commit
-or tag, and never publishes or pushes. A CLI patch does not bump library versions.
+Preparation updates the selected package version, dependency requirements
+that no longer accept it, Cargo.lock, and its package changelog. It prints the
+diff, creates no commit or tag, and never publishes or pushes. A CLI patch does not bump library versions.
 The version argument also accepts `auto` (the default when omitted), an explicit
 SemVer, or cargo-release's `minor`, `major`, `release`, `alpha`, `beta`, and `rc`
 levels. `prepare yaml-rt-cli auto` uses the same per-package Convco policy as
 batch preparation below. For a new package without release history, use
 `prepare-all` to retain its initial version.
 
-Keep `## Unreleased` in every changelog. Before committing, add a nonempty section
-for the selected version, with the actual release date and reviewed notes:
+Both `prepare` and `prepare-all` generate dated changelog sections automatically
+with pinned Convco, using commits under `crates/<package>` since the package's
+previous tag (or `v0.3.2` during migration). Documentation and other normally
+hidden commit types are included, along with breaking-change footers. The helper
+adds resolved dependency requirement changes, including workspace-inherited
+updates. A changed package without matching conventional commits receives a
+packaged-content/metadata entry. New packages receive an initial-release entry.
+No hand editing is required.
 
-```markdown
-## 0.3.3 - YYYY-MM-DD
-
-- Describe the package's user-visible changes.
-```
-
-Replace `YYYY-MM-DD` with a valid date. Record deliberate dependency minimum
-changes in the affected package's notes. Convco validates commits and can
-recommend a package-specific bump during local preparation. Versions are still
-reviewed and committed in Git; CI never calculates a shared version or commits
-release changes.
+The helper retains `## Unreleased`, moves any existing unreleased notes into the
+new section, and preserves historical sections and archive links. Existing dated
+sections for the prepared version are retained on reruns. The date is the local
+preparation date. Review generated notes with the version and dependency diff
+before committing; optional editorial changes remain possible. CI validates the
+committed notes and never writes release changes.
 
 Commit with a Conventional Commit message, then validate:
 
@@ -159,7 +160,7 @@ uses committed history only, so review the preview again after committing any
 uncommitted features or breaking changes.
 
 Both modes simulate cargo-release edits in disposable local checkouts. The dry
-run prints the selected packages, resulting versions, exact manifest/lockfile
+run prints the selected packages, resulting versions, manifest/lockfile/changelog
 diff, and publication order without modifying your working files, commits, or
 tags. Actual preparation applies that same kind of diff in one operation; no
 intermediate commits are created in your checkout. Existing prepared versions
@@ -178,8 +179,8 @@ minimum dependency versions manually when a consumer needs a newly introduced
 API, as described below. Package selection cannot infer that requirement from
 Rust source.
 
-After preparation, review the diff, write dated changelog entries for every
-selected package, and commit all release changes together. Run
+After preparation, review the generated changelogs and dependency diff, then
+commit all release changes together. Run
 `./scripts/release check`, merge the reviewed PR, and wait for successful main CI.
 Then, from a clean `main` checkout at the merged commit:
 
@@ -217,7 +218,7 @@ For a compatible core patch:
 
 ```sh
 ./scripts/release prepare yaml-rt-core patch
-# Edit crates/yaml-rt-core/CHANGELOG.md, review, and commit.
+# Review the generated changelog and dependency diff, then commit.
 ./scripts/release check yaml-rt-core
 # Merge and wait for main CI; switch to the merged main commit.
 ./scripts/release tag yaml-rt-core
@@ -235,7 +236,7 @@ A core change to 0.4.0 is incompatible with `0.3.x`. Prepare core first:
 ```sh
 ./scripts/release prepare yaml-rt-core minor
 # Inspect updated workspace dependency requirements, fix dependent code,
-# update core notes, and commit before another prepare operation.
+# review the generated core notes, and commit before another prepare operation.
 ./scripts/release prepare yaml-rt-rfc9535 minor
 # Review notes and commit each deliberately selected release.
 ```

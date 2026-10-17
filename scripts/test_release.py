@@ -42,7 +42,7 @@ class Guards(unittest.TestCase):
             version = release.package(name)
             self.assertEqual(release.parse_tag(f"{name}/v{version}"), (name, version))
 
-    def test_changelog_requires_reviewed_version(self):
+    def test_changelog_requires_dated_version(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(release, "ROOT", Path(tmp)):
             directory = Path(tmp) / "crates/yaml-rt-cli"
             directory.mkdir(parents=True)
@@ -52,6 +52,27 @@ class Guards(unittest.TestCase):
                 release.notes("yaml-rt-cli", "0.3.3")
             changelog.write_text("# Changelog\n\n## Unreleased\n\n## 0.3.3 - 2026-10-17\n\n- Fix editing.\n")
             self.assertEqual(release.notes("yaml-rt-cli", "0.3.3"), "- Fix editing.\n")
+
+    def test_generated_changelog_preserves_archive_and_unreleased_notes(self):
+        text = "# Changelog\n\n## Unreleased\n\n- Existing pending notes.\n\n## Historical releases\n\n[root changelog](../../CHANGELOG.md)\n"
+        data = {"dependencies": []}
+        with patch.object(release, "convco", return_value="# Changelog\n\n## Prepared release (2026-10-17)\n\n### Fixes\n\n* Preserve comments (abcdef0)\n"):
+            generated = release.release_changelog("yaml-rt-cli", "0.3.3", "v0.3.2", {"package": data}, data, text)
+        self.assertIn("## Unreleased\n\n## 0.3.3 - ", generated)
+        self.assertIn("Existing pending notes.", generated)
+        self.assertIn("Preserve comments", generated)
+        self.assertTrue(generated.endswith("## Historical releases\n\n[root changelog](../../CHANGELOG.md)\n"))
+        with patch.object(release, "convco", side_effect=AssertionError("prepared section must be preserved")):
+            self.assertEqual(release.release_changelog("yaml-rt-cli", "0.3.3", "v0.3.2", {"package": data}, data, generated), generated)
+
+    def test_generated_changelog_empty_history_fallbacks(self):
+        text = "# Changelog\n\n## Unreleased\n"
+        data = {"dependencies": []}
+        with patch.object(release, "convco", return_value="# Changelog"):
+            initial = release.release_changelog("yaml-rt-cli", "0.3.2", None, None, data, text)
+            metadata = release.release_changelog("yaml-rt-cli", "0.3.3", "v0.3.2", {"package": data}, data, text)
+        self.assertIn("Initial independent package release", initial)
+        self.assertIn("Update packaged contents", metadata)
 
     def test_absent_and_registry_failure(self):
         with patch.object(release, "request", return_value=None):
@@ -338,7 +359,8 @@ class CargoReleaseIntegration(unittest.TestCase):
         for name in names:
             path = self.root / "crates" / name / "CHANGELOG.md"
             version = self.versions()[name]
-            path.write_text(path.read_text().replace("## Unreleased\n", f"## Unreleased\n\n## {version} - 2026-10-17\n\n- Fixture changes.\n"))
+            if f"## {version} - " not in path.read_text():
+                path.write_text(path.read_text().replace("## Unreleased\n", f"## Unreleased\n\n## {version} - 2026-10-17\n\n- Fixture changes.\n"))
         self.commit()
 
     def test_batch_unchanged_and_root_docs_are_skipped(self):
@@ -447,10 +469,12 @@ class CargoReleaseIntegration(unittest.TestCase):
         self.baseline()
         self.change("yaml-rt-core", "yaml-rt-derive")
         self.batch()
-        self.release_notes(("yaml-rt-core",))
+        path = self.root / "crates/yaml-rt-derive/CHANGELOG.md"
+        path.write_text("# Changelog\n\n## Unreleased\n")
+        self.commit()
         with patch.object(release, "ROOT", self.root), patch.object(release, "tag") as tag, \
              contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(RuntimeError, "dated, reviewed changelog"):
+            with self.assertRaisesRegex(RuntimeError, "Missing dated changelog"):
                 release.tag_all(dry_run=True)
             tag.assert_not_called()
 
@@ -599,6 +623,78 @@ class CargoReleaseIntegration(unittest.TestCase):
         versions = self.bump("yaml-rt-cli", "auto")
         self.assertEqual(versions.pop("yaml-rt-cli"), "0.4.0")
         self.assertEqual(set(versions.values()), {"0.3.2"})
+
+    def test_changelog_is_package_scoped_and_retains_historical_archive(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-core", "fix(core): correct anchor resolution")
+        self.conventional_change("yaml-rt-cli", "feat(cli): add command option")
+        self.batch()
+        with patch.object(release, "ROOT", self.root):
+            core = release.notes("yaml-rt-core", "0.3.3")
+            cli = release.notes("yaml-rt-cli", "0.3.3")
+        self.assertIn("correct anchor resolution", core)
+        self.assertNotIn("add command option", core)
+        self.assertIn("add command option", cli)
+        self.assertNotIn("correct anchor resolution", cli)
+        self.assertIn("## 0.3.2 - 2026-10-17", (self.root / "crates/yaml-rt-core/CHANGELOG.md").read_text())
+
+    def test_changelog_uses_own_tag_and_includes_docs_and_breaking_notes(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-cli", "fix(cli): already released fix")
+        self.execute("git", "tag", "-a", "yaml-rt-cli/v0.3.2", "-m", "CLI baseline")
+        self.conventional_change("yaml-rt-cli", "feat(cli)!: replace command\n\nBREAKING CHANGE: remove the old flag.")
+        (self.root / "crates/yaml-rt-cli/README.md").write_text("New flag documentation")
+        self.execute("git", "add", ".")
+        self.execute("git", "commit", "-m", "docs(cli): explain replacement flag")
+        self.batch(bump="auto")
+        with patch.object(release, "ROOT", self.root):
+            notes = release.notes("yaml-rt-cli", "0.4.0")
+        self.assertNotIn("already released fix", notes)
+        self.assertIn("remove the old flag", notes)
+        self.assertIn("explain replacement flag", notes)
+
+    def test_changelog_dependency_only_release_and_no_manual_entries(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-core", "fix(core): replace incompatible behavior")
+        selected = self.batch(overrides=("yaml-rt-core=minor",))
+        with patch.object(release, "ROOT", self.root):
+            for name in selected:
+                self.assertTrue(release.notes(name, self.versions()[name]))
+            dependent = release.notes("yaml-rt-rfc9535", "0.3.3")
+        self.assertIn("`yaml-rt-core`", dependent)
+        self.assertIn("`^0.3.2` to `^0.4.0`", dependent)
+        self.assertNotIn("replace incompatible behavior", dependent)
+
+    def test_changelog_dry_run_prints_notes_without_writing(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-cli", "fix(cli): preserve comments")
+        output = io.StringIO()
+        with patch.object(release, "ROOT", self.root), contextlib.redirect_stdout(output):
+            release.prepare_all(dry_run=True)
+        self.assertIn("## 0.3.3 - ", output.getvalue())
+        self.assertIn("preserve comments", output.getvalue())
+        self.assertNotIn("0.3.3", (self.root / "crates/yaml-rt-cli/CHANGELOG.md").read_text())
+        self.assertFalse(self.execute("git", "status", "--porcelain").strip())
+
+    def test_single_explicit_preparation_generates_notes(self):
+        self.auto_available()
+        self.baseline()
+        self.conventional_change("yaml-rt-cli", "fix(cli): preserve comments")
+        self.bump("yaml-rt-cli", "patch")
+        with patch.object(release, "ROOT", self.root):
+            self.assertIn("preserve comments", release.notes("yaml-rt-cli", "0.3.3"))
+
+    def test_convco_failure_leaves_batch_checkout_unchanged(self):
+        self.baseline()
+        self.change("yaml-rt-cli")
+        with patch.object(release, "convco", side_effect=RuntimeError("Convco failed")):
+            with self.assertRaisesRegex(RuntimeError, "Convco failed"):
+                self.batch()
+        self.assertFalse(self.execute("git", "status", "--porcelain").strip())
 
     def stable_core_baseline(self):
         manifest = self.root / "crates/yaml-rt-core/Cargo.toml"

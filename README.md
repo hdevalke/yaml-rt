@@ -760,7 +760,7 @@ crate. Only `yaml-rt-cli` releases produce standalone binaries. The root changel
 archives earlier synchronized releases. See [`RELEASING.md`](RELEASING.md) for
 preparation, validation, tagging, and recovery commands. Use
 `./scripts/release prepare-all auto --dry-run` to preview a batch of changed
-packages with per-package Convco recommendations, and
+packages with per-package Convco versions and automatically generated changelogs, and
 `./scripts/release tag-all --dry-run` to preview sequential tagging
 after preparing their versions and changelogs.
 

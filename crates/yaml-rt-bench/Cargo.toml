@@ -2,7 +2,7 @@
 name = "yaml-rt-bench"
 description = "Parse benchmarks for yaml-rt and YAML parser baselines"
 edition.workspace = true
-version.workspace = true
+version = "0.3.2"
 license.workspace = true
 authors.workspace = true
 readme = "README.md"
@@ -39,3 +39,6 @@ cc = "1.4.4"
 baselines = ["rapidyaml-baseline", "saphyr-baseline"]
 rapidyaml-baseline = []
 saphyr-baseline = ["dep:saphyr"]
+
+[package.metadata.release]
+release = false

@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+"""Small release guard around Cargo, cargo-release 1.1.5, Git and gh.
+
+No dependency solver: Cargo resolves dependencies and cargo-release edits requirements.
+Preparation edits source; tag commands create/push annotated tags. See RELEASING.md.
+"""
+import argparse
+import copy
+import datetime
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent.parent
+PACKAGES = (
+    "yaml-rt-core", "yaml-rt-rfc9535", "yaml-rt-derive", "yaml-rt-serde",
+    "yaml-rt-schema", "yaml-rt", "yaml-rt-cli",
+)
+TOOL_VERSION = "1.1.5"
+# SemVer 2.0: numeric prerelease identifiers cannot have leading zeros.
+NUM = r"(?:0|[1-9][0-9]*)"
+PRE = rf"(?:{NUM}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER = re.compile(rf"{NUM}\.{NUM}\.{NUM}(?:-{PRE}(?:\.{PRE})*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", re.ASCII)
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def run(*args, capture=False, cwd=None):
+    result = subprocess.run(args, cwd=cwd or ROOT, text=True, stdout=subprocess.PIPE if capture else None,
+                            check=True)
+    return result.stdout.strip() if capture else None
+
+
+def package(name):
+    require(name in PACKAGES, f"Not an allowed release package: {name!r}")
+    manifest = ROOT / "crates" / name / "Cargo.toml"
+    data = tomllib.loads(manifest.read_text())
+    require(data["package"]["name"] == name, "Package name mismatch")
+    require(data["package"].get("publish", True) is not False, "Package is not publishable")
+    require(data["package"].get("publish") in (None, True, ["crates-io"]), "Unexpected registry")
+    version = data["package"]["version"]
+    require(isinstance(version, str) and SEMVER.fullmatch(version), "Invalid explicit package version")
+    return version
+
+
+def parse_tag(tag):
+    name, separator, version = tag.partition("/v")
+    require(separator and name in PACKAGES and SEMVER.fullmatch(version), f"Invalid release tag: {tag!r}")
+    require(package(name) == version, "Tag and package version differ")
+    return name, version
+
+
+def notes(name, version, required=True):
+    text = (ROOT / "crates" / name / "CHANGELOG.md").read_text()
+    require("## Unreleased\n" in text, f"Missing Unreleased section for {name}")
+    pattern = rf"^## {re.escape(version)} - (\d{{4}}-\d{{2}}-\d{{2}})\n(.*?)(?=^## |\Z)"
+    match = re.search(pattern, text, flags=re.M | re.S)
+    if not match:
+        require(not required, f"Add a dated, reviewed changelog section: ## {version} - YYYY-MM-DD in {name}")
+        return ""
+    datetime.date.fromisoformat(match[1])
+    require(match[2].strip() and not re.search(r"\b(TODO|TBD)\b", match[2]), "Release notes are empty or unfinished")
+    require(len(re.findall(rf"^## {re.escape(version)} - ", text, re.M)) == 1, "Duplicate changelog version")
+    return match[2].strip() + "\n"
+
+
+def metadata():
+    # Full Cargo resolution verifies actual SemVer compatibility of path dependencies,
+    # including optional dependencies; no handwritten version-requirement evaluator.
+    return json.loads(run("cargo", "metadata", "--all-features", "--locked", "--format-version", "1", capture=True))
+
+
+def clean():
+    require(not run("git", "status", "--porcelain", capture=True), "A clean working tree, including untracked files, is required")
+
+
+def fetch():
+    run("git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "--tags")
+
+
+def main_commit(sha):
+    run("git", "merge-base", "--is-ancestor", sha, "origin/main")
+
+
+def ci_success(sha):
+    # Only successful main-branch push CI counts, never PR or unrelated check runs.
+    query = run("gh", "api", "--method", "GET", "repos/{owner}/{repo}/actions/workflows/ci.yml/runs",
+                "-f", f"head_sha={sha}", "-f", "branch=main", "-f", "event=push", "--paginate",
+                "--jq", '.workflow_runs[] | select(.conclusion == "success") | .head_sha', capture=True)
+    require(sha in query.splitlines(), f"No successful main push CI run for {sha}; wait for CI before releasing")
+
+
+def request(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "yaml-rt-release (github.com/hdevalke/yaml-rt)"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+
+
+def registry(name, version, sha=None):
+    """404 alone means absent. Every other error fails closed.
+
+    Retry acceptance requires the indexed checksum, unyanked API record, and
+    Cargo's packaged VCS SHA + subdirectory, not just a matching version string.
+    """
+    require(name in PACKAGES and SEMVER.fullmatch(version), "Invalid registry query")
+    data = request(f"https://crates.io/api/v1/crates/{name}/{version}")
+    if data is None:
+        return False
+    record = json.loads(data)["version"]
+    require(record["num"] == version and record["crate"] == name, "Unexpected registry response")
+    require(not record["yanked"], "Published version is yanked; prepare a new version")
+    if sha:
+        archive = request(f"https://static.crates.io/crates/{name}/{name}-{version}.crate")
+        require(archive is not None, "Published archive not available yet; retry later")
+        require(hashlib.sha256(archive).hexdigest() == record["checksum"], "Registry archive checksum mismatch")
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            vcs = json.load(tar.extractfile(f"{name}-{version}/.cargo_vcs_info.json"))
+        require(vcs["git"]["sha1"] == sha and not vcs["git"].get("dirty", False)
+                and vcs["path_in_vcs"] == f"crates/{name}",
+                "Published version does not belong to this clean tagged package; never reuse its version")
+    return True
+
+
+def wait_index(name, version, sha):
+    # Run outside the workspace so cargo info cannot return a local path package.
+    with tempfile.TemporaryDirectory(prefix="yaml-rt-index-") as directory:
+        for attempt in range(30):
+            if registry(name, version, sha):
+                result = subprocess.run(["cargo", "info", f"{name}@{version}", "--registry", "crates-io"],
+                                        cwd=directory, stdout=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    return
+            if attempt < 29:
+                time.sleep(10)
+    raise RuntimeError("Publication not indexed after five minutes; rerun without changing the tag")
+
+
+def check(selected=None, ci=False):
+    data = metadata()
+    members = {p["name"]: p for p in data["packages"] if p["id"] in data["workspace_members"]}
+    require({n for n, p in members.items() if p["publish"] != []} == set(PACKAGES), "Publication allowlist differs from manifests")
+    for name in PACKAGES:
+        version = package(name)
+        for dependency in members[name]["dependencies"]:
+            if dependency.get("path") and dependency["kind"] != "dev":
+                require(dependency["name"] in PACKAGES and dependency["req"] != "*",
+                        f"{name} needs a publishable, versioned internal dependency: {dependency['name']}")
+        notes(name, version, required=(selected == name or version != "0.3.2"))
+        # Inspect what Cargo will actually include, including normalized manifests.
+        files = run("cargo", "package", "--list", "--allow-dirty", "--locked", "-p", name, capture=True).splitlines()
+        require({"Cargo.toml", "Cargo.toml.orig", "README.md", "CHANGELOG.md"}.issubset(files),
+                f"Missing required package contents for {name}")
+        require(not any(f.startswith(("target/", ".github/")) for f in files), f"Unexpected package contents for {name}")
+    for name in ((selected,) if selected else PACKAGES if ci else ()):
+        # Development source can diverge from an already published version. Keep
+        # verifying standalone core/derive archives, and strictly dry-run every
+        # unpublished release candidate. A tag never takes this CI-only path.
+        internal = any(d.get("path") and d["kind"] != "dev" for d in members[name]["dependencies"])
+        if ci and internal and registry(name, package(name)):
+            print(f"{name}: current version is already published; verify development source in workspace CI. "
+                  "A new release version must pass its own registry dry run.")
+            continue
+        command = ["cargo", "publish", "--dry-run", "--locked", "--all-features", "--registry", "crates-io", "-p", name]
+        result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        print(result.stdout)
+        if result.returncode:
+            # Ordinary development can stage multiple dependent releases before any
+            # of them exist in the registry. Tagging/publishing never uses this exception.
+            missing = re.search(r'(?:no matching package named [`\'"]([^`\'" ]+)|failed to select a version for (?:the requirement )?[`\'"]([^`\'" =]+))', result.stdout)
+            if ci and missing and (missing[1] or missing[2]) in PACKAGES:
+                print(f"Pending internal registry dependency: {name}. A release check must pass before tagging.")
+            else:
+                raise RuntimeError(f"Publish dry run failed for {name}")
+
+
+def prepare(name, bump):
+    package(name)
+    require(bump in ("patch", "minor", "major", "release", "alpha", "beta", "rc") or SEMVER.fullmatch(bump), "Invalid version/bump")
+    require(run("cargo", "release", "--version", capture=True) == f"cargo-release {TOOL_VERSION}",
+            f"Install cargo-release {TOOL_VERSION} with --locked")
+    clean()
+    before = {n: package(n) for n in PACKAGES}
+    # The version subcommand has no commit, publish, tag or push steps.
+    run("cargo", "release", "version", bump, "-p", name, "--execute", "--no-confirm")
+    require(all(package(n) == v for n, v in before.items() if n != name), "Unrelated package version changed")
+    run("git", "diff", "--stat")
+    run("git", "diff", "--", "Cargo.toml", "Cargo.lock", "crates")
+    print(f"Review dependency requirement changes; bump affected dependents deliberately.\n"
+          f"Write ## {package(name)} - YYYY-MM-DD in crates/{name}/CHANGELOG.md, then commit and run scripts/release check {name}.")
+
+
+def tag(name):
+    version = package(name)
+    clean()
+    require(run("git", "branch", "--show-current", capture=True) == "main", "Tag from the local main branch after merge")
+    fetch()
+    sha = run("git", "rev-parse", "HEAD", capture=True)
+    main_commit(sha)
+    ci_success(sha)
+    release_tag = f"{name}/v{version}"
+    exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/tags/{release_tag}"], cwd=ROOT).returncode
+    require(exists == 1, "Release tag already exists")
+    require(not run("git", "ls-remote", "--tags", "origin", f"refs/tags/{release_tag}", capture=True), "Remote release tag already exists")
+    require(not registry(name, version), "Version already published; prepare a new version")
+    check(name)
+    clean()
+    run("git", "tag", "-a", release_tag, sha, "-m", f"Release {name} {version}")
+    run("git", "push", "origin", f"refs/tags/{release_tag}:refs/tags/{release_tag}")
+
+
+def validate_tag(release_tag):
+    name, version = parse_tag(release_tag)
+    clean()
+    fetch()
+    ref = f"refs/tags/{release_tag}"
+    require(run("git", "cat-file", "-t", ref, capture=True) == "tag", "Annotated release tag required")
+    sha = run("git", "rev-parse", f"{ref}^{{commit}}", capture=True)
+    require(sha == run("git", "rev-parse", "HEAD", capture=True), "Checkout is not the tagged commit")
+    remote = run("git", "ls-remote", "--tags", "origin", ref, capture=True).split()
+    require(remote and remote[0] == run("git", "rev-parse", ref, capture=True), "Remote tag changed")
+    main_commit(sha)
+    ci_success(sha)
+    notes(name, version)
+    return name, version, sha
+
+
+def publish(release_tag):
+    name, version, sha = validate_tag(release_tag)
+    check(name)
+    if registry(name, version, sha):
+        print("Already published from this tagged source; resuming post-publication checks.")
+    else:
+        run("cargo", "publish", "--locked", "--all-features", "--registry", "crates-io", "-p", name)
+    wait_index(name, version, sha)
+
+
+def assets(release_tag, directory):
+    """Idempotent CLI assets: retain existing files, complete missing checksum pairs."""
+    name, version = parse_tag(release_tag)
+    require(name == "yaml-rt-cli", "Only CLI releases have GitHub assets")
+    # gh api distinguishes an absent release from auth/service failures.
+    repository = run("gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner", capture=True)
+    releases = json.loads(run("gh", "api", f"repos/{repository}/releases", "--paginate", "--slurp", capture=True))
+    existing = next((r for page in releases for r in page if r["tag_name"] == release_tag), None)
+    if existing is None:
+        run("gh", "release", "create", release_tag, "--verify-tag", "--title", f"yaml-rt-cli {version}",
+            "--notes", notes(name, version), "--draft")
+        existing = {"assets": [], "draft": True}
+    filenames = {a["name"] for a in existing["assets"]}
+    directory = Path(directory).resolve()
+    archives = sorted(directory.glob("*.tar.gz"))
+    require(len(archives) == 8, "Expected four versioned CLI archives and four aliases")
+    for archive in archives:
+        checksum = archive.with_name(archive.name + ".sha256")
+        require(checksum.is_file(), f"Missing checksum: {checksum}")
+        # Keep the previously uploaded archive on retry, even if rebuilding is
+        # nondeterministic. Never overwrite a successful asset.
+        if archive.name in filenames:
+            run("gh", "release", "download", release_tag, "--pattern", archive.name, "--dir", str(directory), "--clobber")
+        if checksum.name in filenames:
+            run("gh", "release", "download", release_tag, "--pattern", checksum.name, "--dir", str(directory), "--clobber")
+            expected = checksum.read_text().split()
+            require(len(expected) == 2 and expected[1] == archive.name
+                    and expected[0] == hashlib.sha256(archive.read_bytes()).hexdigest(), "Existing asset checksum mismatch")
+        else:
+            checksum.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n")
+        for asset in (archive, checksum):
+            if asset.name not in filenames:
+                run("gh", "release", "upload", release_tag, str(asset))
+    run("gh", "release", "edit", release_tag, "--draft=false", "--latest" if "-" not in version.split("+", 1)[0] else "--prerelease")
+
+
+def snapshot(destination, ref=None):
+    """Copy Git source into an isolated checkout; never use a real worktree/index."""
+    destination.mkdir()
+    if ref:
+        archive = subprocess.check_output(["git", "archive", ref], cwd=ROOT)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            tar.extractall(destination, filter="data")
+    else:
+        paths = subprocess.check_output(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT)
+        for entry in set(paths.decode().split("\0")):
+            source = ROOT / entry
+            if entry and (source.is_file() or source.is_symlink()):
+                target = destination / entry
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+    run("git", "init", "--quiet", cwd=destination)
+    run("git", "config", "user.name", "Release preview", cwd=destination)
+    run("git", "config", "user.email", "release-preview@example.invalid", cwd=destination)
+    run("git", "config", "commit.gpgSign", "false", cwd=destination)
+    run("git", "config", "core.autocrlf", "false", cwd=destination)
+    hooks = destination / ".git" / "empty-hooks"
+    hooks.mkdir()
+    run("git", "config", "core.hooksPath", str(hooks), cwd=destination)
+    checkpoint(destination, force=True)
+
+
+def checkpoint(directory, force=False):
+    run("git", "add", *(["--force"] if force else []), "--all", cwd=directory)
+    run("git", "commit", "--quiet", "--allow-empty", "-m", "chore: checkpoint release simulation", cwd=directory)
+
+
+def local_ref(ref):
+    result = subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/tags/{ref}"], cwd=ROOT)
+    require(result.returncode in (0, 1), f"Cannot inspect tag {ref}")
+    return result.returncode == 0
+
+
+def prior_release(name):
+    result = subprocess.run(["git", "describe", "--tags", "--abbrev=0", "--match", f"{name}/v*", "HEAD"],
+                            cwd=ROOT, text=True, capture_output=True)
+    if result.returncode == 0:
+        ref = result.stdout.strip()
+        require(SEMVER.fullmatch(ref.removeprefix(f"{name}/v")), f"Malformed package release tag: {ref}")
+        return ref
+    # This fixed historical baseline is only for the independent-release migration.
+    if local_ref("v0.3.2"):
+        run("git", "merge-base", "--is-ancestor", "v0.3.2", "HEAD")
+        return "v0.3.2"
+    return None
+
+
+def workspace_packages(directory):
+    data = json.loads(run("cargo", "metadata", "--no-deps", "--locked", "--format-version", "1",
+                          capture=True, cwd=directory))
+    return {p["name"]: p for p in data["packages"] if p["id"] in data["workspace_members"]}
+
+
+def package_state(directory, name, packages):
+    """Published inputs plus Cargo-resolved inheritance, excluding generated locks/VCS."""
+    require(name in packages, f"Package missing from source: {name}")
+    package_data = copy.deepcopy(packages[name])
+    package_data.pop("id")
+    package_data.pop("manifest_path")
+    for dependency in package_data["dependencies"]:
+        dependency.pop("path", None)  # Cargo removes paths in published manifests.
+    for target in package_data["targets"]:
+        target["src_path"] = str(Path(target["src_path"]).relative_to(directory))
+    files = run("cargo", "package", "--list", "--allow-dirty", "--locked", "-p", name,
+                capture=True, cwd=directory).splitlines()
+    crate = directory / "crates" / name
+    contents = {}
+    for filename in files:
+        if filename in ("Cargo.toml.orig", "Cargo.lock", ".cargo_vcs_info.json"):
+            continue
+        source = crate / filename
+        if not source.is_file():
+            # Cargo copies readmes/license files referenced from outside the crate.
+            alternatives = [crate / package_data[field] for field in ("readme", "license_file")
+                            if package_data.get(field)]
+            source = next((p for p in alternatives if p.name == filename and p.is_file()), source)
+        require(source.is_file(), f"Cannot inspect packaged input {name}/{filename}")
+        contents[filename] = hashlib.sha256(source.read_bytes()).hexdigest()
+    if name == "yaml-rt-cli":
+        for filename in ("LICENSE-MIT", "LICENSE-APACHE"):
+            source = directory / filename
+            if source.is_file():
+                contents[f"@binary-archive/{filename}"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    return {"package": package_data, "files": contents}
+
+
+def release_order(names, packages):
+    """Order Cargo's existing path dependency graph; do not resolve version ranges."""
+    remaining = set(names)
+    ordered = []
+    while remaining:
+        ready = [name for name in PACKAGES if name in remaining and not any(
+            dependency.get("path") and dependency["kind"] != "dev" and dependency["name"] in remaining
+            for dependency in packages[name]["dependencies"])]
+        require(ready, "Internal publication dependency cycle")
+        ordered.extend(ready)
+        remaining.difference_update(ready)
+    return ordered
+
+
+def batch_source(scratch):
+    current = scratch / "current"
+    snapshot(current)
+    packages = workspace_packages(current)
+    states = {name: package_state(current, name, packages) for name in PACKAGES}
+    baselines = {}
+    directories = {}
+    baseline_packages = {}
+    for name in PACKAGES:
+        ref = prior_release(name)
+        if ref is None:
+            baselines[name] = (None, None)
+            continue
+        if ref not in directories:
+            directory = scratch / f"baseline-{len(directories)}"
+            snapshot(directory, ref)
+            directories[ref] = directory
+            baseline_packages[ref] = workspace_packages(directory)
+        old_packages = baseline_packages[ref]
+        old = package_state(directories[ref], name, old_packages) if name in old_packages else None
+        if old and ref.startswith(f"{name}/v"):
+            require(old["package"]["version"] == ref.removeprefix(f"{name}/v"), f"Baseline tag disagrees with manifest: {ref}")
+        baselines[name] = (ref, old)
+    return current, packages, states, baselines
+
+
+def bump_argument(value):
+    require(value in ("patch", "minor", "major", "release", "alpha", "beta", "rc")
+            or SEMVER.fullmatch(value), f"Invalid version/bump: {value}")
+    return value
+
+
+def prepare_all(bump="patch", dry_run=False, overrides=()):
+    for name in PACKAGES:
+        package(name)
+    bump_argument(bump)
+    levels = {}
+    for override in overrides:
+        name, separator, level = override.partition("=")
+        require(separator and name in PACKAGES and name not in levels, "Use unique --bump PACKAGE=LEVEL overrides")
+        levels[name] = bump_argument(level)
+    require(run("cargo", "release", "--version", capture=True) == f"cargo-release {TOOL_VERSION}",
+            f"Install cargo-release {TOOL_VERSION} with --locked")
+    if not dry_run:
+        clean()
+    original_head = run("git", "rev-parse", "HEAD", capture=True)
+    with tempfile.TemporaryDirectory(prefix="yaml-rt-prepare-all-") as temporary:
+        current, packages, initial, baselines = batch_source(Path(temporary))
+        start = run("git", "rev-parse", "HEAD", capture=True, cwd=current)
+        selected = {name for name in PACKAGES if initial[name] != baselines[name][1]}
+        processed = set()
+        while selected - processed:
+            for name in release_order(selected - processed, packages):
+                old = baselines[name][1]
+                # Retain explicitly prepared versions and the initial version of new crates.
+                if old and packages[name]["version"] == old["package"]["version"]:
+                    result = subprocess.run(
+                        ["cargo", "release", "version", levels.get(name, bump), "-p", name, "--execute", "--no-confirm"],
+                        cwd=current, text=True, capture_output=True)
+                    require(result.returncode == 0, f"cargo-release failed preparing {name} in an isolated checkout:\n"
+                            + result.stdout + result.stderr)
+                    checkpoint(current)
+                processed.add(name)
+            packages = workspace_packages(current)
+            for name in set(PACKAGES) - selected:
+                if package_state(current, name, packages) != initial[name]:
+                    selected.add(name)  # cargo-release changed this dependent's published inputs.
+        require(set(levels).issubset(selected), "A --bump override names an unchanged package; use prepare PACKAGE to release it deliberately")
+        order = release_order(selected, packages)
+        if not order:
+            print("No changed packages.")
+            return []
+        print("Dry run: working tree will not change." if dry_run else "Preparing changed packages:")
+        for name in order:
+            old_version = initial[name]["package"]["version"]
+            version = packages[name]["version"]
+            reason = baselines[name][0] or "new package"
+            status = f"{old_version} -> {version}" if old_version != version else f"{version} (already prepared or initial release)"
+            print(f"  {name}: {status}; baseline: {reason}")
+        print("Publication order: " + " -> ".join(order))
+        changed = run("git", "diff", "--name-only", start, capture=True, cwd=current).splitlines()
+        allowed = {"Cargo.toml", "Cargo.lock"} | {f"crates/{name}/Cargo.toml" for name in PACKAGES}
+        require(set(changed).issubset(allowed), "cargo-release modified unexpected source files")
+        diff = subprocess.check_output(["git", "diff", "--binary", start], cwd=current, text=True)
+        if diff:
+            print(diff)
+            if not dry_run:
+                clean()
+                require(run("git", "rev-parse", "HEAD", capture=True) == original_head,
+                        "HEAD changed during preparation; stop and review")
+                # Apply the same simulated edits atomically, without intermediate commits.
+                for arguments in (("--check",), ()):
+                    subprocess.run(["git", "apply", *arguments, "-"], input=diff, text=True, cwd=ROOT, check=True)
+        print("Review dependency minimums and write dated changelog entries for these packages before committing.")
+        return order
+
+
+def batch_candidates(packages, states, baselines):
+    sha = run("git", "rev-parse", "HEAD", capture=True)
+    candidates = set()
+    for name in PACKAGES:
+        version = packages[name]["version"]
+        require(SEMVER.fullmatch(version), f"Invalid package version: {name}")
+        release_tag = f"{name}/v{version}"
+        if local_ref(release_tag) and run("git", "rev-parse", f"refs/tags/{release_tag}^{{commit}}", capture=True) == sha:
+            candidates.add(name)  # Include existing same-commit tags for safe batch resumption.
+        elif states[name] != baselines[name][1]:
+            old = baselines[name][1]
+            require(old is None or old["package"]["version"] != version,
+                    f"{name} changed but its version is unprepared; run prepare-all first")
+            candidates.add(name)
+    for name in candidates:
+        notes(name, packages[name]["version"])
+    return release_order(candidates, packages)
+
+
+def wait_release(release_tag, sha, timeout):
+    deadline = time.monotonic() + timeout
+    print(f"Waiting for release workflow: {release_tag}", flush=True)
+    while time.monotonic() < deadline:
+        pages = json.loads(run("gh", "api", "--method", "GET",
+                               "repos/{owner}/{repo}/actions/workflows/release.yml/runs",
+                               "-f", f"head_sha={sha}", "-f", "event=push", "-f", "per_page=100",
+                               "--paginate", "--slurp", capture=True))
+        matches = [record for page in pages for record in page["workflow_runs"]
+                   if record["head_sha"] == sha and record["event"] == "push"
+                   and record["display_title"] == f"Release {release_tag}"]
+        if matches:
+            record = max(matches, key=lambda entry: entry["id"])
+            try:
+                subprocess.run(["gh", "run", "watch", str(record["id"]), "--exit-status", "--interval", "15"],
+                               cwd=ROOT, check=True, timeout=max(1, deadline - time.monotonic()))
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                raise RuntimeError(f"Release incomplete: {record['html_url']}. Rerun failed jobs, then repeat tag-all "
+                                   "from this commit. No further tags were pushed.") from error
+            return
+        time.sleep(min(10, max(0, deadline - time.monotonic())))
+    raise RuntimeError(f"No workflow appeared for {release_tag}; check Actions, then resume tag-all from this commit")
+
+
+def tag_all(dry_run=False, timeout=7200):
+    for name in PACKAGES:
+        package(name)
+    require(timeout > 0, "Timeout must be positive")
+    if not dry_run:
+        clean()
+        require(run("git", "branch", "--show-current", capture=True) == "main", "Tag from main after merge")
+        fetch()
+    with tempfile.TemporaryDirectory(prefix="yaml-rt-tag-all-") as temporary:
+        current, packages, states, baselines = batch_source(Path(temporary))
+        order = batch_candidates(packages, states, baselines)
+    if not order:
+        print("No prepared package releases.")
+        return
+    sha = run("git", "rev-parse", "HEAD", capture=True)
+    if not dry_run:
+        main_commit(sha)
+        ci_success(sha)
+    print("Publication order: " + " -> ".join(order))
+    for name in order:
+        version = package(name)
+        release_tag = f"{name}/v{version}"
+        if dry_run:
+            action = "resume" if local_ref(release_tag) else "create and push"
+            print(f"Would {action} {release_tag}, wait for its workflow, then verify registry provenance/indexing.")
+            continue
+        require(run("git", "rev-parse", "HEAD", capture=True) == sha, "HEAD changed during the batch; stop and review")
+        if local_ref(release_tag):
+            ref = f"refs/tags/{release_tag}"
+            require(run("git", "cat-file", "-t", ref, capture=True) == "tag", "Annotated release tag required")
+            require(run("git", "rev-parse", f"{ref}^{{commit}}", capture=True) == sha, "Existing tag belongs to another commit")
+            remote = run("git", "ls-remote", "--tags", "origin", ref, capture=True)
+            if not remote:
+                require(not registry(name, version), "Published version has no remote tag; investigate instead of recreating it")
+                check(name)
+                clean()
+                run("git", "push", "origin", f"{ref}:{ref}")
+            validate_tag(release_tag)
+            registry(name, version, sha)  # Reject a conflicting/yanked published version before proceeding.
+        else:
+            tag(name)
+        wait_release(release_tag, sha, timeout)
+        wait_index(name, version, sha)
+        print(f"Completed {release_tag}", flush=True)
+    if dry_run:
+        print("Dry run only: main/CI/registry checks and workflow waits are deferred; no tags created or pushed.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = commands.add_parser("prepare")
+    prepare_parser.add_argument("package", choices=PACKAGES)
+    prepare_parser.add_argument("bump")
+    batch_prepare_parser = commands.add_parser("prepare-all")
+    batch_prepare_parser.add_argument("bump", choices=("patch", "minor", "major"), nargs="?", default="patch")
+    batch_prepare_parser.add_argument("--bump", action="append", default=[], dest="overrides", metavar="PACKAGE=LEVEL")
+    batch_prepare_parser.add_argument("--dry-run", action="store_true")
+    batch_tag_parser = commands.add_parser("tag-all")
+    batch_tag_parser.add_argument("--dry-run", action="store_true")
+    batch_tag_parser.add_argument("--timeout", type=int, default=7200, metavar="SECONDS")
+    check_parser = commands.add_parser("check")
+    check_parser.add_argument("package", choices=PACKAGES, nargs="?")
+    check_parser.add_argument("--ci", action="store_true")
+    tag_parser = commands.add_parser("tag")
+    tag_parser.add_argument("package", choices=PACKAGES)
+    for command in ("validate-tag", "publish"):
+        command_parser = commands.add_parser(command)
+        command_parser.add_argument("tag")
+    assets_parser = commands.add_parser("assets")
+    assets_parser.add_argument("tag")
+    assets_parser.add_argument("directory")
+    args = parser.parse_args()
+    if args.command == "prepare":
+        prepare(args.package, args.bump)
+    elif args.command == "prepare-all":
+        prepare_all(args.bump, args.dry_run, args.overrides)
+    elif args.command == "tag-all":
+        tag_all(args.dry_run, args.timeout)
+    elif args.command == "check":
+        check(args.package, args.ci)
+    elif args.command == "tag":
+        tag(args.package)
+    elif args.command == "validate-tag":
+        name, version, _ = validate_tag(args.tag)
+        output = os.environ.get("GITHUB_OUTPUT")
+        if output:
+            with open(output, "a") as stream:
+                stream.write(f"package={name}\nversion={version}\ntag={args.tag}\n")
+    elif args.command == "publish":
+        publish(args.tag)
+    elif args.command == "assets":
+        assets(args.tag, args.directory)
+
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
+        print(f"Release error: {error}", file=sys.stderr)
+        sys.exit(1)

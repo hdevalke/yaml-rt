@@ -2,7 +2,7 @@
 name = "yaml-rt-cli"
 description = "Presentation-preserving command-line YAML query and editor"
 edition.workspace = true
-version.workspace = true
+version = "0.3.2"
 license.workspace = true
 authors.workspace = true
 readme = "README.md"

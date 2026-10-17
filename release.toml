@@ -1,16 +1,12 @@
-pre-release-hook = [
-  "bash",
-  "-c",
-  "convco changelog -C \"${WORKSPACE_ROOT}\" --no-links --unreleased \"${NEW_VERSION}\" -o \"${WORKSPACE_ROOT}/CHANGELOG.md\"",
-]
-pre-release-commit-message = "chore: release v{{version}}"
-tag-message = "yaml-rt v{{version}}"
-tag-name = "v{{version}}"
-consolidate-commits = true
-shared-version = true
-dependent-version = "upgrade"
-allow-branch = ["main"]
-
-[rate-limit]
-new-packages = 7
-existing-packages = 7
+# Local preparation only. Publication belongs to the protected tag workflow.
+# Tool version: cargo-release 1.1.5.
+shared-version = false
+dependent-version = "fix"
+consolidate-commits = false
+publish = false
+tag = false
+push = false
+allow-branch = ["*"]
+pre-release-commit-message = "chore(release): prepare {{crate_name}} {{version}}"
+tag-name = "{{crate_name}}/v{{version}}"
+tag-message = "Release {{crate_name}} {{version}}"

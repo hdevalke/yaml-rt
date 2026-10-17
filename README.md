@@ -754,7 +754,14 @@ RUSTDOCFLAGS="-D warnings" \
   cargo doc --workspace --all-features --no-deps
 ```
 
-See [`RELEASING.md`](RELEASING.md) for the publication process.
+Published crates are versioned independently. Developers review package versions
+and per-package changelogs in Git; package-specific tags publish only the selected
+crate. Only `yaml-rt-cli` releases produce standalone binaries. The root changelog
+archives earlier synchronized releases. See [`RELEASING.md`](RELEASING.md) for
+preparation, validation, tagging, and recovery commands. Use
+`./scripts/release prepare-all patch --dry-run` to preview a batch of changed
+packages, and `./scripts/release tag-all --dry-run` to preview sequential tagging
+after preparing their versions and changelogs.
 
 ## License
 

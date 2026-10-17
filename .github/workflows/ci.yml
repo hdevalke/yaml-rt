@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: ["**"]
   pull_request:
   schedule:
     - cron: "0 4 * * 1"
@@ -177,69 +178,17 @@ jobs:
           submodules: recursive
       - name: Install stable toolchain
         run: rustup toolchain install --profile minimal stable
-      - name: Inspect publishable archives
-        shell: bash
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Test release guards and cargo-release dependency handling
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          set -euo pipefail
-          packages=(
-            yaml-rt-core
-            yaml-rt-rfc9535
-            yaml-rt-derive
-            yaml-rt-serde
-            yaml-rt-schema
-            yaml-rt
-            yaml-rt-cli
-          )
-          for package in "${packages[@]}"; do
-            cargo package --list --locked -p "${package}"
-          done
-      - name: Build independently packageable crates
-        run: |
-          cargo package --locked -p yaml-rt-core
-          cargo package --locked -p yaml-rt-derive
-      - name: Verify normalized dependency versions
-        shell: bash
-        run: |
-          set -euo pipefail
-          metadata="${RUNNER_TEMP}/yaml-rt-metadata.json"
-          cargo metadata --no-deps --locked --format-version 1 > "${metadata}"
-          workspace_version="$(
-            jq -r '.packages[] | select(.name == "yaml-rt-core") | .version' "${metadata}"
-          )"
-          jq -e --arg version "${workspace_version}" --arg requirement "^${workspace_version}" '
-            [
-              .packages[]
-              | select(
-                  .name == "yaml-rt-core"
-                  or .name == "yaml-rt-rfc9535"
-                  or .name == "yaml-rt-derive"
-                  or .name == "yaml-rt-serde"
-                  or .name == "yaml-rt-schema"
-                  or .name == "yaml-rt-cli"
-                  or .name == "yaml-rt"
-                )
-              | .version
-            ] as $versions
-            | [
-                .packages[]
-                | select(
-                    .name == "yaml-rt-rfc9535"
-                    or .name == "yaml-rt-serde"
-                    or .name == "yaml-rt-schema"
-                    or .name == "yaml-rt-cli"
-                    or .name == "yaml-rt"
-                  )
-                | .dependencies[]
-                | select(
-                    .path != null
-                    and (.name | startswith("yaml-rt"))
-                  )
-              ] as $dependencies
-            | ($versions | length == 7)
-              and all($versions[]; . == $version)
-              and ($dependencies | length == 9)
-              and all($dependencies[]; .req == $requirement)
-          ' "${metadata}"
+          cargo install cargo-release --version 1.1.5 --locked
+          python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Verify independent manifests, changelogs and publish dry runs
+        run: python3 -B scripts/release check --ci
 
   security-and-benchmarks:
     name: Security and benchmarks

@@ -469,3 +469,14 @@ forced transition inlining were measured and rejected as neutral-to-slower.
 The global structural tape remains rejected and was not retried. The retained
 implementation uses per-line stack data, preserves the 32-byte node layout,
 adds no dependency, and keeps the expected-failure list empty.
+
+## Package and license
+
+This local benchmark crate is unpublished (`publish = false`). Build and run it
+from this repository with Rust 1.96 or newer using the commands above.
+
+[Source documentation](https://github.com/hdevalke/yaml-rt/tree/main/crates/yaml-rt-bench/src) ·
+[Repository](https://github.com/hdevalke/yaml-rt)
+
+Licensed under either [Apache-2.0](https://github.com/hdevalke/yaml-rt/blob/main/LICENSE-APACHE)
+or [MIT](https://github.com/hdevalke/yaml-rt/blob/main/LICENSE-MIT), at your option.

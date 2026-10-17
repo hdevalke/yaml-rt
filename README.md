@@ -15,7 +15,7 @@ Untouched documents are emitted byte-for-byte. Edits are applied as localized
 source patches, so a changed value normally produces only the diff you asked
 for.
 
-Version 0.1 is suitable for production use within the guarantees and
+Version 0.3 is suitable for production use within the guarantees and
 limitations documented below. Public APIs may still evolve between 0.x
 releases.
 
@@ -77,16 +77,16 @@ The facade crate enables typed-overlay derives by default:
 
 ```toml
 [dependencies]
-yaml-rt = "0.1.0"
+yaml-rt = "0.3.2"
 ```
 
 Choose features explicitly when needed:
 
 ```toml
 [dependencies]
-yaml-rt = { version = "0.1.0", default-features = false }
+yaml-rt = { version = "0.3.2", default-features = false }
 # or
-yaml-rt = { version = "0.1.0", features = ["serde"] }
+yaml-rt = { version = "0.3.2", features = ["serde"] }
 ```
 
 Install the command-line editor with:
@@ -487,9 +487,11 @@ yaml-rt replace /server/port --value 9090 --in-place configs/
 Available operations are `validate`, `schema`, `query`, `get`, `add`, `remove`, `replace`,
 `rename-key`, `move`, `copy`, `test`, and `patch`. Query results are emitted in
 nodelist order as one compact JSON Pointer/value pair per line. JSONPath
-evaluation uses the YAML 1.2 core schema and rejects YAML values that are not
-JSON-compatible, including non-string or duplicate mapping keys and non-finite
-numbers.
+evaluation uses the YAML 1.2 core schema and validates the entire selected
+document for JSON compatibility before selecting nodes. Non-string or duplicate
+mapping keys and non-finite numbers anywhere in that document cause an error,
+even outside the query target. Use an exact JSON Pointer to access a known path
+in YAML that contains such values.
 
 Each operation has a short alias: `v` for `validate`, `q` for `query`, `g` for
 `get`, `a` for `add`, `d` for `remove`, `r` for `replace`, `k` for
@@ -559,15 +561,15 @@ Run `yaml-rt help <operation>` for operation-specific arguments.
 
 | Package | Purpose | Published |
 | --- | --- | --- |
-| `yaml-rt-core` | Dependency-free source model, parser, CST, semantic graph, diagnostics, editor, and emitter | Yes |
-| `yaml-rt-rfc9535` | Native RFC 9535 JSONPath parsing and evaluation over `YamlDoc` | Yes |
-| `yaml-rt-schema` | JSON Schema validation and permissive inference over `YamlDoc` | No |
-| `yaml-rt-derive` | `YamlRt` procedural derive | Yes |
-| `yaml-rt-serde` | Serde serializer and deserializer | Yes |
-| `yaml-rt` | Facade re-exporting the public APIs | Yes |
-| `yaml-rt-cli` | `yaml-rt` command-line editor | Yes |
-| `yaml-rt-wasm` | Filesystem-free command engine and browser bindings for the GitHub Pages playground | No |
-| `yaml-rt-bench` | Local comparison benchmarks | No |
+| [`yaml-rt-core`](crates/yaml-rt-core/README.md) | Dependency-free source model, parser, CST, semantic graph, diagnostics, editor, and emitter | Yes |
+| [`yaml-rt-rfc9535`](crates/yaml-rt-rfc9535/README.md) | Native RFC 9535 JSONPath parsing and evaluation over `YamlDoc` | Yes |
+| [`yaml-rt-schema`](crates/yaml-rt-schema/README.md) | JSON Schema validation and permissive inference over `YamlDoc` | Yes |
+| [`yaml-rt-derive`](crates/yaml-rt-derive/README.md) | `YamlRt` procedural derive | Yes |
+| [`yaml-rt-serde`](crates/yaml-rt-serde/README.md) | Serde serializer and deserializer | Yes |
+| [`yaml-rt`](crates/yaml-rt/README.md) | Facade re-exporting the public APIs | Yes |
+| [`yaml-rt-cli`](crates/yaml-rt-cli/README.md) | `yaml-rt` command-line editor | Yes |
+| [`yaml-rt-wasm`](crates/yaml-rt-wasm/README.md) | Filesystem-free command engine and browser bindings for the GitHub Pages playground | No |
+| [`yaml-rt-bench`](crates/yaml-rt-bench/README.md) | Local comparison benchmarks | No |
 | `fuzz` | Separate cargo-fuzz workspace | No |
 
 ## Parser fuzzing
@@ -711,7 +713,7 @@ surprising output.
 
 ## Stability
 
-The 0.1 line is production-usable for the documented behavior. Patch releases
+The 0.3 line is production-usable for the documented behavior. Patch releases
 will preserve source and semantic behavior unless fixing a correctness or
 safety issue. Because the project is pre-1.0, public Rust APIs and CLI details
 may change in minor releases; such changes are documented in the changelog and

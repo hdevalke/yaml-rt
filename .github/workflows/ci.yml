@@ -229,7 +229,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   fuzz:
-    name: Parser fuzz regressions
+    name: Fuzz regressions
     runs-on: ubuntu-latest
     env:
       CARGO_FUZZ_VERSION: 0.13.2
@@ -251,43 +251,57 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for artifact in regressions/parse_yaml/*; do
-            cargo +nightly fuzz run parse_yaml "${artifact}"
+          for target in parse_yaml edit_yaml apply_patch; do
+            for artifact in "regressions/${target}"/*; do
+              [ -f "${artifact}" ] || continue
+              cargo +nightly fuzz run "${target}" "${artifact}"
+            done
           done
-      - name: Seed parser corpus
-        run: fuzz/scripts/seed_parse_yaml_corpus.sh
-      - name: Create learned parser corpus
-        run: mkdir -p fuzz/corpus/parse_yaml
-      - name: Run parser fuzz smoke test
+      - name: Seed fuzz corpora
+        run: |
+          fuzz/scripts/seed_parse_yaml_corpus.sh
+          fuzz/scripts/seed_edit_yaml_corpus.sh
+          fuzz/scripts/seed_apply_patch_corpus.sh
+      - name: Create learned fuzz corpora
+        run: mkdir -p fuzz/corpus/parse_yaml fuzz/corpus/edit_yaml fuzz/corpus/apply_patch
+      - name: Run fuzz smoke tests
         if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
         working-directory: fuzz
         env:
           LSAN_OPTIONS: detect_leaks=0
-        run: >-
-          cargo +nightly fuzz run parse_yaml corpus/parse_yaml corpus/seeds/parse_yaml --
-          -dict=parse_yaml.dict
-          -max_len=8192
-          -timeout=10
-          -rss_limit_mb=1024
-          -max_total_time=30
-      - name: Run sustained parser fuzzing
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in parse_yaml edit_yaml apply_patch; do
+            cargo +nightly fuzz run "${target}" "corpus/${target}" "corpus/seeds/${target}" -- \
+              -dict="${target}.dict" \
+              -max_len=8192 \
+              -timeout=10 \
+              -rss_limit_mb=1024 \
+              -max_total_time=30
+          done
+      - name: Run sustained fuzzing
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         working-directory: fuzz
         env:
           LSAN_OPTIONS: detect_leaks=0
-        run: >-
-          cargo +nightly fuzz run parse_yaml corpus/parse_yaml corpus/seeds/parse_yaml --
-          -dict=parse_yaml.dict
-          -max_len=8192
-          -timeout=10
-          -rss_limit_mb=1024
-          -max_total_time=300
-      - name: Upload parser fuzz artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in parse_yaml edit_yaml apply_patch; do
+            cargo +nightly fuzz run "${target}" "corpus/${target}" "corpus/seeds/${target}" -- \
+              -dict="${target}.dict" \
+              -max_len=8192 \
+              -timeout=10 \
+              -rss_limit_mb=1024 \
+              -max_total_time=300
+          done
+      - name: Upload fuzz artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: parser-fuzz-artifacts-${{ github.sha }}
-          path: fuzz/artifacts/parse_yaml
+          name: fuzz-artifacts-${{ github.sha }}
+          path: fuzz/artifacts
           if-no-files-found: ignore
 
   workflows:

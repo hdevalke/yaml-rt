@@ -29,3 +29,17 @@ path = "fuzz_targets/deserialize_yaml.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "edit_yaml"
+path = "fuzz_targets/edit_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apply_patch"
+path = "fuzz_targets/apply_patch.rs"
+test = false
+doc = false
+bench = false

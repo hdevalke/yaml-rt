@@ -7,7 +7,7 @@ use yaml_rt_core::YamlDoc;
 
 use crate::{Error, model};
 
-pub type Map = BTreeMap<String, Value>;
+pub(crate) type Map = BTreeMap<String, Value>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Number(String);

@@ -51,24 +51,23 @@ impl Decimal {
     }
 
     fn compare(&self, other: &Self) -> Ordering {
-        if self.is_zero() || other.is_zero() {
-            return match (self.is_zero(), other.is_zero()) {
-                (true, true) => Ordering::Equal,
-                (true, false) => {
-                    if other.negative {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (false, true) => {
-                    if self.negative {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                _ => unreachable!(),
+        let self_is_zero = self.is_zero();
+        let other_is_zero = other.is_zero();
+        if self_is_zero && other_is_zero {
+            return Ordering::Equal;
+        }
+        if self_is_zero {
+            return if other.negative {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        if other_is_zero {
+            return if self.negative {
+                Ordering::Less
+            } else {
+                Ordering::Greater
             };
         }
         if self.negative != other.negative {

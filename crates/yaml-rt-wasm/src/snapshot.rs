@@ -7,7 +7,7 @@ const VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Snapshot {
+struct Snapshot {
     version: u32,
     source: String,
     input_schema: String,
@@ -59,12 +59,12 @@ impl Snapshot {
     }
 }
 
-pub fn encode(snapshot: &Snapshot) -> Result<String, String> {
+fn encode(snapshot: &Snapshot) -> Result<String, String> {
     snapshot.validate()?;
     yaml_rt_serde::to_string(snapshot).map_err(|error| error.to_string())
 }
 
-pub fn decode(source: &str) -> Result<Snapshot, String> {
+fn decode(source: &str) -> Result<Snapshot, String> {
     let snapshot: Snapshot = yaml_rt_serde::from_str(source).map_err(|error| error.to_string())?;
     snapshot.validate()?;
     Ok(snapshot)

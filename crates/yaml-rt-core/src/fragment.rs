@@ -175,12 +175,12 @@ impl YamlFragment {
         let mut output = String::new();
         let mut pending = vec![RenderAction::Node(node, depth)];
         while let Some(action) = pending.pop() {
-            let RenderAction::Node(node, depth) = action else {
-                let RenderAction::Text(text) = action else {
-                    unreachable!();
-                };
-                output.push_str(text);
-                continue;
+            let (node, depth) = match action {
+                RenderAction::Node(node, depth) => (node, depth),
+                RenderAction::Text(text) => {
+                    output.push_str(text);
+                    continue;
+                }
             };
             if depth > 1024 {
                 return Err(FragmentError::new(

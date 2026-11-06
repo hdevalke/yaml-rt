@@ -5221,6 +5221,27 @@ fn diagnostics_render_source_excerpts_and_color() {
 }
 
 #[test]
+fn diagnostics_truncate_long_source_lines_around_the_error() {
+    let source = format!("start{}éerror{}end", "a".repeat(400), "b".repeat(400));
+    let start = source.find("éerror").unwrap();
+    let end = start + "éerror".len();
+    let rendered = Diagnostic::new(
+        DiagnosticKind::Parser,
+        "long line",
+        Span::from_usize(start, end),
+    )
+    .render(&source)
+    .to_string();
+
+    assert!(rendered.len() < 500, "diagnostic was not bounded");
+    assert!(rendered.contains("…"), "{rendered}");
+    assert!(rendered.contains("éerror"), "{rendered}");
+    assert!(rendered.contains("^^^^^^"), "{rendered}");
+    assert!(!rendered.contains(&"a".repeat(200)), "{rendered}");
+    assert!(!rendered.contains(&"b".repeat(200)), "{rendered}");
+}
+
+#[test]
 fn diagnostics_render_empty_multiline_and_untrusted_spans() {
     let source = "first\r\n\tsecond\nthird\n";
     let start = source.find("second").unwrap();

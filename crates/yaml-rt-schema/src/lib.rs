@@ -7,11 +7,12 @@ mod validate;
 mod value;
 
 use std::fmt;
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub use value::Value;
-use yaml_rt_core::{JsonPointer, Span, YamlDoc};
+use yaml_rt_core::{JsonPointer, ResourceLimits, Span, YamlDoc};
 
 pub use generate::generate_schema;
 
@@ -128,7 +129,7 @@ impl Schema {
 
     /// Reads and compiles a JSON or YAML schema file.
     pub fn from_path(path: &Path) -> Result<Self, Error> {
-        let source = fs::read_to_string(path).map_err(Error::source)?;
+        let source = read_source_file(path)?;
         Self::parse(&source, Some(path))
     }
 
@@ -179,6 +180,23 @@ impl Schema {
         self.resources.insert(url.to_string(), value);
         Ok(())
     }
+}
+
+fn read_source_file(path: &Path) -> Result<String, Error> {
+    let byte_limit = ResourceLimits::default().max_source_bytes;
+    let read_limit = byte_limit.saturating_add(1).min(u32::MAX as usize);
+    let mut source = Vec::new();
+    File::open(path)
+        .map_err(Error::source)?
+        .take(read_limit as u64)
+        .read_to_end(&mut source)
+        .map_err(Error::source)?;
+    if source.len() > byte_limit {
+        return Err(Error::new(format!(
+            "schema source exceeds byte limit of {byte_limit}"
+        )));
+    }
+    String::from_utf8(source).map_err(Error::source)
 }
 
 fn parse_schema(source: &str, path: Option<&Path>) -> Result<Value, Error> {

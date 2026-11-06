@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use yaml_rt_core::{
-    Diagnostic, DiagnosticColor, DiagnosticKind, JsonPointer, Span, YamlDoc, YamlError,
-    YamlFragment, YamlPatch,
+    Diagnostic, DiagnosticColor, DiagnosticKind, JsonPointer, ResourceLimits, Span, YamlDoc,
+    YamlError, YamlFragment, YamlPatch,
 };
 use yaml_rt_rfc9535::{JsonPath, QueryMatches};
 use yaml_rt_schema::{Error as SchemaError, Schema, generate_schema};
@@ -627,27 +627,21 @@ fn prepare_operation(
         _ => None,
     };
     let schema = match operation {
-        Operation::Validate(args) => args
-            .schema
-            .as_deref()
-            .map(Schema::from_path)
-            .transpose()
-            .map_err(|error| {
-                let source = args
-                    .schema
-                    .as_deref()
-                    .and_then(|path| fs::read_to_string(path).ok());
-                if let (Some(source), Some(path)) = (source, args.schema.as_deref()) {
+        Operation::Validate(args) => {
+            if let Some(path) = args.schema.as_deref() {
+                let source = read_path(path, "schema file")?;
+                Some(Schema::parse(&source, Some(path)).map_err(|error| {
                     RunError::schema_diagnostic(
                         error,
                         &source,
                         &path.display().to_string(),
                         options.color,
                     )
-                } else {
-                    RunError::display(error)
-                }
-            })?,
+                })?)
+            } else {
+                None
+            }
+        }
         _ => None,
     };
     Ok(PreparedOperation {
@@ -1231,12 +1225,7 @@ fn read_patch(arguments: &PatchSourceArgs, stdin: &mut dyn Read) -> Result<YamlP
         if path == Path::new("-") {
             read_stream(stdin, "patch stdin")?
         } else {
-            fs::read_to_string(path).map_err(|error| {
-                RunError::message(format!(
-                    "cannot read patch file {}: {error}",
-                    path.display()
-                ))
-            })?
+            read_path(path, "patch file")?
         }
     } else {
         unreachable!("Clap requires a patch source")
@@ -1245,8 +1234,7 @@ fn read_patch(arguments: &PatchSourceArgs, stdin: &mut dyn Read) -> Result<YamlP
 }
 
 fn read_target(path: &Path) -> Result<String, RunError> {
-    fs::read_to_string(path)
-        .map_err(|error| RunError::message(format!("cannot read {}: {error}", path.display())))
+    read_path(path, "")
 }
 
 fn read_value(
@@ -1265,12 +1253,7 @@ fn read_value(
             }
             Some(read_stream(stdin, "value stdin")?)
         } else {
-            Some(fs::read_to_string(path).map_err(|error| {
-                RunError::message(format!(
-                    "cannot read value file {}: {error}",
-                    path.display()
-                ))
-            })?)
+            Some(read_path(path, "value file")?)
         }
     } else {
         None
@@ -1282,11 +1265,38 @@ fn read_value(
 }
 
 fn read_stream(stream: &mut dyn Read, name: &str) -> Result<String, RunError> {
-    let mut input = String::new();
-    stream
-        .read_to_string(&mut input)
+    read_with_limit(stream, name, ResourceLimits::default().max_source_bytes)
+}
+
+fn read_path(path: &Path, kind: &str) -> Result<String, RunError> {
+    let name = if kind.is_empty() {
+        path.display().to_string()
+    } else {
+        format!("{kind} {}", path.display())
+    };
+    let mut file = File::open(path)
         .map_err(|error| RunError::message(format!("cannot read {name}: {error}")))?;
-    Ok(input)
+    read_with_limit(&mut file, &name, ResourceLimits::default().max_source_bytes)
+}
+
+fn read_with_limit(
+    stream: &mut dyn Read,
+    name: &str,
+    byte_limit: usize,
+) -> Result<String, RunError> {
+    let read_limit = byte_limit.saturating_add(1).min(u32::MAX as usize);
+    let mut input = Vec::new();
+    stream
+        .take(read_limit as u64)
+        .read_to_end(&mut input)
+        .map_err(|error| RunError::message(format!("cannot read {name}: {error}")))?;
+    if input.len() > byte_limit {
+        return Err(RunError::message(format!(
+            "{name} exceeds byte limit of {byte_limit}"
+        )));
+    }
+    String::from_utf8(input)
+        .map_err(|error| RunError::message(format!("cannot read {name}: {error}")))
 }
 
 fn select_document(doc: &YamlDoc, selected: Option<usize>) -> Result<usize, RunError> {
@@ -1552,6 +1562,22 @@ mod tests {
         assert!(stderr.contains("2 | items: [a, , b]"), "{stderr}");
         assert!(stderr.contains('^'), "{stderr}");
         assert!(!stderr.contains("\x1b["), "{stderr:?}");
+    }
+
+    #[test]
+    fn input_reading_stops_at_the_configured_byte_limit() {
+        let mut oversized = std::io::Cursor::new(b"abcdef".to_vec());
+        let Err(RunError::Message(message)) = read_with_limit(&mut oversized, "stdin", 4) else {
+            panic!("oversized input should be rejected");
+        };
+        assert_eq!(message, "stdin exceeds byte limit of 4");
+        assert_eq!(oversized.position(), 5);
+
+        let mut exact = std::io::Cursor::new(b"abcd".to_vec());
+        let Ok(exact) = read_with_limit(&mut exact, "stdin", 4) else {
+            panic!("input at the limit should be accepted");
+        };
+        assert_eq!(exact, "abcd");
     }
 
     #[test]

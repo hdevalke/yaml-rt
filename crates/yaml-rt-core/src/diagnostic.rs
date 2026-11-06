@@ -2,6 +2,9 @@ use std::fmt;
 
 use crate::{LineCol, Source, Span};
 
+const MAX_DIAGNOSTIC_LINE_CHARS: usize = 160;
+const DIAGNOSTIC_CONTEXT_CHARS: usize = 40;
+
 /// Error type for YAML parsing, semantic lookup, typed overlays, and emission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YamlError {
@@ -235,6 +238,12 @@ impl fmt::Display for DiagnosticRenderer<'_> {
             .saturating_sub(1);
         let line_start = starts[line_index];
         let line_end = source_line_end(self.source, &starts, line_index);
+        let relative_start = start.saturating_sub(line_start);
+        let relative_end = end.min(line_end).saturating_sub(line_start);
+        let current_excerpt = source_excerpt(
+            &self.source[line_start..line_end],
+            Some((relative_start, relative_end)),
+        );
         let position = LineCol {
             line: line_index + 1,
             column: display_width(&self.source[line_start..start]) + 1,
@@ -257,23 +266,27 @@ impl fmt::Display for DiagnosticRenderer<'_> {
         for shown in first_shown..=line_index {
             let shown_start = starts[shown];
             let shown_end = source_line_end(self.source, &starts, shown);
-            let text = expand_tabs(&self.source[shown_start..shown_end]);
+            let excerpt;
+            let text = if shown == line_index {
+                &current_excerpt.text
+            } else {
+                excerpt = source_excerpt(&self.source[shown_start..shown_end], None);
+                &excerpt.text
+            };
+            let text = expand_tabs(text);
             write!(formatter, "\n{:>width$} ", shown + 1, width = width)?;
             self.styled(formatter, "1;34", "|")?;
             write!(formatter, " {text}")?;
         }
 
-        let prefix_width = display_width(&self.source[line_start..start]);
-        let underline_end = end.min(line_end);
-        let underline_width = if underline_end > start {
-            display_width(&self.source[start..underline_end]).max(1)
-        } else {
-            1
-        };
         write!(formatter, "\n{:width$} ", "", width = width)?;
         self.styled(formatter, "1;34", "|")?;
-        write!(formatter, " {}", " ".repeat(prefix_width))?;
-        self.styled(formatter, "1;31", "^".repeat(underline_width))?;
+        write!(formatter, " {}", " ".repeat(current_excerpt.prefix_width))?;
+        self.styled(
+            formatter,
+            "1;31",
+            "^".repeat(current_excerpt.underline_width),
+        )?;
         if !self.diagnostic.expected.is_empty() {
             write!(
                 formatter,
@@ -300,6 +313,69 @@ impl fmt::Display for DiagnosticRenderer<'_> {
         }
         Ok(())
     }
+}
+
+struct SourceExcerpt {
+    text: String,
+    prefix_width: usize,
+    underline_width: usize,
+}
+
+fn source_excerpt(text: &str, focus: Option<(usize, usize)>) -> SourceExcerpt {
+    let focus_start = focus.map_or(0, |(start, _)| start.min(text.len()));
+    let focus_end = focus.map_or(focus_start, |(_, end)| end.max(focus_start).min(text.len()));
+    let focus_start_char = text[..focus_start].chars().count();
+    let focus_end_char = text[..focus_end].chars().count();
+    let start_char = if focus.is_some() {
+        focus_start_char.saturating_sub(DIAGNOSTIC_CONTEXT_CHARS)
+    } else {
+        0
+    };
+    let visible = text
+        .chars()
+        .skip(start_char)
+        .take(MAX_DIAGNOSTIC_LINE_CHARS)
+        .collect::<String>();
+    let visible_chars = visible.chars().count();
+    let omitted_before = start_char > 0;
+    let omitted_after = text
+        .chars()
+        .nth(start_char.saturating_add(visible_chars))
+        .is_some();
+    let prefix = if omitted_before { "…" } else { "" };
+    let suffix = if omitted_after { "…" } else { "" };
+    let mut rendered = String::with_capacity(prefix.len() + visible.len() + suffix.len());
+    rendered.push_str(prefix);
+    rendered.push_str(&visible);
+    rendered.push_str(suffix);
+
+    let relative_start = focus_start_char
+        .saturating_sub(start_char)
+        .min(visible_chars);
+    let relative_end = focus_end_char
+        .saturating_sub(start_char)
+        .min(visible_chars)
+        .max(relative_start);
+    let visible_start = byte_index_at_char(&visible, relative_start);
+    let visible_end = byte_index_at_char(&visible, relative_end);
+    let rendered_start = prefix.len() + visible_start;
+    let rendered_end = prefix.len() + visible_end;
+    let prefix_width = display_width(&rendered[..rendered_start]);
+    let underline_width = display_width(&rendered[..rendered_end])
+        .saturating_sub(prefix_width)
+        .max(1);
+
+    SourceExcerpt {
+        text: rendered,
+        prefix_width,
+        underline_width,
+    }
+}
+
+fn byte_index_at_char(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
 fn line_starts(source: &str) -> Vec<usize> {

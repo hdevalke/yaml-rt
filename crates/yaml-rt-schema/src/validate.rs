@@ -1,7 +1,5 @@
 #![allow(clippy::collapsible_if, clippy::too_many_arguments)]
 use std::collections::{HashMap, HashSet};
-#[cfg(not(target_arch = "wasm32"))]
-use std::fs;
 use std::sync::OnceLock;
 
 use crate::value::{Map, Value};
@@ -9,12 +7,12 @@ use iri_string::types::{IriReferenceStr, IriStr, UriReferenceStr, UriStr};
 use regex::Regex;
 use url::Url;
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::parse_schema;
 use crate::{
     DIALECT, Error, Schema,
     model::{Instance, escape},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{parse_schema, read_source_file};
 
 pub(crate) fn check_schema(schema: &Value, path: &str) -> Result<(), Error> {
     check_schema_inner(schema, path).map_err(|mut error| {
@@ -680,7 +678,7 @@ impl Validator<'_> {
                 let path = target_base
                     .to_file_path()
                     .map_err(|_| Error::new("invalid file schema reference"))?;
-                let source = fs::read_to_string(&path).map_err(Error::source)?;
+                let source = read_source_file(&path)?;
                 let document = parse_schema(&source, Some(&path))?;
                 check_schema(&document, "")?;
                 check_meta_schema(&document)?;

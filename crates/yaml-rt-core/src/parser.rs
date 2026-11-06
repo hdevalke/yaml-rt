@@ -1430,15 +1430,6 @@ impl<'source> Parser<'source> {
                     value_start,
                 )?;
                 return self.parse_explicit_mapping_entry(entry, lines, index, prepared);
-            } else if is_compact_explicit_empty_key_mapping(value) {
-                self.parse_compact_explicit_empty_key_mapping(
-                    entry,
-                    line,
-                    value_start - line.content_start,
-                    value,
-                    value_start,
-                )?;
-                return Ok(1);
             } else if let Some(colon_byte) = find_mapping_colon(value) {
                 return self.parse_mapping_entry(
                     entry,
@@ -1459,81 +1450,6 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(value_node)?;
             Ok(consumed)
         }
-    }
-
-    fn parse_compact_explicit_empty_key_mapping(
-        &mut self,
-        parent: NodeId,
-        line: SourceLine<'_>,
-        indent: usize,
-        body: &str,
-        absolute_start: usize,
-    ) -> Result<(), YamlError> {
-        let mapping = self.mapping_for_line(
-            parent,
-            indent,
-            Span::from_usize(line.content_start + indent, line.content_end),
-        );
-        let outer_entry = self.push_node(
-            NodeKind::MappingEntry,
-            Span::from_usize(absolute_start, line.content_end),
-        );
-        self.attach_child_at(mapping.0 as usize, outer_entry);
-
-        let inner_mapping = self.push_node(
-            NodeKind::BlockMapping,
-            Span::from_usize(absolute_start, line.content_end),
-        );
-        self.attach_child_at(outer_entry.0 as usize, inner_mapping);
-        self.push_node_event(
-            YamlEventKind::MappingStart {
-                style: CollectionStyle::Block,
-                tag: None,
-                anchor: None,
-            },
-            Span::from_usize(absolute_start, line.content_end),
-            inner_mapping,
-        );
-
-        let inner_entry = self.push_node(
-            NodeKind::MappingEntry,
-            Span::from_usize(absolute_start, line.content_end),
-        );
-        self.attach_child_at(inner_mapping.0 as usize, inner_entry);
-
-        let colon_offset = body
-            .find(':')
-            .expect("compact explicit empty key mapping contains colon");
-        let colon_start = absolute_start + colon_offset;
-        let key = self.push_empty_scalar(colon_start);
-        self.attach_child_at(inner_entry.0 as usize, key);
-        self.emit_scalar_event(key)?;
-
-        let raw_value = &body[colon_offset + 1..];
-        let value_trimmed = raw_value.trim_start();
-        let value = if value_trimmed.is_empty() {
-            self.push_empty_scalar(line.content_end)
-        } else {
-            let leading = raw_value.len() - value_trimmed.len();
-            self.push_node(
-                NodeKind::Scalar,
-                Span::from_usize(
-                    absolute_start + colon_offset + 1 + leading,
-                    absolute_start + body.len(),
-                ),
-            )
-        };
-        self.attach_child_at(inner_entry.0 as usize, value);
-        self.emit_scalar_event(value)?;
-        self.push_event(
-            YamlEventKind::MappingEnd,
-            Span::empty_from_usize(line.content_end),
-        );
-
-        let outer_value = self.push_empty_scalar(line.content_end);
-        self.attach_child_at(outer_entry.0 as usize, outer_value);
-        self.emit_scalar_event(outer_value)?;
-        Ok(())
     }
 
     fn parse_compact_block_mapping_node(
@@ -4948,13 +4864,6 @@ fn is_explicit_mapping_key(body: &str) -> bool {
 
 fn is_explicit_mapping_value(body: &str) -> bool {
     body == ":" || body.starts_with(": ") || body.starts_with(":\t")
-}
-
-fn is_compact_explicit_empty_key_mapping(body: &str) -> bool {
-    let Some(after_question) = body.strip_prefix('?') else {
-        return false;
-    };
-    is_explicit_mapping_value(after_question.trim_start())
 }
 
 fn reject_invalid_indicator_tab(body: &str, absolute_start: usize) -> Result<(), YamlError> {

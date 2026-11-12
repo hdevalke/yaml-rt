@@ -263,7 +263,11 @@ does not guarantee dependency order.
 
 ## What Actions does
 
-Ordinary branch/PR CI retains formatting, tests on three OSes, facade feature
+CI runs on pull requests and pushes to `main`, avoiding duplicate branch-push
+and PR runs. The main push run validates the exact merged commit required for
+release tags. Scheduled and manual runs remain available.
+
+Ordinary CI retains formatting, tests on three OSes, facade feature
 combinations, Clippy, rustdoc, YAML and JSON Schema conformance, package checks,
 benchmarks, audit, fuzz regressions, Conventional Commits, and workflow linting.
 It also tests the release helper with disposable Git repositories. Core and

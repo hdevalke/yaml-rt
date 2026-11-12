@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.4 - 2026-11-12
+
+### Fixes
+
+* bound input and diagnostic resource usage (795da42)
+
+### Other
+
+* remove unreachable fallback branches (dc6e26c)
+
 ## 0.3.3 - 2026-10-17
 
 ### Features

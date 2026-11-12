@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-cli"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "clap",
  "yaml-rt-core",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-core"
-version = "0.3.3"
+version = "0.3.4"
 
 [[package]]
 name = "yaml-rt-derive"
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-schema"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "idna",
  "iri-string",

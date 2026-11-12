@@ -2,7 +2,7 @@
 name = "yaml-rt-schema"
 description = "JSON Schema 2020-12 validation and inference for yaml-rt"
 edition.workspace = true
-version = "0.3.3"
+version = "0.3.4"
 license.workspace = true
 authors.workspace = true
 readme = "README.md"

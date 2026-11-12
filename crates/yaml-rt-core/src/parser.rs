@@ -2900,6 +2900,24 @@ impl<'source> Parser<'source> {
             self.nodes[parent_index].first_child = child.0;
         }
         self.nodes[parent_index].last_child = child.0;
+        // Structural spans exclude the final line break. Block scalars retain
+        // it for decoding/chomping, so propagate all but that one break (never
+        // trim content whitespace or earlier blank lines). Entry starts may
+        // precede their collection's start because they include indentation.
+        let syntax = &self.nodes[child.as_usize()];
+        let mut end = syntax.span.end as usize;
+        if matches!(
+            syntax.kind,
+            NodeKind::LiteralScalar | NodeKind::FoldedScalar
+        ) {
+            let text = self.source.slice(syntax.span);
+            end -= if text.ends_with("\r\n") {
+                2
+            } else {
+                usize::from(text.ends_with(['\r', '\n']))
+            };
+        }
+        self.extend_node_span(parent, end);
     }
 
     fn push_empty_scalar(&mut self, offset: usize) -> NodeId {
@@ -2925,7 +2943,10 @@ impl<'source> Parser<'source> {
         let mut current = Some(node);
         while let Some(node) = current {
             let syntax = &mut self.nodes[node.as_usize()];
-            syntax.span.end = syntax.span.end.max(end);
+            if syntax.span.end >= end {
+                break;
+            }
+            syntax.span.end = end;
             current = node_link(syntax.parent);
         }
     }

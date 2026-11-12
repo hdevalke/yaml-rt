@@ -798,7 +798,19 @@ impl YamlDoc {
             let yaml = value.prepared_for_replacement(self, target)?.to_yaml()?;
             indent_continuation_lines(&yaml, self.node_indent(self.expect_node(target)?))
         };
-        self.replace_node_text(target, replacement)?;
+        let mut span = self.expect_node(target)?.span;
+        // Structural spans leave the final break to their surrounding entry.
+        // A fragment ending in a block scalar already supplies its own break;
+        // consume the existing separator once rather than changing keep chomp.
+        if replacement.ends_with(['\r', '\n']) {
+            let rest = &self.as_source()[span.end as usize..];
+            span.end += if rest.starts_with("\r\n") {
+                2
+            } else {
+                u32::from(rest.starts_with(['\r', '\n']))
+            };
+        }
+        self.queue_edit(span, replacement)?;
         Ok(())
     }
 
@@ -1077,8 +1089,11 @@ impl YamlDoc {
                 let indent = self.block_mapping_entry_indent(mapping);
                 let offset = self.mapping_insertion_offset(mapping_node);
                 let preserve_unterminated_eof = insertion_at_unterminated_eof(self, offset);
+                if preserve_unterminated_eof {
+                    self.preserve_unterminated_keep_scalar()?;
+                }
                 let mut insertion = insertion_prefix(self, offset);
-                let value = value.prepared(self)?.to_yaml()?;
+                let value = value.prepared(self)?.to_terminated_yaml()?;
                 let line_ending = self.preferred_line_ending().to_owned();
                 insertion.push_str(&format_block_mapping_entry(
                     &key,
@@ -1196,8 +1211,11 @@ impl YamlDoc {
                     self.sequence_insertion_offset(sequence_node)
                 };
                 let preserve_unterminated_eof = insertion_at_unterminated_eof(self, offset);
+                if preserve_unterminated_eof {
+                    self.preserve_unterminated_keep_scalar()?;
+                }
                 let mut insertion = insertion_prefix(self, offset);
-                let value = value.prepared(self)?.to_yaml()?;
+                let value = value.prepared(self)?.to_terminated_yaml()?;
                 let line_ending = self.preferred_line_ending().to_owned();
                 insertion.push_str(&format_block_sequence_entry(&value, indent, &line_ending));
                 if preserve_unterminated_eof && !value.contains(['\n', '\r']) {
@@ -1205,6 +1223,19 @@ impl YamlDoc {
                 }
                 self.queue_edit(Span::empty_from_usize(offset), insertion)?;
             }
+        }
+        Ok(())
+    }
+
+    fn preserve_unterminated_keep_scalar(&mut self) -> Result<(), YamlEditError> {
+        // Appending an entry supplies the previously missing scalar line break.
+        // Strip chomping keeps the existing value unchanged in that context.
+        if let Some(span) = self
+            .root()
+            .and_then(|root| self.unterminated_keep_indicator(root))
+            && !self.edits.iter().any(|edit| edit.span == span)
+        {
+            self.queue_edit(span, "-".to_owned())?;
         }
         Ok(())
     }
@@ -1272,20 +1303,12 @@ impl YamlDoc {
     }
 
     fn anchor_has_external_alias(&self, root: NodeId) -> bool {
-        let Some(root_span) = self.node(root).map(super::syntax::Node::span) else {
-            return false;
-        };
         let anchored = self
             .nodes
             .iter()
             .enumerate()
             .map(|(index, _)| NodeId::from_usize(index))
-            .filter(|node| {
-                self.anchor(*node).is_some()
-                    && self.node(*node).is_some_and(|node| {
-                        node.span().start >= root_span.start && node.span().end <= root_span.end
-                    })
-            })
+            .filter(|node| self.anchor(*node).is_some() && self.is_in_subtree(*node, root))
             .collect::<Vec<_>>();
         self.nodes
             .iter()
@@ -1293,9 +1316,7 @@ impl YamlDoc {
             .map(|(index, _)| NodeId::from_usize(index))
             .filter(|node| matches!(self.semantic_kind(*node), Some(SemanticKind::Alias)))
             .any(|alias| {
-                let outside = self.node(alias).is_some_and(|node| {
-                    node.span().start < root_span.start || node.span().end > root_span.end
-                });
+                let outside = !self.is_in_subtree(alias, root);
                 outside
                     && self
                         .resolve_alias(alias)
@@ -1409,14 +1430,10 @@ pub(crate) fn safe_plain_string(value: &str) -> bool {
 }
 
 fn safe_plain_string_syntax(value: &str) -> bool {
-    if value.is_empty()
+    !(value.is_empty()
         || value.trim() != value
         || value.contains(['\n', '\r', '\t', ':', '#', '[', ']', '{', '}', ','])
-        || value.starts_with(['-', '?', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`'])
-    {
-        return false;
-    }
-    true
+        || value.starts_with(['-', '?', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`']))
 }
 
 fn safe_plain_key_with_tag(value: &str, tag: Option<&str>) -> bool {

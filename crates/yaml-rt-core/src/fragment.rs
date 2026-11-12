@@ -66,6 +66,23 @@ impl YamlFragment {
             .map_err(FragmentError::from)
     }
 
+    /// Renders a block insertion that will be followed by a line break. An
+    /// unterminated keep-chomp scalar needs strip chomping in that context.
+    pub(crate) fn to_terminated_yaml(&self) -> Result<String, FragmentError> {
+        let mut yaml = self.to_yaml()?;
+        if let Some(indicator) = self.doc.unterminated_keep_indicator(self.root) {
+            let root = self.doc.node(self.root).expect("fragment root exists");
+            let prefix = &self.doc.as_source()[root.span.start as usize..indicator.start as usize];
+            let line_start = self.doc.as_source()[..root.span.start as usize]
+                .rfind(['\n', '\r'])
+                .map_or(0, |index| index + 1);
+            let offset =
+                deindent_continuation_lines(prefix, root.span.start as usize - line_start).len();
+            yaml.replace_range(offset..offset + 1, "-");
+        }
+        Ok(yaml)
+    }
+
     pub(crate) fn contains_anchor(&self) -> bool {
         self.subtree_nodes()
             .any(|node| self.doc.anchor(node).is_some())
@@ -267,27 +284,25 @@ impl YamlFragment {
     }
 
     fn subtree_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
-        let span = self.doc.node(self.root).map(super::syntax::Node::span);
-        self.doc
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(index, _)| NodeId::from_usize(index))
-            .filter(move |node| {
-                let Some(root_span) = span else {
-                    return false;
-                };
-                self.doc.node(*node).is_some_and(|node| {
-                    node.span().start >= root_span.start && node.span().end <= root_span.end
-                })
-            })
+        // Span containment excludes a terminal block scalar's final break and
+        // is therefore not a reliable test of CST membership.
+        let mut pending = vec![self.root];
+        std::iter::from_fn(move || {
+            let node = pending.pop()?;
+            pending.extend(
+                self.doc
+                    .children(node)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev(),
+            );
+            Some(node)
+        })
     }
 
     fn validate_alias_scope(&self) -> Result<(), FragmentError> {
-        let root_span = self
-            .doc
+        self.doc
             .node(self.root)
-            .map(super::syntax::Node::span)
             .ok_or_else(|| FragmentError::new("fragment root node is missing"))?;
         for node in self.subtree_nodes() {
             if !matches!(self.doc.semantic_kind(node), Some(SemanticKind::Alias)) {
@@ -299,12 +314,7 @@ impl YamlFragment {
                     self.doc.alias_name(node).unwrap_or_default()
                 ))
             })?;
-            let target_span = self
-                .doc
-                .node(target)
-                .map(super::syntax::Node::span)
-                .ok_or_else(|| FragmentError::new("alias target is missing"))?;
-            if target_span.start < root_span.start || target_span.end > root_span.end {
+            if !self.doc.is_in_subtree(target, self.root) {
                 return Err(FragmentError::new(
                     "a value alias cannot reference a node outside the value root",
                 ));
@@ -315,6 +325,32 @@ impl YamlFragment {
 }
 
 impl YamlDoc {
+    pub(crate) fn unterminated_keep_indicator(&self, node: NodeId) -> Option<crate::Span> {
+        let mut last = self.node(node)?;
+        while let Some(child) = crate::syntax::node_link(last.last_child) {
+            last = self.node(child)?;
+        }
+        if !matches!(
+            last.kind,
+            crate::NodeKind::LiteralScalar | crate::NodeKind::FoldedScalar
+        ) || last.span.end as usize != self.as_source().len()
+        {
+            return None;
+        }
+        let text = self.source.slice(last.span);
+        if text.ends_with(['\r', '\n']) {
+            return None;
+        }
+        let offset = text
+            .bytes()
+            .take_while(|byte| matches!(byte, b'|' | b'>' | b'+' | b'-' | b'1'..=b'9'))
+            .position(|byte| byte == b'+')?;
+        Some(crate::Span::from_usize(
+            last.span.start as usize + offset,
+            last.span.start as usize + offset + 1,
+        ))
+    }
+
     /// Extracts one semantic node as valid standalone YAML where possible.
     ///
     /// # Errors
@@ -322,7 +358,21 @@ impl YamlDoc {
     /// Returns an error when `node` does not identify a node in this document.
     pub fn extract_node(&self, node: NodeId) -> Result<String, YamlError> {
         let node = self.expect_node(node)?;
-        let source = self.source.slice(node.span);
+        let mut span = node.span;
+        // Structural parents end before the final line break, but a terminal
+        // block scalar owns that break. Include it in standalone YAML so clip
+        // and keep chomping decode exactly as they did in the source document.
+        let mut last = node;
+        while let Some(child) = crate::syntax::node_link(last.last_child) {
+            last = self.expect_node(child)?;
+        }
+        if matches!(
+            last.kind,
+            crate::NodeKind::LiteralScalar | crate::NodeKind::FoldedScalar
+        ) {
+            span.end = span.end.max(last.span.end);
+        }
+        let source = self.source.slice(span);
         let line_start = self.source.as_str()[..node.span.start as usize]
             .rfind(['\n', '\r'])
             .map_or(0, |index| index + 1);

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use yaml_rt_core::{DiagnosticKind, NodeId, SemanticKind, YamlDoc, YamlError, YamlScalarStyle};
 
+mod common;
+
 /// Environment variable overriding the in-repo YAML Test Suite data checkout.
 const SUITE_DIR_ENV: &str = "YAML_TEST_SUITE_DIR";
 /// Optional comma-separated list of case ids to run, such as `MJS9` or `VJP3:00`.
@@ -307,6 +309,8 @@ fn run_case(case: &SuiteCase) -> Result<(), ClassifiedFailure> {
         )
     })?;
     let output = doc.to_string();
+    common::check_span_ends(&doc)
+        .map_err(|error| ClassifiedFailure::new(FailureCategory::Parser, error))?;
     if output != input {
         return Err(ClassifiedFailure::new(
             FailureCategory::EmitterRoundTrip,

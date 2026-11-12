@@ -6,6 +6,50 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn get_and_copy_preserve_a_mapping_ending_in_a_block_scalar() {
+    let input =
+        "config:\n  enabled: true\n  message: |\n    First line\n    Second line\n    Third line\n";
+    for arguments in [
+        vec!["get", "/config", "-"],
+        vec!["copy", "/config", "/backup", "-"],
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_yaml-rt"))
+            .args(&arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let yaml = String::from_utf8(output.stdout).unwrap();
+        let doc = yaml_rt_core::YamlDoc::parse(&yaml).unwrap();
+        let path = if arguments[0] == "get" {
+            assert_eq!(
+                yaml,
+                "enabled: true\nmessage: |\n  First line\n  Second line\n  Third line\n"
+            );
+            "/message"
+        } else {
+            "/backup/message"
+        };
+        let node = doc
+            .resolve_pointer(0, &yaml_rt_core::JsonPointer::parse(path).unwrap())
+            .unwrap();
+        assert_eq!(
+            doc.scalar_value(node).unwrap(),
+            "First line\nSecond line\nThird line\n"
+        );
+    }
+}
+
 fn temp_dir() -> PathBuf {
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let path =

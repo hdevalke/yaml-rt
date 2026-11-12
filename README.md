@@ -170,6 +170,15 @@ The lower-level API exposes the lossless concrete syntax tree, semantic node
 metadata, JSON Pointer operations, fragments, diagnostics with spans, and
 patch-oriented editing primitives.
 
+Block entry and collection CST spans cover multiline child content and end
+before the final line break; block scalars retain that break for chomping.
+Collection spans may start after indentation that their entry wrappers include.
+`extract_node()`
+includes a terminal block scalar's owned line break so extracted and copied
+values keep their scalar semantics, including keep chomping. When an insertion
+must terminate an unterminated keep-chomp scalar, strip chomping preserves its
+value without the newly required separator newline.
+
 ## Typed round-trip overlays
 
 `YamlRt` maps Rust configuration models onto YAML without turning the

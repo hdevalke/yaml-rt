@@ -645,6 +645,18 @@ impl YamlDoc {
         Children::new(&self.nodes, node)
     }
 
+    pub(crate) fn is_in_subtree(&self, mut node: NodeId, root: NodeId) -> bool {
+        loop {
+            if node == root {
+                return true;
+            }
+            let Some(parent) = self.node(node).and_then(Node::parent) else {
+                return false;
+            };
+            node = parent;
+        }
+    }
+
     pub(crate) fn semantic_children(&self, node: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         self.children(node)
             .filter(|child| self.semantic_metadata(*child).is_some())

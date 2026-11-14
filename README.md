@@ -764,7 +764,9 @@ parsed left-to-right with a bounded explicit frame stack. Both machines
 register semantic metadata directly in CST nodes during recognition, so deeply
 nested input does not rely on call-stack recursion, no completed-CST semantic
 pass is required, and each CST node is attached in its grammatical context
-exactly once.
+exactly once. Successful parses compact the CST arena when unused capacity
+accounts for at least 4 KiB and 50% of the arena, reducing retained memory for
+inputs whose node count is poorly predicted by their line count.
 
 ## Roadmap
 

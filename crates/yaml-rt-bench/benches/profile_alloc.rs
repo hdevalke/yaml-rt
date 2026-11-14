@@ -160,6 +160,22 @@ fn main() {
     println!("retained allocated bytes: {retained_allocated_bytes}");
     println!("retained peak live bytes: {retained_peak_bytes}");
     println!("retained bytes: {retained_bytes}");
+    match &retained {
+        Parsed::Full(doc) => println!("source lines: {}", doc.source().line_starts().len()),
+        Parsed::Cst { source, nodes } => {
+            println!("source lines: {}", source.line_starts().len());
+            println!("CST nodes: {}", nodes.len());
+            println!("CST capacity: {}", nodes.capacity());
+            println!(
+                "CST allocated bytes: {}",
+                nodes.capacity() * size_of::<Node>()
+            );
+            println!(
+                "CST unused capacity bytes: {}",
+                (nodes.capacity() - nodes.len()) * size_of::<Node>()
+            );
+        }
+    }
 }
 
 struct Config {

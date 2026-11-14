@@ -25,6 +25,22 @@ fn resource_limits_reject_input_before_unbounded_parser_growth() {
 }
 
 #[test]
+fn large_block_scalar_keeps_a_small_lossless_cst() {
+    let input = format!("body: |\n{}", "  content\n".repeat(1_000));
+    let doc = YamlDoc::parse(&input).expect("large block scalar should parse");
+
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(doc.nodes.len(), 6);
+    assert!(doc.nodes.capacity() * size_of::<Node>() < 4096);
+    let mapping = doc.root_mapping().expect("root is a mapping");
+    let value = doc
+        .get_mapping_value(mapping, "body")
+        .expect("mapping lookup succeeds")
+        .expect("body exists");
+    assert_eq!(doc.scalar_value(value).unwrap(), "content\n".repeat(1_000));
+}
+
+#[test]
 fn configured_collection_depth_applies_to_flow_and_block_yaml() {
     let limits = ResourceLimits {
         max_collection_depth: 2,

@@ -269,6 +269,15 @@ impl<'source> Parser<'source> {
         );
 
         let semantics = self.semantics.finish()?;
+        // Line-based reservation and geometric growth can both leave large
+        // arenas mostly unused. Compact only substantial slack, keeping the
+        // ordinary small-document and close-fitting paths allocation-free.
+        let spare_nodes = self.nodes.capacity() - self.nodes.len();
+        if spare_nodes.saturating_mul(size_of::<Node>()) >= 4096
+            && spare_nodes >= self.nodes.capacity().div_ceil(2)
+        {
+            self.nodes.shrink_to_fit();
+        }
         Ok(ParsedYaml {
             nodes: self.nodes,
             semantics,

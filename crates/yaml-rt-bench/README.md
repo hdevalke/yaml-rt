@@ -125,7 +125,7 @@ cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
 cargo bench -p yaml-rt-bench --features saphyr-baseline --bench parse
 ```
 
-The current layouts are 28 bytes for `Node`, 2 bytes for `SemanticKind`, and
+The current layouts are 32 bytes for `Node`, 2 bytes for `SemanticKind`, and
 104 bytes for the on-demand public `YamlEvent`. The allocation profiler prints
 these sizes so future layout changes are visible in benchmark logs.
 
@@ -471,6 +471,100 @@ forced transition inlining were measured and rejected as neutral-to-slower.
 The global structural tape remains rejected and was not retried. The retained
 implementation uses per-line stack data, preserves the 32-byte node layout,
 adds no dependency, and keeps the expected-failure list empty.
+
+## Allocation layout investigation (2026-11-14)
+
+The counting allocator and Valgrind Massif identified the CST arena as the
+largest allocation. For 1,000 flat mapping entries it reserves 96,224 bytes;
+the generated 1,000-entry block-scalar workload reserves 672,224 bytes. Cached
+line facts were another repeated record, occupying 16 bytes per source line.
+Storing their next-line index in native-endian byte storage removes alignment
+padding and reduces `LineFacts` to 14 bytes without narrowing its index range,
+using packed references, or adding unsafe code or dependencies.
+
+Release counting-allocator results for complete documents, with 1,000 entries
+per generated shape:
+
+| workload | retained before | retained after | bytes saved |
+| --- | ---: | ---: | ---: |
+| flat mapping | 141,024 | 139,022 | 2,002 |
+| mixed block/flow | 1,760,767 | 1,752,763 | 8,004 |
+| shallow flow | 484,522 | 484,520 | 2 |
+| quoted scalars | 321,656 | 317,654 | 4,002 |
+| block scalars | 1,037,934 | 1,023,932 | 14,002 |
+| JSON objects | 508,025 | 508,023 | 2 |
+
+Peak live and total allocated bytes decrease by the same amounts; allocation
+counts are unchanged. This is a 12.5% reduction in the line-facts arena and
+approximately 0.45–1.42% in retained memory for these multiline workloads.
+Short Criterion checks (20 baseline samples, 30 candidate samples, 1-second
+warmup, 2–3-second measurement) detected no slowdown for flat mapping or mixed
+block/flow. These checks are exploratory, not a stable throughput claim.
+
+The profiler now prints source line counts and, in `cst` mode, CST length,
+capacity, allocated bytes, and unused capacity bytes. The block-scalar shape
+has 6,003 nodes but reserves space for 21,007, leaving **480,128 bytes** unused.
+Improving the line-count-based reservation heuristic is a larger follow-up
+opportunity; this pass leaves that heuristic unchanged.
+
+For allocation call stacks, build `profile_alloc` with `--no-run`, then use the
+executable path Cargo reports:
+
+```sh
+valgrind --tool=massif --time-unit=B --detailed-freq=1 \
+  --massif-out-file=/tmp/yaml-rt-massif.out \
+  PATH_TO_PROFILE_ALLOC --shape block 1000 1 full
+ms_print /tmp/yaml-rt-massif.out
+```
+
+Massif includes benchmark input generation and runtime allocations. Use its
+call stacks for attribution and the counting allocator's parse-scoped totals
+for comparisons. Keep profiling artifacts outside the repository.
+
+## CST capacity compaction (2026-11-15)
+
+A follow-up to the layout investigation measures conditional CST compaction
+after successful parsing. The initial reservation heuristic remains unchanged.
+The completed arena is shrunk only when unused capacity is at least 4 KiB and
+50% of the allocation. This targets excessive initial reservation while leaving
+ordinary geometric-growth slack, small arenas, and close-fitting arenas alone.
+
+Release allocation profiles for complete documents with 1,000 entries per shape,
+relative to the 14-byte line-facts implementation above:
+
+| workload | retained before | retained after | reduction |
+| --- | ---: | ---: | ---: |
+| flat mapping | 139,022 B | 139,022 B | 0% |
+| mixed block/flow | 1,752,763 B | 1,752,763 B | 0% |
+| shallow flow | 484,520 B | 484,520 B | 0% |
+| quoted scalars | 317,654 B | 317,654 B | 0% |
+| block scalars | 1,023,932 B | 543,804 B | 46.9% |
+| JSON objects | 508,023 B | 508,023 B | 0% |
+
+Each affected parse adds one shrinking reallocation. The counting allocator's
+construction peak is unchanged; this optimization targets retained memory.
+Its cumulative allocated-byte counter includes the entire new allocation size
+for every realloc, even a shrink. Accordingly, block scalars increase from
+1,173,564 to 1,365,660 cumulative requested bytes. These are allocation traffic
+totals, not simultaneous live memory or evidence of an additional copy.
+
+A broader 25%-slack threshold was also tested. It saved 40.2% of retained memory
+on mixed block/flow and 35.2% on shallow flow, but regressed mixed block/flow
+throughput in repeated measurements, including alternating before/after runs
+on CPU 0 (11.5% slower by the median of three run medians). It was rejected in
+favor of the more conservative 50% threshold.
+
+The final implementation was measured with three alternating before/after
+default-sampling Criterion runs on CPU 0. Median-of-three run medians were:
+
+| workload | before | after | change in parse time |
+| --- | ---: | ---: | ---: |
+| block scalars, 128 entries | 178.83 us | 177.55 us | -0.7% |
+| mixed block/flow, 1,000 items | 3.2648 ms | 3.3787 ms | +3.5% |
+
+The mixed workload no longer triggers shrinking. Timing varied across runs,
+so these results establish a retained-memory benefit on block scalars rather
+than a throughput improvement. Peak live memory remains unchanged.
 
 ## Package and license
 

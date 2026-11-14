@@ -190,7 +190,8 @@ pub(crate) struct LineFacts {
     value_start: u16,
     scalar_end: u16,
     flags: u16,
-    next_significant: u32,
+    // Byte storage avoids u32 alignment padding in this per-line record.
+    next_significant: [u8; 4],
 }
 
 impl LineFacts {
@@ -200,7 +201,7 @@ impl LineFacts {
         value_start: NO_LINE_OFFSET,
         scalar_end: NO_LINE_OFFSET,
         flags: LINE_OFFSET_OVERFLOW,
-        next_significant: NO_LINE_INDEX,
+        next_significant: NO_LINE_INDEX.to_ne_bytes(),
     };
 
     pub(crate) fn indent(self) -> Option<usize> {
@@ -239,7 +240,8 @@ impl LineFacts {
     }
 
     fn next_significant(self) -> Option<usize> {
-        (self.next_significant != NO_LINE_INDEX).then_some(self.next_significant as usize)
+        let index = u32::from_ne_bytes(self.next_significant);
+        (index != NO_LINE_INDEX).then_some(index as usize)
     }
 
     const fn has(self, flag: u16) -> bool {
@@ -532,7 +534,7 @@ fn build_line_facts(text: &str, line_starts: &[u32]) -> Vec<LineFacts> {
 fn populate_next_significant_lines(facts: &mut [LineFacts]) {
     let mut next = NO_LINE_INDEX;
     for (index, fact) in facts.iter_mut().enumerate().rev() {
-        fact.next_significant = next;
+        fact.next_significant = next.to_ne_bytes();
         if !fact.has(LINE_BLANK | LINE_COMMENT) {
             next = u32::try_from(index).expect("line index exceeds u32 capacity");
         }
@@ -565,7 +567,7 @@ fn analyze_line(line: &[u8]) -> LineFacts {
             value_start: NO_LINE_OFFSET,
             scalar_end: NO_LINE_OFFSET,
             flags: flags | LINE_OFFSET_OVERFLOW,
-            next_significant: NO_LINE_INDEX,
+            next_significant: NO_LINE_INDEX.to_ne_bytes(),
         };
     };
 
@@ -596,7 +598,7 @@ fn analyze_line(line: &[u8]) -> LineFacts {
             value_start: value_start.unwrap_or(NO_LINE_OFFSET),
             scalar_end,
             flags,
-            next_significant: NO_LINE_INDEX,
+            next_significant: NO_LINE_INDEX.to_ne_bytes(),
         };
     }
 
@@ -606,7 +608,7 @@ fn analyze_line(line: &[u8]) -> LineFacts {
         value_start: NO_LINE_OFFSET,
         scalar_end: NO_LINE_OFFSET,
         flags,
-        next_significant: NO_LINE_INDEX,
+        next_significant: NO_LINE_INDEX.to_ne_bytes(),
     }
 }
 
@@ -785,7 +787,19 @@ mod line_facts_tests {
         assert_eq!(facts[5].next_significant(), Some(6));
         assert_eq!(facts[6].next_significant(), Some(8));
         assert_eq!(facts[9].next_significant(), None);
-        assert_eq!(std::mem::size_of::<LineFacts>(), 16);
+        assert_eq!(std::mem::size_of::<LineFacts>(), 14);
+    }
+
+    #[test]
+    fn compact_line_links_preserve_the_full_index_range() {
+        for index in [0, 1, u16::MAX as u32, u16::MAX as u32 + 1, u32::MAX - 1] {
+            let facts = LineFacts {
+                next_significant: index.to_ne_bytes(),
+                ..LineFacts::FALLBACK
+            };
+            assert_eq!(facts.next_significant(), Some(index as usize));
+        }
+        assert_eq!(LineFacts::FALLBACK.next_significant(), None);
     }
 
     #[test]

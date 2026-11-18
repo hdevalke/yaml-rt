@@ -414,9 +414,19 @@ conversion resolves aliases and intentionally discards comments, anchors,
 styles, and original scalar spelling. YAML `<<` keys remain ordinary mapping
 entries until `Value::apply_merge()` is called.
 
-Serde serialization emits deterministic block-style YAML. Use a typed
-round-trip overlay instead when comments, quoting, whitespace, or other source
-presentation must be retained.
+Serde serialization generates new YAML with deterministic formatting. For
+example, a field containing `"hello\nworld"` is written as a literal block.
+
+```yaml
+message: |-
+  hello
+  world
+```
+
+The serializer preserves trailing newlines and uses double-quoted escapes
+for multiline keys and values containing carriage returns. Use a
+`YamlRt` overlay on a `YamlDoc` when editing existing YAML to preserve its
+comments, whitespace, and scalar styles.
 
 ## Command-line query and editor
 

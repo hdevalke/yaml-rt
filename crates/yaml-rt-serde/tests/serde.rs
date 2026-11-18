@@ -72,6 +72,10 @@ fn enum_shapes_use_yaml_tags_and_round_trip() {
         "!Newtype x\n"
     );
     assert_eq!(
+        to_string(&Mode::Newtype("x\ny\n\n".into())).unwrap(),
+        "!Newtype\n|+\n  x\n  y\n\n"
+    );
+    assert_eq!(
         to_string(&Mode::Tuple(1, false)).unwrap(),
         "!Tuple\n- 1\n- false\n"
     );
@@ -295,7 +299,7 @@ fn deterministic_scalar_and_empty_collection_formatting() {
             String::new(),
         ])
         .unwrap(),
-        "- plain\n- \"null\"\n- \"line\\nbreak\"\n- \"\"\n"
+        "- plain\n- \"null\"\n- |-\n  line\n  break\n- \"\"\n"
     );
     assert_eq!(to_string(&Vec::<u8>::new()).unwrap(), "[]\n");
     assert_eq!(
@@ -305,6 +309,143 @@ fn deterministic_scalar_and_empty_collection_formatting() {
     assert_eq!(to_string(&f64::INFINITY).unwrap(), ".inf\n");
     assert_eq!(to_string(&f64::NEG_INFINITY).unwrap(), "-.inf\n");
     assert_eq!(to_string(&f64::NAN).unwrap(), ".nan\n");
+}
+
+#[test]
+fn literal_values_select_chomping_and_content_indentation() {
+    for (value, expected) in [
+        ("hello\nworld", "message: |-\n  hello\n  world\n"),
+        ("hello\nworld\n", "message: |\n  hello\n  world\n"),
+        ("hello\nworld\n\n", "message: |+\n  hello\n  world\n\n"),
+        ("\n", "message: |2+\n\n"),
+        ("\n  a\nb ", "message: |2-\n\n    a\n  b \n"),
+        ("a\r\nb", "message: \"a\\r\\nb\"\n"),
+        ("a\n\tb", "message: |-\n  a\n  \tb\n"),
+        ("\tindented\ntext", "message: |2-\n  \tindented\n  text\n"),
+    ] {
+        assert_eq!(
+            to_string(&BTreeMap::from([("message", value)])).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn multiline_strings_round_trip_in_value_contexts() {
+    for text in [
+        "",
+        "true",
+        "null",
+        "1.2",
+        "a\nb",
+        "a\nb\n",
+        "a\nb\n\n\n",
+        "\n",
+        "\n\n",
+        "\n\n\n",
+        "\n\nhello",
+        "  indented\nless\n",
+        "\n   \n  first  \n\nsecond \n  ",
+        "   \n ",
+        "a\n  \n\n",
+        "---\n...\n# comment\nx: y\n- [item]",
+        "é\n🍵",
+        "a\n\tb",
+        "\t\n\tindented\n \t \n",
+        "a\0b\n",
+        "a\rb",
+        "a\r\nb",
+        "\n\r",
+        "\u{0085}\ntext",
+        "a\u{fffe}\n\u{ffff}",
+        "\u{feff}text\n",
+        "a\u{0001}b",
+        "line\u{2028}break\n",
+        "# title\nbody",
+    ] {
+        let yaml = to_string(text).unwrap();
+        assert_eq!(from_str::<String>(&yaml).unwrap(), text, "{yaml:?}");
+
+        let tagged = Mode::Newtype(text.into());
+        let yaml = to_string(&tagged).unwrap();
+        assert_eq!(from_str::<Mode>(&yaml).unwrap(), tagged, "{yaml:?}");
+
+        // Exercise adjacent scalars and a final scalar at end of document.
+        let strings = vec![text.to_owned(); 2];
+        let nested = BTreeMap::from([("items".to_owned(), strings)]);
+        let yaml = to_string(&nested).unwrap();
+        assert_eq!(
+            from_str::<BTreeMap<String, Vec<String>>>(&yaml).unwrap(),
+            nested,
+            "{yaml:?}"
+        );
+
+        let nested = vec![BTreeMap::from([("tag".to_owned(), tagged)]); 2];
+        let yaml = to_string(&nested).unwrap();
+        assert_eq!(
+            from_str::<Vec<BTreeMap<String, Mode>>>(&yaml).unwrap(),
+            nested,
+            "{yaml:?}"
+        );
+    }
+}
+
+#[test]
+fn multiline_keys_stay_quoted_and_tagged_values_use_literals() {
+    let value = BTreeMap::from([("first\nsecond".to_owned(), Mode::Newtype("a\nb".into()))]);
+    let yaml = to_string(&value).unwrap();
+    assert_eq!(yaml, "\"first\\nsecond\": !Newtype |-\n  a\n  b\n");
+    assert_eq!(from_str::<BTreeMap<String, Mode>>(&yaml).unwrap(), value);
+}
+
+#[test]
+fn implicit_key_limit_counts_the_quoted_spelling() {
+    for (size, explicit) in [(1020, false), (1021, true)] {
+        let key = format!("{}\n", "é".repeat(size));
+        let value = BTreeMap::from([(key, "line\n".to_owned())]);
+        let yaml = to_string(&value).unwrap();
+        assert_eq!(yaml.starts_with("? "), explicit);
+        assert_eq!(from_str::<BTreeMap<String, String>>(&yaml).unwrap(), value);
+    }
+}
+
+#[test]
+fn keep_chomping_stops_at_collection_and_document_boundaries() {
+    use yaml_rt_serde::Value;
+
+    let value = Value::Sequence(vec![
+        "first\n\n".into(),
+        Value::Mapping(Default::default()),
+        "\n".into(),
+        Value::Sequence(Vec::new()),
+        "last\n\n".into(),
+    ]);
+    let mut serializer = Serializer::new(Vec::new());
+    value.serialize(&mut serializer).unwrap();
+    "next\ndocument".serialize(&mut serializer).unwrap();
+    let output = serializer.into_inner().unwrap();
+    assert_eq!(
+        output,
+        b"- |+\n  first\n\n- {}\n- |2+\n\n- []\n- |+\n  last\n\n---\n|-\n  next\n  document\n"
+    );
+    let mut docs = Deserializer::from_slice(&output);
+    assert_eq!(Value::deserialize(docs.next().unwrap()).unwrap(), value);
+    assert_eq!(
+        String::deserialize(docs.next().unwrap()).unwrap(),
+        "next\ndocument"
+    );
+}
+
+#[test]
+fn ambiguous_single_line_strings_remain_string_values() {
+    for text in ["true", "null", "1.2", "+.Inf", "", "key:", "... end"] {
+        let yaml = to_string(text).unwrap();
+        assert_eq!(yaml, format!("\"{text}\"\n"));
+        assert_eq!(
+            from_str::<yaml_rt_serde::Value>(&yaml).unwrap().as_str(),
+            Some(text)
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]

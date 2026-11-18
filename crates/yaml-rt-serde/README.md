@@ -49,6 +49,28 @@ Their `_with_limits` counterparts accept custom parser resource limits.
 `to_string` and `to_writer` emit deterministic block-style YAML.
 `Deserializer` and `Serializer` expose the lower-level Serde adapters.
 
+### Multiline strings
+
+A field containing `"hello\nworld"` produces the following literal block.
+
+```yaml
+message: |-
+  hello
+  world
+```
+
+Literal blocks use `|-` for no trailing newline, `|` for one, and `|+` for
+several. A value made entirely of newlines also uses keep chomping (`+`).
+A leading blank line or leading whitespace gets an explicit indentation
+indicator (`2`) so that spaces in the value survive deserialization.
+
+Literal blocks preserve tabs in the content. Multiline string keys use double
+quotes. Values with carriage returns (including CRLF), control characters
+other than tab and line feed, Unicode line or paragraph separators, U+FEFF,
+U+FFFE, or U+FFFF also use double-quoted escapes.
+For edits to existing YAML, use a `YamlRt` overlay on a `YamlDoc` to retain
+comments, whitespace, and the original scalar styles.
+
 ## Dynamic values
 
 ```rust

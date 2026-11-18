@@ -440,11 +440,13 @@ impl<'input, 'de> NodeDeserializer<'input, 'de> {
             return Err(Error::message("expected a scalar value"));
         };
         let value = self.doc().scalar_value(node).map_err(Error::from)?;
-        let tag = self
-            .doc()
-            .resolved_tag(node)
-            .map_err(Error::from)?
-            .map(Cow::into_owned);
+        // A local tag already consumed as an enum variant belongs to the
+        // wrapper. Resolve its payload using the scalar's own style.
+        let tag = if self.ignore_tag {
+            None
+        } else {
+            self.doc().resolved_tag(node).map_err(Error::from)?
+        };
         let resolved = resolve_scalar(&value, style, tag.as_deref())
             .map_err(|error| Error::message(error.to_string()))?;
         self.annotate(scalar_kind_from_resolved(resolved))

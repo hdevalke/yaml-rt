@@ -187,6 +187,24 @@ fn tagged_values_and_serde_enums_share_the_same_model() {
         value: Value::from("payload"),
     }));
     assert_eq!(to_string(&manual).unwrap(), "!Manual payload\n");
+    assert_eq!(
+        from_str::<Value>(&to_string(&manual).unwrap()).unwrap(),
+        manual
+    );
+}
+
+#[test]
+fn tagged_multiline_strings_round_trip_as_dynamic_values() {
+    for text in ["head\ntail\n\n", "\n", "a\r\nb"] {
+        let tagged = Value::Tagged(Box::new(TaggedValue {
+            tag: Tag::new("Note"),
+            value: Value::from(text),
+        }));
+        for value in [tagged.clone(), Value::Sequence(vec![tagged])] {
+            let yaml = to_string(&value).unwrap();
+            assert_eq!(from_str::<Value>(&yaml).unwrap(), value, "{yaml:?}");
+        }
+    }
 }
 
 #[test]

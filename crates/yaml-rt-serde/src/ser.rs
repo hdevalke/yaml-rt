@@ -76,9 +76,7 @@ where
         }
         let mut output = String::new();
         render_value(value, 0, &mut output);
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
+        output.push('\n');
         self.writer
             .write_all(output.as_bytes())
             .map_err(Error::io)?;
@@ -620,7 +618,7 @@ fn render_value(value: &Value, indent: usize, output: &mut String) {
     enum RenderAction<'a> {
         Value(&'a Value, usize),
         Nested(&'a Value, usize),
-        Inline(&'a Value),
+        Key(&'a Value, usize),
         Indent(usize),
         Text(&'static str),
     }
@@ -630,18 +628,30 @@ fn render_value(value: &Value, indent: usize, output: &mut String) {
         match action {
             RenderAction::Text(text) => output.push_str(text),
             RenderAction::Indent(indent) => push_indent(output, indent),
-            RenderAction::Inline(value) => render_inline(value, output),
+            RenderAction::Key(key, indent) => {
+                let start = output.len();
+                render_leaf(key, None, output);
+                // YAML limits implicit keys to 1024 Unicode characters in source,
+                // including quotes, escape sequences, and tag properties.
+                let key_text = &output[start..];
+                if key_text.len() > 1024 && key_text.chars().count() > 1024 {
+                    output.insert_str(start, "? ");
+                    output.push('\n');
+                    push_indent(output, indent);
+                }
+                output.push(':');
+            }
             RenderAction::Nested(value, indent) => match value {
-                Value::Tagged(tagged) if !is_inline(&tagged.value) => {
+                Value::Tagged(tagged) if !is_leaf(&tagged.value) => {
                     output.push(' ');
                     output.push('!');
                     output.push_str(tagged.tag.as_suffix());
                     output.push('\n');
                     pending.push(RenderAction::Value(&tagged.value, indent));
                 }
-                _ if is_inline(value) => {
+                _ if is_leaf(value) => {
                     output.push(' ');
-                    pending.push(RenderAction::Inline(value));
+                    render_leaf(value, Some(indent), output);
                 }
                 _ => {
                     output.push('\n');
@@ -649,15 +659,7 @@ fn render_value(value: &Value, indent: usize, output: &mut String) {
                 }
             },
             RenderAction::Value(value, indent) => match value {
-                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-                    push_indent(output, indent);
-                    render_scalar(value, output);
-                }
-                Value::Sequence(values) if values.is_empty() => {
-                    push_indent(output, indent);
-                    output.push_str("[]");
-                }
-                Value::Sequence(values) => {
+                Value::Sequence(values) if !values.is_empty() => {
                     for (index, value) in values.iter().enumerate().rev() {
                         pending.push(RenderAction::Nested(value, indent + 2));
                         pending.push(RenderAction::Text("-"));
@@ -667,16 +669,11 @@ fn render_value(value: &Value, indent: usize, output: &mut String) {
                         }
                     }
                 }
-                Value::Mapping(entries) if entries.is_empty() => {
-                    push_indent(output, indent);
-                    output.push_str("{}");
-                }
-                Value::Mapping(entries) => {
+                Value::Mapping(entries) if !entries.is_empty() => {
                     for (index, (key, value)) in entries.iter().enumerate().rev() {
                         pending.push(RenderAction::Nested(value, indent + 2));
-                        if is_inline(key) {
-                            pending.push(RenderAction::Text(":"));
-                            pending.push(RenderAction::Inline(key));
+                        if is_leaf(key) {
+                            pending.push(RenderAction::Key(key, indent));
                             pending.push(RenderAction::Indent(indent));
                         } else {
                             pending.push(RenderAction::Text(":"));
@@ -691,24 +688,28 @@ fn render_value(value: &Value, indent: usize, output: &mut String) {
                         }
                     }
                 }
-                Value::Tagged(tagged) => {
+                // Put the root tag on its own line so the block header starts
+                // a literal node and its entire body participates in chomping.
+                Value::Tagged(tagged)
+                    if !is_leaf(&tagged.value)
+                        || matches!(&tagged.value, Value::String(text) if can_render_literal(text)) =>
+                {
                     push_indent(output, indent);
                     output.push('!');
                     output.push_str(tagged.tag.as_suffix());
-                    if is_inline(&tagged.value) {
-                        output.push(' ');
-                        pending.push(RenderAction::Inline(&tagged.value));
-                    } else {
-                        output.push('\n');
-                        pending.push(RenderAction::Value(&tagged.value, indent));
-                    }
+                    output.push('\n');
+                    pending.push(RenderAction::Value(&tagged.value, indent));
+                }
+                _ => {
+                    push_indent(output, indent);
+                    render_leaf(value, Some(indent + 2), output);
                 }
             },
         }
     }
 }
 
-fn is_inline(value: &Value) -> bool {
+fn is_leaf(value: &Value) -> bool {
     let mut value = value;
     while let Value::Tagged(tagged) = value {
         value = &tagged.value;
@@ -720,7 +721,7 @@ fn is_inline(value: &Value) -> bool {
         || matches!(value, Value::Mapping(entries) if entries.is_empty())
 }
 
-fn render_inline(mut value: &Value, output: &mut String) {
+fn render_leaf(mut value: &Value, content_indent: Option<usize>, output: &mut String) {
     while let Value::Tagged(tagged) = value {
         output.push('!');
         output.push_str(tagged.tag.as_suffix());
@@ -730,17 +731,55 @@ fn render_inline(mut value: &Value, output: &mut String) {
     match value {
         Value::Sequence(values) if values.is_empty() => output.push_str("[]"),
         Value::Mapping(entries) if entries.is_empty() => output.push_str("{}"),
-        _ => render_scalar(value, output),
-    }
-}
-
-fn render_scalar(value: &Value, output: &mut String) {
-    match value {
         Value::Null => output.push_str("null"),
         Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
         Value::Number(value) => output.push_str(&value.to_string()),
-        Value::String(value) => render_string(value, output),
-        _ => unreachable!("collections are not scalars"),
+        Value::String(value) => {
+            if let Some(indent) = content_indent
+                && can_render_literal(value)
+            {
+                render_literal(value, indent, output);
+            } else {
+                render_string(value, output);
+            }
+        }
+        _ => unreachable!("expected a scalar or empty collection"),
+    }
+}
+
+fn needs_escape(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{2028}' | '\u{2029}' | '\u{feff}' | '\u{fffe}' | '\u{ffff}'
+        )
+}
+
+fn can_render_literal(value: &str) -> bool {
+    value.contains('\n')
+        && !value
+            .chars()
+            .any(|c| !matches!(c, '\n' | '\t') && needs_escape(c))
+}
+
+fn render_literal(value: &str, indent: usize, output: &mut String) {
+    output.push('|');
+    if value.starts_with(char::is_whitespace) {
+        output.push('2');
+    }
+    if !value.ends_with('\n') {
+        output.push('-');
+    } else if value.ends_with("\n\n") || value == "\n" {
+        // Even one LF needs keep chomping when there are no content lines.
+        output.push('+');
+    }
+    // The document or next collection entry supplies the last line break.
+    for line in value.split_terminator('\n') {
+        output.push('\n');
+        if !line.is_empty() {
+            push_indent(output, indent);
+            output.push_str(line);
+        }
     }
 }
 
@@ -759,7 +798,7 @@ fn render_string(value: &str, output: &mut String) {
             '\t' => output.push_str("\\t"),
             '\u{08}' => output.push_str("\\b"),
             '\u{0C}' => output.push_str("\\f"),
-            character if character.is_control() => {
+            character if needs_escape(character) => {
                 use std::fmt::Write as _;
                 let _ = write!(output, "\\u{:04X}", character as u32);
             }
@@ -770,7 +809,7 @@ fn render_string(value: &str, output: &mut String) {
 }
 
 fn is_safe_plain(value: &str) -> bool {
-    if value.is_empty() || value.trim() != value || value.contains(['\n', '\r', '\t']) {
+    if value.is_empty() || value.trim() != value || value.chars().any(needs_escape) {
         return false;
     }
     if value.starts_with([
@@ -779,7 +818,12 @@ fn is_safe_plain(value: &str) -> bool {
     ]) {
         return false;
     }
-    if value.contains(": ") || value.contains(" #") || value == "---" || value == "..." {
+    if value.contains(": ")
+        || value.ends_with(':')
+        || value.contains(" #")
+        || value == "..."
+        || value.starts_with("... ")
+    {
         return false;
     }
     if matches!(
@@ -796,6 +840,9 @@ fn is_safe_plain(value: &str) -> bool {
             | ".inf"
             | ".Inf"
             | ".INF"
+            | "+.inf"
+            | "+.Inf"
+            | "+.INF"
             | "-.inf"
             | "-.Inf"
             | "-.INF"
@@ -843,7 +890,7 @@ mod tests {
     #[test]
     fn renderer_handles_deep_sequences_iteratively() {
         let depth = 1024;
-        let mut value = Value::String("value".to_owned());
+        let mut value = Value::String("first\nsecond\n".to_owned());
         for _ in 0..depth {
             value = Value::Sequence(vec![value]);
         }
@@ -851,7 +898,8 @@ mod tests {
         let mut output = String::new();
         render_value(&value, 0, &mut output);
         assert_eq!(output.matches('-').count(), depth);
-        assert!(output.ends_with(&format!("{}- value", "  ".repeat(depth - 1))));
+        let indent = "  ".repeat(depth);
+        assert!(output.ends_with(&format!("- |\n{indent}first\n{indent}second")));
     }
 
     #[test]

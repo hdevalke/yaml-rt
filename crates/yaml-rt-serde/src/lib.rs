@@ -6,7 +6,15 @@
 //!
 //! [`from_str`] and [`from_slice`] deserialize one YAML document. [`from_reader`]
 //! accepts any byte reader. [`to_string`] and [`to_writer`] emit deterministic
-//! block-style YAML.
+//! block-style YAML. Multiline string values use literal blocks when their
+//! content can be written verbatim. Chomping preserves trailing line feeds.
+//!
+//! ```
+//! use std::collections::BTreeMap;
+//! let fields = BTreeMap::from([("message", "hello\nworld")]);
+//! assert_eq!(yaml_rt_serde::to_string(&fields)?, "message: |-\n  hello\n  world\n");
+//! # Ok::<(), yaml_rt_serde::Error>(())
+//! ```
 //!
 //! [`Value`] provides a `yaml_serde`-compatible generic YAML model. [`to_value`]
 //! and [`from_value`] convert between it and typed Serde values without an

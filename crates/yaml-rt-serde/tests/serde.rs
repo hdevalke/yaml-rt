@@ -81,6 +81,24 @@ fn enum_shapes_use_yaml_tags_and_round_trip() {
     );
 }
 
+#[test]
+fn tagged_scalar_payloads_round_trip() {
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    enum Scalar {
+        Flag(bool),
+        Count(u32),
+    }
+
+    for (value, expected) in [
+        (Scalar::Flag(true), "!Flag true\n"),
+        (Scalar::Count(42), "!Count 42\n"),
+    ] {
+        let yaml = to_string(&value).unwrap();
+        assert_eq!(yaml, expected);
+        assert_eq!(from_str::<Scalar>(&yaml).unwrap(), value);
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct AttributeConfig {
     #[serde(rename = "display-name", alias = "name")]

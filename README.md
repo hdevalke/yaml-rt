@@ -187,6 +187,9 @@ values keep their scalar semantics, including keep chomping. When an insertion
 must terminate an unterminated keep-chomp scalar, strip chomping preserves its
 value without the newly required separator newline.
 
+When a replacement supplies no root anchor, the editor keeps the target's anchor.
+A replacement that would break a surviving alias fails transactionally.
+
 ## Typed round-trip overlays
 
 `YamlRt` maps Rust configuration models onto YAML without turning the

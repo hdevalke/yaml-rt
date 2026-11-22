@@ -555,6 +555,74 @@ fn typed_block_scalar_write_reparses_to_the_exact_requested_string() {
     }
 }
 
+fn alias_value(doc: &YamlDoc, path: &str) -> String {
+    let alias = doc.resolve_pointer(0, &pointer(path)).unwrap();
+    let target = doc.resolve_alias(alias).expect("alias must still resolve");
+    doc.scalar_value(target).unwrap().into_owned()
+}
+
+#[test]
+fn replacements_keep_external_alias_bindings_and_reject_removing_live_nested_anchors() {
+    let input = "first: &id [one]\nref1: *id\nsecond: &id {old: two}\nref2: *id\n";
+    let mut doc = YamlDoc::parse(input).unwrap();
+    doc.replace_at(0, &pointer("/second"), &YamlFragment::parse("ZZ").unwrap())
+        .unwrap();
+    assert_eq!(
+        doc.as_source(),
+        "first: &id [one]\nref1: *id\nsecond: &id ZZ\nref2: *id\n"
+    );
+    assert_eq!(scalar(&doc, 0, "/ref1/0"), "one");
+    assert_eq!(alias_value(&doc, "/ref2"), "ZZ");
+
+    let failed = YamlDoc::parse("a: &outer [&inner old]\nb: *inner\nc: *outer\n").unwrap();
+    for (source, replacement) in [
+        (failed.as_source(), "&outer ZZ"),
+        ("first: &id old\nsecond: &id [old]\nref: *id\n", "&other ZZ"),
+    ] {
+        let mut doc = YamlDoc::parse(source).unwrap();
+        let path = if source.starts_with("a:") {
+            "/a"
+        } else {
+            "/second"
+        };
+        let error = doc
+            .replace_at(
+                0,
+                &pointer(path),
+                &YamlFragment::parse(replacement).unwrap(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("anchor used by an alias"));
+        assert_eq!(doc.as_source(), source);
+    }
+}
+
+#[test]
+fn fragment_anchor_renames_follow_alias_bindings() {
+    let mut doc = YamlDoc::parse("a: &id [old]\nb: *id\n").unwrap();
+    let fragment = YamlFragment::parse("&id [*id, &id leaf, *id]").unwrap();
+    doc.replace_at(0, &pointer("/a"), &fragment).unwrap();
+    assert_eq!(doc.as_source(), "a: &id [*id, &id_1 leaf, *id_1]\nb: *id\n");
+    assert_eq!(scalar(&doc, 0, "/b/1"), "leaf");
+    assert_eq!(alias_value(&doc, "/b/2"), "leaf");
+    assert!(doc.resolve_pointer(0, &pointer("/a/0/1")).is_ok());
+}
+
+#[test]
+fn replacement_tags_follow_scalar_preservation_and_whole_fragment_syntax() {
+    let mut doc = YamlDoc::parse("a: !!str old\nb: !Old &id [old]\nc: *id\n").unwrap();
+    doc.replace_at(0, &pointer("/a"), &YamlFragment::parse("new").unwrap())
+        .unwrap();
+    doc.replace_at(0, &pointer("/b"), &YamlFragment::parse("!New new").unwrap())
+        .unwrap();
+    let a = doc.resolve_pointer(0, &pointer("/a")).unwrap();
+    let b = doc.resolve_pointer(0, &pointer("/b")).unwrap();
+    assert_eq!(doc.raw_tag(a), Some("!!str"));
+    assert_eq!(doc.raw_tag(b), Some("!New"));
+    assert_eq!(doc.anchor(b), Some("id"));
+    assert_eq!(alias_value(&doc, "/c"), "new");
+}
+
 #[test]
 fn inline_block_scalar_consumes_deferred_leading_blank_lines() {
     for ending in ["\n", "\r\n", "\r"] {

@@ -115,15 +115,12 @@ impl YamlFragment {
         exempt_anchor: Option<&str>,
     ) -> Result<Self, FragmentError> {
         let mut used = target.anchor_names();
-        if let Some(anchor) = exempt_anchor {
-            used.remove(anchor);
-        }
         let mut renamed = BTreeMap::new();
         for node in self.subtree_nodes() {
             let Some(name) = self.doc.anchor(node) else {
                 continue;
             };
-            if used.insert(name.to_owned()) {
+            if (node == self.root && exempt_anchor == Some(name)) || used.insert(name.to_owned()) {
                 continue;
             }
             let mut suffix = 1_u64;
@@ -134,7 +131,7 @@ impl YamlFragment {
                 }
                 suffix = suffix.saturating_add(1);
             };
-            renamed.insert(name.to_owned(), replacement);
+            renamed.insert(node, replacement);
         }
         if renamed.is_empty() {
             return Ok(self.clone());
@@ -146,19 +143,18 @@ impl YamlFragment {
             let Some(properties) = doc.semantic_properties(node) else {
                 continue;
             };
-            if let Some(span) = properties.anchor {
-                let old = doc.source.slice(span);
-                if let Some(new) = renamed.get(old) {
-                    doc.queue_edit(span, new.clone())
-                        .map_err(FragmentError::from)?;
-                }
+            if let Some(span) = properties.anchor
+                && let Some(new) = renamed.get(&node)
+            {
+                doc.queue_edit(span, new.clone())
+                    .map_err(FragmentError::from)?;
             }
-            if let Some(span) = properties.alias {
-                let old = doc.source.slice(span);
-                if let Some(new) = renamed.get(old) {
-                    doc.queue_edit(span, new.clone())
-                        .map_err(FragmentError::from)?;
-                }
+            if let Some(span) = properties.alias
+                && let Some(target) = doc.resolve_alias(node)
+                && let Some(new) = renamed.get(&target)
+            {
+                doc.queue_edit(span, new.clone())
+                    .map_err(FragmentError::from)?;
             }
         }
         doc.commit_edits().map_err(FragmentError::from)?;
@@ -170,17 +166,11 @@ impl YamlFragment {
     }
 
     pub(crate) fn render_flow(&self, target: &YamlDoc) -> Result<String, FragmentError> {
-        let prepared = self.prepared(target)?;
-        prepared.render_node_flow(prepared.root, 0)
+        self.prepared(target)?.render_prepared_flow()
     }
 
-    pub(crate) fn render_flow_for_replacement(
-        &self,
-        target: &YamlDoc,
-        replaced: NodeId,
-    ) -> Result<String, FragmentError> {
-        let prepared = self.prepared_for_replacement(target, replaced)?;
-        prepared.render_node_flow(prepared.root, 0)
+    pub(crate) fn render_prepared_flow(&self) -> Result<String, FragmentError> {
+        self.render_node_flow(self.root, 0)
     }
 
     fn render_node_flow(&self, node: NodeId, depth: usize) -> Result<String, FragmentError> {

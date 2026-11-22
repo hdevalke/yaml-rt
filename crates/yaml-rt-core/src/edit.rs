@@ -847,11 +847,32 @@ impl YamlDoc {
                 }
             }
         }
+        let old_anchor = self.anchor(target);
+        let new_anchor = value.document().anchor(value.root());
+        let inherited_anchor = old_anchor.filter(|_| new_anchor.is_none());
+        if (old_anchor.is_some()
+            || matches!(
+                kind,
+                Some(SemanticKind::Mapping { .. } | SemanticKind::Sequence { .. })
+            ))
+            && self.external_alias_targets(target).any(|bound| {
+                bound != target || new_anchor.is_some_and(|name| Some(name) != old_anchor)
+            })
+        {
+            return Err(YamlEditError::new(
+                "replacement would remove an anchor used by an alias outside the replaced node",
+            ));
+        }
+        let prepared = value.prepared_for_replacement(self, target)?;
         let mut replacement = if target_is_flow || self.is_flow_context(target) {
-            value.render_flow_for_replacement(self, target)?
+            let rendered = prepared.render_prepared_flow()?;
+            if let Some(anchor) = inherited_anchor {
+                format!("&{anchor} {rendered}")
+            } else {
+                rendered
+            }
         } else {
-            let prepared = value.prepared_for_replacement(self, target)?;
-            let yaml = if !owned_ending.is_empty()
+            let mut yaml = if !owned_ending.is_empty()
                 || !following_ending.is_empty()
                 || header_comment.is_some()
             {
@@ -869,6 +890,16 @@ impl YamlDoc {
                     }
                 )
             );
+            if let Some(anchor) = inherited_anchor {
+                let separation = if replacement_is_block_collection
+                    && prepared.document().raw_tag(prepared.root()).is_none()
+                {
+                    self.preferred_line_ending()
+                } else {
+                    " "
+                };
+                yaml.insert_str(0, &format!("&{anchor}{separation}"));
+            }
             if let Some(indent) = inline_block_indent.filter(|_| replacement_is_block_collection) {
                 let start = span.start as usize;
                 let prefix = &self.as_source()[self.line_start_offset(start)..start];
@@ -1400,24 +1431,19 @@ impl YamlDoc {
     }
 
     fn anchor_has_external_alias(&self, root: NodeId) -> bool {
-        let anchored = self
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(index, _)| NodeId::from_usize(index))
-            .filter(|node| self.anchor(*node).is_some() && self.is_in_subtree(*node, root))
-            .collect::<Vec<_>>();
+        self.external_alias_targets(root).next().is_some()
+    }
+
+    fn external_alias_targets(&self, root: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes
             .iter()
             .enumerate()
             .map(|(index, _)| NodeId::from_usize(index))
-            .filter(|node| matches!(self.semantic_kind(*node), Some(SemanticKind::Alias)))
-            .any(|alias| {
-                let outside = !self.is_in_subtree(alias, root);
-                outside
-                    && self
-                        .resolve_alias(alias)
-                        .is_some_and(|target| anchored.contains(&target))
+            .filter(|&node| matches!(self.semantic_kind(node), Some(SemanticKind::Alias)))
+            .filter_map(move |alias| {
+                let target = self.resolve_alias(alias)?;
+                (self.is_in_subtree(target, root) && !self.is_in_subtree(alias, root))
+                    .then_some(target)
             })
     }
 

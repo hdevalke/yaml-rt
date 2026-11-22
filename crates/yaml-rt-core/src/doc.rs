@@ -415,7 +415,7 @@ impl YamlDoc {
             .parse()
             .map_err(|error| error.with_position_from(&source))?;
         let mut semantics = parsed.semantics;
-        semantics.index_anchors(&source, &parsed.nodes);
+        semantics.index_anchors(&source);
         Ok(Self {
             source,
             nodes: parsed.nodes,

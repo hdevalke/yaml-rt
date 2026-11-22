@@ -162,18 +162,20 @@ impl SemanticStore {
         (node.property != NO_PROPERTIES).then(|| self.properties[node.property as usize].document)
     }
 
-    pub(crate) fn index_anchors(&mut self, source: &crate::Source, nodes: &[Node]) {
+    pub(crate) fn index_anchors(&mut self, source: &crate::Source) {
         self.anchor_index.clear();
         for binding in &self.anchors {
-            let Some(target) = nodes.get(binding.target.as_usize()) else {
-                continue;
-            };
             self.anchor_index
                 .entry(binding.document)
                 .or_default()
                 .entry(source.slice(binding.name).to_owned())
                 .or_default()
-                .push((target.span.start, binding.target));
+                .push((binding.name.start, binding.target));
+        }
+        // Collections can be registered after their contents. Alias lookup
+        // partitions by the lexical position of the anchor declaration.
+        for bindings in self.anchor_index.values_mut().flat_map(HashMap::values_mut) {
+            bindings.sort_unstable_by_key(|&(offset, _)| offset);
         }
     }
 

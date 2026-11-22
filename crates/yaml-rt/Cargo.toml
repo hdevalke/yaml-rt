@@ -22,9 +22,9 @@ derive = ["dep:yaml-rt-derive"]
 serde = ["dep:yaml-rt-serde"]
 
 [dependencies]
-yaml-rt-core.workspace = true
+yaml-rt-core = { version = "0.3.5", path = "../yaml-rt-core" }
 yaml-rt-derive = { workspace = true, optional = true }
-yaml-rt-serde = { workspace = true, optional = true }
+yaml-rt-serde = { version = "0.3.4", path = "../yaml-rt-serde", optional = true }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }

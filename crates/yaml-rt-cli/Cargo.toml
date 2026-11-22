@@ -19,6 +19,6 @@ doc = false
 
 [dependencies]
 clap.workspace = true
-yaml-rt-core.workspace = true
+yaml-rt-core = { version = "0.3.5", path = "../yaml-rt-core" }
 yaml-rt-rfc9535.workspace = true
 yaml-rt-schema.workspace = true

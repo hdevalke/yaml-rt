@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 0.3.5 - 2026-11-22
+
+### Fixes
+
+* **editor:** allow replacement of omitted values (6ddf50a)
+* **editor:** preserve live alias bindings during replacement (492dd74)
+* **typed:** preserve exact values in block scalar writes (f91f5dd)
+* **editor:** preserve separators when replacing block scalars (dfbd33d)
+* **parser:** count leading blank lines in block scalars (a6ffa56)
+* **parser:** enforce the implicit mapping key length limit (e87d61e)
+* **core:** support bare carriage return line endings (b4ebb90)
+* **parser:** normalize block scalar line breaks (e9a27b0)
+* **parser:** exclude separator trivia from flow entry spans (9581d2b)
+* **parser:** exclude trailing trivia from block scalar spans (64bab97)
+* **parser:** allow omitted values in final flow mapping entries (330926a)
+* **parser:** scan flow scalars in their grammar context (96c41db)
+* **parser:** enforce collection depth before descending (b85a974)
+
+### Other
+
+* **parser:** skip flow key lookahead without a colon (bc0b8d5)
+* **core:** reduce line facts and excess CST storage (10db46e)
+
 ## 0.3.4 - 2026-11-12
 
 ### Fixes

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.4 - 2026-11-22
+
+### Features
+
+* **serde:** emit multiline strings as literal blocks (4788939)
+
+### Other
+
+* **serde:** cover tagged boolean and numeric enum payloads (f04bbf9)
+
 ## 0.3.3 - 2026-10-17
 
 ### Features

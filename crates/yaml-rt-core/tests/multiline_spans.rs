@@ -463,3 +463,25 @@ fn multiline_collection_mutations_preserve_neighbors() {
         }
     }
 }
+
+#[test]
+fn inline_block_scalar_consumes_deferred_leading_blank_lines() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for (header, body) in [("|", "one\ntwo"), (">", "one two")] {
+            let source =
+                format!("a: {header} # note\n\n\n  one\n  two\nb: next\n").replace('\n', ending);
+            let doc = YamlDoc::parse(&source).unwrap();
+            assert_eq!(scalar(&doc, 0, "/a"), format!("\n\n{body}\n"));
+            assert_eq!(scalar(&doc, 0, "/b"), "next");
+            assert_eq!(doc.to_string(), source);
+            common::check_span_ends(&doc).unwrap();
+        }
+        let over_indented = "a: |\n   \n  one\nb: next\n".replace('\n', ending);
+        let error = YamlDoc::parse(&over_indented).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid block scalar content indentation")
+        );
+    }
+}

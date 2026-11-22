@@ -2524,32 +2524,33 @@ impl<'source> Parser<'source> {
         let mut pending_blank_lines = 0usize;
         let mut pending_blank_end = end;
         let mut pending_blank_indent = None::<usize>;
+        let mut deepest_leading_blank = (0, initial_line.content_start);
         let mut reached_end = true;
 
         for line in lines.iter_from(index + 1) {
-            let trimmed = line.content_without_break.trim();
+            let body = line.content_without_break;
             // Inline headers and nested scalars already stop at column zero by indentation.
-            if !inline_header
-                && parent_indent == 0
-                && is_document_marker_line(line.content_without_break)
-            {
+            if !inline_header && parent_indent == 0 && is_document_marker_line(body) {
                 reached_end = false;
                 break;
             }
 
-            let tab_content_line =
-                trimmed.is_empty() && line.content_without_break.as_bytes().contains(&b'\t');
-            if tab_content_line
-                && content_indent == usize::MAX
-                && count_literal_content_indent(line.content_without_break) == 0
+            let indent = count_literal_content_indent(body);
+            let content = &body[indent..];
+            if content_indent == usize::MAX
+                && indent == 0
+                && content.starts_with('\t')
+                && content.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
             {
                 return Err(tab_indentation_error(line.content_start));
             }
-            if trimmed.is_empty() && !tab_content_line {
+            if content.is_empty() {
+                if content_indent == usize::MAX && indent > deepest_leading_blank.0 {
+                    deepest_leading_blank = (indent, line.content_start);
+                }
                 if content_indent == usize::MAX && inline_header {
                     pending_blank_lines += 1;
                     pending_blank_end = line.line_end;
-                    let indent = count_literal_content_indent(line.content_without_break);
                     pending_blank_indent =
                         Some(pending_blank_indent.map_or(indent, |current| current.min(indent)));
                     continue;
@@ -2559,11 +2560,10 @@ impl<'source> Parser<'source> {
                 continue;
             }
 
-            let indent = count_literal_content_indent(line.content_without_break);
             if content_indent == usize::MAX
                 && pending_blank_lines > 0
                 && indent <= pending_blank_indent.unwrap_or(usize::MAX)
-                && line.content_without_break[indent..].starts_with('#')
+                && content.starts_with('#')
             {
                 return Err(invalid_block_scalar_content(line.content_start + indent));
             }
@@ -2571,6 +2571,11 @@ impl<'source> Parser<'source> {
                 if indent <= parent_indent && (parent_indent > 0 || inline_header) {
                     reached_end = false;
                     break;
+                }
+                if deepest_leading_blank.0 > indent {
+                    return Err(invalid_block_scalar_content(
+                        deepest_leading_blank.1 + indent,
+                    ));
                 }
                 content_indent = indent;
             }
@@ -2580,10 +2585,8 @@ impl<'source> Parser<'source> {
                 break;
             }
 
-            if pending_blank_lines > 0 {
-                pending_blank_lines = 0;
-            }
-            consumed += 1;
+            consumed += pending_blank_lines + 1;
+            pending_blank_lines = 0;
             end = line.line_end;
         }
 
@@ -2591,7 +2594,7 @@ impl<'source> Parser<'source> {
             consumed += pending_blank_lines;
             end = pending_blank_end;
             if content_indent == usize::MAX {
-                content_indent = pending_blank_indent.unwrap_or_default();
+                content_indent = deepest_leading_blank.0;
             }
         }
 

@@ -873,13 +873,21 @@ mod line_facts_tests {
     }
 
     #[test]
-    fn long_line_offsets_fall_back_without_changing_parse_behavior() {
+    fn long_line_offsets_fall_back_to_the_same_implicit_key_diagnostic() {
         let key = "k".repeat(u16::MAX as usize);
         let input = format!("{key}: value\n");
         let source = Source::new(input.clone()).expect("long fixture is printable YAML");
         assert_eq!(source.line_facts(0).mapping_colon(), None);
 
-        let doc = YamlDoc::parse(&input).expect("long mapping key should use the full scanner");
-        assert_eq!(doc.to_string(), input);
+        let optimized = Parser::new(&source)
+            .parse()
+            .expect_err("long key is invalid");
+        let mut general = source;
+        general.line_facts.clear();
+        let general = Parser::new(&general)
+            .parse()
+            .expect_err("long key is invalid");
+        assert_eq!(optimized.diagnostic, general.diagnostic);
+        assert_eq!(optimized.diagnostic.span, Span::new(1024, 1025));
     }
 }

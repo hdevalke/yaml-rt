@@ -573,6 +573,7 @@ impl<'source> Parser<'source> {
         absolute_start: usize,
         facts: SimpleMappingFacts,
     ) -> Result<usize, YamlError> {
+        validate_implicit_key_length(body, facts.colon(), absolute_start)?;
         let entry = self.push_node(
             NodeKind::MappingEntry,
             Span::from_usize(line.content_start, line.content_end),
@@ -770,6 +771,7 @@ impl<'source> Parser<'source> {
         colon_byte: usize,
         absolute_start: usize,
     ) -> Result<usize, YamlError> {
+        validate_implicit_key_length(body, colon_byte, absolute_start)?;
         let mapping = self.mapping_for_line(
             document,
             indent,
@@ -1515,6 +1517,7 @@ impl<'source> Parser<'source> {
         absolute_start: usize,
         colon_byte: usize,
     ) -> Result<usize, YamlError> {
+        validate_implicit_key_length(body, colon_byte, absolute_start)?;
         self.check_block_collection_depth(absolute_start)?;
         let mapping = self.push_node(
             NodeKind::BlockMapping,
@@ -1932,7 +1935,7 @@ impl<'source> Parser<'source> {
         }
         if has_value {
             if !explicit {
-                reject_split_implicit_flow_mapping_key(
+                validate_implicit_flow_pair_key(
                     flow.text,
                     entry_start,
                     flow.position,
@@ -5057,7 +5060,7 @@ fn reject_invalid_flow_continuation_indent(
     ))
 }
 
-fn reject_split_implicit_flow_mapping_key(
+fn validate_implicit_flow_pair_key(
     text: &str,
     start: usize,
     colon: usize,
@@ -5073,7 +5076,40 @@ fn reject_split_implicit_flow_mapping_key(
             .with_expected("a mapping separator on the same line as the implicit key"),
         ));
     }
+    validate_implicit_key_length(&text[start..], colon - start, absolute_start + start)
+}
+
+const MAX_IMPLICIT_KEY_CHARS: usize = 1024;
+
+#[inline]
+fn validate_implicit_key_length(
+    text: &str,
+    colon: usize,
+    absolute_start: usize,
+) -> Result<(), YamlError> {
+    // A short byte span always meets the character limit.
+    if colon > MAX_IMPLICIT_KEY_CHARS {
+        return validate_long_implicit_key(&text[..colon], absolute_start);
+    }
     Ok(())
+}
+
+#[cold]
+fn validate_long_implicit_key(key: &str, absolute_start: usize) -> Result<(), YamlError> {
+    let Some((offset, character)) = key.char_indices().nth(MAX_IMPLICIT_KEY_CHARS) else {
+        return Ok(());
+    };
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Parser,
+            "implicit mapping key exceeds 1024 Unicode characters",
+            Span::from_usize(
+                absolute_start + offset,
+                absolute_start + offset + character.len_utf8(),
+            ),
+        )
+        .with_expected("an explicit key or a shorter implicit key"),
+    ))
 }
 
 fn reject_unindented_split_flow_mapping_value(

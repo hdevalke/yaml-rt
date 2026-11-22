@@ -5509,3 +5509,55 @@ fn diagnostics_render_empty_multiline_and_untrusted_spans() {
         .to_string();
     assert!(invalid.contains("Source: bad span"), "{invalid}");
 }
+
+#[test]
+fn implicit_key_limit_counts_source_characters_in_the_restricted_productions() {
+    for character in ["x", "é", "😀"] {
+        for (prefix, suffix) in [
+            ("", ": value\n"),
+            ("nested:\n  ", ": value\n"),
+            ("- ", ": value\n"),
+            ("? ", ": value\n: outer\n"),
+            ("[", ": value]\n"),
+        ] {
+            let input = format!("{prefix}{}{suffix}", character.repeat(1024));
+            let doc = YamlDoc::parse(&input).unwrap_or_else(|error| panic!("{prefix:?}: {error}"));
+            assert_eq!(doc.to_string(), input);
+            let input = format!("{prefix}{}{suffix}", character.repeat(1025));
+            let error = YamlDoc::parse(&input).unwrap_err();
+            assert!(
+                error
+                    .diagnostic
+                    .message
+                    .contains("exceeds 1024 Unicode characters")
+            );
+            let start = prefix.len() + 1024 * character.len();
+            assert_eq!(
+                error.diagnostic.span,
+                Span::from_usize(start, start + character.len())
+            );
+        }
+    }
+
+    for (prefix, suffix) in [
+        ("\"", "\": value\n"),
+        ("[\"", "\": value]\n"),
+        ("[", "]: value\n"),
+    ] {
+        assert!(YamlDoc::parse(&format!("{prefix}{}{suffix}", "x".repeat(1022))).is_ok());
+        let error = YamlDoc::parse(&format!("{prefix}{}{suffix}", "x".repeat(1023))).unwrap_err();
+        assert!(
+            error
+                .diagnostic
+                .message
+                .contains("exceeds 1024 Unicode characters")
+        );
+    }
+    let key = "é".repeat(1025);
+    assert!(YamlDoc::parse(&format!("? {key}\n: value\n")).is_ok());
+    assert!(YamlDoc::parse(&format!("[? {key}: value]\n")).is_ok());
+    assert!(YamlDoc::parse(&format!("{{{key}: value}}\n")).is_ok());
+    assert!(YamlDoc::parse(&format!("[{key}]\n")).is_ok());
+    assert!(YamlDoc::parse(&format!("{} : value\n", "x".repeat(1023))).is_ok());
+    assert!(YamlDoc::parse(&format!("{} : value\n", "x".repeat(1024))).is_err());
+}

@@ -261,6 +261,85 @@ fn lexer_keeps_embedded_quotes_inside_plain_scalars() {
 }
 
 #[test]
+fn flow_plain_quotes_do_not_hide_collection_boundaries() {
+    let input = "- {a: it's here}\n- {b: that's here}\n";
+    let doc = YamlDoc::parse(input).unwrap();
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+SEQ\n+MAP {}\n=VAL :a\n=VAL :it's here\n-MAP\n+MAP {}\n=VAL :b\n=VAL :that's here\n-MAP\n-SEQ\n-DOC\n-STR\n"
+    );
+    assert_eq!(doc.to_string(), input);
+
+    let input = "[{a: one ' mark\n  and two \" marks, b: mark - here}, http://x#part, 'a,b}', \"c]d\"] # kept\n";
+    let doc = YamlDoc::parse(input).unwrap();
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+SEQ []\n+MAP {}\n=VAL :a\n=VAL :one ' mark and two \" marks\n=VAL :b\n=VAL :mark - here\n-MAP\n=VAL :http://x#part\n=VAL 'a,b}\n=VAL \"c]d\n-SEQ\n-DOC\n-STR\n"
+    );
+    assert_eq!(doc.to_string(), input);
+    let tokens = doc.tokens().unwrap();
+    assert_eq!(tokens_to_string(&tokens, doc.source()), input);
+    assert_eq!(
+        tokens
+            .iter()
+            .filter(|token| token.kind == TokenKind::Comment)
+            .map(|token| doc.source().slice(token.span))
+            .collect::<Vec<_>>(),
+        ["# kept"]
+    );
+    assert_eq!(
+        tokens
+            .iter()
+            .filter(|token| matches!(
+                token.kind,
+                TokenKind::SingleQuotedScalar | TokenKind::DoubleQuotedScalar
+            ))
+            .map(|token| doc.source().slice(token.span))
+            .collect::<Vec<_>>(),
+        ["'a,b}'", "\"c]d\""]
+    );
+}
+
+#[test]
+fn flow_scalar_boundaries_are_shared_by_keys_values_and_lookahead() {
+    let input = "[it's here]: value\nother: [{'a':b}, {a':b,}, {key: a\u{00a0}b}]\n";
+    let doc = YamlDoc::parse(input).unwrap();
+    assert_eq!(doc.to_string(), input);
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+MAP\n+SEQ []\n=VAL :it's here\n-SEQ\n=VAL :value\n=VAL :other\n+SEQ []\n+MAP {}\n=VAL 'a\n=VAL :b\n-MAP\n+MAP {}\n=VAL :a':b\n=VAL :\n-MAP\n+MAP {}\n=VAL :key\n=VAL :a\u{00a0}b\n-MAP\n-SEQ\n-MAP\n-DOC\n-STR\n"
+    );
+
+    let input = "{\"a\":[b]}";
+    let doc = YamlDoc::parse(input).unwrap();
+    let value = doc
+        .get_mapping_value(doc.root_mapping().unwrap(), "a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(flow_sequence_scalar_texts(&doc, value), ["b"]);
+}
+
+#[test]
+fn flow_scalar_scanning_rejects_invalid_plain_starts_and_quoted_suffixes() {
+    for (input, offending) in [
+        ("{a: 'one' 'two'}", "'two'"),
+        ("{a: \"one\"suffix}", "suffix"),
+        ("{a: @reserved}", "@reserved"),
+        ("{a: -}", "-}"),
+        ("{a:[b]}", "[b]"),
+        ("{a: x]}", "]}"),
+        ("{a: x [y]}", "[y]"),
+    ] {
+        let error = YamlDoc::parse(input).unwrap_err();
+        assert_eq!(
+            error.diagnostic.span.start as usize,
+            input.find(offending).unwrap(),
+            "{input}: {error}"
+        );
+    }
+}
+
+#[test]
 fn events_render_root_scalar() {
     let doc = YamlDoc::parse("value\n").expect("valid scalar");
 
@@ -3206,7 +3285,7 @@ fn parser_rejects_fuzzed_flow_mapping_key_indicator_without_panicking() {
     assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
     assert_eq!(
         error.diagnostic.message,
-        "block indicator `...` is not allowed as a flow scalar"
+        "block indicator `|` is not allowed as a flow scalar"
     );
     assert!(error.diagnostic.position.is_some());
 }
@@ -3279,7 +3358,6 @@ fn parser_rejects_flow_collections_after_scalar_nodes_without_panicking() {
         "[*x [b]]\n",
         "[plain {b: c}]\n",
         "{outer: [one, *x {nested: value}]}\n",
-        "--- ? \t[[!>+- ? \t[[!>+ \"\n \"\n",
     ] {
         let error = YamlDoc::parse(input).expect_err("trailing collection must be rejected");
 
@@ -3290,6 +3368,11 @@ fn parser_rejects_flow_collections_after_scalar_nodes_without_panicking() {
         );
         assert!(error.diagnostic.position.is_some());
     }
+
+    let input = "--- ? \t[[!>+- ? \t[[!>+ \"\n \"\n";
+    let error = YamlDoc::parse(input).unwrap_err();
+    assert_eq!(error.diagnostic.kind, DiagnosticKind::Parser);
+    assert_eq!(error.diagnostic.span, Span::new(14, 15));
 }
 
 #[test]

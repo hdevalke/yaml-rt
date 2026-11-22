@@ -624,6 +624,56 @@ fn replacement_tags_follow_scalar_preservation_and_whole_fragment_syntax() {
 }
 
 #[test]
+fn structured_replacement_fills_omitted_values_and_preserves_trivia() {
+    for (input, path, expected) in [
+        ("a: # keep\nb: next\n", "/a", "a: ZZ # keep\nb: next\n"),
+        ("{a: , b: next}\n", "/a", "{a: ZZ , b: next}\n"),
+        ("{a, b: next}\n", "/a", "{a: ZZ, b: next}\n"),
+        (
+            "{ a # keep\n, b: next }",
+            "/a",
+            "{ a: ZZ # keep\n, b: next }",
+        ),
+        ("- # keep\n- next\n", "/0", "- ZZ # keep\n- next\n"),
+        ("[a:, next]\n", "/0/a", "[a: ZZ, next]\n"),
+        ("? a # keep\nb: next\n", "/a", "? a # keep\n: ZZ\nb: next\n"),
+        (
+            "? a\n: # keep\nb: next\n",
+            "/a",
+            "? a\n: ZZ # keep\nb: next\n",
+        ),
+        (
+            "a: &id !!str # keep\nb: *id\n",
+            "/a",
+            "a: &id !!str ZZ # keep\nb: *id\n",
+        ),
+        ("{a: &id, b: *id}\n", "/a", "{a: &id ZZ, b: *id}\n"),
+    ] {
+        let mut doc = YamlDoc::parse(input).unwrap_or_else(|error| panic!("{input:?}: {error}"));
+        doc.replace_at(0, &pointer(path), &YamlFragment::parse("ZZ").unwrap())
+            .unwrap_or_else(|error| panic!("{input:?}: {error}"));
+        assert_eq!(doc.as_source(), expected);
+        assert_eq!(scalar(&doc, 0, path), "ZZ");
+    }
+}
+
+#[test]
+fn patch_can_fill_empty_slots_with_block_fragments() {
+    use yaml_rt_core::YamlPatch;
+    let input = "root:\r\n  a: # keep\r\n  b: # also keep\r\ntail: next\r\n";
+    let mut doc = YamlDoc::parse(input).unwrap();
+    let patch = YamlPatch::parse("- op: add\n  path: /root/a\n  value:\n    x: one\n- op: replace\n  path: /root/b\n  value: ZZ\n").unwrap();
+    doc.apply_patch(0, &patch).unwrap();
+    assert_eq!(
+        doc.as_source(),
+        "root:\r\n  a: # keep\r\n    x: one\r\n  b: ZZ # also keep\r\ntail: next\r\n"
+    );
+    assert_eq!(scalar(&doc, 0, "/root/a/x"), "one");
+    assert_eq!(scalar(&doc, 0, "/root/b"), "ZZ");
+    assert_eq!(scalar(&doc, 0, "/tail"), "next");
+}
+
+#[test]
 fn inline_block_scalar_consumes_deferred_leading_blank_lines() {
     for ending in ["\n", "\r\n", "\r"] {
         for (header, body) in [("|", "one\ntwo"), (">", "one two")] {

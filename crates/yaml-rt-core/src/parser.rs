@@ -4430,7 +4430,9 @@ impl<'source> BlockMachine<'source> {
         Ok(indent < frame.indent as usize
             || indent == frame.indent as usize
                 && frame.allow_same_indent_content
-                && (is_explicit_mapping_key(body) || is_explicit_mapping_value(body))
+                && (is_explicit_mapping_key(body)
+                    || is_explicit_mapping_value(body)
+                    || find_mapping_colon(body).is_some())
             || indent == frame.indent as usize
                 && !(frame.allow_same_indent_content
                     || frame.allow_indentless_sequence && is_sequence_entry(body)))

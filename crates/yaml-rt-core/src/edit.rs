@@ -750,15 +750,24 @@ impl YamlDoc {
         target: NodeId,
         value: &YamlFragment,
     ) -> Result<(), YamlEditError> {
-        if self
-            .node(target)
-            .is_some_and(|node| node.kind() == crate::NodeKind::Scalar)
+        let node = self.expect_node(target)?;
+        let value_has_properties = value.document().anchor(value.root()).is_some()
+            || value.document().raw_tag(value.root()).is_some();
+        if node.kind() == crate::NodeKind::Scalar
+            && (node.span.is_empty()
+                || (!value_has_properties
+                    && (self.anchor(target).is_some() || self.raw_tag(target).is_some())
+                    && self.node_value_start(target)? == node.span.end as usize))
+            && let Some(entry) = self.containing_entry(target)
+        {
+            return self.queue_empty_value_replacement(target, entry, value);
+        }
+        if node.kind() == crate::NodeKind::Scalar
             && matches!(
                 value.document().semantic_kind(value.root()),
                 Some(SemanticKind::Scalar { .. })
             )
-            && value.document().raw_tag(value.root()).is_none()
-            && value.document().anchor(value.root()).is_none()
+            && !value_has_properties
         {
             let mut replacement = value.to_yaml()?;
             if !replacement.contains(['\n', '\r']) {
@@ -776,6 +785,93 @@ impl YamlDoc {
             }
         }
         self.queue_fragment_replacement_whole(target, value)
+    }
+
+    fn queue_empty_value_replacement(
+        &mut self,
+        target: NodeId,
+        entry: NodeId,
+        value: &YamlFragment,
+    ) -> Result<(), YamlEditError> {
+        let target_span = self.expect_node(target)?.span;
+        let entry_node = self.expect_node(entry)?;
+        let source = self.as_source();
+        let flow = self.is_flow_context(target);
+        let end = entry_node.span.end as usize;
+        let (offset, missing_colon) = if !target_span.is_empty() {
+            (target_span.end as usize, false)
+        } else if entry_node.kind() == crate::NodeKind::SequenceEntry {
+            (target_span.start as usize, false)
+        } else {
+            let key = self
+                .children(entry)
+                .next()
+                .ok_or_else(|| YamlEditError::new("empty mapping entry has no key"))?;
+            let key_end = self.expect_node(key)?.span.end as usize;
+            let tail = source.get(key_end..end).unwrap_or_default();
+            let separator = skip_flow_whitespace(tail, 0);
+            if tail.as_bytes().get(separator) == Some(&b':') {
+                (key_end + separator + 1, false)
+            } else {
+                (if flow { key_end } else { end }, true)
+            }
+        };
+        if flow {
+            let rendered = value.render_flow(self)?;
+            let prefix = if missing_colon { ": " } else { " " };
+            self.queue_edit(
+                Span::empty_from_usize(offset),
+                format!("{prefix}{rendered}"),
+            )?;
+            return Ok(());
+        }
+
+        let indent = self.block_entry_indent(entry);
+        let line_end = source[offset..]
+            .find(['\r', '\n'])
+            .map_or(source.len(), |end| offset + end);
+        let existing_ending = leading_line_break(&source[line_end..]);
+        let ending = if existing_ending.is_empty() {
+            self.preferred_line_ending()
+        } else {
+            existing_ending
+        };
+        let prepared = value.prepared(self)?;
+        let rendered = if existing_ending.is_empty() {
+            prepared.to_yaml()?
+        } else {
+            prepared.to_terminated_yaml()?
+        };
+        let block_collection = matches!(
+            prepared.document().semantic_kind(prepared.root()),
+            Some(
+                SemanticKind::Mapping {
+                    style: CollectionStyle::Block
+                } | SemanticKind::Sequence {
+                    style: CollectionStyle::Block
+                }
+            )
+        );
+        let mut prefix = if missing_colon {
+            format!("{ending}{}:", " ".repeat(indent))
+        } else {
+            String::new()
+        };
+        if block_collection || rendered.contains(['\r', '\n']) {
+            prefix.push_str(ending);
+            prefix.push_str(&indent_text(&rendered, indent + 2));
+            let consume = if rendered.ends_with(['\r', '\n']) {
+                existing_ending.len()
+            } else {
+                0
+            };
+            self.queue_edit(Span::from_usize(line_end, line_end + consume), prefix)?;
+        } else {
+            prefix.push(' ');
+            prefix.push_str(&rendered);
+            self.queue_edit(Span::empty_from_usize(offset), prefix)?;
+        }
+        Ok(())
     }
 
     fn block_entry_indent(&self, entry: NodeId) -> usize {

@@ -50,7 +50,6 @@ enum FlowFrameState {
     MappingAwaitKey {
         entry: NodeId,
         entry_start: u32,
-        explicit: bool,
     },
     MappingAwaitValue {
         entry: NodeId,
@@ -1873,11 +1872,9 @@ impl<'source> Parser<'source> {
                 );
                 flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
             }
-            FlowFrameState::MappingAwaitKey {
-                entry: _,
-                entry_start: _,
-                explicit: _,
-            } => self.resume_flow_mapping_key(flow, frame_index, frame, child)?,
+            FlowFrameState::MappingAwaitKey { .. } => {
+                self.resume_flow_mapping_key(flow, frame_index, frame, child)?
+            }
             FlowFrameState::MappingAwaitValue { entry, entry_start } => {
                 self.attach_child_at(entry.as_usize(), child);
                 self.finish_flow_mapping_entry(
@@ -2023,12 +2020,7 @@ impl<'source> Parser<'source> {
         frame: FlowFrame,
         child: NodeId,
     ) -> Result<(), YamlError> {
-        let FlowFrameState::MappingAwaitKey {
-            entry,
-            entry_start,
-            explicit,
-        } = frame.state
-        else {
+        let FlowFrameState::MappingAwaitKey { entry, entry_start } = frame.state else {
             return Err(invalid_flow_parser_state(
                 flow.absolute_start + flow.position,
             ));
@@ -2070,8 +2062,9 @@ impl<'source> Parser<'source> {
                 };
                 self.start_flow_node(flow, frame.close)?;
             }
-        } else if explicit || flow.text[flow.position..].starts_with(',') {
-            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+        } else if flow.text[flow.position..].starts_with([',', '}']) {
+            let key_end = self.nodes[child.as_usize()].span.end as usize;
+            let value = self.push_empty_flow_scalar(key_end);
             self.attach_child_at(entry.as_usize(), value);
             self.finish_flow_mapping_entry(
                 frame.node,
@@ -2082,11 +2075,13 @@ impl<'source> Parser<'source> {
             );
             flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
         } else {
-            let found = flow.text[flow.position..]
-                .chars()
-                .next()
-                .unwrap_or(frame.close);
-            return Err(missing_flow_mapping_colon(
+            let Some(found) = flow.text[flow.position..].chars().next() else {
+                return Err(missing_flow_mapping_end(
+                    flow.absolute_start,
+                    flow.text.len(),
+                ));
+            };
+            return Err(expected_flow_mapping_key_end(
                 flow.absolute_start + flow.position,
                 found,
             ));
@@ -2336,7 +2331,6 @@ impl<'source> Parser<'source> {
             flow.frames[frame_index].state = FlowFrameState::MappingAwaitKey {
                 entry,
                 entry_start: Span::usize_to_u32(entry_start),
-                explicit,
             };
             self.start_flow_node(flow, frame.close)?;
         }
@@ -5943,14 +5937,14 @@ fn unexpected_flow_mapping_comma(offset: usize) -> YamlError {
     )
 }
 
-fn missing_flow_mapping_colon(offset: usize, found: char) -> YamlError {
+fn expected_flow_mapping_key_end(offset: usize, found: char) -> YamlError {
     YamlError::new(
         Diagnostic::new(
             DiagnosticKind::Parser,
-            format!("missing colon after flow mapping key before `{found}`"),
+            format!("unexpected token `{found}` after flow mapping key"),
             Span::from_usize(offset, offset + found.len_utf8()),
         )
-        .with_expected(":"),
+        .with_expected(":, comma, or }"),
     )
 }
 

@@ -3248,6 +3248,49 @@ fn yaml_value_writes_flow_mapping_values() {
 }
 
 #[test]
+fn flow_mapping_omitted_values_work_at_either_entry_boundary() {
+    for input in ["{x}", "{x,}", "{x # kept\n}", "{x # kept\n,}"] {
+        let doc = YamlDoc::parse(input).unwrap();
+        let mapping = doc.root_mapping().unwrap();
+        let value = doc.get_mapping_value(mapping, "x").unwrap().unwrap();
+        assert_eq!(doc.node(value).unwrap().span(), Span::empty(2));
+        assert_eq!(doc.scalar_value(value).unwrap(), "");
+        assert_eq!(
+            doc.events_to_test_string(),
+            "+STR\n+DOC\n+MAP {}\n=VAL :x\n=VAL :\n-MAP\n-DOC\n-STR\n"
+        );
+        assert_eq!(doc.to_string(), input);
+    }
+
+    let input = "{text: first phrase, second phrase}";
+    let doc = YamlDoc::parse(input).unwrap();
+    let mapping = doc.root_mapping().unwrap();
+    let first = doc.get_mapping_value(mapping, "text").unwrap().unwrap();
+    let second = doc
+        .get_mapping_value(mapping, "second phrase")
+        .unwrap()
+        .unwrap();
+    assert_eq!(doc.scalar_value(first).unwrap(), "first phrase");
+    assert_eq!(
+        resolve_scalar(
+            &doc.scalar_value(second).unwrap(),
+            YamlScalarStyle::Plain,
+            None
+        )
+        .unwrap(),
+        ResolvedScalar::Null
+    );
+    assert_eq!(doc.to_string(), input);
+
+    let input = "{'quoted', [sequence], {m: n}}";
+    let doc = YamlDoc::parse(input).unwrap();
+    assert_eq!(
+        doc.events_to_test_string(),
+        "+STR\n+DOC\n+MAP {}\n=VAL 'quoted\n=VAL :\n+SEQ []\n=VAL :sequence\n-SEQ\n=VAL :\n+MAP {}\n=VAL :m\n=VAL :n\n-MAP\n=VAL :\n-MAP\n-DOC\n-STR\n"
+    );
+}
+
+#[test]
 fn parser_reports_malformed_flow_mappings() {
     for (input, message) in [
         ("settings: {a: b\n", "missing flow mapping closing brace"),
@@ -3257,8 +3300,8 @@ fn parser_reports_malformed_flow_mappings() {
             "unexpected comma in flow mapping",
         ),
         (
-            "settings: {a b}\n",
-            "missing colon after flow mapping key before `}`",
+            "settings: {\"a\" \"b\"}\n",
+            "unexpected token `\"` after flow mapping key",
         ),
         ("{a: b} }\n", "unexpected token `}` after flow collection"),
     ] {

@@ -3448,7 +3448,7 @@ fn flow_collection_mapping_key_colon(
     absolute_start: usize,
     max_depth: usize,
 ) -> Result<Option<usize>, YamlError> {
-    if !body_starts_flow_value(body, absolute_start)? {
+    if !body_starts_flow_value(body, absolute_start)? || !body.as_bytes().contains(&b':') {
         return Ok(None);
     }
     let properties = parse_node_properties(

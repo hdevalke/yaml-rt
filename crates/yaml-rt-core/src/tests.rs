@@ -49,8 +49,73 @@ fn configured_collection_depth_applies_to_flow_and_block_yaml() {
     let flow = YamlDoc::parse_with_limits("[[[]]]\n", limits).unwrap_err();
     assert!(flow.to_string().contains("nesting limit of 2"));
 
-    let block = YamlDoc::parse_with_limits("-\n  -\n    -\n      - value\n", limits).unwrap_err();
+    let block = YamlDoc::parse_with_limits("-\n  -\n    - value\n", limits).unwrap_err();
     assert!(block.to_string().contains("nesting limit of 2"));
+
+    for (input, offset) in [
+        ("- - - value\n", 4),
+        ("outer:\n  inner: [value]\n", 16),
+        ("[key: [value]]", 6),
+        ("[[key]: value]", 1),
+        ("[[[key]]: value]", 2),
+    ] {
+        let error = YamlDoc::parse_with_limits(input, limits).unwrap_err();
+        assert!(error.diagnostic.message.contains("nesting limit of 2"));
+        assert_eq!(
+            error.diagnostic.span,
+            Span::new(offset, offset + 1),
+            "{input:?}"
+        );
+    }
+    for input in ["- - value\n", "key: [value]\n", "[key: value]", "[[value]]"] {
+        let doc = YamlDoc::parse_with_limits(input, limits).unwrap();
+        assert_eq!(doc.to_string(), input);
+    }
+}
+
+#[test]
+fn collection_depth_zero_accepts_only_collection_free_documents() {
+    let limits = ResourceLimits {
+        max_collection_depth: 0,
+        ..ResourceLimits::default()
+    };
+    let doc = YamlDoc::parse_with_limits("value\n", limits).unwrap();
+    assert_eq!(doc.to_string(), "value\n");
+    for input in ["[value]", "{key: value}", "- value", "key: value"] {
+        let error = YamlDoc::parse_with_limits(input, limits).unwrap_err();
+        assert!(error.diagnostic.message.contains("nesting limit of 0"));
+        assert_eq!(error.diagnostic.span, Span::new(0, 1));
+    }
+}
+
+#[test]
+fn compact_block_entries_are_stack_safe_at_and_beyond_the_default_limit() {
+    let limit = ResourceLimits::default().max_collection_depth;
+    for (prefix, count) in [("- ", limit), ("- ? ", limit / 2)] {
+        let input = prefix.repeat(count) + "value\n";
+        let doc = YamlDoc::parse(&input).unwrap();
+        assert_eq!(doc.to_string(), input);
+        assert_eq!(
+            doc.events()
+                .filter(|event| matches!(
+                    event.kind,
+                    YamlEventKind::SequenceStart { .. } | YamlEventKind::MappingStart { .. }
+                ))
+                .count(),
+            limit
+        );
+    }
+
+    let input = "- ".repeat(100_000) + "value\n";
+    let error = YamlDoc::parse(&input).unwrap_err();
+    assert_eq!(
+        error.diagnostic.message,
+        "block collection nesting limit of 1024 exceeded"
+    );
+    assert_eq!(
+        error.diagnostic.span,
+        Span::from_usize(2 * limit, 2 * limit + 1)
+    );
 }
 
 #[test]

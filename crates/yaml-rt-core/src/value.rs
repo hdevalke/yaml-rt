@@ -690,7 +690,12 @@ mod tests {
                 assert!(roots_are_equal(&left, &equal).unwrap());
                 assert!(!roots_are_equal(&left, &unequal).unwrap());
 
-                let too_deep = YamlDoc::parse(&nested_block_mapping(1025, "1")).unwrap();
+                let limits = crate::ResourceLimits {
+                    max_collection_depth: 1025,
+                    ..crate::ResourceLimits::default()
+                };
+                let too_deep =
+                    YamlDoc::parse_with_limits(&nested_block_mapping(1025, "1"), limits).unwrap();
                 assert!(
                     roots_are_equal(&too_deep, &too_deep)
                         .unwrap_err()

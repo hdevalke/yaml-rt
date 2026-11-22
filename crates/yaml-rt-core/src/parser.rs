@@ -64,6 +64,22 @@ struct FlowFrame {
     node: NodeId,
     close: char,
     state: FlowFrameState,
+    depth: u32,
+    deepest: FlowDepth,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FlowDepth {
+    depth: u32,
+    offset: u32,
+}
+
+impl FlowDepth {
+    fn include(&mut self, other: Self) {
+        if other.depth > self.depth {
+            *self = other;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,7 +93,7 @@ struct FlowParseState<'text> {
     absolute_start: usize,
     root: NodeId,
     frames: Vec<FlowFrame>,
-    completed: Option<(NodeId, usize)>,
+    completed: Option<(NodeId, usize, FlowDepth)>,
     position: usize,
 }
 
@@ -85,19 +101,18 @@ impl<'text> FlowParseState<'text> {
     fn new(
         text: &'text str,
         absolute_start: usize,
-        root: NodeId,
-        open: char,
+        root: FlowFrame,
         mut frames: Vec<FlowFrame>,
     ) -> Self {
         frames.clear();
-        frames.push(flow_frame(root, open));
+        frames.push(root);
         Self {
             text,
             absolute_start,
-            root,
+            root: root.node,
             frames,
             completed: None,
-            position: open.len_utf8(),
+            position: 1,
         }
     }
 }
@@ -168,6 +183,13 @@ struct BlockValueFrame {
     empty_offset: u32,
     allow_indentless_sequence: bool,
     allow_same_indent_content: bool,
+}
+
+struct ExplicitMappingKey<'text> {
+    entry: NodeId,
+    mapping: NodeId,
+    text: &'text str,
+    start: usize,
 }
 
 struct BlockMachine<'source> {
@@ -330,7 +352,8 @@ impl<'source> Parser<'source> {
             count_indent(content, line.content_start)?
         };
         let body = &content[indent..];
-        let prepared = PreparedBlockLine::new(line, indent)?;
+        let prepared =
+            PreparedBlockLine::new(line, indent, lines.source.limits().max_collection_depth)?;
         if body.as_bytes().first() == Some(&b'\t')
             && (is_explicit_mapping_key(body)
                 || is_explicit_mapping_value(body)
@@ -358,7 +381,13 @@ impl<'source> Parser<'source> {
             }
             reject_compact_decorated_document(rest, line.content_end - rest.len())?;
             let rest_start = line.content_end - rest.len();
-            let prepared = PreparedBlockLine::from_body(line, 0, rest, rest_start)?;
+            let prepared = PreparedBlockLine::from_body(
+                line,
+                0,
+                rest,
+                rest_start,
+                lines.source.limits().max_collection_depth,
+            )?;
             return self.parse_content_body(document, lines, index, prepared);
         }
 
@@ -453,10 +482,8 @@ impl<'source> Parser<'source> {
             return Ok(1);
         }
 
-        if is_sequence_entry(body) {
-            self.parse_sequence_entry(document, lines, index, line, indent, body)
-        } else if is_explicit_mapping_key(body) {
-            self.parse_explicit_mapping_entry(document, lines, index, prepared)
+        if is_sequence_entry(body) || is_explicit_mapping_key(body) {
+            self.parse_block_entry_chain(document, lines, index, line, indent, body, absolute_start)
         } else if body.starts_with('|') || body.starts_with('>') {
             let (node, consumed) =
                 self.parse_block_scalar(lines, index, absolute_start, indent, body, true)?;
@@ -521,7 +548,7 @@ impl<'source> Parser<'source> {
             document,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
-        );
+        )?;
         self.append_simple_plain_mapping_entry(
             mapping,
             lines,
@@ -748,7 +775,7 @@ impl<'source> Parser<'source> {
             document,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
-        );
+        )?;
         let entry = self.push_node(
             NodeKind::MappingEntry,
             Span::from_usize(line.content_start, line.content_end),
@@ -903,22 +930,19 @@ impl<'source> Parser<'source> {
         Ok(1)
     }
 
-    fn parse_explicit_mapping_entry(
+    fn prepare_explicit_mapping_key<'text>(
         &mut self,
         document: NodeId,
-        lines: LineTable<'_>,
-        index: usize,
-        prepared: PreparedBlockLine<'_>,
-    ) -> Result<usize, YamlError> {
-        let line = prepared.line;
-        let indent = prepared.indent();
-        let body = prepared.body;
-        let absolute_start = prepared.absolute_start();
+        line: SourceLine<'_>,
+        indent: usize,
+        body: &'text str,
+        absolute_start: usize,
+    ) -> Result<Option<ExplicitMappingKey<'text>>, YamlError> {
         let mapping = self.mapping_for_line(
             document,
             indent,
             Span::from_usize(line.content_start + indent, line.content_end),
-        );
+        )?;
         let entry = self.push_node(
             NodeKind::MappingEntry,
             Span::from_usize(line.content_start, line.content_end),
@@ -937,7 +961,7 @@ impl<'source> Parser<'source> {
                 BlockEntryPhase::Key,
                 line.content_end,
             );
-            return Ok(1);
+            return Ok(None);
         }
         let leading = after_question.len() - after_question.trim_start().len();
         let key_start = absolute_start + 1 + leading;
@@ -957,18 +981,14 @@ impl<'source> Parser<'source> {
                 BlockEntryPhase::Key,
                 line.content_end,
             );
-            return Ok(1);
+            return Ok(None);
         }
-        let key_consumed =
-            self.parse_explicit_mapping_key_node(entry, lines, index, indent, key_text, key_start)?;
-        self.defer_explicit_mapping(
+        Ok(Some(ExplicitMappingKey {
             entry,
             mapping,
-            indent,
-            BlockEntryPhase::Separator,
-            line.content_end,
-        );
-        Ok(key_consumed)
+            text: key_text,
+            start: key_start,
+        }))
     }
 
     fn parse_explicit_mapping_key_node(
@@ -986,39 +1006,11 @@ impl<'source> Parser<'source> {
             self.attach_child_at(entry.0 as usize, node);
             self.emit_scalar_event(node)?;
             Ok(consumed)
-        } else if is_sequence_entry(key_text) {
-            let current_line = lines
-                .cursor_from(index)
-                .next()
-                .expect("current line index is in bounds");
-            let key_indent = key_start - current_line.content_start;
-            let mut consumed =
-                self.parse_sequence_entry(entry, lines, index, current_line, key_indent, key_text)?;
-            let mut nested_index = index + consumed;
-            while nested_index < lines.len() {
-                let line = lines
-                    .cursor_from(nested_index)
-                    .next()
-                    .expect("nested line index is in bounds");
-                let trimmed = line.content_without_break.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    consumed += 1;
-                    nested_index += 1;
-                    continue;
-                }
-                let indent = content_line_indent(line.content_without_break);
-                let body = &line.content_without_break[indent..];
-                if indent != key_indent || !is_sequence_entry(body) {
-                    break;
-                }
-                let prepared = PreparedBlockLine::new(line, indent)?;
-                let nested_consumed =
-                    self.parse_content_body(entry, lines, nested_index, prepared)?;
-                consumed += nested_consumed;
-                nested_index += nested_consumed;
-            }
-            Ok(consumed)
-        } else if let Some(colon_byte) = flow_collection_mapping_key_colon(key_text, key_start)? {
+        } else if let Some(colon_byte) = flow_collection_mapping_key_colon(
+            key_text,
+            key_start,
+            self.source.limits().max_collection_depth,
+        )? {
             self.parse_compact_block_mapping_node(entry, key_text, key_start, colon_byte)
         } else if body_starts_flow_value(key_text, key_start)? {
             let (key, _end, consumed) = self.parse_flow_value_lines(lines, index, key_start)?;
@@ -1109,13 +1101,14 @@ impl<'source> Parser<'source> {
             self.defer_explicit_mapping_value(entry, mapping, indent, line.content_end);
             Ok(1)
         } else if is_sequence_entry(value_trimmed) {
-            self.parse_sequence_entry(
+            self.parse_block_entry_chain(
                 entry,
                 lines,
                 index,
                 line,
                 value_start - line.content_start,
                 value_trimmed,
+                value_start,
             )
         } else if let Some(colon_byte) = find_mapping_colon(value_trimmed) {
             self.parse_compact_block_mapping_node(entry, value_trimmed, value_start, colon_byte)?;
@@ -1309,156 +1302,211 @@ impl<'source> Parser<'source> {
     }
 
     #[expect(
-        clippy::too_many_lines,
-        reason = "sequence entry parsing shares one span and indentation context"
+        clippy::too_many_arguments,
+        reason = "compact entries keep both their structural indentation and source offset"
     )]
-    fn parse_sequence_entry(
+    fn parse_block_entry_chain(
         &mut self,
-        document: NodeId,
+        mut parent: NodeId,
         lines: LineTable<'_>,
         index: usize,
         line: SourceLine<'_>,
-        indent: usize,
-        body: &str,
+        mut indent: usize,
+        mut body: &str,
+        mut start: usize,
     ) -> Result<usize, YamlError> {
-        let sequence = self.sequence_for_line(
-            document,
-            indent,
-            Span::from_usize(line.content_start + indent, line.content_end),
-        );
-        let entry = self.push_node(
-            NodeKind::SequenceEntry,
-            Span::from_usize(line.content_start, line.content_end),
-        );
-        self.attach_child_at(sequence.0 as usize, entry);
-        self.extend_node_span(sequence, line.content_end);
+        let mut explicit_keys: InlineVec<_, 2> = InlineVec::new();
+        let consumed = loop {
+            if let Some(error) = self.limit_error.take() {
+                return Err(error);
+            }
+            if is_explicit_mapping_key(body) {
+                let Some(key) =
+                    self.prepare_explicit_mapping_key(parent, line, indent, body, start)?
+                else {
+                    break 1;
+                };
+                explicit_keys.push((key.entry, key.mapping, indent));
+                if is_sequence_entry(key.text) {
+                    parent = key.entry;
+                    indent = key.start - line.content_start;
+                    start = key.start;
+                    body = key.text;
+                    continue;
+                }
+                break self.parse_explicit_mapping_key_node(
+                    key.entry, lines, index, indent, key.text, key.start,
+                )?;
+            }
 
-        let after_dash = if body == "-" { "" } else { &body[1..] };
-        reject_invalid_indicator_tab(body, line.content_start + indent)?;
-        reject_invalid_sequence_tab_separated_nested_indicator(body, line.content_start + indent)?;
-        let value = after_dash.trim_start();
-        if value.is_empty() || value.starts_with('#') {
-            self.defer_block_value(
-                BlockEntryKind::Sequence,
-                entry,
-                sequence,
-                indent,
-                line.content_start + indent + 1,
-                false,
-                false,
+            let sequence =
+                self.sequence_for_line(parent, indent, Span::from_usize(start, line.content_end))?;
+            if let Some(error) = self.limit_error.take() {
+                return Err(error);
+            }
+            let entry = self.push_node(
+                NodeKind::SequenceEntry,
+                Span::from_usize(line.content_start, line.content_end),
             );
-            Ok(1)
-        } else {
-            let leading = after_dash.len() - value.len();
-            let value_start = line.content_start + indent + 1 + leading;
-            if is_simple_plain_atom(value) && !is_sequence_entry(value) {
-                let (value_node, consumed) =
-                    self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
-                self.attach_child_at(entry.as_usize(), value_node);
-                self.emit_property_free_plain_scalar(value_node);
-                return Ok(consumed);
+            if let Some(error) = self.limit_error.take() {
+                return Err(error);
             }
-            if let Some(colon_byte) = simple_plain_key_mapping_colon(value) {
-                return self.parse_mapping_entry(
-                    entry,
-                    lines,
-                    index,
-                    line,
-                    value_start - line.content_start,
-                    value,
-                    colon_byte,
-                    value_start,
-                );
-            }
-            let value_properties = parse_node_properties(
-                value,
-                Span::from_usize(value_start, value_start + value.len()),
-            )?;
-            reject_invalid_node_property_placement(value, value_start, &value_properties)?;
-            reject_invalid_block_node_property_punctuation(value, value_start, &value_properties)?;
-            if value.starts_with('|') || value.starts_with('>') {
-                let (node, consumed) =
-                    self.parse_block_scalar(lines, index, value_start, indent, value, false)?;
-                self.attach_child_at(entry.0 as usize, node);
-                self.emit_scalar_event(node)?;
-                return Ok(consumed);
-            } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
-                && let Some(header_offset) = block_scalar_after_node_properties(value, value_start)?
-            {
-                self.push_pending_node_properties(
-                    &value[..header_offset],
-                    value_start,
-                    self.source_indent_at(value_start + header_offset),
-                )?;
-                let (node, consumed) = self.parse_block_scalar(
-                    lines,
-                    index,
-                    value_start + header_offset,
-                    indent,
-                    &value[header_offset..],
-                    false,
-                )?;
-                self.attach_child_at(entry.0 as usize, node);
-                self.emit_scalar_event(node)?;
-                return Ok(consumed);
-            } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
-                && let Some(next_indent) =
-                    property_only_block_collection_indent(value, lines, index, value_start)?
-                        .filter(|next_indent| *next_indent > indent)
-            {
-                self.push_pending_node_properties(value, value_start, next_indent)?;
+            self.attach_child_at(sequence.as_usize(), entry);
+            self.extend_node_span(sequence, line.content_end);
+
+            reject_invalid_indicator_tab(body, start)?;
+            reject_invalid_sequence_tab_separated_nested_indicator(body, start)?;
+            let after_dash = &body[1..];
+            let value = after_dash.trim_start();
+            if value.is_empty() || value.starts_with('#') {
                 self.defer_block_value(
                     BlockEntryKind::Sequence,
                     entry,
                     sequence,
                     indent,
-                    line.content_end,
+                    start + 1,
                     false,
-                    true,
+                    false,
                 );
-                return Ok(1);
-            } else if is_sequence_entry(value) {
-                return self.parse_sequence_entry(
+                break 1;
+            }
+
+            let value_start = start + 1 + after_dash.len() - value.len();
+            if is_sequence_entry(value) || is_explicit_mapping_key(value) {
+                parent = entry;
+                indent = value_start - line.content_start;
+                start = value_start;
+                body = value;
+            } else {
+                break self.parse_sequence_value(
+                    sequence,
                     entry,
                     lines,
                     index,
                     line,
-                    value_start - line.content_start,
-                    value,
-                );
-            } else if body_starts_flow_value(value, value_start)? {
-                let (value_node, _end, consumed) =
-                    self.parse_flow_value_lines(lines, index, value_start)?;
-                self.attach_child_at(entry.0 as usize, value_node);
-                return Ok(consumed);
-            } else if is_explicit_mapping_key(value) {
-                let prepared = PreparedBlockLine::from_body(
-                    line,
-                    value_start - line.content_start,
+                    indent,
                     value,
                     value_start,
                 )?;
-                return self.parse_explicit_mapping_entry(entry, lines, index, prepared);
-            } else if let Some(colon_byte) = find_mapping_colon(value) {
-                return self.parse_mapping_entry(
-                    entry,
-                    lines,
-                    index,
-                    line,
-                    value_start - line.content_start,
-                    value,
-                    colon_byte,
-                    value_start,
-                );
             }
-            validate_quoted_scalar_trailing_content(value, value_start)?;
-            reject_nested_plain_mapping_colon(value, value_start)?;
+        };
+        while let Some((entry, mapping, indent)) = explicit_keys.pop() {
+            self.defer_explicit_mapping(
+                entry,
+                mapping,
+                indent,
+                BlockEntryPhase::Separator,
+                line.content_end,
+            );
+        }
+        Ok(consumed)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "sequence values use the entry, its collection, and the source line context"
+    )]
+    fn parse_sequence_value(
+        &mut self,
+        sequence: NodeId,
+        entry: NodeId,
+        lines: LineTable<'_>,
+        index: usize,
+        line: SourceLine<'_>,
+        indent: usize,
+        value: &str,
+        value_start: usize,
+    ) -> Result<usize, YamlError> {
+        if is_simple_plain_atom(value) {
             let (value_node, consumed) =
                 self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
-            self.attach_child_at(entry.0 as usize, value_node);
-            self.emit_scalar_event(value_node)?;
-            Ok(consumed)
+            self.attach_child_at(entry.as_usize(), value_node);
+            self.emit_property_free_plain_scalar(value_node);
+            return Ok(consumed);
         }
+        if let Some(colon_byte) = simple_plain_key_mapping_colon(value) {
+            return self.parse_mapping_entry(
+                entry,
+                lines,
+                index,
+                line,
+                value_start - line.content_start,
+                value,
+                colon_byte,
+                value_start,
+            );
+        }
+        let value_properties = parse_node_properties(
+            value,
+            Span::from_usize(value_start, value_start + value.len()),
+        )?;
+        reject_invalid_node_property_placement(value, value_start, &value_properties)?;
+        reject_invalid_block_node_property_punctuation(value, value_start, &value_properties)?;
+        if value.starts_with('|') || value.starts_with('>') {
+            let (node, consumed) =
+                self.parse_block_scalar(lines, index, value_start, indent, value, false)?;
+            self.attach_child_at(entry.0 as usize, node);
+            self.emit_scalar_event(node)?;
+            return Ok(consumed);
+        } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
+            && let Some(header_offset) = block_scalar_after_node_properties(value, value_start)?
+        {
+            self.push_pending_node_properties(
+                &value[..header_offset],
+                value_start,
+                self.source_indent_at(value_start + header_offset),
+            )?;
+            let (node, consumed) = self.parse_block_scalar(
+                lines,
+                index,
+                value_start + header_offset,
+                indent,
+                &value[header_offset..],
+                false,
+            )?;
+            self.attach_child_at(entry.0 as usize, node);
+            self.emit_scalar_event(node)?;
+            return Ok(consumed);
+        } else if (value_properties.anchor().is_some() || value_properties.tag().is_some())
+            && let Some(next_indent) =
+                property_only_block_collection_indent(value, lines, index, value_start)?
+                    .filter(|next_indent| *next_indent > indent)
+        {
+            self.push_pending_node_properties(value, value_start, next_indent)?;
+            self.defer_block_value(
+                BlockEntryKind::Sequence,
+                entry,
+                sequence,
+                indent,
+                line.content_end,
+                false,
+                true,
+            );
+            return Ok(1);
+        } else if body_starts_flow_value(value, value_start)? {
+            let (value_node, _end, consumed) =
+                self.parse_flow_value_lines(lines, index, value_start)?;
+            self.attach_child_at(entry.0 as usize, value_node);
+            return Ok(consumed);
+        } else if let Some(colon_byte) = find_mapping_colon(value) {
+            return self.parse_mapping_entry(
+                entry,
+                lines,
+                index,
+                line,
+                value_start - line.content_start,
+                value,
+                colon_byte,
+                value_start,
+            );
+        }
+        validate_quoted_scalar_trailing_content(value, value_start)?;
+        reject_nested_plain_mapping_colon(value, value_start)?;
+        let (value_node, consumed) =
+            self.parse_block_plain_scalar(lines, index, indent, value_start, false)?;
+        self.attach_child_at(entry.0 as usize, value_node);
+        self.emit_scalar_event(value_node)?;
+        Ok(consumed)
     }
 
     fn parse_compact_block_mapping_node(
@@ -1468,6 +1516,7 @@ impl<'source> Parser<'source> {
         absolute_start: usize,
         colon_byte: usize,
     ) -> Result<usize, YamlError> {
+        self.check_block_collection_depth(absolute_start)?;
         let mapping = self.push_node(
             NodeKind::BlockMapping,
             Span::from_usize(absolute_start, absolute_start + body.len()),
@@ -1482,6 +1531,13 @@ impl<'source> Parser<'source> {
             Span::from_usize(absolute_start, absolute_start + body.len()),
             mapping,
         );
+
+        self.push_block_frame(BlockFrame {
+            indent: Span::usize_to_u32(self.source.line_col(absolute_start).column - 1),
+            node: mapping,
+            collection: OpenEventCollection::Mapping,
+            previous_same_kind: NO_BLOCK_FRAME,
+        });
 
         let entry = self.push_node(
             NodeKind::MappingEntry,
@@ -1525,12 +1581,6 @@ impl<'source> Parser<'source> {
         self.attach_child_at(entry.0 as usize, value);
         self.emit_scalar_event(value)?;
 
-        self.push_block_frame(BlockFrame {
-            indent: Span::usize_to_u32(self.source.line_col(absolute_start).column - 1),
-            node: mapping,
-            collection: OpenEventCollection::Mapping,
-            previous_same_kind: NO_BLOCK_FRAME,
-        });
         Ok(1)
     }
 
@@ -1781,6 +1831,8 @@ impl<'source> Parser<'source> {
         let Some(open) = text.chars().next() else {
             return Err(empty_flow_value(absolute_start));
         };
+        let depth = self.block_frames.len() + 1;
+        self.check_flow_collection_depth(depth, absolute_start)?;
         let root = self.push_node(
             if open == '[' {
                 NodeKind::FlowSequence
@@ -1790,13 +1842,14 @@ impl<'source> Parser<'source> {
             Span::from_usize(absolute_start, absolute_start + open.len_utf8()),
         );
         let frames = std::mem::take(&mut self.flow_frames);
-        let mut flow = FlowParseState::new(text, absolute_start, root, open, frames);
+        let frame = flow_frame(root, open, depth, absolute_start);
+        let mut flow = FlowParseState::new(text, absolute_start, frame, frames);
         let result = loop {
             if let Some(error) = self.limit_error.take() {
                 break Err(error);
             }
-            if let Some((child, child_end)) = flow.completed.take() {
-                match self.resume_completed_flow_node(&mut flow, child, child_end) {
+            if let Some((child, child_end, deepest)) = flow.completed.take() {
+                match self.resume_completed_flow_node(&mut flow, child, child_end, deepest) {
                     Ok(Some(end)) => break Ok((flow.root, end)),
                     Ok(None) => {}
                     Err(error) => break Err(error),
@@ -1816,18 +1869,22 @@ impl<'source> Parser<'source> {
         flow: &mut FlowParseState<'_>,
         child: NodeId,
         child_end: usize,
+        deepest: FlowDepth,
     ) -> Result<Option<usize>, YamlError> {
         flow.position = child_end;
         let Some(frame_index) = flow.frames.len().checked_sub(1) else {
             return Ok(Some(flow.position));
         };
         let frame = flow.frames[frame_index];
+        if !matches!(frame.state, FlowFrameState::SequenceAwaitItem { .. }) {
+            flow.frames[frame_index].deepest.include(deepest);
+        }
         match frame.state {
             FlowFrameState::SequenceAwaitItem {
                 entry: _,
                 entry_start: _,
                 explicit: _,
-            } => self.resume_flow_sequence_item(flow, frame_index, frame, child)?,
+            } => self.resume_flow_sequence_item(flow, frame_index, frame, child, deepest)?,
             FlowFrameState::SequenceAwaitValue {
                 entry,
                 mapping,
@@ -1875,6 +1932,7 @@ impl<'source> Parser<'source> {
         frame_index: usize,
         frame: FlowFrame,
         child: NodeId,
+        deepest: FlowDepth,
     ) -> Result<(), YamlError> {
         let FlowFrameState::SequenceAwaitItem {
             entry,
@@ -1888,7 +1946,13 @@ impl<'source> Parser<'source> {
         };
         let entry_start = entry_start as usize;
         flow.position = skip_flow_whitespace(flow.text, flow.position);
-        if flow.text[flow.position..].starts_with(':') {
+        let has_value = flow.text[flow.position..].starts_with(':');
+        if explicit || has_value {
+            self.include_flow_pair_depth(flow, frame_index, entry_start, deepest)?;
+        } else {
+            flow.frames[frame_index].deepest.include(deepest);
+        }
+        if has_value {
             if !explicit {
                 reject_split_implicit_flow_mapping_key(
                     flow.text,
@@ -2109,6 +2173,7 @@ impl<'source> Parser<'source> {
         if flow.text[flow.position..].starts_with(':')
             && is_flow_mapping_separator_colon(flow.text, flow.position)
         {
+            self.include_flow_pair_depth(flow, frame_index, entry_start, FlowDepth::default())?;
             let mapping = self.push_node(
                 NodeKind::FlowMapping,
                 Span::empty_from_usize(flow.absolute_start + entry_start),
@@ -2143,6 +2208,7 @@ impl<'source> Parser<'source> {
                 self.start_flow_node(flow, frame.close)?;
             }
         } else if explicit && flow.text[flow.position..].starts_with([',', ']']) {
+            self.include_flow_pair_depth(flow, frame_index, entry_start, FlowDepth::default())?;
             let mapping = self.push_node(
                 NodeKind::FlowMapping,
                 Span::empty_from_usize(flow.absolute_start + entry_start),
@@ -2328,7 +2394,43 @@ impl<'source> Parser<'source> {
                 .finish_flow_collection(&mut self.nodes, frame.node, span);
         }
         flow.frames.pop();
-        flow.completed = Some((frame.node, flow.position));
+        flow.completed = Some((frame.node, flow.position, frame.deepest));
+    }
+
+    fn check_flow_collection_depth(&self, depth: usize, offset: usize) -> Result<(), YamlError> {
+        let limit = self.source.limits().max_collection_depth;
+        if depth > limit {
+            return Err(collection_depth_limit_exceeded("flow", offset, limit));
+        }
+        Ok(())
+    }
+
+    fn include_flow_pair_depth(
+        &self,
+        flow: &mut FlowParseState<'_>,
+        frame_index: usize,
+        start: usize,
+        key_depth: FlowDepth,
+    ) -> Result<(), YamlError> {
+        let frame = &mut flow.frames[frame_index];
+        let depth = frame.depth + 1;
+        let offset = flow.absolute_start + start;
+        self.check_flow_collection_depth(depth as usize, offset)?;
+        frame.deepest.include(FlowDepth {
+            depth,
+            offset: Span::usize_to_u32(offset),
+        });
+        if key_depth.depth != 0 {
+            // An implicit pair is recognized after reading its key. Its
+            // collection key, if present, moves one level deeper.
+            let depth = key_depth.depth + 1;
+            self.check_flow_collection_depth(depth as usize, key_depth.offset as usize)?;
+            frame.deepest.include(FlowDepth {
+                depth,
+                offset: key_depth.offset,
+            });
+        }
+        Ok(())
     }
 
     fn start_flow_node(
@@ -2336,17 +2438,18 @@ impl<'source> Parser<'source> {
         flow: &mut FlowParseState<'_>,
         close: char,
     ) -> Result<(), YamlError> {
-        match self.prepare_flow_node(flow.text, flow.position, flow.absolute_start, close)? {
+        let parent = flow.frames.last().expect("an open flow collection");
+        let depth = parent.depth as usize
+            + usize::from(matches!(
+                parent.state,
+                FlowFrameState::SequenceAwaitValue { .. }
+            ))
+            + 1;
+        match self.prepare_flow_node(flow.text, flow.position, flow.absolute_start, close, depth)? {
             FlowNode::Scalar(node, end) => {
-                flow.completed = Some((node, end));
+                flow.completed = Some((node, end, FlowDepth::default()));
             }
             FlowNode::Collection(frame, after_open) => {
-                if flow.frames.len() >= self.source.limits().max_collection_depth {
-                    return Err(flow_collection_depth_limit_exceeded(
-                        flow.absolute_start + after_open - 1,
-                        self.source.limits().max_collection_depth,
-                    ));
-                }
                 flow.frames.push(frame);
                 flow.position = after_open;
             }
@@ -2360,6 +2463,7 @@ impl<'source> Parser<'source> {
         start: usize,
         absolute_start: usize,
         close: char,
+        depth: usize,
     ) -> Result<FlowNode, YamlError> {
         let properties = parse_node_properties(
             &text[start..],
@@ -2390,6 +2494,7 @@ impl<'source> Parser<'source> {
             return Ok(FlowNode::Scalar(node, marker));
         }
         if matches!(character, '[' | '{') {
+            self.check_flow_collection_depth(depth, absolute_start + marker)?;
             let node = self.push_node(
                 if character == '[' {
                     NodeKind::FlowSequence
@@ -2403,7 +2508,7 @@ impl<'source> Parser<'source> {
             );
             self.register_flow_collection_semantics(node, properties, None)?;
             return Ok(FlowNode::Collection(
-                flow_frame(node, character),
+                flow_frame(node, character, depth, absolute_start + marker),
                 marker + character.len_utf8(),
             ));
         }
@@ -2580,10 +2685,16 @@ impl<'source> Parser<'source> {
         Ok((scalar, consumed))
     }
 
-    fn mapping_for_line(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
+    fn mapping_for_line(
+        &mut self,
+        parent: NodeId,
+        indent: usize,
+        span: Span,
+    ) -> Result<NodeId, YamlError> {
         if let Some(node) = self.collection_at(self.last_mapping_frame, indent) {
-            node
+            Ok(node)
         } else {
+            self.check_block_collection_depth(span.start as usize)?;
             let (span, properties) = self.collection_properties(indent, span);
             let mapping = self.push_node(NodeKind::BlockMapping, span);
             self.attach_child_at(parent.0 as usize, mapping);
@@ -2605,7 +2716,7 @@ impl<'source> Parser<'source> {
                 mapping,
                 semantic_properties(&properties, None),
             );
-            mapping
+            Ok(mapping)
         }
     }
 
@@ -2618,10 +2729,16 @@ impl<'source> Parser<'source> {
         })
     }
 
-    fn sequence_for_line(&mut self, parent: NodeId, indent: usize, span: Span) -> NodeId {
+    fn sequence_for_line(
+        &mut self,
+        parent: NodeId,
+        indent: usize,
+        span: Span,
+    ) -> Result<NodeId, YamlError> {
         if let Some(node) = self.collection_at(self.last_sequence_frame, indent) {
-            node
+            Ok(node)
         } else {
+            self.check_block_collection_depth(span.start as usize)?;
             let (span, properties) = self.collection_properties(indent, span);
             let sequence = self.push_node(NodeKind::BlockSequence, span);
             self.attach_child_at(parent.0 as usize, sequence);
@@ -2643,7 +2760,7 @@ impl<'source> Parser<'source> {
                 sequence,
                 semantic_properties(&properties, None),
             );
-            sequence
+            Ok(sequence)
         }
     }
 
@@ -2652,22 +2769,15 @@ impl<'source> Parser<'source> {
         (frame.indent as usize == indent).then_some(frame.node)
     }
 
-    fn push_block_frame(&mut self, mut frame: BlockFrame) {
-        // The block parser retains one transition frame beyond the semantic
-        // collection depth while attaching a terminal nested value.
-        if self.block_frames.len() > self.source.limits().max_collection_depth {
-            self.limit_error.get_or_insert_with(|| {
-                YamlError::new(Diagnostic::new(
-                    DiagnosticKind::Parser,
-                    format!(
-                        "block collection nesting limit of {} exceeded",
-                        self.source.limits().max_collection_depth
-                    ),
-                    self.nodes[frame.node.as_usize()].span,
-                ))
-            });
-            return;
+    fn check_block_collection_depth(&self, offset: usize) -> Result<(), YamlError> {
+        let limit = self.source.limits().max_collection_depth;
+        if self.block_frames.len() >= limit {
+            return Err(collection_depth_limit_exceeded("block", offset, limit));
         }
+        Ok(())
+    }
+
+    fn push_block_frame(&mut self, mut frame: BlockFrame) {
         let index = u32::try_from(self.block_frames.len())
             .expect("block collection stack exceeds u32 capacity");
         let last = match frame.collection {
@@ -2778,7 +2888,12 @@ impl<'source> Parser<'source> {
         let is_mapping_sibling = is_explicit_mapping_key(body)
             || is_explicit_mapping_value(body)
             || known_mapping
-            || flow_collection_mapping_key_colon(body, line.content_start + indent)?.is_some()
+            || flow_collection_mapping_key_colon(
+                body,
+                line.content_start + indent,
+                self.source.limits().max_collection_depth,
+            )?
+            .is_some()
             || find_mapping_colon(body).is_some();
         if !self.mapping_is_open_at(indent) || !is_mapping_sibling {
             return Err(invalid_nested_block_sequence_sibling(
@@ -3423,6 +3538,7 @@ fn body_may_start_with_node_properties(body: &str) -> bool {
 fn flow_collection_mapping_key_colon(
     body: &str,
     absolute_start: usize,
+    max_depth: usize,
 ) -> Result<Option<usize>, YamlError> {
     if !body_starts_flow_value(body, absolute_start)? {
         return Ok(None);
@@ -3433,9 +3549,11 @@ fn flow_collection_mapping_key_colon(
     )?;
     let marker_offset =
         properties.value_start() + leading_flow_whitespace(&body[properties.value_start()..]);
-    let Ok(flow_end) =
-        flow_collection_source_end(&body[marker_offset..], absolute_start + marker_offset)
-    else {
+    let Ok(flow_end) = flow_collection_source_end(
+        &body[marker_offset..],
+        absolute_start + marker_offset,
+        max_depth,
+    ) else {
         return Ok(None);
     };
     let end = marker_offset + flow_end;
@@ -4075,12 +4193,13 @@ struct PreparedBlockLine<'source> {
 }
 
 impl<'source> PreparedBlockLine<'source> {
-    fn new(line: SourceLine<'source>, indent: usize) -> Result<Self, YamlError> {
+    fn new(line: SourceLine<'source>, indent: usize, max_depth: usize) -> Result<Self, YamlError> {
         Self::from_body(
             line,
             indent,
             &line.content_without_break[indent..],
             line.content_start + indent,
+            max_depth,
         )
     }
 
@@ -4089,6 +4208,7 @@ impl<'source> PreparedBlockLine<'source> {
         indent: usize,
         body: &'source str,
         absolute_start: usize,
+        max_depth: usize,
     ) -> Result<Self, YamlError> {
         let cached_mapping_colon = line
             .facts
@@ -4099,7 +4219,7 @@ impl<'source> PreparedBlockLine<'source> {
         } else {
             let starts_flow = body_starts_flow_value(body, absolute_start)?;
             let mapping_colon = if starts_flow {
-                flow_collection_mapping_key_colon(body, absolute_start)?
+                flow_collection_mapping_key_colon(body, absolute_start, max_depth)?
             } else {
                 find_mapping_colon(body)
             };
@@ -4420,7 +4540,11 @@ impl<'source> BlockMachine<'source> {
             self.parser.close_collections_deeper_than(indent);
             reject_unexpected_line_start(body, line.content_start + indent)?;
             let previous_depth = self.parser.block_frames.len();
-            let prepared = PreparedBlockLine::new(line, indent)?;
+            let prepared = PreparedBlockLine::new(
+                line,
+                indent,
+                self.lines.source.limits().max_collection_depth,
+            )?;
             let consumed =
                 self.parser
                     .parse_content_body(frame.owner, self.lines, index, prepared)?;
@@ -4437,7 +4561,11 @@ impl<'source> BlockMachine<'source> {
         {
             self.parser.close_collections_deeper_than(indent);
             let previous_depth = self.parser.block_frames.len();
-            let prepared = PreparedBlockLine::new(line, indent)?;
+            let prepared = PreparedBlockLine::new(
+                line,
+                indent,
+                self.lines.source.limits().max_collection_depth,
+            )?;
             let consumed =
                 self.parser
                     .parse_content_body(frame.owner, self.lines, index, prepared)?;
@@ -4531,7 +4659,11 @@ impl<'source> BlockMachine<'source> {
             self.capture_deferred_frame();
             return Ok(self.depth_transition(previous_depth, consumed));
         }
-        let prepared = PreparedBlockLine::new(line, indent)?;
+        let prepared = PreparedBlockLine::new(
+            line,
+            indent,
+            self.lines.source.limits().max_collection_depth,
+        )?;
         let structural = is_sequence_entry(body)
             || is_explicit_mapping_key(body)
             || prepared.mapping_colon().is_some()
@@ -5277,7 +5409,11 @@ fn reject_trailing_flow_content(
     ))
 }
 
-fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize, YamlError> {
+fn flow_collection_source_end(
+    text: &str,
+    absolute_start: usize,
+    max_depth: usize,
+) -> Result<usize, YamlError> {
     let start = leading_flow_whitespace(text);
     let Some(open) = text[start..].chars().next() else {
         return Err(empty_flow_value(absolute_start));
@@ -5287,6 +5423,13 @@ fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize
         '{' => '}',
         _ => return Err(empty_flow_value(absolute_start)),
     };
+    if max_depth == 0 {
+        return Err(collection_depth_limit_exceeded(
+            "flow",
+            absolute_start + start,
+            max_depth,
+        ));
+    }
     let mut stack = vec![close];
     let mut position = start + open.len_utf8();
 
@@ -5301,12 +5444,15 @@ fn flow_collection_source_end(text: &str, absolute_start: usize) -> Result<usize
             '#' if is_flow_comment_start(text, position) => {
                 position = flow_comment_end(text, position);
             }
-            '[' => {
-                stack.push(']');
-                position += 1;
-            }
-            '{' => {
-                stack.push('}');
+            '[' | '{' => {
+                if stack.len() >= max_depth {
+                    return Err(collection_depth_limit_exceeded(
+                        "flow",
+                        absolute_start + position,
+                        max_depth,
+                    ));
+                }
+                stack.push(if character == '[' { ']' } else { '}' });
                 position += 1;
             }
             ']' | '}' => {
@@ -5433,19 +5579,22 @@ fn flow_scalar_end(
     Ok(position)
 }
 
-fn flow_frame(node: NodeId, open: char) -> FlowFrame {
-    if open == '[' {
-        FlowFrame {
-            node,
-            close: ']',
-            state: FlowFrameState::SequenceExpectItem,
-        }
+fn flow_frame(node: NodeId, open: char, depth: usize, offset: usize) -> FlowFrame {
+    let (close, state) = if open == '[' {
+        (']', FlowFrameState::SequenceExpectItem)
     } else {
-        FlowFrame {
-            node,
-            close: '}',
-            state: FlowFrameState::MappingExpectKey,
-        }
+        ('}', FlowFrameState::MappingExpectKey)
+    };
+    let depth = Span::usize_to_u32(depth);
+    FlowFrame {
+        node,
+        close,
+        state,
+        depth,
+        deepest: FlowDepth {
+            depth,
+            offset: Span::usize_to_u32(offset),
+        },
     }
 }
 
@@ -5734,10 +5883,10 @@ fn invalid_flow_parser_state(offset: usize) -> YamlError {
     ))
 }
 
-fn flow_collection_depth_limit_exceeded(offset: usize, limit: usize) -> YamlError {
+fn collection_depth_limit_exceeded(style: &str, offset: usize, limit: usize) -> YamlError {
     YamlError::new(Diagnostic::new(
         DiagnosticKind::Parser,
-        format!("flow collection nesting limit of {limit} exceeded"),
+        format!("{style} collection nesting limit of {limit} exceeded"),
         Span::from_usize(offset, offset + 1),
     ))
 }
@@ -6001,7 +6150,7 @@ mod layout_tests {
 
     #[test]
     fn transient_parser_records_stay_compact() {
-        assert_eq!(size_of::<FlowFrame>(), 24);
+        assert_eq!(size_of::<FlowFrame>(), 36);
         assert_eq!(size_of::<NodeProperties>(), 32);
         assert_eq!(size_of::<PendingNodeProperties>(), 40);
         assert_eq!(size_of::<BlockFrame>(), 16);

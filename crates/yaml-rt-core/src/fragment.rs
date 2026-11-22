@@ -566,7 +566,13 @@ mod tests {
                 let accepted = YamlFragment::parse(&nested_block_sequence(1024)).unwrap();
                 assert!(accepted.render_flow(&target).is_ok());
 
-                let rejected = YamlFragment::parse(&nested_block_sequence(1025)).unwrap();
+                let limits = crate::ResourceLimits {
+                    max_collection_depth: 1025,
+                    ..crate::ResourceLimits::default()
+                };
+                let doc = YamlDoc::parse_with_limits(&nested_block_sequence(1025), limits).unwrap();
+                let root = doc.document_root(0).unwrap().unwrap();
+                let rejected = YamlFragment { doc, root };
                 assert!(
                     rejected
                         .render_flow(&target)

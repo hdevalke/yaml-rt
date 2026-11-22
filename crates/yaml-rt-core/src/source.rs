@@ -12,7 +12,8 @@ pub struct ResourceLimits {
     pub max_lines: usize,
     /// Maximum number of CST nodes produced by the parser.
     pub max_nodes: usize,
-    /// Maximum nested block or flow collection depth.
+    /// Maximum number of block and flow collections on any root-to-node
+    /// path, including the root collection and implicit flow mappings.
     pub max_collection_depth: usize,
     /// Maximum aliases followed in one direct alias chain.
     pub max_alias_chain: usize,

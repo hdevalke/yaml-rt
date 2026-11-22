@@ -6596,18 +6596,7 @@ fn decode_literal_scalar_value(
     if content.is_empty() && header.chomp == BlockChomp::Keep && content_start > header_text.len() {
         return Ok("\n".to_owned());
     }
-    let mut decoded = String::new();
-    let mut position = 0;
-
-    while position < content.len() {
-        let (line, next_position) = next_literal_content_line(content, position);
-        let (body, break_text) = split_line_break(line);
-        let stripped = strip_literal_indent(body, content_indent);
-        decoded.push_str(stripped);
-        decoded.push_str(break_text);
-        position = next_position;
-    }
-
+    let decoded = decode_block_scalar_content(content, content_indent);
     if decoded.is_empty() && !content.is_empty() && header.chomp == BlockChomp::Keep {
         return Ok("\n".to_owned());
     }
@@ -6649,7 +6638,9 @@ fn decode_block_scalar_content(content: &str, content_indent: usize) -> String {
         let (body, break_text) = split_line_break(line);
         let stripped = strip_literal_indent(body, content_indent);
         decoded.push_str(stripped);
-        decoded.push_str(break_text);
+        if !break_text.is_empty() {
+            decoded.push('\n');
+        }
         position = next_position;
     }
 
@@ -6762,7 +6753,7 @@ fn next_literal_content_line(text: &str, start: usize) -> (&str, usize) {
     (&text[start..], text.len())
 }
 
-fn split_line_break(line: &str) -> (&str, &str) {
+pub(crate) fn split_line_break(line: &str) -> (&str, &str) {
     if let Some(body) = line.strip_suffix("\r\n") {
         (body, "\r\n")
     } else if let Some(body) = line.strip_suffix('\n') {

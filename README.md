@@ -178,6 +178,8 @@ zero-width spans, and flow collection spans include their closing delimiters.
 Extraction supplies braces when a flow sequence uses single-pair mapping syntax.
 Block entry and collection CST spans cover multiline child content and end
 before the final line break; block scalars retain that break for chomping.
+Decoded block scalar values normalize physical line breaks to LF. The CST
+preserves the original spelling and line endings.
 Collection spans may start after indentation that their entry wrappers include.
 `extract_node()`
 includes a terminal block scalar's owned line break so extracted and copied

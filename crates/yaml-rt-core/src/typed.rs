@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 
 use crate::edit::closing_delimiter_offset;
+use crate::parser::split_line_break;
 use crate::{
     BlockChomp, Diagnostic, DiagnosticKind, MappingEntryStyle, Node, NodeId, NodeKind,
     NonFiniteFloat, ResolvedScalar, SemanticKind, Span, YamlDoc, YamlEditError, YamlError,
@@ -722,10 +723,22 @@ fn format_block_scalar_replacement(
         block_scalar_header_line(text, scalar.span)?;
     let header = &text[..header_end];
     let header_line = &text[header_start..header_end];
+    let header_value = &header_line[header_value_start..];
     let header_info = parse_block_scalar_header(
-        header_line[header_value_start..].trim_start(),
+        header_value,
         scalar.span.start as usize + header_start + header_value_start,
     )?;
+    if value.contains('\r') {
+        // A block scalar normalizes physical line breaks. Use escapes for
+        // carriage returns that are part of the requested string value.
+        let prefix = &text[..header_start + header_value_start];
+        let suffix = header_value
+            .trim_start_matches(|c: char| matches!(c, '|' | '>' | '+' | '-' | '1'..='9'));
+        let separation = if suffix.starts_with('#') { " " } else { "" };
+        let quoted = crate::fragment::quote_string(value);
+        let (_, ending) = split_line_break(text);
+        return Ok(format!("{prefix}{quoted}{separation}{suffix}{ending}"));
+    }
     let content_indent = doc
         .block_scalar_content_indent(scalar)
         .unwrap_or_else(|| doc.node_indent(scalar) + header_info.indent.unwrap_or(2));

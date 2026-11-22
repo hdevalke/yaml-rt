@@ -2268,7 +2268,7 @@ fn column_zero_markers_remain_document_boundaries() {
     let crlf = "foo: |\r\n  bar\r\n  ---\r\n  baz\r\n";
     let doc = YamlDoc::parse(crlf).expect("indented marker remains scalar content with CRLF");
     let value = doc.get_path(&["foo"]).unwrap().unwrap();
-    assert_eq!(doc.scalar_value(value).unwrap(), "bar\r\n---\r\nbaz\n");
+    assert_eq!(doc.scalar_value(value).unwrap(), "bar\n---\nbaz\n");
     assert_eq!(doc.to_string(), crlf);
 
     let input = "foo: |\n  bar\n---\nnext\n";
@@ -2611,6 +2611,21 @@ fn parser_reports_invalid_folded_scalar_headers() {
         assert!(!error.diagnostic.expected.is_empty());
         assert!(error.diagnostic.position.is_some());
     }
+}
+
+#[test]
+fn yaml_value_preserves_carriage_returns_when_replacing_a_block_scalar() {
+    let mut doc = YamlDoc::parse("body: |+ # kept\r\n  old\r\nnext: kept\r\n").unwrap();
+    let body = doc.get_path(&["body"]).unwrap().unwrap();
+    let value = "first\r\nsecond\r".to_owned();
+    value.write_yaml(&mut doc, Some(body)).unwrap();
+    doc.commit_edits().unwrap();
+    assert_eq!(
+        doc.as_source(),
+        "body: \"first\\r\\nsecond\\r\" # kept\r\nnext: kept\r\n"
+    );
+    let body = doc.get_path(&["body"]).unwrap().unwrap();
+    assert_eq!(doc.scalar_value(body).unwrap(), value);
 }
 
 #[test]

@@ -12,6 +12,16 @@ fn scalar(doc: &YamlDoc, document: usize, path: &str) -> String {
 }
 
 #[test]
+fn block_scalar_values_normalize_physical_line_breaks() {
+    let input = "literal: |+\r\n  first\r\n  second\r\n\r\nfolded: >+\r\n\r\n  first\r\n  second\r\n\r\nquoted: \"first\\r\\nsecond\"\r\n";
+    let doc = YamlDoc::parse(input).unwrap();
+    assert_eq!(scalar(&doc, 0, "/literal"), "first\nsecond\n\n");
+    assert_eq!(scalar(&doc, 0, "/folded"), "\nfirst second\n\n");
+    assert_eq!(scalar(&doc, 0, "/quoted"), "first\r\nsecond");
+    assert_eq!(doc.to_string(), input);
+}
+
+#[test]
 fn block_scalar_syntax_ends_before_unowned_trivia() {
     for (input, path, syntax, value) in [
         ("a: one  # note\n", "/a", "one", "one"),

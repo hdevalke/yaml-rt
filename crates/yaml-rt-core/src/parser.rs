@@ -4820,6 +4820,49 @@ pub(crate) fn parse_block_scalar_header(
     })
 }
 
+pub(crate) fn block_scalar_header_range(
+    text: &str,
+    span: Span,
+) -> Result<std::ops::Range<usize>, YamlError> {
+    let mut line_start = 0;
+    while line_start < text.len() {
+        let line_end = text[line_start..]
+            .find(['\r', '\n'])
+            .map_or(text.len(), |offset| line_start + offset);
+        let line = &text[line_start..line_end];
+        let properties = parse_node_properties(
+            line,
+            Span::from_usize(
+                span.start as usize + line_start,
+                span.start as usize + line_end,
+            ),
+        )?;
+        let value = line[properties.value_start()..].trim_start();
+        if value.starts_with('|') || value.starts_with('>') {
+            let leading = line[properties.value_start()..].len() - value.len();
+            return Ok(line_start + properties.value_start() + leading..line_end);
+        }
+
+        line_start = line_end;
+        if text[line_start..].starts_with("\r\n") {
+            line_start += 2;
+        } else if text[line_start..].starts_with(['\r', '\n']) {
+            line_start += 1;
+        } else {
+            break;
+        }
+    }
+
+    Err(YamlError::new(
+        Diagnostic::new(
+            DiagnosticKind::Emitter,
+            "could not find block scalar header",
+            span,
+        )
+        .with_expected("| or > block scalar header"),
+    ))
+}
+
 fn invalid_block_scalar_header(offset: usize, found: char) -> YamlError {
     YamlError::new(
         Diagnostic::new(

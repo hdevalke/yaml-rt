@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::fragment::{indent_continuation_lines, indent_text};
-use crate::parser::skip_flow_whitespace;
+use crate::parser::{block_scalar_header_range, skip_flow_whitespace, split_line_break};
 use crate::pointer::parse_sequence_index;
 use crate::{
     CollectionStyle, Diagnostic, DiagnosticKind, FragmentError, JsonPointer, NodeId, PointerError,
@@ -778,13 +778,34 @@ impl YamlDoc {
         self.queue_fragment_replacement_whole(target, value)
     }
 
+    fn block_entry_indent(&self, entry: NodeId) -> usize {
+        let node = self.node(entry).expect("entry exists");
+        let text = self.source.slice(node.span);
+        let body = text.trim_start_matches(' ');
+        let start = node.span.start as usize + text.len() - body.len();
+        let key_start = if node.kind() == crate::NodeKind::MappingEntry
+            && !body
+                .strip_prefix('?')
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t', '\r', '\n']))
+        {
+            self.children(entry)
+                .next()
+                .and_then(|key| self.node(key))
+                .map_or(start, |key| key.span.start as usize)
+        } else {
+            start
+        };
+        key_start - self.line_start_offset(key_start)
+    }
+
     pub(crate) fn queue_fragment_replacement_whole(
         &mut self,
         target: NodeId,
         value: &YamlFragment,
     ) -> Result<(), YamlEditError> {
+        let kind = self.semantic_kind(target);
         let target_is_flow = matches!(
-            self.semantic_kind(target),
+            kind,
             Some(
                 SemanticKind::Mapping {
                     style: CollectionStyle::Flow
@@ -793,23 +814,96 @@ impl YamlDoc {
                 }
             )
         );
-        let replacement = if target_is_flow || self.is_flow_context(target) {
+        let target_node = self.expect_node(target)?;
+        let mut span = target_node.span;
+        let text = self.source.slice(span);
+        let (_, owned_ending) = split_line_break(text);
+        let following_ending = leading_line_break(&self.as_source()[span.end as usize..]);
+        let ending = if owned_ending.is_empty() {
+            self.preferred_line_ending()
+        } else {
+            owned_ending
+        };
+        let mut header_comment = None;
+        let mut block_entry_indent = None;
+        let mut inline_block_indent = None;
+        if matches!(
+            target_node.kind(),
+            crate::NodeKind::LiteralScalar | crate::NodeKind::FoldedScalar
+        ) {
+            let header = &text[block_scalar_header_range(text, span)?];
+            header_comment = header.find('#').map(|index| {
+                let prefix = &header[..index];
+                &header[prefix.trim_end_matches([' ', '\t']).len()..]
+            });
+            if let Some(entry) = self.containing_entry(target) {
+                let indent = self.block_entry_indent(entry);
+                block_entry_indent = Some(indent);
+                let entry_start = self.expect_node(entry)?.span.start as usize;
+                if self.line_start_offset(entry_start)
+                    == self.line_start_offset(span.start as usize)
+                {
+                    inline_block_indent = Some(indent);
+                }
+            }
+        }
+        let mut replacement = if target_is_flow || self.is_flow_context(target) {
             value.render_flow_for_replacement(self, target)?
         } else {
-            let yaml = value.prepared_for_replacement(self, target)?.to_yaml()?;
-            indent_continuation_lines(&yaml, self.node_indent(self.expect_node(target)?))
-        };
-        let mut span = self.expect_node(target)?.span;
-        // Structural spans leave the final break to their surrounding entry.
-        // A fragment ending in a block scalar already supplies its own break;
-        // consume the existing separator once rather than changing keep chomp.
-        if replacement.ends_with(['\r', '\n']) {
-            let rest = &self.as_source()[span.end as usize..];
-            span.end += if rest.starts_with("\r\n") {
-                2
+            let prepared = value.prepared_for_replacement(self, target)?;
+            let yaml = if !owned_ending.is_empty()
+                || !following_ending.is_empty()
+                || header_comment.is_some()
+            {
+                prepared.to_terminated_yaml()?
             } else {
-                u32::from(rest.starts_with(['\r', '\n']))
+                prepared.to_yaml()?
             };
+            let replacement_is_block_collection = matches!(
+                prepared.document().semantic_kind(prepared.root()),
+                Some(
+                    SemanticKind::Mapping {
+                        style: CollectionStyle::Block
+                    } | SemanticKind::Sequence {
+                        style: CollectionStyle::Block
+                    }
+                )
+            );
+            if let Some(indent) = inline_block_indent.filter(|_| replacement_is_block_collection) {
+                let start = span.start as usize;
+                let prefix = &self.as_source()[self.line_start_offset(start)..start];
+                span.start -=
+                    Span::usize_to_u32(prefix.len() - prefix.trim_end_matches([' ', '\t']).len());
+                format!("{ending}{}", indent_text(&yaml, indent + 2))
+            } else {
+                let indent = inline_block_indent.unwrap_or_else(|| self.node_indent(target_node));
+                indent_continuation_lines(&yaml, indent)
+            }
+        };
+        if let Some(comment) = header_comment {
+            if !replacement.contains(['\r', '\n']) {
+                if comment.starts_with('#') {
+                    replacement.push(' ');
+                }
+                replacement.push_str(comment);
+            } else {
+                if !replacement.ends_with(['\r', '\n']) {
+                    replacement.push_str(ending);
+                }
+                let indent = block_entry_indent.unwrap_or(0);
+                replacement.push_str(&" ".repeat(indent));
+                replacement.push_str(comment.trim_start_matches([' ', '\t']));
+            }
+        }
+        // A block scalar can own the separator before the following entry.
+        // Reuse it when changing to an unterminated fragment. When a fragment
+        // supplies the separator, consume an external break only if needed.
+        if replacement.ends_with(['\r', '\n']) {
+            if owned_ending.is_empty() {
+                span.end += Span::usize_to_u32(following_ending.len());
+            }
+        } else {
+            replacement.push_str(owned_ending);
         }
         self.queue_edit(span, replacement)?;
         Ok(())
@@ -1346,6 +1440,18 @@ pub(crate) fn closing_delimiter_offset(
         .rfind(delimiter)
         .ok_or_else(|| YamlEditError::new(format!("missing `{delimiter}` delimiter")))?;
     Ok(span.start as usize + relative)
+}
+
+fn leading_line_break(text: &str) -> &str {
+    if text.starts_with("\r\n") {
+        "\r\n"
+    } else if text.starts_with('\r') {
+        "\r"
+    } else if text.starts_with('\n') {
+        "\n"
+    } else {
+        ""
+    }
 }
 
 fn insertion_prefix(doc: &YamlDoc, offset: usize) -> String {

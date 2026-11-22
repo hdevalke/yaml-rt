@@ -341,14 +341,16 @@ impl YamlDoc {
         if text.ends_with(['\r', '\n']) {
             return None;
         }
-        let offset = text
+        let header_range = crate::parser::block_scalar_header_range(text, last.span).ok()?;
+        let header_start = header_range.start;
+        let header = &text[header_range];
+        let indicators = &header[..header
             .bytes()
             .take_while(|byte| matches!(byte, b'|' | b'>' | b'+' | b'-' | b'1'..=b'9'))
-            .position(|byte| byte == b'+')?;
-        Some(crate::Span::from_usize(
-            last.span.start as usize + offset,
-            last.span.start as usize + offset + 1,
-        ))
+            .count()];
+        let offset = last.span.start as usize + header_start;
+        let keep = indicators.find('+')?;
+        Some(crate::Span::from_usize(offset + keep, offset + keep + 1))
     }
 
     /// Extracts one semantic node as valid standalone YAML where possible.

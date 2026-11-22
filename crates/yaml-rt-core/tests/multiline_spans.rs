@@ -465,6 +465,55 @@ fn multiline_collection_mutations_preserve_neighbors() {
 }
 
 #[test]
+fn block_scalar_replacement_keeps_the_separator_and_header_comment() {
+    for ending in ["\n", "\r\n", "\r"] {
+        for head in ["|", ">-", "|+"] {
+            let input =
+                format!("root:\n  a: {head} # keep\n    old\n  b: next\n").replace('\n', ending);
+            let mut doc = YamlDoc::parse(&input).unwrap();
+            doc.replace_at(0, &pointer("/root/a"), &YamlFragment::parse("ZZ").unwrap())
+                .unwrap();
+            assert_eq!(
+                doc.as_source(),
+                "root:\n  a: ZZ # keep\n  b: next\n".replace('\n', ending)
+            );
+            assert_eq!(scalar(&doc, 0, "/root/a"), "ZZ");
+            assert_eq!(scalar(&doc, 0, "/root/b"), "next");
+        }
+    }
+}
+
+#[test]
+fn block_scalar_replacement_preserves_the_incoming_fragment_and_neighboring_trivia() {
+    for (fragment, expected) in [
+        ("a: one", "value:\n  a: one\n# original note\ntail: kept\n"),
+        (
+            "|- # incoming note\n  new",
+            "value: |- # incoming note\n  new\n# original note\ntail: kept\n",
+        ),
+    ] {
+        let mut doc = YamlDoc::parse("value: | # original note\n  old\ntail: kept\n").unwrap();
+        doc.replace_at(
+            0,
+            &pointer("/value"),
+            &YamlFragment::parse(fragment).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc.as_source(), expected);
+        assert_eq!(scalar(&doc, 0, "/tail"), "kept");
+    }
+    let mut doc = YamlDoc::parse("value: |\n  old\n# between\ntail: kept\n").unwrap();
+    let fragment = YamlFragment::parse("|+\n  new\n\n").unwrap();
+    doc.replace_at(0, &pointer("/value"), &fragment).unwrap();
+    assert_eq!(scalar(&doc, 0, "/value"), "new\n\n");
+    assert_eq!(scalar(&doc, 0, "/tail"), "kept");
+    assert_eq!(
+        doc.as_source(),
+        "value: |+\n  new\n\n# between\ntail: kept\n"
+    );
+}
+
+#[test]
 fn inline_block_scalar_consumes_deferred_leading_blank_lines() {
     for ending in ["\n", "\r\n", "\r"] {
         for (header, body) in [("|", "one\ntwo"), (">", "one two")] {

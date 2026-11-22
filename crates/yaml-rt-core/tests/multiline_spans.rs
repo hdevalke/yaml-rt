@@ -1,6 +1,6 @@
 mod common;
 
-use yaml_rt_core::{JsonPointer, Span, YamlDoc, YamlFragment};
+use yaml_rt_core::{JsonPointer, MappingEntryStyle, Span, YamlDoc, YamlFragment};
 
 fn pointer(path: &str) -> JsonPointer {
     JsonPointer::parse(path).unwrap()
@@ -13,12 +13,55 @@ fn scalar(doc: &YamlDoc, document: usize, path: &str) -> String {
 
 #[test]
 fn block_scalar_values_normalize_physical_line_breaks() {
-    let input = "literal: |+\r\n  first\r\n  second\r\n\r\nfolded: >+\r\n\r\n  first\r\n  second\r\n\r\nquoted: \"first\\r\\nsecond\"\r\n";
-    let doc = YamlDoc::parse(input).unwrap();
-    assert_eq!(scalar(&doc, 0, "/literal"), "first\nsecond\n\n");
-    assert_eq!(scalar(&doc, 0, "/folded"), "\nfirst second\n\n");
-    assert_eq!(scalar(&doc, 0, "/quoted"), "first\r\nsecond");
-    assert_eq!(doc.to_string(), input);
+    let input = "literal: |+\n  first\n  second\n\nfolded: >+\n\n  first\n  second\n\nquoted: \"first\\r\\nsecond\"\n";
+    for ending in ["\n", "\r\n", "\r"] {
+        let input = input.replace('\n', ending);
+        let doc = YamlDoc::parse(&input).unwrap();
+        assert_eq!(scalar(&doc, 0, "/literal"), "first\nsecond\n\n");
+        assert_eq!(scalar(&doc, 0, "/folded"), "\nfirst second\n\n");
+        assert_eq!(scalar(&doc, 0, "/quoted"), "first\r\nsecond");
+        assert_eq!(doc.to_string(), input);
+    }
+}
+
+#[test]
+fn multiline_replacement_preserves_indentation_and_line_endings() {
+    for ending in ["\n", "\r\n", "\r"] {
+        let input = "root:\n  target: old\n  sibling: kept\n".replace('\n', ending);
+        let replacement = "|\n  first\n  second\n".replace('\n', ending);
+        let expected =
+            "root:\n  target: |\n     first\n     second\n  sibling: kept\n".replace('\n', ending);
+        let mut doc = YamlDoc::parse(&input).unwrap();
+        doc.replace_at(
+            0,
+            &pointer("/root/target"),
+            &YamlFragment::parse(&replacement).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc.as_source(), expected);
+        assert_eq!(scalar(&doc, 0, "/root/target"), "first\nsecond\n");
+        assert_eq!(scalar(&doc, 0, "/root/sibling"), "kept");
+    }
+}
+
+#[test]
+fn inserted_comment_lines_each_receive_a_comment_indicator() {
+    let mut doc = YamlDoc::parse("existing: kept\r").unwrap();
+    let root = doc.root_mapping().unwrap();
+    doc.insert_mapping_entry_with_comment(
+        root,
+        "new",
+        "value",
+        MappingEntryStyle::Inherit,
+        Some("first\rnext: still a comment\r\nlast"),
+    )
+    .unwrap();
+    doc.commit_edits().unwrap();
+    assert_eq!(
+        doc.as_source(),
+        "existing: kept\r# first\r# next: still a comment\r# last\rnew: value\r"
+    );
+    assert_eq!(doc.mapping_entries(doc.root_mapping().unwrap()).count(), 2);
 }
 
 #[test]

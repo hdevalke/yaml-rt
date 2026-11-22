@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::fragment::indent_text;
+use crate::fragment::{indent_continuation_lines, indent_text};
 use crate::parser::skip_flow_whitespace;
 use crate::pointer::parse_sequence_index;
 use crate::{
@@ -1388,28 +1388,6 @@ fn format_block_sequence_entry(value: &str, indent: usize, ending: &str) -> Stri
     let mut output = format!("{prefix}-{ending}{value}");
     if !output.ends_with(['\n', '\r']) {
         output.push_str(ending);
-    }
-    output
-}
-
-fn indent_continuation_lines(value: &str, indent: usize) -> String {
-    if indent == 0 {
-        return value.to_owned();
-    }
-    let prefix = " ".repeat(indent);
-    let mut output = String::with_capacity(value.len());
-    let mut after_break = false;
-    for character in value.chars() {
-        if after_break && !matches!(character, '\r' | '\n') {
-            output.push_str(&prefix);
-            after_break = false;
-        }
-        output.push(character);
-        if character == '\n' {
-            after_break = true;
-        } else if character != '\r' {
-            after_break = false;
-        }
     }
     output
 }

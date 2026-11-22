@@ -2746,7 +2746,9 @@ impl<'source> Parser<'source> {
 
     fn source_indent_at(&self, offset: usize) -> usize {
         let text = self.source.as_str();
-        let line_start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
+        let line_start = text[..offset]
+            .rfind(['\r', '\n'])
+            .map_or(0, |index| index + 1);
         content_line_indent(&text[line_start..offset])
     }
 
@@ -5061,7 +5063,7 @@ fn reject_split_implicit_flow_mapping_key(
     colon: usize,
     absolute_start: usize,
 ) -> Result<(), YamlError> {
-    if text[start..colon].contains('\n') {
+    if text[start..colon].contains(['\r', '\n']) {
         return Err(YamlError::new(
             Diagnostic::new(
                 DiagnosticKind::Parser,
@@ -5081,9 +5083,7 @@ fn reject_unindented_split_flow_mapping_value(
     absolute_start: usize,
     flow_indent: usize,
 ) -> Result<(), YamlError> {
-    if !text[whitespace_start..value_start].contains('\n')
-        && !text[whitespace_start..value_start].contains('\r')
-    {
+    if !text[whitespace_start..value_start].contains(['\r', '\n']) {
         return Ok(());
     }
     if text[value_start..]
@@ -6713,6 +6713,18 @@ fn literal_lines(mut text: &str) -> Vec<(&str, &str)> {
 
 fn line_is_more_indented(line: &str) -> bool {
     line.starts_with(' ') || line.starts_with('\t')
+}
+
+/// Iterates through YAML physical lines without their line breaks.
+pub(crate) fn yaml_lines(mut text: &str) -> impl Iterator<Item = &str> {
+    std::iter::from_fn(move || {
+        if text.is_empty() {
+            return None;
+        }
+        let (line, next) = split_first_line(text);
+        text = &text[next..];
+        Some(line)
+    })
 }
 
 fn split_first_line(text: &str) -> (&str, usize) {

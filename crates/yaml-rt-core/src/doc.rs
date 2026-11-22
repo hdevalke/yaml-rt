@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::parser::yaml_lines;
 use crate::syntax::node_link;
 use crate::{
     Children, CollectionStyle, Diagnostic, DiagnosticKind, FromYamlDoc, Node, NodeId, NodeKind,
@@ -2015,7 +2016,7 @@ impl YamlDoc {
         let start = self.line_start_for_offset(mapping.span.start as usize);
         let end = mapping.span.end as usize;
         let text = &self.source.as_str()[start..end];
-        text.contains("\n\n") || text.contains("\r\n\r\n")
+        yaml_lines(text).any(str::is_empty)
     }
 
     fn format_mapping_entry_replacement(
@@ -2043,7 +2044,7 @@ impl YamlDoc {
             replacement.push_str(line_ending);
         }
         if let Some(comment) = comment {
-            for line in comment.lines() {
+            for line in yaml_lines(comment) {
                 replacement.push_str(&indent_text);
                 replacement.push('#');
                 if !line.is_empty() {
@@ -2090,7 +2091,7 @@ impl YamlDoc {
             replacement.push_str(line_ending);
         }
         if let Some(comment) = comment {
-            for line in comment.lines() {
+            for line in yaml_lines(comment) {
                 replacement.push_str(&indent_text);
                 replacement.push('#');
                 if !line.is_empty() {
@@ -2102,7 +2103,7 @@ impl YamlDoc {
         }
         replacement.push_str(&indent_text);
         replacement.push_str(&crate::edit::emit_string_key(key));
-        if fragment.contains('\n') || fragment.starts_with(' ') {
+        if fragment.contains(['\r', '\n']) || fragment.starts_with(' ') {
             replacement.push(':');
             replacement.push_str(line_ending);
             replacement.push_str(&fragment);
@@ -2161,18 +2162,10 @@ impl YamlDoc {
 
     pub(crate) fn block_scalar_content_indent(&self, scalar: &Node) -> Option<usize> {
         let text = self.source.slice(scalar.span);
-        let header_end = text.find(['\r', '\n'])?;
-        let mut rest = &text[header_end..];
-        while let Some(stripped) = rest.strip_prefix('\r').or_else(|| rest.strip_prefix('\n')) {
-            rest = stripped;
-        }
-        for line in rest.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            return Some(line.bytes().take_while(|byte| *byte == b' ').count());
-        }
-        None
+        yaml_lines(text)
+            .skip(1)
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.bytes().take_while(|byte| *byte == b' ').count())
     }
 
     pub(crate) fn queue_edit(&mut self, span: Span, replacement: String) -> Result<(), YamlError> {

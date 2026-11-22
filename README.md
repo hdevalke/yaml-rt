@@ -692,8 +692,8 @@ do not enter the core parser. The official JSON Schema Test Suite is pinned at
 ## YAML 1.2.2 conformance
 
 The parser is tested against all 402 cases in the YAML Test Suite tag
-`data-2022-01-17`, including semantic JSON comparisons where fixtures provide
-them. The expected-failure list is empty.
+`data-2022-01-17` with LF, CRLF, and bare CR inputs. The harness compares
+semantic JSON where fixtures provide it. The expected-failure list is empty.
 
 The conformance harness is opt-in for ordinary package tests. A complete local
 run uses the pinned submodule:

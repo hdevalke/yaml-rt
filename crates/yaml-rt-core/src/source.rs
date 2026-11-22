@@ -486,7 +486,7 @@ fn validate_source_chunk(
             if !matches!(byte, b'\t' | b'\n' | b'\r' | b' '..=b'~') {
                 return Err(invalid_yaml_character(offset, char::from(byte)));
             }
-            if byte == b'\n' {
+            if byte == b'\n' || (byte == b'\r' && bytes.get(offset + 1) != Some(&b'\n')) {
                 line_starts.push(Span::usize_to_u32(offset + 1));
             }
         } else if unicode_sequence_may_be_non_printable(bytes, offset) {

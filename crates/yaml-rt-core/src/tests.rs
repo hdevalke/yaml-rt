@@ -143,6 +143,24 @@ fn source_tracks_line_columns() {
 }
 
 #[test]
+fn source_indexes_mixed_breaks_and_counts_a_split_crlf_once() {
+    // The CR is at the end of a source scanner chunk.
+    let input = "a".repeat(31) + "\r\nx\ry\nz\r";
+    let source = Source::new(input.clone()).unwrap();
+    assert_eq!(source.as_str(), input);
+    assert_eq!(source.line_starts(), &[0, 33, 35, 37, 39]);
+    assert_eq!(source.line_col(35), LineCol { line: 3, column: 1 });
+
+    let limits = ResourceLimits {
+        max_lines: 4,
+        ..ResourceLimits::default()
+    };
+    let error = Source::new_with_limits(input, limits).unwrap_err();
+    assert!(error.diagnostic.message.contains("line limit of 4"));
+    assert_eq!(error.diagnostic.span, Span::empty(39));
+}
+
+#[test]
 fn source_rejects_invalid_yaml_characters() {
     let error = Source::new("valid\0invalid".to_owned()).expect_err("NUL is not YAML text");
 
@@ -3744,7 +3762,7 @@ fn parser_handles_utf8_in_offset_sensitive_positions_without_panicking() {
 
 #[test]
 fn parser_indexes_unicode_lines_by_byte_offset() {
-    let input = "clé: un\r\n次:\n  - 値\n";
+    let input = "clé: un\r\n次:\r  - 値\n";
     let doc = YamlDoc::parse(input).expect("Unicode keys and mixed line endings parse");
     let first = doc.get_path(&["clé"]).unwrap().unwrap();
     let sequence = doc.get_path(&["次"]).unwrap().unwrap();

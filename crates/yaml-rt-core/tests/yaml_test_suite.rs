@@ -290,8 +290,25 @@ fn run_case(case: &SuiteCase) -> Result<(), ClassifiedFailure> {
             format!("failed to read {}: {error}", case.input.display()),
         )
     })?;
-    let parsed = YamlDoc::parse(&input);
+    run_case_input(case, &input)?;
 
+    // Preserve the fixture's bytes for its original run. The generated runs
+    // exercise other physical line breaks against the same semantic oracle.
+    let lf = input.replace("\r\n", "\n").replace('\r', "\n");
+    for (name, ending) in [("LF", "\n"), ("CRLF", "\r\n"), ("CR", "\r")] {
+        let variant = lf.replace('\n', ending);
+        if variant != input {
+            run_case_input(case, &variant).map_err(|mut failure| {
+                failure.message = format!("input with {name} line endings. {}", failure.message);
+                failure
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn run_case_input(case: &SuiteCase, input: &str) -> Result<(), ClassifiedFailure> {
+    let parsed = YamlDoc::parse(input);
     if case.is_error {
         if parsed.is_ok() {
             return Err(ClassifiedFailure::new(

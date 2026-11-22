@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 
 use crate::edit::closing_delimiter_offset;
-use crate::parser::split_line_break;
+use crate::parser::{split_line_break, yaml_lines};
 use crate::{
     BlockChomp, Diagnostic, DiagnosticKind, MappingEntryStyle, Node, NodeId, NodeKind,
     NonFiniteFloat, ResolvedScalar, SemanticKind, Span, YamlDoc, YamlEditError, YamlError,
@@ -243,7 +243,7 @@ where
             output.push_str(&indent_text);
             output.push_str(&crate::edit::emit_string_key(key));
             let value = value.to_yaml_fragment(indent + 2, line_ending)?;
-            if value.contains('\n') || value.starts_with(' ') {
+            if value.contains(['\r', '\n']) || value.starts_with(' ') {
                 output.push(':');
                 output.push_str(line_ending);
                 output.push_str(&value);
@@ -277,7 +277,7 @@ where
             output.push_str(&indent_text);
             output.push_str(&crate::edit::emit_string_key(key));
             let value = value.to_yaml_fragment(indent + 2, line_ending)?;
-            if value.contains('\n') || value.starts_with(' ') {
+            if value.contains(['\r', '\n']) || value.starts_with(' ') {
                 output.push(':');
                 output.push_str(line_ending);
                 output.push_str(&value);
@@ -338,7 +338,7 @@ where
     let output_indent = " ".repeat(indent);
     let mut output = String::new();
 
-    for line in rendered.lines().skip(1) {
+    for line in yaml_lines(&rendered).skip(1) {
         if line.trim_start().starts_with("__rty_placeholder:") {
             continue;
         }
@@ -483,7 +483,7 @@ pub fn __tag_yaml_fragment(
             }
         )
     );
-    if is_block_collection || payload.contains('\n') || payload.starts_with(' ') {
+    if is_block_collection || payload.contains(['\r', '\n']) || payload.starts_with(' ') {
         Ok(format!(
             "{}!{tag}{line_ending}{payload}",
             " ".repeat(indent)
@@ -812,7 +812,7 @@ fn push_block_sequence_item(
     line_ending: &str,
 ) {
     output.push_str(indent_text);
-    if fragment.contains('\n') || fragment.starts_with(' ') {
+    if fragment.contains(['\r', '\n']) || fragment.starts_with(' ') {
         output.push('-');
         output.push_str(line_ending);
         output.push_str(fragment);

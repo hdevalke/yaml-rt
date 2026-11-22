@@ -436,12 +436,19 @@ fn deindent_continuation_lines(source: &str, indent: usize) -> String {
 }
 
 pub(crate) fn indent_text(source: &str, indent: usize) -> String {
+    indent_lines(source, indent, true)
+}
+
+pub(crate) fn indent_continuation_lines(source: &str, indent: usize) -> String {
+    indent_lines(source, indent, false)
+}
+
+fn indent_lines(source: &str, indent: usize, mut at_line_start: bool) -> String {
     if indent == 0 || source.is_empty() {
         return source.to_owned();
     }
     let prefix = " ".repeat(indent);
     let mut output = String::with_capacity(source.len() + prefix.len());
-    let mut at_line_start = true;
     for character in source.chars() {
         if at_line_start && !matches!(character, '\r' | '\n') {
             output.push_str(&prefix);

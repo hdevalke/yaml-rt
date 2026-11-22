@@ -49,11 +49,9 @@ enum FlowFrameState {
     MappingExpectKey,
     MappingAwaitKey {
         entry: NodeId,
-        entry_start: u32,
     },
     MappingAwaitValue {
         entry: NodeId,
-        entry_start: u32,
     },
     MappingAfterPair,
 }
@@ -1886,28 +1884,15 @@ impl<'source> Parser<'source> {
                 mapping_entry,
             } => {
                 self.attach_child_at(mapping_entry.as_usize(), child);
-                self.finish_flow_mapping_sequence_item(
-                    frame.node,
-                    entry,
-                    mapping,
-                    mapping_entry,
-                    flow.position,
-                    flow.absolute_start,
-                );
+                self.finish_flow_mapping_sequence_item(frame.node, entry, mapping);
                 flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
             }
             FlowFrameState::MappingAwaitKey { .. } => {
                 self.resume_flow_mapping_key(flow, frame_index, frame, child)?
             }
-            FlowFrameState::MappingAwaitValue { entry, entry_start } => {
+            FlowFrameState::MappingAwaitValue { entry } => {
                 self.attach_child_at(entry.as_usize(), child);
-                self.finish_flow_mapping_entry(
-                    frame.node,
-                    entry,
-                    entry_start as usize,
-                    flow.position,
-                    flow.absolute_start,
-                );
+                self.attach_child_at(frame.node.as_usize(), entry);
                 flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
             }
             _ => {
@@ -1956,21 +1941,16 @@ impl<'source> Parser<'source> {
             }
             let mapping = self.push_node(
                 NodeKind::FlowMapping,
-                Span::from_usize(
-                    flow.absolute_start + entry_start,
-                    flow.absolute_start + flow.position,
-                ),
+                Span::empty_from_usize(flow.absolute_start + entry_start),
             );
             self.register_implicit_flow_mapping(mapping);
             let mapping_entry = self.push_node(
                 NodeKind::MappingEntry,
-                Span::from_usize(
-                    flow.absolute_start + entry_start,
-                    flow.absolute_start + flow.position,
-                ),
+                Span::empty_from_usize(flow.absolute_start + entry_start),
             );
             self.attach_child_at(mapping.as_usize(), mapping_entry);
             self.attach_child_at(mapping_entry.as_usize(), child);
+            let value_start = flow.position + 1;
             flow.position = flow_value_after_separator(
                 flow.text,
                 flow.position,
@@ -1979,16 +1959,9 @@ impl<'source> Parser<'source> {
                 self.flow_key_is_json(child),
             )?;
             if flow.text[flow.position..].starts_with([',', ']']) {
-                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + value_start);
                 self.attach_child_at(mapping_entry.as_usize(), value);
-                self.finish_flow_mapping_sequence_item(
-                    frame.node,
-                    entry,
-                    mapping,
-                    mapping_entry,
-                    flow.position,
-                    flow.absolute_start,
-                );
+                self.finish_flow_mapping_sequence_item(frame.node, entry, mapping);
                 flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
             } else {
                 flow.frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
@@ -2001,36 +1974,21 @@ impl<'source> Parser<'source> {
         } else if explicit {
             let mapping = self.push_node(
                 NodeKind::FlowMapping,
-                Span::from_usize(
-                    flow.absolute_start + entry_start,
-                    flow.absolute_start + flow.position,
-                ),
+                Span::empty_from_usize(flow.absolute_start + entry_start),
             );
             self.register_implicit_flow_mapping(mapping);
             let mapping_entry = self.push_node(
                 NodeKind::MappingEntry,
-                Span::from_usize(
-                    flow.absolute_start + entry_start,
-                    flow.absolute_start + flow.position,
-                ),
+                Span::empty_from_usize(flow.absolute_start + entry_start),
             );
-            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+            let value = self.push_empty_flow_scalar(self.nodes[child.as_usize()].span.end as usize);
             self.attach_child_at(mapping.as_usize(), mapping_entry);
             self.attach_child_at(mapping_entry.as_usize(), child);
             self.attach_child_at(mapping_entry.as_usize(), value);
-            self.finish_flow_mapping_sequence_item(
-                frame.node,
-                entry,
-                mapping,
-                mapping_entry,
-                flow.position,
-                flow.absolute_start,
-            );
+            self.finish_flow_mapping_sequence_item(frame.node, entry, mapping);
             flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
         } else {
             self.attach_child_at(entry.as_usize(), child);
-            self.nodes[entry.as_usize()].span.end =
-                Span::usize_to_u32(flow.absolute_start + flow.position);
             self.attach_child_at(frame.node.as_usize(), entry);
             flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
         }
@@ -2044,12 +2002,11 @@ impl<'source> Parser<'source> {
         frame: FlowFrame,
         child: NodeId,
     ) -> Result<(), YamlError> {
-        let FlowFrameState::MappingAwaitKey { entry, entry_start } = frame.state else {
+        let FlowFrameState::MappingAwaitKey { entry } = frame.state else {
             return Err(invalid_flow_parser_state(
                 flow.absolute_start + flow.position,
             ));
         };
-        let entry_start = entry_start as usize;
         self.attach_child_at(entry.as_usize(), child);
         flow.position = skip_flow_whitespace(flow.text, flow.position);
         if self.flow_key_has_value(flow, child) {
@@ -2069,34 +2026,19 @@ impl<'source> Parser<'source> {
                 self.source_indent_at(flow.absolute_start),
             )?;
             if flow.text[flow.position..].starts_with([',', '}']) {
-                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + value_start);
                 self.attach_child_at(entry.as_usize(), value);
-                self.finish_flow_mapping_entry(
-                    frame.node,
-                    entry,
-                    entry_start,
-                    flow.position,
-                    flow.absolute_start,
-                );
+                self.attach_child_at(frame.node.as_usize(), entry);
                 flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
             } else {
-                flow.frames[frame_index].state = FlowFrameState::MappingAwaitValue {
-                    entry,
-                    entry_start: Span::usize_to_u32(entry_start),
-                };
+                flow.frames[frame_index].state = FlowFrameState::MappingAwaitValue { entry };
                 self.start_flow_node(flow, frame.close)?;
             }
         } else if flow.text[flow.position..].starts_with([',', '}']) {
             let key_end = self.nodes[child.as_usize()].span.end as usize;
             let value = self.push_empty_flow_scalar(key_end);
             self.attach_child_at(entry.as_usize(), value);
-            self.finish_flow_mapping_entry(
-                frame.node,
-                entry,
-                entry_start,
-                flow.position,
-                flow.absolute_start,
-            );
+            self.attach_child_at(frame.node.as_usize(), entry);
             flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
         } else {
             let Some(found) = flow.text[flow.position..].chars().next() else {
@@ -2205,6 +2147,7 @@ impl<'source> Parser<'source> {
             let key = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
             self.attach_child_at(mapping.as_usize(), mapping_entry);
             self.attach_child_at(mapping_entry.as_usize(), key);
+            let value_start = flow.position + 1;
             flow.position = flow_value_after_separator(
                 flow.text,
                 flow.position,
@@ -2213,16 +2156,9 @@ impl<'source> Parser<'source> {
                 false,
             )?;
             if flow.text[flow.position..].starts_with([',', ']']) {
-                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + value_start);
                 self.attach_child_at(mapping_entry.as_usize(), value);
-                self.finish_flow_mapping_sequence_item(
-                    frame.node,
-                    entry,
-                    mapping,
-                    mapping_entry,
-                    flow.position,
-                    flow.absolute_start,
-                );
+                self.finish_flow_mapping_sequence_item(frame.node, entry, mapping);
                 flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
             } else {
                 flow.frames[frame_index].state = FlowFrameState::SequenceAwaitValue {
@@ -2243,19 +2179,12 @@ impl<'source> Parser<'source> {
                 NodeKind::MappingEntry,
                 Span::empty_from_usize(flow.absolute_start + entry_start),
             );
-            let key = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
-            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+            let key = self.push_empty_flow_scalar(flow.absolute_start + entry_start + 1);
+            let value = self.push_empty_flow_scalar(flow.absolute_start + entry_start + 1);
             self.attach_child_at(mapping.as_usize(), mapping_entry);
             self.attach_child_at(mapping_entry.as_usize(), key);
             self.attach_child_at(mapping_entry.as_usize(), value);
-            self.finish_flow_mapping_sequence_item(
-                frame.node,
-                entry,
-                mapping,
-                mapping_entry,
-                flow.position,
-                flow.absolute_start,
-            );
+            self.finish_flow_mapping_sequence_item(frame.node, entry, mapping);
             flow.frames[frame_index].state = FlowFrameState::SequenceAfterItem;
         } else {
             flow.frames[frame_index].state = FlowFrameState::SequenceAwaitItem {
@@ -2321,41 +2250,23 @@ impl<'source> Parser<'source> {
                 self.source_indent_at(flow.absolute_start),
             )?;
             if flow.text[flow.position..].starts_with([',', '}']) {
-                let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+                let value = self.push_empty_flow_scalar(flow.absolute_start + value_start);
                 self.attach_child_at(entry.as_usize(), value);
-                self.finish_flow_mapping_entry(
-                    frame.node,
-                    entry,
-                    entry_start,
-                    flow.position,
-                    flow.absolute_start,
-                );
+                self.attach_child_at(frame.node.as_usize(), entry);
                 flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
             } else {
-                flow.frames[frame_index].state = FlowFrameState::MappingAwaitValue {
-                    entry,
-                    entry_start: Span::usize_to_u32(entry_start),
-                };
+                flow.frames[frame_index].state = FlowFrameState::MappingAwaitValue { entry };
                 self.start_flow_node(flow, frame.close)?;
             }
         } else if explicit && flow.text[flow.position..].starts_with([',', '}']) {
-            let key = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
-            let value = self.push_empty_flow_scalar(flow.absolute_start + flow.position);
+            let key = self.push_empty_flow_scalar(flow.absolute_start + entry_start + 1);
+            let value = self.push_empty_flow_scalar(flow.absolute_start + entry_start + 1);
             self.attach_child_at(entry.as_usize(), key);
             self.attach_child_at(entry.as_usize(), value);
-            self.finish_flow_mapping_entry(
-                frame.node,
-                entry,
-                entry_start,
-                flow.position,
-                flow.absolute_start,
-            );
+            self.attach_child_at(frame.node.as_usize(), entry);
             flow.frames[frame_index].state = FlowFrameState::MappingAfterPair;
         } else {
-            flow.frames[frame_index].state = FlowFrameState::MappingAwaitKey {
-                entry,
-                entry_start: Span::usize_to_u32(entry_start),
-            };
+            flow.frames[frame_index].state = FlowFrameState::MappingAwaitKey { entry };
             self.start_flow_node(flow, frame.close)?;
         }
         Ok(())
@@ -2510,15 +2421,19 @@ impl<'source> Parser<'source> {
         let Some(character) = text[marker..].chars().next() else {
             return Err(empty_flow_value(absolute_start + start));
         };
-        if (properties.anchor().is_some() || properties.tag().is_some())
+        if let Some(property_end) = properties
+            .anchor()
+            .into_iter()
+            .chain(properties.tag())
+            .map(|span| span.end)
+            .max()
             && (character == ','
                 || character == close
                 || character == ':' && is_flow_mapping_separator_colon(text, marker))
         {
-            let property_end = marker - trailing_flow_whitespace(&text[start..marker]);
             let node = self.push_node(
                 NodeKind::Scalar,
-                Span::from_usize(absolute_start + start, absolute_start + property_end),
+                Span::new(Span::usize_to_u32(absolute_start + start), property_end),
             );
             self.register_flow_scalar_semantics(node, properties)?;
             return Ok(FlowNode::Scalar(node, marker));
@@ -2562,33 +2477,12 @@ impl<'source> Parser<'source> {
         sequence: NodeId,
         entry: NodeId,
         mapping: NodeId,
-        mapping_entry: NodeId,
-        end: usize,
-        absolute_start: usize,
     ) {
-        let absolute_end = Span::usize_to_u32(absolute_start + end);
-        self.nodes[mapping_entry.as_usize()].span.end = absolute_end;
-        self.nodes[mapping.as_usize()].span.end = absolute_end;
-        let mapping_span = self.nodes[mapping.as_usize()].span;
+        let span = self.nodes[mapping.as_usize()].span;
         self.semantics
-            .finish_flow_collection(&mut self.nodes, mapping, mapping_span);
+            .finish_flow_collection(&mut self.nodes, mapping, span);
         self.attach_child_at(entry.as_usize(), mapping);
-        self.nodes[entry.as_usize()].span.end = Span::usize_to_u32(absolute_start + end);
         self.attach_child_at(sequence.as_usize(), entry);
-    }
-
-    fn finish_flow_mapping_entry(
-        &mut self,
-        mapping: NodeId,
-        entry: NodeId,
-        entry_start: usize,
-        end: usize,
-        absolute_start: usize,
-    ) {
-        self.nodes[entry.as_usize()].span =
-            Span::from_usize(absolute_start + entry_start, absolute_start + end);
-        self.attach_child_at(mapping.as_usize(), entry);
-        self.nodes[mapping.as_usize()].span.end = Span::usize_to_u32(absolute_start + end);
     }
 
     fn register_implicit_flow_mapping(&mut self, mapping: NodeId) {
@@ -5513,7 +5407,7 @@ fn flow_collection_source_end(
     }
 }
 
-fn skip_flow_whitespace(text: &str, mut position: usize) -> usize {
+pub(crate) fn skip_flow_whitespace(text: &str, mut position: usize) -> usize {
     while let Some(character) = text[position..].chars().next() {
         if is_yaml_separation(character) {
             position += character.len_utf8();
@@ -5528,18 +5422,6 @@ fn skip_flow_whitespace(text: &str, mut position: usize) -> usize {
 
 fn leading_flow_whitespace(text: &str) -> usize {
     skip_flow_whitespace(text, 0)
-}
-
-fn trailing_flow_whitespace(text: &str) -> usize {
-    let mut length = 0;
-    for character in text.chars().rev() {
-        if is_yaml_separation(character) {
-            length += character.len_utf8();
-        } else {
-            break;
-        }
-    }
-    length
 }
 
 pub(crate) fn is_yaml_separation(character: char) -> bool {

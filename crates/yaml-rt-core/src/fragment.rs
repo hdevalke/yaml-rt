@@ -377,7 +377,16 @@ impl YamlDoc {
             .rfind(['\n', '\r'])
             .map_or(0, |index| index + 1);
         let base_indent = node.span.start as usize - line_start;
-        Ok(deindent_continuation_lines(source, base_indent))
+        let extracted = deindent_continuation_lines(source, base_indent);
+        // A flow sequence can spell a mapping without braces. Its entry
+        // starts at the same byte as the mapping, unlike a braced mapping.
+        if node.kind == crate::NodeKind::FlowMapping
+            && let Some(entry) = crate::syntax::node_link(node.first_child)
+            && self.expect_node(entry)?.span.start == node.span.start
+        {
+            return Ok(format!("{{{extracted}}}"));
+        }
+        Ok(extracted)
     }
 
     pub(crate) fn anchor_names(&self) -> BTreeSet<String> {

@@ -8,10 +8,9 @@ use crate::{
     Parser, ScalarStyle, SemanticKind, SemanticProperties, SemanticStore, Source, Span, ToYamlDoc,
     ToYamlFragment, Token, YamlEditError, YamlError, YamlEvent, YamlFragment,
     decode_scalar_value_with_content_indent, directive_emit_error, edits_conflict,
-    events_to_test_string, format_scalar_value, lex, parse_node_properties, plain_scalar_end,
-    resolve_tag, strip_inline_comment, validate_plain_mapping_fragment,
-    validate_tag_directive_parts_for_emit, validate_yaml_chars,
-    validate_yaml_directive_version_for_emit,
+    events_to_test_string, format_scalar_value, lex, parse_node_properties, resolve_tag,
+    strip_inline_comment, validate_plain_mapping_fragment, validate_tag_directive_parts_for_emit,
+    validate_yaml_chars, validate_yaml_directive_version_for_emit,
 };
 
 /// Pending source edit used by the patch-based emitter.
@@ -1098,9 +1097,9 @@ impl YamlDoc {
 
     /// Returns the decoded value text for a scalar node.
     ///
-    /// Plain scalars have trailing inline comments stripped, single-quoted
-    /// scalars unescape doubled apostrophes, and double-quoted scalars unescape
-    /// the common JSON/YAML escapes used by typed overlays.
+    /// Plain scalars use their content span, single-quoted scalars unescape
+    /// doubled apostrophes, and double-quoted scalars unescape the common
+    /// JSON/YAML escapes used by typed overlays.
     ///
     /// # Errors
     ///
@@ -1133,7 +1132,7 @@ impl YamlDoc {
             })
         ) && !value_text.contains(['\n', '\r'])
         {
-            return Ok(Cow::Borrowed(&value_text[..plain_scalar_end(value_text)]));
+            return Ok(Cow::Borrowed(value_text));
         }
         decode_scalar_value_with_content_indent(
             value_text,
@@ -1185,13 +1184,8 @@ impl YamlDoc {
             return Ok(None);
         }
         let properties = parse_node_properties(text, node_ref.span)?;
-        let value_text = &text[properties.value_start()..];
-        let value_len = plain_scalar_end(value_text);
         let start = Span::offset_from_usize(node_ref.span.start, properties.value_start());
-        Ok(Some(Span::new(
-            start,
-            Span::offset_from_usize(start, value_len),
-        )))
+        Ok(Some(Span::new(start, node_ref.span.end)))
     }
 
     /// Queues a scalar value replacement at `path` while preserving the existing

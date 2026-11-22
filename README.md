@@ -173,6 +173,9 @@ patch-oriented editing primitives.
 Plain and quoted scalar CST spans end at the scalar spelling, before trailing
 separation and comments. Node properties are included when they are part of the
 node's syntax.
+Flow entries end at their last child or indicator. Empty flow values have
+zero-width spans, and flow collection spans include their closing delimiters.
+Extraction supplies braces when a flow sequence uses single-pair mapping syntax.
 Block entry and collection CST spans cover multiline child content and end
 before the final line break; block scalars retain that break for chomping.
 Collection spans may start after indentation that their entry wrappers include.

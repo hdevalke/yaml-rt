@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::fragment::indent_text;
+use crate::parser::skip_flow_whitespace;
 use crate::pointer::parse_sequence_index;
 use crate::{
     CollectionStyle, Diagnostic, DiagnosticKind, FragmentError, JsonPointer, NodeId, PointerError,
@@ -868,11 +869,13 @@ impl YamlDoc {
             .ok_or_else(|| YamlEditError::new("flow collection entry is missing"))?;
         let entry_span = self.expect_node(entry)?.span;
         if entries.get(index + 1).is_none() && self.flow_collection_is_multiline(collection)? {
+            let span = self.multiline_flow_terminal_entry_span(collection, entry)?;
             if let Some(previous) = index.checked_sub(1).and_then(|index| entries.get(index)) {
                 let separator = self.flow_separator_after(*previous, entry)?;
-                self.queue_edit(separator, String::new())?;
+                if separator.end <= span.start {
+                    self.queue_edit(separator, String::new())?;
+                }
             }
-            let span = self.multiline_flow_terminal_entry_span(collection, entry)?;
             self.queue_edit(span, String::new())?;
             return Ok(());
         }
@@ -895,21 +898,16 @@ impl YamlDoc {
             .contains(['\r', '\n']))
     }
 
-    fn flow_entry_value_end(&self, entry: NodeId) -> Result<usize, YamlEditError> {
-        self.semantic_children(entry)
-            .last()
-            .and_then(|value| self.node(value))
-            .map(|value| value.span.end as usize)
-            .ok_or_else(|| YamlEditError::new("flow collection entry does not contain a value"))
-    }
-
     fn flow_separator_after(&self, previous: NodeId, next: NodeId) -> Result<Span, YamlEditError> {
-        let start = self.flow_entry_value_end(previous)?;
+        let start = self.expect_node(previous)?.span.end as usize;
         let end = self.expect_node(next)?.span.start as usize;
-        let separator = self.source().as_str()[start..end]
-            .find(',')
-            .map(|relative| start + relative)
-            .ok_or_else(|| YamlEditError::new("flow collection entries have no separator"))?;
+        let between = &self.as_source()[..end];
+        let separator = skip_flow_whitespace(between, start);
+        if between.as_bytes().get(separator) != Some(&b',') {
+            return Err(YamlEditError::new(
+                "flow collection entries have no separator",
+            ));
+        }
         Ok(Span::from_usize(separator, separator + 1))
     }
 
@@ -926,7 +924,7 @@ impl YamlDoc {
             _ => return Err(YamlEditError::new("expected a flow collection")),
         };
         let close = closing_delimiter_offset(self, collection_node.span, delimiter)?;
-        let content_end = self.flow_entry_value_end(entry)?;
+        let content_end = entry_node.span.end as usize;
         let line_end = self.source().as_str()[content_end..close]
             .find(['\r', '\n'])
             .map(|relative| content_end + relative)
@@ -1131,11 +1129,11 @@ impl YamlDoc {
         let key = emit_string_key(key);
         let value = value.render_flow(self)?;
         if self.flow_collection_is_multiline(mapping)? {
-            let content_start = self.flow_entry_content_start(before_entry)?;
+            let content_start = entry.span.start as usize;
             let line_start = self.line_start_offset(content_start);
             if line_start != self.line_start_offset(self.expect_node(mapping)?.span.start as usize)
+                && let Some(indent) = self.flow_entry_indent(line_start, content_start)
             {
-                let indent = &self.source().as_str()[line_start..content_start];
                 self.queue_edit(
                     Span::empty_from_usize(line_start),
                     format!("{indent}{key}: {value},{}", self.preferred_line_ending()),
@@ -1176,10 +1174,11 @@ impl YamlDoc {
                 if let Some(entry) = entries.get(index).copied()
                     && self.flow_collection_is_multiline(sequence)?
                 {
-                    let content_start = self.flow_entry_content_start(entry)?;
+                    let content_start = self.expect_node(entry)?.span.start as usize;
                     let line_start = self.line_start_offset(content_start);
-                    if line_start != self.line_start_offset(sequence_span.start as usize) {
-                        let indent = &self.source().as_str()[line_start..content_start];
+                    if line_start != self.line_start_offset(sequence_span.start as usize)
+                        && let Some(indent) = self.flow_entry_indent(line_start, content_start)
+                    {
                         self.queue_edit(
                             Span::empty_from_usize(line_start),
                             format!("{indent}{value},{}", self.preferred_line_ending()),
@@ -1240,12 +1239,12 @@ impl YamlDoc {
         Ok(())
     }
 
-    fn flow_entry_content_start(&self, entry: NodeId) -> Result<usize, YamlEditError> {
-        self.semantic_children(entry)
-            .next()
-            .and_then(|value| self.node(value))
-            .map(|value| value.span.start as usize)
-            .ok_or_else(|| YamlEditError::new("flow collection entry does not contain a value"))
+    fn flow_entry_indent(&self, line_start: usize, start: usize) -> Option<&str> {
+        let prefix = &self.as_source()[line_start..start];
+        prefix
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t'))
+            .then_some(prefix)
     }
 
     fn queue_multiline_flow_append(
@@ -1259,22 +1258,26 @@ impl YamlDoc {
             return Ok(false);
         }
         let close_line = self.line_start_offset(close);
-        let indent = if let Some(last) = entries.last().copied() {
-            let content_start = self.flow_entry_content_start(last)?;
-            if self.line_start_offset(content_start) == close_line {
-                return Ok(false);
-            }
-            self.source().as_str()[self.line_start_offset(content_start)..content_start].to_owned()
-        } else {
-            let close_indent = self.source().as_str()[close_line..close]
-                .bytes()
-                .take_while(|byte| *byte == b' ')
-                .count();
-            " ".repeat(close_indent + 2)
+        let Some(close_indent) = self.flow_entry_indent(close_line, close) else {
+            return Ok(false);
         };
-        if let Some(last) = entries.last().copied() {
-            let separator = Span::empty_from_usize(self.flow_entry_value_end(last)?);
-            self.queue_edit(separator, ",".to_owned())?;
+        let last = entries
+            .last()
+            .map(|&entry| self.expect_node(entry))
+            .transpose()?;
+        let indent = if let Some(last) = last {
+            let start = last.span.start as usize;
+            self.flow_entry_indent(self.line_start_offset(start), start)
+        } else {
+            None
+        };
+        let indent = indent.map_or_else(|| format!("{close_indent}  "), str::to_owned);
+        if let Some(last) = last {
+            let end = last.span.end as usize;
+            let separator = skip_flow_whitespace(&self.as_source()[..close], end);
+            if separator == close {
+                self.queue_edit(Span::empty_from_usize(end), ",".to_owned())?;
+            }
         }
         self.queue_edit(
             Span::empty_from_usize(close_line),

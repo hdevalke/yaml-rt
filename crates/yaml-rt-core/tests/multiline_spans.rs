@@ -1,6 +1,6 @@
 mod common;
 
-use yaml_rt_core::{JsonPointer, YamlDoc, YamlFragment};
+use yaml_rt_core::{JsonPointer, Span, YamlDoc, YamlFragment};
 
 fn pointer(path: &str) -> JsonPointer {
     JsonPointer::parse(path).unwrap()
@@ -85,6 +85,101 @@ fn block_quoted_scalar_spans_require_valid_trailing_syntax() {
             start + suffix.chars().next().unwrap().len_utf8()
         );
     }
+}
+
+#[test]
+fn flow_entry_spans_cover_syntax_without_trailing_trivia() {
+    let input = "items: [v  # first\r\n  , k: 'x'  # pair\r\n  ] # tail\r\nmap: {a:  # empty\r\n  , b: &ref  # property only\r\n  , c  # omitted\r\n  }\r\n";
+    let doc = YamlDoc::parse(input).unwrap();
+    let slice = |node| doc.source().slice(doc.node(node).unwrap().span());
+    let sequence = doc.resolve_pointer(0, &pointer("/items")).unwrap();
+    let sequence_entries = doc.children(sequence).collect::<Vec<_>>();
+    assert_eq!(slice(sequence_entries[0]), "v");
+    assert_eq!(slice(sequence_entries[1]), "k: 'x'");
+    let pair = doc.resolve_pointer(0, &pointer("/items/1")).unwrap();
+    assert_eq!(slice(pair), "k: 'x'");
+    assert_eq!(doc.extract_node(pair).unwrap(), "{k: 'x'}");
+    assert_eq!(slice(doc.children(pair).next().unwrap()), "k: 'x'");
+    assert!(slice(sequence).ends_with("\r\n  ]"));
+
+    let mapping = doc.resolve_pointer(0, &pointer("/map")).unwrap();
+    let mapping_entries = doc.children(mapping).collect::<Vec<_>>();
+    assert_eq!(slice(mapping_entries[0]), "a:");
+    assert_eq!(slice(mapping_entries[1]), "b: &ref");
+    assert_eq!(slice(mapping_entries[2]), "c");
+    let empty = doc.resolve_pointer(0, &pointer("/map/a")).unwrap();
+    let after_colon = input.find("a:").unwrap() + 2;
+    assert_eq!(
+        doc.node(empty).unwrap().span(),
+        Span::empty_from_usize(after_colon)
+    );
+    let decorated = doc.resolve_pointer(0, &pointer("/map/b")).unwrap();
+    assert_eq!(slice(decorated), "&ref");
+    assert_eq!(doc.anchor(decorated), Some("ref"));
+    assert_eq!(doc.scalar_value(decorated).unwrap(), "");
+    common::check_span_ends(&doc).unwrap();
+    assert_eq!(doc.to_string(), input);
+
+    let mut replaced = doc.clone();
+    replaced
+        .replace_at(
+            0,
+            &pointer("/items/1/k"),
+            &YamlFragment::parse("new").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(replaced.to_string(), input.replace("'x'", "'new'"));
+
+    let mut copied = doc;
+    copied
+        .copy_at(0, &pointer("/items/1"), &pointer("/copy"))
+        .unwrap();
+    assert_eq!(scalar(&copied, 0, "/copy/k"), "x");
+    assert!(copied.as_source().starts_with(input));
+}
+
+#[test]
+fn empty_explicit_flow_entries_own_their_indicators() {
+    for input in ["{?  # note\n}", "[?  # note\n]"] {
+        let doc = YamlDoc::parse(input).unwrap();
+        let root = doc.document_root(0).unwrap().unwrap();
+        let root_entry = doc.children(root).next().unwrap();
+        let mapping_entry = if input.starts_with('[') {
+            let mapping = doc.children(root_entry).next().unwrap();
+            doc.children(mapping).next().unwrap()
+        } else {
+            root_entry
+        };
+        assert_eq!(doc.node(root_entry).unwrap().span(), Span::new(1, 2));
+        assert_eq!(doc.node(mapping_entry).unwrap().span(), Span::new(1, 2));
+        for child in doc.children(mapping_entry) {
+            assert_eq!(doc.node(child).unwrap().span(), Span::empty(2));
+        }
+        assert_eq!(doc.to_string(), input);
+    }
+}
+
+#[test]
+fn flow_edits_find_separators_outside_comments_and_reuse_trailing_commas() {
+    let mut doc =
+        YamlDoc::parse("items: [\n  a # keep, literally\n  ,\n  b\n]\ntail: kept\n").unwrap();
+    doc.remove_at(0, &pointer("/items/1")).unwrap();
+    assert_eq!(
+        doc.to_string(),
+        "items: [\n  a # keep, literally\n  \n]\ntail: kept\n"
+    );
+    assert_eq!(scalar(&doc, 0, "/items/0"), "a");
+    assert_eq!(scalar(&doc, 0, "/tail"), "kept");
+
+    let mut doc = YamlDoc::parse("items: [\n  a # kept\n  , b\n]\n").unwrap();
+    doc.remove_at(0, &pointer("/items/1")).unwrap();
+    assert_eq!(doc.to_string(), "items: [\n  a # kept\n]\n");
+
+    let mut doc = YamlDoc::parse("map: {\n  a: 1, # kept\n}\n").unwrap();
+    doc.add_at(0, &pointer("/map/b"), &YamlFragment::parse("2").unwrap())
+        .unwrap();
+    assert_eq!(doc.to_string(), "map: {\n  a: 1, # kept\n  b: 2\n}\n");
+    assert_eq!(scalar(&doc, 0, "/map/b"), "2");
 }
 
 #[test]

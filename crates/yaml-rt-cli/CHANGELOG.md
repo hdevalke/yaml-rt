@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.5 - 2026-11-22
+
+- Build the CLI with updated parser and round-trip editing behavior, including
+  fixes for block scalars, omitted values, and alias bindings.
+- Refresh locked dependencies, including `url` 2.5.9 and `yoke-derive` 0.8.4.
+
+### Dependencies
+
+- Update `yaml-rt-core` (normal) requirement from `^0.3.3` to `^0.3.5`.
+
 ## 0.3.4 - 2026-11-12
 
 ### Fixes

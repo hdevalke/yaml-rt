@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.4 - 2026-11-22
+
+- Pick up parser and round-trip editing fixes from core and multiline literal
+  output when the `serde` feature is enabled.
+
+### Dependencies
+
+- Update `yaml-rt-core` (normal) requirement from `^0.3.3` to `^0.3.5`.
+- Update `yaml-rt-serde` (normal) requirement from `^0.3.2` to `^0.3.4`.
+
 ## 0.3.3 - 2026-10-17
 
 ### Features

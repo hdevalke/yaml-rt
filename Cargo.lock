@@ -1114,7 +1114,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "yaml-rt"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "serde",
  "yaml-rt-core",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "yaml-rt-cli"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "clap",
  "yaml-rt-core",

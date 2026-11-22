@@ -514,6 +514,48 @@ fn block_scalar_replacement_preserves_the_incoming_fragment_and_neighboring_triv
 }
 
 #[test]
+fn typed_block_scalar_write_reparses_to_the_exact_requested_string() {
+    use yaml_rt_core::YamlValue;
+    for ending in ["\n", "\r\n", "\r"] {
+        for head in ["|", "|-", "|+", ">", ">-", ">+", ">2-"] {
+            for requested in [
+                "",
+                "new",
+                "new\n",
+                "new\n\n",
+                "one\ntwo",
+                "one\n\ntwo",
+                "\nlead\n",
+                "one\n  indent\ntwo\n",
+                "  preserve",
+                "a\nb\n \nc",
+                "\n\n",
+                "a\rb",
+            ] {
+                for suffix in ["\nb: next\n", ""] {
+                    let input = format!("a: {head} # keep\n  old{suffix}").replace('\n', ending);
+                    let mut doc = YamlDoc::parse(&input).unwrap();
+                    let a = doc.resolve_pointer(0, &pointer("/a")).unwrap();
+                    requested.to_owned().write_yaml(&mut doc, Some(a)).unwrap();
+                    let output = doc.to_string();
+                    let doc = YamlDoc::parse(&output)
+                        .unwrap_or_else(|error| panic!("{output:?}: {error}"));
+                    assert_eq!(scalar(&doc, 0, "/a"), requested, "{output:?}");
+                    assert!(output.contains(" # keep"), "{output:?}");
+                    if !suffix.is_empty() {
+                        assert_eq!(scalar(&doc, 0, "/b"), "next", "{output:?}");
+                        assert!(
+                            output.ends_with(&suffix.replace('\n', ending)),
+                            "{output:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn inline_block_scalar_consumes_deferred_leading_blank_lines() {
     for ending in ["\n", "\r\n", "\r"] {
         for (header, body) in [("|", "one\ntwo"), (">", "one two")] {

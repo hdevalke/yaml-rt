@@ -193,6 +193,10 @@ value without the newly required separator newline.
 Rust value into the source of truth. Reading does not discard syntax, and
 writing patches only modeled values unless configured otherwise.
 
+Typed string edits preserve the decoded value exactly. When a block scalar's
+current spelling cannot represent the new value, the writer adjusts its
+chomping indicator or uses double-quoted escapes.
+
 ```rust
 use yaml_rt::{FromYamlDoc, ToYamlDoc, YamlDoc, YamlError, YamlRt};
 

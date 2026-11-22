@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 
 use crate::edit::closing_delimiter_offset;
-use crate::parser::{split_line_break, yaml_lines};
+use crate::parser::{block_scalar_header_range, split_line_break, yaml_lines};
 use crate::{
     BlockChomp, Diagnostic, DiagnosticKind, MappingEntryStyle, Node, NodeId, NodeKind,
     NonFiniteFloat, ResolvedScalar, SemanticKind, Span, YamlDoc, YamlEditError, YamlError,
@@ -690,7 +690,7 @@ fn write_existing_scalar(
         .node(node)
         .filter(|node| matches!(node.kind, NodeKind::LiteralScalar | NodeKind::FoldedScalar))
     {
-        let replacement = format_block_scalar_replacement(doc, block_scalar, value)?;
+        let replacement = format_block_scalar_replacement(doc, node, block_scalar, value)?;
         doc.queue_edit(block_scalar.span, replacement)?;
         return Ok(node);
     }
@@ -714,95 +714,115 @@ fn write_existing_scalar(
 
 fn format_block_scalar_replacement(
     doc: &YamlDoc,
+    node: NodeId,
     scalar: &Node,
     value: &str,
 ) -> Result<String, YamlError> {
     validate_yaml_chars(value)?;
     let text = doc.source.slice(scalar.span);
-    let (header_start, header_end, header_value_start) =
-        block_scalar_header_line(text, scalar.span)?;
-    let header = &text[..header_end];
-    let header_line = &text[header_start..header_end];
-    let header_value = &header_line[header_value_start..];
-    let header_info = parse_block_scalar_header(
-        header_value,
-        scalar.span.start as usize + header_start + header_value_start,
-    )?;
-    if value.contains('\r') {
-        // A block scalar normalizes physical line breaks. Use escapes for
-        // carriage returns that are part of the requested string value.
-        let prefix = &text[..header_start + header_value_start];
-        let suffix = header_value
-            .trim_start_matches(|c: char| matches!(c, '|' | '>' | '+' | '-' | '1'..='9'));
-        let separation = if suffix.starts_with('#') { " " } else { "" };
-        let quoted = crate::fragment::quote_string(value);
-        let (_, ending) = split_line_break(text);
-        return Ok(format!("{prefix}{quoted}{separation}{suffix}{ending}"));
-    }
-    let content_indent = doc
-        .block_scalar_content_indent(scalar)
-        .unwrap_or_else(|| doc.node_indent(scalar) + header_info.indent.unwrap_or(2));
-    let indent_text = " ".repeat(content_indent);
-    let line_ending = doc.preferred_line_ending();
-    let mut output = String::new();
-    output.push_str(header);
-    output.push_str(line_ending);
-    for line in value.split('\n') {
-        if line.is_empty() {
-            output.push_str(line_ending);
+    let header_range = block_scalar_header_range(text, scalar.span)?;
+    let indicator_start = header_range.start;
+    let header = &text[header_range];
+    let header_info =
+        parse_block_scalar_header(header, scalar.span.start as usize + indicator_start)?;
+    let indicator_end = header
+        .bytes()
+        .take_while(|byte| matches!(byte, b'|' | b'>' | b'+' | b'-' | b'1'..=b'9'))
+        .count();
+    let header_suffix = &header[indicator_end..];
+    let prefix = &text[..indicator_start];
+    let (_, owned_ending) = split_line_break(text);
+    let line_ending = if owned_ending.is_empty() {
+        doc.preferred_line_ending()
+    } else {
+        owned_ending
+    };
+    let content = value.trim_end_matches('\n');
+    let trailing_breaks = value.len() - content.len();
+    let mut content_lines = content.split('\n').filter(|line| !line.is_empty());
+    let first_starts_with_space = content_lines
+        .next()
+        .is_some_and(|line| line.starts_with([' ', '\t']));
+    let has_whitespace_line = value
+        .split('\n')
+        .any(|line| !line.is_empty() && line.bytes().all(|byte| matches!(byte, b' ' | b'\t')));
+    // Implicit indentation would consume leading spaces on the first content line.
+    // Escapes also represent CR and all-blank values without changing their meaning.
+    if value.contains('\r')
+        || (content.is_empty() && trailing_breaks != 0)
+        || (header_info.indent.is_none() && first_starts_with_space)
+        || has_whitespace_line
+    {
+        let separation = if header_suffix.starts_with('#') {
+            " "
         } else {
+            ""
+        };
+        let quoted = crate::fragment::quote_string(value);
+        return Ok(format!(
+            "{prefix}{quoted}{separation}{header_suffix}{owned_ending}"
+        ));
+    }
+
+    let chomp = match (trailing_breaks, header_info.chomp) {
+        (0, BlockChomp::Keep) => BlockChomp::Strip,
+        (0, BlockChomp::Clip) if !content.is_empty() => BlockChomp::Strip,
+        (0, original) => original,
+        (1, BlockChomp::Keep) => BlockChomp::Keep,
+        (1, _) => BlockChomp::Clip,
+        _ => BlockChomp::Keep,
+    };
+    let content_indent = doc
+        .semantic_properties(node)
+        .and_then(|properties| properties.content_indent)
+        .map(|indent| indent as usize)
+        .filter(|&indent| header_info.indent.is_some() || indent != 0)
+        .or_else(|| doc.block_scalar_content_indent(scalar))
+        .unwrap_or_else(|| doc.node_indent(scalar) + header_info.indent.unwrap_or(2));
+    let mut output = String::from(prefix);
+    let indicators = &header[..indicator_end];
+    let chomp_indicator = match chomp {
+        BlockChomp::Strip => "-",
+        BlockChomp::Clip => "",
+        BlockChomp::Keep => "+",
+    };
+    if let Some(index) = indicators.find(['-', '+']) {
+        output.push_str(&indicators[..index]);
+        output.push_str(chomp_indicator);
+        output.push_str(&indicators[index + 1..]);
+    } else {
+        output.push_str(indicators);
+        output.push_str(chomp_indicator);
+    }
+    if header_suffix.starts_with('#') && output.len() == prefix.len() + 1 {
+        output.push(' ');
+    }
+    output.push_str(header_suffix);
+    if !content.is_empty() || !owned_ending.is_empty() {
+        output.push_str(line_ending);
+    }
+
+    let indent_text = " ".repeat(content_indent);
+    let folded = scalar.kind() == NodeKind::FoldedScalar;
+    let mut previous_foldable = false;
+    for (index, line) in content.split('\n').enumerate() {
+        if index != 0 {
+            output.push_str(line_ending);
+        }
+        if !line.is_empty() {
+            let foldable = !line.starts_with([' ', '\t']);
+            if folded && previous_foldable && foldable {
+                output.push_str(line_ending);
+            }
             output.push_str(&indent_text);
             output.push_str(line);
-            output.push_str(line_ending);
+            previous_foldable = foldable;
         }
     }
-    if matches!(header_info.chomp, BlockChomp::Strip) {
-        while output.ends_with(line_ending) {
-            let new_len = output.len() - line_ending.len();
-            output.truncate(new_len);
-        }
+    for _ in 0..trailing_breaks.max(usize::from(!content.is_empty() && !owned_ending.is_empty())) {
+        output.push_str(line_ending);
     }
     Ok(output)
-}
-
-fn block_scalar_header_line(text: &str, span: Span) -> Result<(usize, usize, usize), YamlError> {
-    let mut line_start = 0;
-    while line_start < text.len() {
-        let line_end = text[line_start..]
-            .find(['\r', '\n'])
-            .map_or(text.len(), |offset| line_start + offset);
-        let line = &text[line_start..line_end];
-        let properties = parse_node_properties(
-            line,
-            Span::from_usize(
-                span.start as usize + line_start,
-                span.start as usize + line_end,
-            ),
-        )?;
-        let value = line[properties.value_start()..].trim_start();
-        if value.starts_with('|') || value.starts_with('>') {
-            let leading = line[properties.value_start()..].len() - value.len();
-            return Ok((line_start, line_end, properties.value_start() + leading));
-        }
-
-        line_start = line_end;
-        if text[line_start..].starts_with("\r\n") {
-            line_start += 2;
-        } else if text[line_start..].starts_with(['\r', '\n']) {
-            line_start += 1;
-        } else {
-            break;
-        }
-    }
-
-    Err(YamlError::new(
-        Diagnostic::new(
-            DiagnosticKind::Emitter,
-            "could not find block scalar header",
-            span,
-        )
-        .with_expected("| or > block scalar header"),
-    ))
 }
 
 fn push_block_sequence_item(

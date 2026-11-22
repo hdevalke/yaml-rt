@@ -1283,7 +1283,7 @@ fn yaml_value_writes_decorated_block_scalars() {
         .write_yaml(&mut literal, Some(message))
         .expect("anchored literal writes");
 
-    assert_eq!(literal.to_string(), "&msg\n|-\nnew");
+    assert_eq!(literal.to_string(), "&msg\n|-\nnew\n");
 
     let mut folded = YamlDoc::parse("folded:\n   !foo\n  >1\n old\n").expect("valid folded");
     let message = folded_scalar(&folded).expect("folded exists");
@@ -1292,7 +1292,7 @@ fn yaml_value_writes_decorated_block_scalars() {
         .write_yaml(&mut folded, Some(message))
         .expect("tagged folded writes");
 
-    assert_eq!(folded.to_string(), "folded:\n   !foo\n  >1\n new text\n");
+    assert_eq!(folded.to_string(), "folded:\n   !foo\n  >1-\n new text\n");
 }
 
 #[test]
@@ -2659,7 +2659,7 @@ fn yaml_value_writes_literal_scalar_values() {
         .write_yaml(&mut doc, Some(message))
         .expect("literal scalar writes");
 
-    assert_eq!(doc.to_string(), "message: |\n  updated\n");
+    assert_eq!(doc.to_string(), "message: |-\n  updated\n");
 }
 
 #[test]
@@ -2675,7 +2675,7 @@ fn yaml_value_writes_folded_scalar_values() {
         .write_yaml(&mut doc, Some(message))
         .expect("folded scalar writes");
 
-    assert_eq!(doc.to_string(), "message: >\n  updated\n");
+    assert_eq!(doc.to_string(), "message: >-\n  updated\n");
 }
 
 #[test]
@@ -4470,7 +4470,7 @@ fn string_write_rewrites_literal_block_scalar() {
         .write_yaml(&mut doc, Some(message))
         .expect("literal scalar rewrite queues");
 
-    assert_eq!(doc.to_string(), "message: |\n  new\n  text\n");
+    assert_eq!(doc.to_string(), "message: |-\n  new\n  text\n");
 }
 
 #[test]
@@ -4486,7 +4486,7 @@ fn string_write_rewrites_folded_block_scalar() {
         .write_yaml(&mut doc, Some(message))
         .expect("folded scalar rewrite queues");
 
-    assert_eq!(doc.to_string(), "message: >\n  new text\n");
+    assert_eq!(doc.to_string(), "message: >-\n  new text\n");
 }
 
 #[test]

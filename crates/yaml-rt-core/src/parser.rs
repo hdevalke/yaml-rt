@@ -681,6 +681,8 @@ impl<'source> Parser<'source> {
             }
         }
 
+        let line_end = lines.content_end(index + consumed - 1);
+        validate_quoted_scalar_suffix(&self.source.as_str()[absolute_end..line_end], absolute_end)?;
         let node = self.push_node(
             NodeKind::Scalar,
             Span::from_usize(absolute_start, absolute_end),
@@ -1563,19 +1565,26 @@ impl<'source> Parser<'source> {
             self.emit_scalar_event(key)?;
         }
 
+        let raw_start = absolute_start + colon_byte + 1;
         let raw_value = &body[colon_byte + 1..];
-        let value_trimmed = raw_value.trim_start();
-        let value = if value_trimmed.is_empty() {
-            self.push_empty_scalar(absolute_start + body.len())
+        let value_text = raw_value.trim_start_matches([' ', '\t']);
+        let value_start = raw_start + raw_value.len() - value_text.len();
+        let properties = parse_node_properties(
+            value_text,
+            Span::from_usize(value_start, raw_start + raw_value.len()),
+        )?;
+        let content = &value_text[properties.value_start()..];
+        let value_end = if let Some(length) = quoted_scalar_end(content) {
+            let quote_end = value_start + properties.value_start() + length;
+            validate_quoted_scalar_suffix(&content[length..], quote_end)?;
+            quote_end
         } else {
-            let leading = raw_value.len() - value_trimmed.len();
-            self.push_node(
-                NodeKind::Scalar,
-                Span::from_usize(
-                    absolute_start + colon_byte + 1 + leading,
-                    absolute_start + body.len(),
-                ),
-            )
+            raw_start + plain_scalar_end(raw_value)
+        };
+        let value = if value_end <= value_start {
+            self.push_empty_scalar(raw_start)
+        } else {
+            self.push_node(NodeKind::Scalar, Span::from_usize(value_start, value_end))
         };
         self.attach_child_at(entry.0 as usize, value);
         self.emit_scalar_event(value)?;
@@ -1698,35 +1707,37 @@ impl<'source> Parser<'source> {
             .cursor_from(index)
             .next()
             .expect("current line index is in bounds");
-        let mut end = initial_line.content_end;
         let mut pending_blank_lines = 0usize;
-        let mut scalar_has_inline_comment = plain_scalar_line_has_inline_comment(
-            &self.source.as_str()[value_start..initial_line.content_end],
-        );
         let initial_text = &self.source.as_str()[value_start..initial_line.content_end];
-        let scalar_has_node_properties = if initial_text.starts_with(['!', '&']) {
-            let properties = parse_node_properties(
-                initial_text,
-                Span::from_usize(value_start, initial_line.content_end),
-            )?;
-            properties.anchor().is_some() || properties.tag().is_some()
-        } else {
-            false
-        };
         let initial_properties = parse_node_properties(
             initial_text,
             Span::from_usize(value_start, initial_line.content_end),
         )?;
+        let scalar_has_node_properties =
+            initial_properties.anchor().is_some() || initial_properties.tag().is_some();
+        let content_start = value_start + initial_properties.value_start();
         let scalar_style = scalar_style_from_first_char(
-            initial_text[initial_properties.value_start()..]
+            self.source.as_str()[content_start..initial_line.content_end]
                 .chars()
                 .next()
                 .unwrap_or(' '),
         );
+        let plain = scalar_style == YamlScalarStyle::Plain;
+        let (mut end, mut scalar_has_inline_comment) = if plain {
+            let (length, comment) = plain_scalar_line_boundary(initial_text);
+            (value_start + length, comment)
+        } else {
+            (
+                initial_line.content_end,
+                separated_comment_offset(initial_text).is_some(),
+            )
+        };
 
         for line in lines.iter_from(index + 1) {
-            let trimmed = line.content_without_break.trim();
-            if is_document_marker_line(line.content_without_break) {
+            let trimmed = line.content_without_break.trim_matches([' ', '\t']);
+            if is_document_marker_line(line.content_without_break)
+                || plain && trimmed.starts_with('#')
+            {
                 break;
             }
 
@@ -1760,10 +1771,23 @@ impl<'source> Parser<'source> {
 
             consumed += pending_blank_lines + 1;
             pending_blank_lines = 0;
-            end = line.content_end;
-            scalar_has_inline_comment |= plain_scalar_line_has_inline_comment(body);
+            if plain {
+                let (length, comment) = plain_scalar_line_boundary(body);
+                end = line.content_start + indent + length;
+                scalar_has_inline_comment = comment;
+            } else {
+                end = line.content_end;
+                scalar_has_inline_comment = separated_comment_offset(body).is_some();
+            }
         }
 
+        if !plain {
+            let text = &self.source.as_str()[content_start..end];
+            if let Some(length) = quoted_scalar_end(text) {
+                validate_quoted_scalar_suffix(&text[length..], content_start + length)?;
+                end = content_start + length;
+            }
+        }
         let node = self.push_node(NodeKind::Scalar, Span::from_usize(value_start, end));
         if consumed > 1 {
             self.mark_scalar_syntax(node, scalar_style, scalar_style == YamlScalarStyle::Plain);
@@ -5228,8 +5252,13 @@ fn invalid_plain_scalar_continuation(offset: usize) -> YamlError {
     )
 }
 
-fn plain_scalar_line_has_inline_comment(text: &str) -> bool {
-    separated_comment_offset(text).is_some()
+fn plain_scalar_line_boundary(text: &str) -> (usize, bool) {
+    let comment = separated_comment_offset(text);
+    let content = &text[..comment.unwrap_or(text.len())];
+    (
+        content.trim_end_matches([' ', '\t']).len(),
+        comment.is_some(),
+    )
 }
 
 fn separated_comment_offset(text: &str) -> Option<usize> {
@@ -5265,44 +5294,36 @@ fn mapping_comment_with_colon_offset(text: &str) -> Option<usize> {
         .then_some(comment)
 }
 
+fn quoted_scalar_end(text: &str) -> Option<usize> {
+    match text.as_bytes().first() {
+        Some(b'"') => double_quoted_scalar_end(text),
+        Some(b'\'') => single_quoted_scalar_end(text),
+        _ => None,
+    }
+}
+
 fn validate_quoted_scalar_trailing_content(
     text: &str,
     absolute_start: usize,
 ) -> Result<(), YamlError> {
-    let Some(quote) = text
-        .chars()
-        .next()
-        .filter(|quote| matches!(quote, '"' | '\''))
-    else {
-        return Ok(());
-    };
-    let end = match quote {
-        '"' => double_quoted_scalar_end(text),
-        '\'' => single_quoted_scalar_end(text),
-        _ => None,
+    if let Some(end) = quoted_scalar_end(text) {
+        validate_quoted_scalar_suffix(&text[end..], absolute_start + end)?;
     }
-    .unwrap_or(text.len());
-    if end == text.len() {
-        return Ok(());
-    }
-    let trailing = &text[end..];
-    if trailing.is_empty() {
-        return Ok(());
-    }
-    let whitespace = trailing
-        .bytes()
-        .take_while(|byte| matches!(*byte, b' ' | b'\t'))
-        .count();
-    if whitespace == trailing.len() {
-        return Ok(());
-    }
-    if whitespace == 0 || !trailing[whitespace..].starts_with('#') {
-        let offset = absolute_start + end + whitespace;
+    Ok(())
+}
+
+fn validate_quoted_scalar_suffix(trailing: &str, absolute_start: usize) -> Result<(), YamlError> {
+    let content = trailing.trim_start_matches([' ', '\t']);
+    let whitespace = trailing.len() - content.len();
+    if let Some(character) = content.chars().next()
+        && (whitespace == 0 || character != '#')
+    {
+        let offset = absolute_start + whitespace;
         return Err(YamlError::new(
             Diagnostic::new(
                 DiagnosticKind::Parser,
                 "unexpected content after quoted scalar",
-                Span::from_usize(offset, offset + 1),
+                Span::from_usize(offset, offset + character.len_utf8()),
             )
             .with_expected("line break or separated comment"),
         ));
@@ -6336,18 +6357,7 @@ pub(crate) fn single_quoted_scalar_end(text: &str) -> Option<usize> {
 }
 
 pub(crate) fn plain_scalar_end(text: &str) -> usize {
-    let mut end = text.len();
-    let mut previous_was_whitespace = false;
-
-    for (offset, character) in text.char_indices() {
-        if character == '#' && previous_was_whitespace {
-            end = offset;
-            break;
-        }
-        previous_was_whitespace = matches!(character, ' ' | '\t');
-    }
-
-    text[..end].trim_end_matches([' ', '\t']).len()
+    plain_scalar_line_boundary(text).0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

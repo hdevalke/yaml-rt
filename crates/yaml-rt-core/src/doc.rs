@@ -7,10 +7,10 @@ use crate::{
     Children, CollectionStyle, Diagnostic, DiagnosticKind, FromYamlDoc, Node, NodeId, NodeKind,
     Parser, ScalarStyle, SemanticKind, SemanticProperties, SemanticStore, Source, Span, ToYamlDoc,
     ToYamlFragment, Token, YamlEditError, YamlError, YamlEvent, YamlFragment,
-    decode_scalar_value_with_content_indent, directive_emit_error, double_quoted_scalar_end,
-    edits_conflict, events_to_test_string, format_scalar_value, lex, parse_node_properties,
-    plain_scalar_end, resolve_tag, single_quoted_scalar_end, strip_inline_comment,
-    validate_plain_mapping_fragment, validate_tag_directive_parts_for_emit, validate_yaml_chars,
+    decode_scalar_value_with_content_indent, directive_emit_error, edits_conflict,
+    events_to_test_string, format_scalar_value, lex, parse_node_properties, plain_scalar_end,
+    resolve_tag, strip_inline_comment, validate_plain_mapping_fragment,
+    validate_tag_directive_parts_for_emit, validate_yaml_chars,
     validate_yaml_directive_version_for_emit,
 };
 
@@ -1872,56 +1872,22 @@ impl YamlDoc {
         let value_text = &text[properties.value_start()..];
         let value_start = Span::offset_from_usize(node.span.start, properties.value_start());
 
-        if value_text.starts_with('"') {
-            let end = double_quoted_scalar_end(value_text).ok_or_else(|| {
-                YamlError::new(
+        let style = match value_text.as_bytes().first() {
+            Some(b'"') => ScalarStyle::DoubleQuoted,
+            Some(b'\'') => ScalarStyle::SingleQuoted,
+            Some(_) => ScalarStyle::Plain,
+            None => {
+                return Err(YamlError::new(
                     Diagnostic::new(
                         DiagnosticKind::Emitter,
-                        "could not find the end of the double-quoted scalar",
+                        "could not find scalar text to replace",
                         node.span,
                     )
-                    .with_expected("a closed double-quoted scalar"),
-                )
-            })?;
-            return Ok((
-                Span::new(value_start, Span::offset_from_usize(value_start, end)),
-                ScalarStyle::DoubleQuoted,
-            ));
-        }
-
-        if value_text.starts_with('\'') {
-            let end = single_quoted_scalar_end(value_text).ok_or_else(|| {
-                YamlError::new(
-                    Diagnostic::new(
-                        DiagnosticKind::Emitter,
-                        "could not find the end of the single-quoted scalar",
-                        node.span,
-                    )
-                    .with_expected("a closed single-quoted scalar"),
-                )
-            })?;
-            return Ok((
-                Span::new(value_start, Span::offset_from_usize(value_start, end)),
-                ScalarStyle::SingleQuoted,
-            ));
-        }
-
-        let end = plain_scalar_end(value_text);
-        if end == 0 {
-            return Err(YamlError::new(
-                Diagnostic::new(
-                    DiagnosticKind::Emitter,
-                    "could not find plain scalar text to replace",
-                    node.span,
-                )
-                .with_expected("plain scalar text"),
-            ));
-        }
-
-        Ok((
-            Span::new(value_start, Span::offset_from_usize(value_start, end)),
-            ScalarStyle::Plain,
-        ))
+                    .with_expected("scalar text"),
+                ));
+            }
+        };
+        Ok((Span::new(value_start, node.span.end), style))
     }
 
     pub(crate) fn node_value_start(&self, node: NodeId) -> Result<usize, YamlError> {

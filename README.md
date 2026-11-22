@@ -170,6 +170,9 @@ The lower-level API exposes the lossless concrete syntax tree, semantic node
 metadata, JSON Pointer operations, fragments, diagnostics with spans, and
 patch-oriented editing primitives.
 
+Plain and quoted scalar CST spans end at the scalar spelling, before trailing
+separation and comments. Node properties are included when they are part of the
+node's syntax.
 Block entry and collection CST spans cover multiline child content and end
 before the final line break; block scalars retain that break for chomping.
 Collection spans may start after indentation that their entry wrappers include.

@@ -12,6 +12,82 @@ fn scalar(doc: &YamlDoc, document: usize, path: &str) -> String {
 }
 
 #[test]
+fn block_scalar_syntax_ends_before_unowned_trivia() {
+    for (input, path, syntax, value) in [
+        ("a: one  # note\n", "/a", "one", "one"),
+        (
+            "a: one\r\n  café#part \t# note\r\nb: three\r\n",
+            "/a",
+            "one\r\n  café#part",
+            "one café#part",
+        ),
+        (
+            "a: &ref one's value  # note\nb: *ref\n",
+            "/a",
+            "&ref one's value",
+            "one's value",
+        ),
+        ("- ' a # b '  # note\n", "/0", "' a # b '", " a # b "),
+        (
+            "a: &ref \"a # b\"  # note\n",
+            "/a",
+            "&ref \"a # b\"",
+            "a # b",
+        ),
+        ("? key\n: child: one  # note\n", "/key/child", "one", "one"),
+    ] {
+        let mut doc = YamlDoc::parse(input).unwrap();
+        let node = doc.resolve_pointer(0, &pointer(path)).unwrap();
+        let span = doc.node(node).unwrap().span();
+        assert_eq!(doc.source().slice(span), syntax, "{input:?}");
+        assert_eq!(doc.scalar_value(node).unwrap(), value, "{input:?}");
+        assert_eq!(doc.to_string(), input);
+        common::check_span_ends(&doc).unwrap();
+        if !syntax.starts_with('&') {
+            doc.replace_node_text(node, "new").unwrap();
+            let mut expected = input.to_owned();
+            expected.replace_range(span.start as usize..span.end as usize, "new");
+            assert_eq!(doc.to_string(), expected);
+            assert_eq!(scalar(&YamlDoc::parse(&expected).unwrap(), 0, path), "new");
+        }
+    }
+}
+
+#[test]
+fn block_scalar_edits_preserve_the_comment_after_the_value() {
+    let input = "a: one\n  two  # note\nb: three\n";
+    let mut scalar_edit = YamlDoc::parse(input).unwrap();
+    scalar_edit.set_scalar(&["a"], "new").unwrap();
+    assert_eq!(scalar_edit.to_string(), "a: new  # note\nb: three\n");
+
+    let mut whole_edit = YamlDoc::parse(input).unwrap();
+    let replacement = YamlFragment::parse("[new]").unwrap();
+    whole_edit
+        .replace_at(0, &pointer("/a"), &replacement)
+        .unwrap();
+    assert_eq!(whole_edit.to_string(), "a: [new]  # note\nb: three\n");
+    assert_eq!(scalar(&whole_edit, 0, "/a/0"), "new");
+    assert_eq!(scalar(&whole_edit, 0, "/b"), "three");
+}
+
+#[test]
+fn block_quoted_scalar_spans_require_valid_trailing_syntax() {
+    for (input, suffix) in [
+        ("- 'one' 'two'\n", "'two'"),
+        ("a: &ref \"one\" é\n", "é"),
+        ("\"one\"suffix\n", "suffix"),
+    ] {
+        let error = YamlDoc::parse(input).unwrap_err();
+        let start = input.find(suffix).unwrap();
+        assert_eq!(error.diagnostic.span.start as usize, start);
+        assert_eq!(
+            error.diagnostic.span.end as usize,
+            start + suffix.chars().next().unwrap().len_utf8()
+        );
+    }
+}
+
+#[test]
 fn block_scalar_extraction_and_copy_preserve_content_and_chomping() {
     for header in ["|", "|-", "|+", ">", ">-", ">+", "|2+"] {
         for ending in ["\n", "\r\n"] {
